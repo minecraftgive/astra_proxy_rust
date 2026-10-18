@@ -641,6 +641,8 @@ impl Editor {
                 text("name", "TUN 接口名（留空自动分配）", "", false),
                 text("address", "TUN IPv4 地址", "198.18.0.1", false),
                 number("prefix", "TUN 地址前缀", 30, 0, 32),
+                text("ipv6_address", "TUN IPv6 地址（可选）", "", false),
+                number("ipv6_prefix", "TUN IPv6 地址前缀", 126, 0, 128),
                 number("mtu", "TUN MTU", 1500, 1280, 9000),
                 Spec {
                     kind: Type::StringList,
@@ -656,7 +658,13 @@ impl Editor {
                     )
                 },
                 text("gateway", "原出口网关", "", false),
-                text("interface", "原出口接口（如 en0 / eth0）", "", false),
+                text("gateway6", "原出口 IPv6 网关（可选）", "", false),
+                text(
+                    "interface",
+                    "原出口接口（如 en0 / eth0 / Ethernet 或 Windows 索引）",
+                    "",
+                    false,
+                ),
             ]
         } else if matches!(last_key(path), Some("tproxy" | "redirect")) {
             vec![text(
@@ -2331,17 +2339,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "run after cargo build --workspace"]
     async fn live_visual_outbound_templates_pass_core_validation() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = std::path::PathBuf::from(format!("/tmp/astra-form-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("astra-form-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        astra_ipc::platform::set_private(&directory, 0o700).unwrap();
         let bin = std::env::current_exe()
             .unwrap()
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("astra-proxy");
+            .join(astra_ipc::platform::executable("astra-proxy"));
         for (selected, kind) in OUTBOUND_KINDS.iter().enumerate() {
             let mut e = Editor::new(
                 "proxy".into(),

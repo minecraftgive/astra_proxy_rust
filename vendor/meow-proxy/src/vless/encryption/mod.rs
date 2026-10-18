@@ -40,8 +40,8 @@ pub(crate) use stream::EncryptionStream;
 pub use client::ClientInstance;
 pub use factory::parse_client_encryption;
 
-#[cfg(test)]
-pub(crate) mod server;
+#[cfg(any(test,feature="vless-server"))]
+pub mod server;
 
 #[cfg(test)]
 mod loopback_tests;

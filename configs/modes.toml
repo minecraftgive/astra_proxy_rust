@@ -8,7 +8,7 @@ http_listen = "127.0.0.1:8080"
 # [system_proxy]
 # services = ["Wi-Fi"] # 仅 macOS；省略/[] 自动发现全部启用服务
 
-# 原生 Rust TUN，Linux/macOS 均需管理员权限。
+# 原生 Rust TUN，Linux/macOS/Windows 均需建卡权限；Windows 还需 Wintun，见 windows.toml。
 # [tun]
 # name = "utun20" # macOS；Linux 示例 astra0；省略则自动分配
 # address = "198.18.0.1"

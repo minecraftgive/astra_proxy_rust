@@ -901,8 +901,10 @@ default_action = "direct"
     #[tokio::test]
     #[ignore = "run after cargo build --workspace"]
     async fn live_recovery_and_defaults() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
-        let directory = PathBuf::from(format!("/tmp/astra-ui-recover-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("astra-ui-recover-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let home = directory.join("state");
         let socket = home.join("manager.sock");
@@ -997,10 +999,15 @@ default_action = "direct"
         assert_eq!(ui.input, blocked.display().to_string());
         assert!(matches!(&ui.prompt, Some(Prompt::Config(name)) if name == "rules"));
         ui.prompt = None;
-        // A real permission error can be fixed, then retried without restarting the TUI.
+        // Repair a real filesystem error and retry without restarting the UI.
         let locked = directory.join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(&locked, "parent occupied by file").unwrap();
         let locked_path = locked.join("rule.toml");
         ui.execute(
             &socket,
@@ -1011,7 +1018,13 @@ default_action = "direct"
             )),
         )
         .await;
+        #[cfg(unix)]
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(&locked).unwrap();
+            std::fs::create_dir(&locked).unwrap();
+        }
         assert!(ui.recovery.is_some());
         ui.key(key('c'));
         let Input::Run(retry, origin) =
@@ -1045,6 +1058,7 @@ default_action = "direct"
             ui.editor.as_ref().unwrap().text()
         );
         assert!(restored.recovery.is_some());
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&session_path)
                 .unwrap()

@@ -1,0 +1,36 @@
+# Rust build output (including vendored crates)
+target/
+**/*.rs.bk
+
+# Release packages
+/dist/
+
+# Local runtime data and development tools
+/.astra/
+/.build-tools/
+/.test-tools/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# OS metadata and editor temporary files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+/Local/

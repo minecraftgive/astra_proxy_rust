@@ -1,3 +1,4 @@
+use astra_ipc::platform::OpenOptionsExt;
 mod editor;
 mod log_stream;
 mod logs;
@@ -7,7 +8,6 @@ mod ui;
 use anyhow::{Context, Result};
 use std::{
     fs::OpenOptions,
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
@@ -15,10 +15,7 @@ use std::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")?
-        .join(".astra/tui");
+    let mut home = astra_ipc::platform::home_dir()?.join(".astra/tui");
     let mut bin = std::env::current_exe()?
         .parent()
         .context("Missing executable directory")?
@@ -35,7 +32,7 @@ async fn main() -> Result<()> {
             "--manager" => daemon = true,
             "--shutdown" => shutdown = true,
             "--help" | "-h" => {
-                println!("astra-tui [--state-dir DIR] [--bin-dir DIR]\n  --manager   Run the IPC manager in foreground\n  --shutdown  Drain all managed cores and stop the manager\n\nDefault: ~/.astra/tui; core executables beside astra-tui.\nQuitting the TUI leaves the manager and cores running.");
+                println!("astra-tui [--state-dir DIR] [--bin-dir DIR]\n  --manager   Run the IPC manager in foreground\n  --shutdown  Drain all managed cores and stop the manager\n\nDefault: {}\nCore executables beside astra-tui.\nQuitting the TUI leaves the manager and cores running.", home.display());
                 return Ok(());
             }
             _ => anyhow::bail!("Unknown argument: {arg}"),
@@ -45,10 +42,7 @@ async fn main() -> Result<()> {
     home = std::fs::canonicalize(home)?;
     bin = std::fs::canonicalize(bin)?;
     let socket = home.join("manager.sock");
-    anyhow::ensure!(
-        home.as_os_str().len() + 30 < 104,
-        "State directory path is too long for Unix sockets"
-    );
+    astra_ipc::platform::validate_state_directory(&home)?;
     if daemon {
         return manager::serve(home, bin).await;
     }
@@ -71,7 +65,8 @@ async fn main() -> Result<()> {
             .append(true)
             .mode(0o600)
             .open(home.join("manager.log"))?;
-        let mut child = Command::new(std::env::current_exe()?)
+        let mut command = Command::new(std::env::current_exe()?);
+        command
             .arg("--manager")
             .arg("--state-dir")
             .arg(&home)
@@ -79,9 +74,9 @@ async fn main() -> Result<()> {
             .arg(&bin)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()?;
+            .stderr(log);
+        astra_ipc::platform::background_command(&mut command, true);
+        let mut child = command.spawn()?;
         let mut ready = false;
         for _ in 0..50 {
             if protocol::call(&socket, protocol::Action::List)

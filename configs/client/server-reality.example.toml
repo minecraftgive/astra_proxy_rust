@@ -1,0 +1,20 @@
+# CLIENT ONLY. Insert the matching client_public_key, never the server private key.
+standalone = true
+standalone_outbound = "remote-server"
+socks5_listen = "127.0.0.1:1080"
+
+[[outbounds]]
+kind = "native"
+tag = "remote-server"
+[outbounds.config]
+protocol = "vless"
+server = "your-server.example.com"
+port = 24443
+uuid = "11111111-2222-4333-8444-555555555555"
+# flow = "xtls-rprx-vision"
+# mux = "h2mux"
+[outbounds.config.tls]
+server_name = "www.example.com"
+reality_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY"
+reality_short_id = "0123456789abcdef"
+fingerprint = "chrome"

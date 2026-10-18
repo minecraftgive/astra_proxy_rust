@@ -2,6 +2,8 @@
 
 Source: crates.io meow-proxy 0.23.1; upstream https://github.com/meow-rs/meow-rs (MIT, see LICENSE).
 
+- Add `vmess::server` for the independent native Astra server. It validates AEAD AuthID time/CRC, rejects replay, decrypts bounded request headers, emits AEAD response headers, and reuses the existing AES-GCM/ChaCha body codec. UDP record boundaries are carried through the internal duplex as length-prefixed records; these internal lengths are not added to VMess wire packets. Standard chunk options are supported; masked-size/global-padding and mux extensions are rejected. Local interoperability: `python scripts/server_regression.py --case vmess --case vmess-chacha`.
+
 - Shadowsocks raw UDP and Hysteria2: accept a reply carrying the same domain and port as the association's bound target. Return an unspecified IP to the caller, which retains the original domain. Unknown/unbound domain sources remain rejected. No local DNS resolution is introduced. Required for real sing-box domain-target UDP interoperability.
 
 Astra integration coverage: `python3 scripts/protocol_matrix.py --udp --case sing-shadowsocks --case sing-hysteria2`.
@@ -22,3 +24,5 @@ Tests cover client-first UDP, AES-GCM/ChaCha20-Poly1305, record boundaries, empt
 - Hysteria2 UDP: raise the native payload cap to 65507 bytes and bound reassembly to eight packets / 65507 total retained bytes / ten seconds. Reject conflicting addresses/counts and avoid charging duplicates twice. Native QUIC tests pass empty through 32768 bytes; sing-box still truncates the return of an 8192-byte echo to 4096, despite delivery of all 8192 bytes to the target. Test with `cargo test --manifest-path vendor/meow-proxy/Cargo.toml --no-default-features --features hysteria2 --lib hysteria2::`.
 
 - VLESS Encryption over buffered transports flushes every encrypted record. The relay now exposes a Vision-aware stream that switches at exact plaintext write offsets and waits for acknowledged record consumption before reading ahead. DIRECT bypasses the VLESS Encryption record layer while preserving the underlying HTTP/TLS transport. This avoids decrypting already-raw TLS bytes and losing buffered data at the transition. Native raw TCP/TLS Vision behavior remains unchanged. Integration: scripts/vless_node_regression.py --inner-tls (TLS 1.3-capable Python).
+
+- Add an opt-in `vless-server` feature and the explicitly named `vless_server_decryption` export. The server role imports persisted X25519 / ML-KEM private seeds, derives its public-key chain, performs inbound 1-RTT / 0-RTT handshakes, and reuses the existing record relay. Ticket lifetimes/capacity and handshake replay windows are enforced. DIRECT boundary controls are exposed for the server role. The outbound client API and configuration are unchanged; client-only builds do not enable this feature. Tests: `scripts/server_extensions_regression.py` and server-core unit tests.

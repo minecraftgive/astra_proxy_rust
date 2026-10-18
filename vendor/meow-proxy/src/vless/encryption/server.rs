@@ -1,8 +1,10 @@
-//! Reference **server** port of Xray/mihomo `encryption/server.go`, used only by
-//! the loopback integration test to verify the client against an independent
-//! implementation of the same wire protocol. Not compiled into shipped builds.
+//! Native VLESS server decryption, isolated behind the vless-server feature.
+//! Uses the shared record codec without changing the outbound client role.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport, TryKeyInit};
 use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768};
@@ -21,27 +23,27 @@ use super::aead::{
 use super::client::{spawn_relay, DataPhase};
 
 /// A long-term server key with its public encoding cached alongside.
-pub(crate) enum ServerKey {
+pub enum ServerKey {
     X25519(StaticSecret, [u8; 32]),
     MlKem(Box<DecapsulationKey<MlKem768>>, Vec<u8>),
 }
 
 impl ServerKey {
     /// Generate a fresh X25519 server key.
-    pub(crate) fn new_x25519() -> Self {
+    pub fn new_x25519() -> Self {
         let sk = StaticSecret::from(rand_array::<32>());
         let pk = PublicKey::from(&sk).to_bytes();
         ServerKey::X25519(sk, pk)
     }
 
     /// Generate a fresh ML-KEM-768 server key.
-    pub(crate) fn new_mlkem() -> Self {
+    pub fn new_mlkem() -> Self {
         let (dk, ek) = MlKem768::generate_keypair();
         ServerKey::MlKem(Box::new(dk), ek.to_bytes().as_slice().to_vec())
     }
 
     /// The public bytes a client uses in its `encryption` string.
-    pub(crate) fn public_bytes(&self) -> Vec<u8> {
+    pub fn public_bytes(&self) -> Vec<u8> {
         match self {
             ServerKey::X25519(_, pk) => pk.to_vec(),
             ServerKey::MlKem(_, ek) => ek.clone(),
@@ -49,8 +51,8 @@ impl ServerKey {
     }
 }
 
-/// A minimal reference `ServerInstance` (client-facing role only).
-pub(crate) struct ServerInstance {
+/// Server-side state for native VLESS inbound decryption.
+pub struct ServerInstance {
     keys: Vec<ServerKey>,
     nfs_pkeys_bytes: Vec<Vec<u8>>,
     hash32s: Vec<[u8; 32]>,
@@ -59,17 +61,28 @@ pub(crate) struct ServerInstance {
     seconds_from: i64,
     seconds_to: i64,
     padding: Padding,
-    sessions: Mutex<HashMap<[u8; 16], Vec<u8>>>,
+    sessions: Mutex<HashMap<[u8; 16], (Vec<u8>, Instant)>>,
+    replay: Mutex<HashMap<[u8; 16], Instant>>,
 }
 
 impl ServerInstance {
-    pub(crate) fn init(
+    pub fn init(
         keys: Vec<ServerKey>,
         xor_mode: u32,
         seconds_from: i64,
         seconds_to: i64,
         padding: &str,
     ) -> std::result::Result<Self, String> {
+        if keys.is_empty()
+            || keys.len() > 8
+            || xor_mode > 2
+            || seconds_from < 0
+            || seconds_to < 0
+            || seconds_from > 3600
+            || seconds_to > 3600
+        {
+            return Err("invalid server decryption parameters".into());
+        }
         let mut nfs_pkeys_bytes = Vec::with_capacity(keys.len());
         let mut hash32s = Vec::with_capacity(keys.len());
         let mut relays_length = 0usize;
@@ -93,10 +106,11 @@ impl ServerInstance {
             seconds_to,
             padding: parse_padding(padding)?,
             sessions: Mutex::new(HashMap::new()),
+            replay: Mutex::new(HashMap::new()),
         })
     }
 
-    pub(crate) async fn handshake(&self, mut stream: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+    pub async fn handshake(&self, mut stream: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
         let mut use_aes = true;
 
         // ── Read iv + relays and recover nfsKey ───────────────────────────────
@@ -108,6 +122,13 @@ impl ServerInstance {
         let iv: [u8; 16] = iv_and_relays[..16].try_into().unwrap();
         let mut relays = iv_and_relays[16..].to_vec();
 
+        {
+            let mut replay = self.replay.lock();
+            replay.retain(|_, at| at.elapsed() < Duration::from_secs(7200));
+            if replay.len() >= 65536 || replay.insert(iv, Instant::now()).is_some() {
+                return Err(server_err("replayed or over-capacity encryption handshake"));
+            }
+        }
         let mut nfs_key: Vec<u8> = Vec::new();
         let mut last_ctr = None;
         let mut pos = 0usize;
@@ -143,6 +164,9 @@ impl ServerInstance {
                         .as_slice()
                         .to_vec();
                 }
+            }
+            if nfs_key.iter().all(|b| *b == 0) {
+                return Err(server_err("non-contributory server key exchange"));
             }
             if j == n - 1 {
                 break;
@@ -227,7 +251,18 @@ impl ServerInstance {
         };
         ticket[..2].copy_from_slice(&encode_length(seconds as usize));
         if seconds > 0 {
-            self.sessions.lock().insert(ticket, pfs_key.clone());
+            let mut sessions = self.sessions.lock();
+            sessions.retain(|_, v| v.1 > Instant::now());
+            if sessions.len() >= 4096 {
+                return Err(server_err("ticket capacity exceeded"));
+            }
+            sessions.insert(
+                ticket,
+                (
+                    pfs_key.clone(),
+                    Instant::now() + Duration::from_secs(seconds as u64),
+                ),
+            );
         }
 
         // ── Assemble + fragment-write serverHello (raw, pre-XOR) ──────────────
@@ -323,7 +358,8 @@ impl ServerInstance {
             .sessions
             .lock()
             .get(&ticket_arr)
-            .cloned()
+            .filter(|v| v.1 > Instant::now())
+            .map(|v| v.0.clone())
             .ok_or_else(|| server_err("0-RTT: unknown ticket"))?;
 
         let mut united_key = pfs_key;
@@ -375,4 +411,53 @@ fn rand_between(from: i64, to: i64) -> i64 {
 
 fn server_err(msg: &str) -> MeowError {
     MeowError::Proxy(format!("vless-encryption(server): {msg}"))
+}
+
+impl ServerKey {
+    pub fn from_private(bytes: &[u8]) -> std::result::Result<Self, String> {
+        match bytes.len() {
+            32 => {
+                let sk = StaticSecret::from(<[u8; 32]>::try_from(bytes).unwrap());
+                let pk = PublicKey::from(&sk).to_bytes();
+                Ok(Self::X25519(sk, pk))
+            }
+            64 => {
+                let seed = ml_kem::Seed::try_from(bytes).map_err(|_| "invalid ML-KEM seed")?;
+                let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
+                let pk = dk.encapsulation_key().to_bytes().to_vec();
+                Ok(Self::MlKem(Box::new(dk), pk))
+            }
+            _ => Err(
+                "decryption private key must be X25519 (32 bytes) or ML-KEM seed (64 bytes)".into(),
+            ),
+        }
+    }
+    pub fn private_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::X25519(sk, _) => sk.to_bytes().to_vec(),
+            Self::MlKem(dk, _) => dk.to_seed().expect("generated seed").to_vec(),
+        }
+    }
+}
+pub fn enable_server_raw_read(stream: &mut dyn Stream) -> bool {
+    if let Some(stream) = stream
+        .as_any_mut()
+        .downcast_mut::<super::stream::EncryptionStream>()
+    {
+        stream.enable_raw_read();
+        true
+    } else {
+        false
+    }
+}
+pub fn enable_server_raw_write(stream: &mut dyn Stream) -> bool {
+    if let Some(stream) = stream
+        .as_any_mut()
+        .downcast_mut::<super::stream::EncryptionStream>()
+    {
+        stream.enable_raw_write();
+        true
+    } else {
+        false
+    }
 }

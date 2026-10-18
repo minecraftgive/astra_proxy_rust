@@ -1,0 +1,22 @@
+pub mod egress;
+pub mod mode_config;
+#[cfg(not(windows))]
+pub mod system_proxy;
+#[cfg(windows)]
+#[path = "windows_system_proxy.rs"]
+pub mod system_proxy;
+pub mod transparent;
+pub mod tun;
+#[cfg(windows)]
+pub mod windows_network;
+
+pub(crate) fn system_listener_changed(
+    new: &crate::config::ProxyConfig,
+    old: &crate::config::ProxyConfig,
+) -> bool {
+    if cfg!(windows) {
+        new.http_listen != old.http_listen
+    } else {
+        new.socks5_listen != old.socks5_listen
+    }
+}

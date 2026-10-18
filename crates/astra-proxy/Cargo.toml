@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+astra-protocols = { path = "../astra-protocols" }
 astra-ipc = { path = "../astra-ipc" }
 tokio.workspace = true
 serde.workspace = true
@@ -14,21 +18,11 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 moka = { version = "0.12", features = ["sync"] }
 tokio-rustls = "0.26"
-webpki-roots = "1"
-sha2 = "0.10"
-hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
-meow-proxy = { version = "=0.23.1", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "hysteria2", "mux"] }
 meow-common = "=0.23.1"
-meow-transport = { version = "=0.23.1", features = ["reality", "xhttp", "grpc", "httpupgrade", "h2"] }
-rustls-pemfile = "2"
-async-trait = "0.1"
 bytes = "1"
 http = "1"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 
-h2 = "0.4"
 arc-swap = "1.9.3"
 futures-util = "0.3.34"
 libc = "0.2.191"
@@ -38,3 +32,6 @@ tun-rs = { version = "2.8.13", features = ["async"] }
 etherparse = "0.16"
 
 ipnet = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_WinInet"] }

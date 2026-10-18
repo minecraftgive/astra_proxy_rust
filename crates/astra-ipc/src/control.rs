@@ -1,10 +1,8 @@
 //! Separate, owner-only management socket. Routing IPC remains unchanged.
+use crate::platform::LocalListener as UnixListener;
 use serde::{Deserialize, Serialize};
-use std::{io, os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
-use tokio::{
-    net::UnixListener,
-    time::{timeout, Duration},
-};
+use std::{io, path::PathBuf, time::Instant};
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
@@ -50,6 +48,7 @@ pub fn applied(path: &std::path::Path, text: &str) {
 
 pub struct Control {
     listener: Option<UnixListener>,
+    #[cfg_attr(windows, allow(dead_code))]
     path: Option<PathBuf>,
     started: Instant,
 }
@@ -65,9 +64,9 @@ impl Control {
             Some(path) => {
                 let listener = UnixListener::bind(path)?;
                 if let Err(e) =
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    crate::platform::set_private(crate::platform::endpoint_path(path), 0o600)
                 {
-                    let _ = std::fs::remove_file(path);
+                    crate::platform::remove_socket(path);
                     return Err(e);
                 }
                 Some(listener)
@@ -94,7 +93,7 @@ impl Control {
     {
         let signal = crate::shutdown_signal();
         tokio::pin!(signal);
-        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        let mut hup = crate::platform::ReloadSignal::new()?;
         loop {
             let connection = async {
                 match &self.listener {
@@ -147,7 +146,7 @@ impl Control {
 impl Drop for Control {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
-            let _ = std::fs::remove_file(path);
+            crate::platform::remove_socket(path);
         }
     }
 }
@@ -159,7 +158,7 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
         3
     };
     timeout(Duration::from_secs(seconds), async {
-        let mut stream = tokio::net::UnixStream::connect(path).await?;
+        let mut stream = crate::platform::LocalStream::connect(path).await?;
         crate::send(
             &mut stream,
             &Request {
@@ -189,7 +188,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn status_version_rejection_stop_and_cleanup() {
-        let path = PathBuf::from(format!("/tmp/astra-ctl-test-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("astra-ctl-test-{}.sock", std::process::id()));
         let control = Control::bind(Some(path.clone())).unwrap();
         let task = tokio::spawn(async move {
             control.shutdown().await.unwrap();
@@ -198,7 +197,7 @@ mod tests {
             request(&path, Command::Status).await.unwrap().pid,
             std::process::id()
         );
-        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let mut stream = crate::platform::LocalStream::connect(&path).await.unwrap();
         crate::send(
             &mut stream,
             &Request {
@@ -216,10 +215,8 @@ mod tests {
     }
     #[test]
     fn existing_socket_is_never_overwritten() {
-        let path = PathBuf::from(format!(
-            "/tmp/astra-ctl-existing-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("astra-ctl-existing-{}.sock", std::process::id()));
         std::fs::write(&path, "keep").unwrap();
         // Bind rejects existing regular files before creating a Tokio listener.
         let runtime = tokio::runtime::Runtime::new().unwrap();

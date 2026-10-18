@@ -6,6 +6,8 @@
 
 ## 架构
 
+配套服务端已单独提供 `astra-server-core` 和 `astra-server-tui`，覆盖客户端全部协议类型（SS/SS2022、VMess、Trojan、VLESS、Hysteria2、TUIC，以及认证 SOCKS5/HTTP CONNECT）。服务端原生 Rust 实现，独立配置、管理接口和安装包，无需客户端规则核心；REALITY、Vision、VLESS 解密、Mux/XUDP 等入站扩展见 [服务器端扩展](docs/SERVER_EXTENSIONS.md)，启动与独立打包方法见 [服务端说明](docs/SERVER.md)。客户端使用出站配置，服务器端使用独立的入站配置，两端程序与安装包分开。
+
 - `astra-proxy`：入站握手、路由缓存、原生协议出站、TCP relay 与 UDP 会话管理。
 - `astra-rule`：启动时编译规则索引，按配置顺序返回第一条匹配规则。
 - `astra-ipc`：版本化请求与响应、bincode 长度帧，路由通道只传元数据；管理通道独立。
@@ -25,7 +27,7 @@
 
 ## 系统接管与热重载
 
-新增 macOS/Linux 原生 TUN、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理。配置表可独立开启或关闭；TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置，节点切换保留既有连接。
+提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。配置表可独立开启或关闭；TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置，节点切换保留既有连接。
 
 精简配置见 [configs/modes.toml](configs/modes.toml)，平台权限、TUN 防自环、透明代理路由、设置恢复及实测边界见 [模式与热重载说明](docs/PROXY_MODES.md)。设备和防火墙权限相关路径尚需目标机器验收，不能仅凭配置校验视为已接管系统流量。
 
@@ -58,7 +60,7 @@ python3 scripts/astra.py --bin-dir target/release --proxy /path/to/proxy-standal
 | UDP 未完项 | 部分协议的大包/空包边界；Hysteria2/sing-box 返回方向超过 4096 字节仍有截断 |
 | XHTTP | stream-one、stream-up、packet-up；当前范围为 HTTP/2 |
 | TCP 半关闭 | relay 使用 `copy_bidirectional`，但最终行为取决于协议和服务端；不能据此保证所有路径支持半关闭 |
-| 尚未实现 | Fake-IP、DNS 嗅探、Windows IPC |
+| 尚未实现 | Fake-IP、DNS 嗅探 |
 
 XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确认已排队 POST 后结束整个隧道；需要上传结束后继续接收响应的应用不能依赖该模式。普通互通测试是在收到回显后才关闭上传；严格半关闭测试使用 `--trailer`，当前 VLESS/Xray 路径仍有失败。
 
@@ -66,7 +68,7 @@ XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确
 
 ## 安装包
 
-macOS arm64 安装包的解压、校验和启动步骤见 [安装说明](docs/INSTALL.md)。新构建包包含两个 core 和 `astra-tui` 三个原生可执行文件；参考服务端不随包分发。本机初始性能数据见 [性能基线](docs/PERFORMANCE.md)。
+分发包的解压和启动步骤见 [安装说明](docs/INSTALL.md)。客户端与服务端分别打包为 `client/` 与 `server/`；每包仅包含自己的执行文件与一份完整示例配置。客户端还包含离线转换工具及可选 Wintun 运行库。本机初始性能数据见 [性能基线](docs/PERFORMANCE.md)。
 
 VLESS Encryption、Vision 与 XHTTP 的配置字段见 [原生协议说明](docs/NATIVE_PROTOCOLS.md)。私人节点配置及验证记录保存在 Git 忽略的 `Local/` 目录，不随项目发布。
 
@@ -96,13 +98,15 @@ python3 scripts/astra.py --check --proxy example_proxy.toml --rules example_rule
 
 ## 构建与启动
 
-目标平台：Linux/macOS（当前互通测试环境为 macOS arm64）。需要 Rust 工具链、CMake、Clang/C++ 与 libclang；Python 3 用于启动和测试脚本。
+目标平台：Linux/macOS/Windows。Windows 本地 IPC 使用仅当前用户可访问的命名管道，支持双核心、独立代理及 TUI；已加入 Wintun 与当前用户系统 HTTP/HTTPS 代理实现，已通过系统 HTTP/HTTPS、恢复和 TUN 双栈专用地址转发检查，全局路由接管尚未验收。透明代理 TPROXY/REDIRECT 仍仅限 Linux。加密协议矩阵的既有验收环境为 macOS arm64，Windows 本地验证范围见 [安装说明](docs/INSTALL.md)。需要 Rust 工具链、CMake、Clang/C++ 与 libclang；Windows x64 另需 MSVC C++ 工具和 NASM。Python 3 用于构建、启动和测试脚本。
 
-统一编译、测试并分发三个原生程序：
+编译、测试并分发客户端原生程序：
 
 ```sh
 ./scripts/build.sh
 ```
+
+Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；也可执行 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。
 
 安装包输出到 `dist/`，包含 `astra-proxy`、`astra-rule`、`astra-tui`、配置、文档与依赖许可，并附 SHA-256 和验证报告。支持 `--debug`、`--build-only`、`--label`、`--output-dir`；详见 [构建与打包说明](docs/INSTALL.md)。
 
@@ -117,7 +121,7 @@ cargo test --workspace
 ./target/release/astra-tui
 ```
 
-按 Tab 切换 core，n 添加实例，s/x/r 启动、停止、重启，e 编辑配置。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。新打包脚本会包含 `bin/astra-tui`；旧安装包需重新构建。
+按 Tab 切换 core，n 添加实例，s/x/r 启动、停止、重启，e 编辑配置。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
 
 本地直连示例：
 
@@ -196,3 +200,7 @@ python3 scripts/tuic_regression.py
 双进程的价值是规则与连接生命周期隔离，尚无数据证明它比单进程更快。索引、缓存及持久 IPC 已减少每个新连接的工作；后续先测缓存命中/未命中的建连 p50/p95/p99、吞吐、CPU 和峰值内存，再决定调整 IPC 池或 relay 缓冲。当前单规则微基准不能代表大量规则或整机代理性能。
 
 优先补协议边界、取消清理与可定位错误，再做有测量依据的优化。架构审查及验收方案见 [架构评价](docs/ARCHITECTURE_REVIEW.md)。
+
+## 代码分层
+
+共享协议、proxy 核心和操作系统适配的目录及依赖规则见 [模块架构](docs/ARCHITECTURE.md)。运行 `python scripts/check_architecture.py` 检查模块边界。

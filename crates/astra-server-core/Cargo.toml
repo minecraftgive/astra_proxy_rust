@@ -1,0 +1,47 @@
+[package]
+name = "astra-server-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+astra-protocols = { path = "../astra-protocols" }
+astra-ipc = { path = "../astra-ipc" }
+astra-server-api = { path = "../astra-server-api" }
+tokio.workspace = true
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+arc-swap = "1.9.3"
+bytes = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+ipnet = { version = "2", features = ["serde"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "security-replay-attack-detect"] }
+meow-proxy = { version = "=0.23.1", default-features = false, features = ["vmess", "vless", "vless-server", "mux"] }
+meow-transport = { version = "=0.23.1", features = ["grpc"] }
+futures-util = "0.3"
+h2 = "0.4"
+http = "1"
+tokio-tungstenite = "0.29"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.9"
+blake2 = "0.10"
+yamux = "0.14"
+tokio-util = { version = "0.7", features = ["compat"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+meow-common = "=0.23.1"

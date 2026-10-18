@@ -40,24 +40,28 @@ decision_cache_ttl_secs = 5
 # 可选表默认全部未启用。取消表头注释时，也只取消所需字段的注释。
 # 顶层设置必须放在所有 [表] / [[outbounds]] 之前，避免误写入前一张表。
 
-# 系统代理：macOS 网络服务、Linux GNOME 当前用户的 D-Bus 会话。
+# 系统代理：macOS 网络服务、Linux GNOME 当前用户的 D-Bus、Windows 当前用户 LAN 代理。
 # [system_proxy]
 # services = ["Wi-Fi"] # macOS 服务名列表；省略/[] 自动发现全部启用服务；Linux 必须省略/[]
-# 使用上方 socks5_listen；仅接管遵循系统代理的应用，不强制接管全部系统流量。
+# macOS/Linux 使用 socks5_listen；Windows 使用回环 http_listen，支持普通 HTTP 与 HTTPS CONNECT。
+# Windows 的 services 必须省略/[]；只接管遵循系统代理的应用，不改变 WinHTTP 或 VPN/RAS 设置。
 # 启用前保存 SOCKS 和优先级更高的 HTTP/HTTPS/PAC 等原设置；正常停止/关闭此模式时恢复。
 # macOS 需要网络服务写权限；已有需认证的 SOCKS 设置会拒绝接管，避免无法恢复密码。
 # 写入前生成 0600 恢复文件；存在未恢复文件时拒绝覆盖，异常退出恢复命令见后文。
 
-# 原生 TUN：Linux/macOS；root 或 Linux CAP_NET_ADMIN；不启动外部协议核心。
+# 原生 TUN：Linux/macOS/Windows；Unix 需 root/CAP_NET_ADMIN，Windows 需管理员及官方 Wintun DLL。
 # [tun]
 # name = "utun20" # macOS；Linux 示例 astra0；省略自动分配；多实例不可重名
 # address = "198.18.0.1" # 默认 IPv4 接口地址
 # prefix = 30 # 默认 30；0..32
+# ipv6_address = "fd00:198:18::1" # 可选；Windows 接管 IPv6 路由时必填
+# ipv6_prefix = 126 # 默认 126；0..128
 # mtu = 1500 # 默认 1500；1280..9000
 # routes = [] # 默认 []：只创建设备，由外部管理路由；列表项必须为 IPv4/IPv6 CIDR
 # bypass = [] # 默认 []：经原网关/物理接口绕过的 CIDR；不可覆盖已有冲突路由
 # gateway = "192.168.1.1" # 可选：接管前的网关，按真实网络替换
-# interface = "en0" # 可选：接管前物理接口，Linux 示例 eth0；托管 routes 时必填
+# gateway6 = "fe80::1" # 可选：接管前 IPv6 网关；Windows scope 根据 interface 推断
+# interface = "en0" # 接管前物理接口；Linux eth0；Windows Ethernet/中文别名/索引；托管 routes 时必填
 # 全局 IPv4 接管变体：将上方 routes/bypass 两行替换为下面两行，不能重复定义同名键：
 # routes = ["0.0.0.0/1", "128.0.0.0/1"]
 # bypass = ["203.0.113.8/32", "8.8.8.8/32"] # 必须替换为实际节点 IP / 被接管范围内的 DNS

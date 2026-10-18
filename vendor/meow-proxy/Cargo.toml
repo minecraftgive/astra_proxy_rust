@@ -27,6 +27,7 @@ license = "MIT"
 repository = "https://github.com/meow-rs/meow-rs"
 
 [features]
+vless-server = ["vless-encryption"]
 anytls = ["dep:meow-anytls"]
 default = [
     "ss",

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert"]
+members = ["crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-api", "crates/astra-server-core", "crates/astra-server-tui"]
 resolver = "2"
 exclude = ["vendor/meow-proxy"]
 

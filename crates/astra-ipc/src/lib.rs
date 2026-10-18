@@ -1,11 +1,12 @@
 //! Control plane only. No packet payload ever crosses this interface.
+use crate::platform::LocalStream as UnixStream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 pub mod control;
 pub mod logging;
+pub mod platform;
 
 pub const API_VERSION: u16 = 2;
 const MAX_MESSAGE_BYTES: u32 = 8192;
@@ -105,11 +106,4 @@ async fn receive_bounded<T: DeserializeOwned>(
     bincode::deserialize(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Both interactive runs and service managers get the same shutdown path.
-pub async fn shutdown_signal() -> io::Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = terminate.recv() => Ok(()),
-    }
-}
+pub use platform::shutdown_signal;

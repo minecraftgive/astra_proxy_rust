@@ -6,13 +6,13 @@
 
 | 方式 | 平台 | 流量范围 | 要求 |
 |---|---|---|---|
-| SOCKS5 / HTTP CONNECT | Linux/macOS | 应用显式发送给监听端口的流量 | 无管理员权限要求 |
-| `[system_proxy]` | macOS、Linux GNOME | 遵循桌面系统代理的应用 | macOS 网络服务写权限；GNOME 用户 D-Bus 会话 |
-| `[tun]` | Linux/macOS | 路由进入虚拟网卡的 TCP/UDP | root / Linux CAP_NET_ADMIN |
+| SOCKS5 / HTTP CONNECT | Linux/macOS/Windows | 应用显式发送给监听端口的流量；Windows 另支持普通 HTTP 转发 | 无管理员权限要求 |
+| `[system_proxy]` | macOS、Linux GNOME、Windows | 遵循桌面系统代理的应用 | macOS 网络服务写权限；GNOME 用户 D-Bus；Windows 当前用户 |
+| `[tun]` | Linux/macOS/Windows | 路由进入虚拟网卡的 TCP/UDP | root / Linux CAP_NET_ADMIN；Windows 管理员 + Wintun |
 | `[tproxy]` | Linux | 策略路由与 TPROXY 送入的 TCP/UDP | CAP_NET_ADMIN 或 CAP_NET_RAW、内核 TPROXY、nftables/iptables |
 | `[redirect]` | Linux | NAT REDIRECT 送入的 TCP | 外部 NAT 规则；UDP 使用 TPROXY |
 
-这些模式可并用；配置表存在即启用，删除整张表即可关闭。TPROXY/REDIRECT 在 macOS 的配置检查阶段就会被拒绝。普通监听、原生出站和 standalone 保持原有语义。
+这些模式可并用；配置表存在即启用，删除整张表即可关闭。TPROXY/REDIRECT 在 macOS/Windows 的配置检查阶段就会被拒绝。普通监听、原生出站和 standalone 保持原有语义。Windows TUN、系统代理与普通 HTTP 转发已通过本机集成检查，范围及复现见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)。
 
 完整字段见 `example_proxy.toml`，精简模板见 `configs/modes.toml`。
 
@@ -29,7 +29,20 @@ services = ["Wi-Fi"] # macOS；省略或 [] 自动发现启用的网络服务
 
 Linux GNOME 使用空表 `[system_proxy]`，不要填写 macOS 的服务名。服务运行在当前桌面用户的 D-Bus 会话中；无 GNOME 会话的 Linux 服务器使用 TUN/TPROXY。
 
-系统集成使用 SOCKS。现有 HTTP 入站仅支持 CONNECT，不会将它错误注册为支持普通 HTTP 请求的系统 HTTP 代理。启用时临时关闭优先级更高的 HTTP/HTTPS/PAC 自动设置，GNOME 清空 HTTP/HTTPS/FTP 代理 host；原值全部记录后才写入，正常停止或关闭此模式时恢复。系统代理仍由应用决定是否遵循，不能强制接管忽略代理的程序。已有需要认证的 macOS SOCKS 设置不能完整读回密码，因此会拒绝启用并保留原设置。
+macOS/Linux 系统集成使用 SOCKS，HTTP 入站在这两个平台仍只支持 CONNECT。启用时临时关闭优先级更高的 HTTP/HTTPS/PAC 自动设置，GNOME 清空 HTTP/HTTPS/FTP 代理 host；原值全部记录后才写入，正常停止或关闭此模式时恢复。系统代理仍由应用决定是否遵循，不能强制接管忽略代理的程序。已有需要认证的 macOS SOCKS 设置不能完整读回密码，因此会拒绝启用并保留原设置。
+
+Windows 使用回环 HTTP 代理：
+
+```toml
+http_listen = "127.0.0.1:8080"
+
+[system_proxy]
+# Windows 不填 services；该字段仅用于 macOS。
+```
+
+Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS 代理。普通 HTTP 请求由 Hyper 校验消息边界、移除逐跳头并流式转发，HTTPS 沿用 CONNECT 隧道；普通 HTTP 当前每条连接处理一个请求，`Upgrade` 需走独立 CONNECT（不支持明文 WebSocket 升级）。启用时记录手动代理地址、绕过列表、PAC URL 和自动检测标志，再设置 `http=回环地址;https=回环地址`、`<local>` 绕过并临时关闭 PAC/自动检测；正常关闭时恢复原值并通知应用。WinHTTP、VPN/RAS 连接、其他用户账户以及不遵循系统代理的应用不在该设置范围内。
+
+Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；发生崩溃时新实例会指出要恢复的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
 
 写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则在初始代理配置旁，例如 `configs/modes.system-proxy-state.toml`。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
 
@@ -38,6 +51,8 @@ Linux GNOME 使用空表 `[system_proxy]`，不要填写 macOS 的服务名。�
 ```
 
 恢复失败会保留文件供重试。正常退出后文件删除。不要删除尚未恢复的文件。
+
+Windows 使用相同入口，例如 `./target/debug/astra-proxy.exe --restore-system-proxy C:/Astra/state/proxy.system-proxy-state.toml`。此命令会实际改动系统设置，应在确认旧实例停止且需要恢复时执行。
 
 ## 原生 TUN
 
@@ -68,6 +83,12 @@ bypass = ["203.0.113.10/32", "8.8.8.8/32"] # 节点 IP + 原 DNS
 ```
 
 进程需以具备建卡/改路由权限的身份运行；TUI 不会自动提权，也不会读取管理员密码。建议由系统服务管理权限，TUI 使用对应管理服务进行操作。
+
+Windows 使用 [Wintun 官方签名 DLL](https://www.wintun.net/)。运行前按 [安装说明](INSTALL.md) 准备匹配架构的 DLL 和许可文件；准备脚本只下载和复制文件，不加载驱动。DLL 默认从可执行文件目录按完整路径加载，也可由 `ASTRA_WINTUN_DLL` 指定可信路径。Astra 不在退出时卸载共享 Wintun 驱动，不复用其他应用已有的同名网卡。
+
+Windows 配置模板见 `configs/windows.toml`，两项模式默认关闭。启用 TUN 时 `name` 可用 `Astra`，`interface` 填实际物理网卡别名（如 `Ethernet`、`Wi-Fi`、中文别名）或接口索引。不能将 `interface` 指向 TUN 本身。托管路由使用 Windows IP Helper API 的临时路由，保留物理默认路由并使用两个 `/1` 接管路由；不接受 `/0`。已有冲突路由会拒绝，不覆盖外部条目；失败时清理本次新建项。直连 TCP/UDP 使用 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 绑定原出口，回环目的地址保持回环。
+
+可选 `ipv6_address = "fd00:198:18::1"`、`ipv6_prefix = 126` 配置 TUN 的 IPv6 地址；Windows 托管 IPv6 路由必须有该地址。双栈时 IPv4 网关写 `gateway`，IPv6 网关写 `gateway6`，例如 `fe80::1`；链路本地 IPv6 网关的 scope 根据物理 `interface` 填入。接管 IPv6 时使用 `::/1`、`8000::/1`，同时为 IPv6 节点和 DNS 添加更具体的 bypass。只有 IPv4 配置不会自动接管 IPv6。Windows 网卡和路由管理要求管理员权限；已运行的非管理员 TUI manager 不会因后来打开管理员 TUI 而自动提权。
 
 先安装 bypass，再安装接管路由；只添加自己拥有的路由，遇到已有冲突路由时拒绝并回滚新添加项，不覆盖外部路由。运行前检查被接管范围内的节点 IP 是否被 bypass 覆盖，防止节点连接回到 TUN。域名节点在准备时解析并检查所有结果；DNS 本身也应走原网关，节点 DNS 记录改变后需要更新 bypass。局域网 DNS 若已有比接管路由更具体的物理接口路由，则不会被接管，不需重复添加 bypass；不要重复添加原网关已有的主机路由。直连 TCP/UDP 绑定指定物理接口，避免直连规则形成循环。未接管的 IPv6 不会因上述 IPv4 配置而自动进入 TUN，IPv6 路由与 bypass 需要另行配置匹配的网关。
 
@@ -141,9 +162,11 @@ TCP/UDP 限额跨配置版本共享；降低额度不切断已有会话，降到
 
 ## 验证与边界
 
+2026-10-19 已完成 Windows 实际设备与 WinINet 集成检查：系统 HTTP/HTTPS、独占接管、热开关、正常/崩溃恢复；Wintun 双栈 TCP 1..1MiB、UDP 0..1200 字节、重载及设备/测试路由清理。首轮发现并修复 TUN UDP 回包方向错误。仅使用专用测试地址路由，未验证全局路由接管或公网部署，详细记录见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)。
+
 本次在 macOS 验证了配置切换、SIGHUP、文件监测、监听端口更新、解析/绑定失败回滚、旧 TCP 保留、规则持久连接更新和缓存版本通知。用户态 TUN 测试注入原始 TCP/UDP 包并通过选定 SOCKS5 出站回显，覆盖 TCP 握手以及 UDP 空包、普通包、1200 字节包；IPv4/IPv6 UDP 包编码均有检查。系统代理的设置计划与恢复顺序有隔离测试。
 
-Linux 专用透明 socket、原目的地址解析和出口绑定代码通过 x86_64-unknown-linux-gnu 交叉编译检查。当前主机没有 Linux 内核环境，也未改动用户的系统代理、TUN 或系统路由；管理员权限下的设备/桌面设置及 Linux 防火墙端到端仍需在目标机器验收，不能视为已经实测。
+Linux 专用透明 socket、原目的地址解析和出口绑定代码通过 x86_64-unknown-linux-gnu 交叉编译检查。Linux 运行、系统桌面设置和防火墙端到端仍需在 Linux 目标机器验收；Windows 的本机测试不能替代 Linux 验收。
 
 ```sh
 python3 scripts/reload_regression.py --bin-dir target/release

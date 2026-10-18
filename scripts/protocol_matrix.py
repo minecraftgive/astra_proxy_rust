@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from platform_support import process_flags, interrupt
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 USER = '00000000-0000-0000-0000-000000000001'
@@ -139,12 +140,12 @@ def process(command, directory, name):
     log_path = directory / (name + '.log')
     with log_path.open('w') as log:
         child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
-                                 env=dict(os.environ, RUST_LOG=os.environ.get('RUST_LOG', 'info')))
+                                 env=dict(os.environ, RUST_LOG=os.environ.get('RUST_LOG', 'info')), **process_flags())
         try:
             yield child, log_path
         finally:
             if child.poll() is None:
-                child.send_signal(signal.SIGTERM)
+                interrupt(child)
                 try:
                     child.wait(timeout=15)
                 except subprocess.TimeoutExpired:

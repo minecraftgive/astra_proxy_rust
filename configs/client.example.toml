@@ -1,0 +1,1561 @@
+# CLIENT ONLY：客户端完整示例；不能交给 astra-server-core。
+# 校验：astra-proxy --check client.example.toml
+# 运行：astra-proxy client.example.toml；交互管理：astra-tui
+# 默认独立模式，无需 Rule Core；节点为占位数据，运行前替换。
+# 文件末尾以注释收录完整 Rule Core 示例，按说明另存后可启用规则模式。
+# 所有服务器、UUID、密码、公钥和 pin 都是占位数据，使用前替换。
+# 配置检查不会连接服务器；通过检查不代表每个组合已有互通验证。
+# 已实测组合与服务端边界见 docs/COMPATIBILITY.md。
+# 本文件同时注册多个出站；规则模式按 tag 选用，独立模式用 standalone_outbound 固定选择。
+# 不会自动测速、负载均衡或故障切换。启用系统接管前删除未用占位节点并填写真实参数。
+# 运行时按当前平台选择配置，不要一次取消所有可选模式的注释。
+# Direct/Block 是规则 action，不是 [[outbounds]] 的 kind。
+
+# ---------- 全部顶层设置（标出的运行数值为默认值；监听与 socket 需按实例配置） ----------
+watch_config = false              # true：每秒监测当前文件内容，校验/资源准备成功后热重载；支持原子替换
+standalone = true                 # true：全部入站流量使用固定出站，无需 Rule Core
+standalone_outbound = "vless-tls" # 仅 standalone=true 时可设置；多节点必填，单节点可省略
+# 本文件默认固定 vless-tls；切换节点时修改 standalone_outbound。
+# 独立模式仅启动 Proxy Core，TCP/UDP 全部使用选定节点；UDP 能力取决于节点协议。
+# 无节点、标签不存在或多节点未选择会拒绝启动；上游故障不会回退直连。
+# rule_socket 可省略；ipc_connections/decision_timeout_ms/决策缓存不参与独立模式路由。
+rule_socket = "/tmp/astra-rule.sock" # 与 example_rule.toml 的 socket 一致；独立模式可省略
+socks5_listen = "127.0.0.1:1080"    # TCP CONNECT + UDP ASSOCIATE；无入站认证
+http_listen = "127.0.0.1:8080"      # 仅 HTTP CONNECT；无普通 HTTP 转发
+# 可只保留一个监听；也可移除两个监听，仅启用 TUN/TPROXY/REDIRECT 中至少一种。
+# 所有 TCP 监听地址必须不同，端口非零；IPv6 例：[::1]:1080。系统代理额外要求 SOCKS5 loopback 监听。
+ipc_connections = 8               # 1..128；持久 UDS 通道数量
+# 单次决策总期限包括排队、连接和重试；规则不可用时缓存未命中新请求失败关闭。
+decision_timeout_ms = 500          # >0
+connect_timeout_secs = 8           # >0；出站连接/握手期限
+shutdown_timeout_secs = 10         # 停止接受连接后等待会话退出的秒数；0 表示不等待
+max_connections = 4096            # >0；TCP 会话（含 UDP 控制连接）额度
+max_udp_flows = 512                # 1..65536；所有关联共享的 UDP 流额度
+udp_targets_per_association = 32   # 1..max_udp_flows；每个关联最大目标数
+udp_idle_timeout_secs = 120        # >0；UDP 流/关联空闲回收
+# 缓存最多 65536 项；TTL=0 禁用。规则变更推送新版本，缓存按版本隔离；断连后不使用旧版本缓存。
+# 版本推送存在短暂异步传播延迟；既有数据流不重新选择出口。
+decision_cache_ttl_secs = 5
+
+# ---------- 系统接管模式：表存在即启用，删除整表关闭，可与普通监听并用 ----------
+# 可选表默认全部未启用。取消表头注释时，也只取消所需字段的注释。
+# 顶层设置必须放在所有 [表] / [[outbounds]] 之前，避免误写入前一张表。
+
+# 系统代理：macOS 网络服务、Linux GNOME 当前用户的 D-Bus、Windows 当前用户 LAN 代理。
+# [system_proxy]
+# services = ["Wi-Fi"] # macOS 服务名列表；省略/[] 自动发现全部启用服务；Linux 必须省略/[]
+# macOS/Linux 使用 socks5_listen；Windows 使用回环 http_listen，支持普通 HTTP 与 HTTPS CONNECT。
+# Windows 的 services 必须省略/[]；只接管遵循系统代理的应用，不改变 WinHTTP 或 VPN/RAS 设置。
+# 启用前保存 SOCKS 和优先级更高的 HTTP/HTTPS/PAC 等原设置；正常停止/关闭此模式时恢复。
+# macOS 需要网络服务写权限；已有需认证的 SOCKS 设置会拒绝接管，避免无法恢复密码。
+# 写入前生成 0600 恢复文件；存在未恢复文件时拒绝覆盖，异常退出恢复命令见后文。
+
+# 原生 TUN：Linux/macOS/Windows；Unix 需 root/CAP_NET_ADMIN，Windows 需管理员及官方 Wintun DLL。
+# [tun]
+# name = "utun20" # macOS；Linux 示例 astra0；省略自动分配；多实例不可重名
+# address = "198.18.0.1" # 默认 IPv4 接口地址
+# prefix = 30 # 默认 30；0..32
+# ipv6_address = "fd00:198:18::1" # 可选；Windows 接管 IPv6 路由时必填
+# ipv6_prefix = 126 # 默认 126；0..128
+# mtu = 1500 # 默认 1500；1280..9000
+# routes = [] # 默认 []：只创建设备，由外部管理路由；列表项必须为 IPv4/IPv6 CIDR
+# bypass = [] # 默认 []：经原网关/物理接口绕过的 CIDR；不可覆盖已有冲突路由
+# gateway = "192.168.1.1" # 可选：接管前的网关，按真实网络替换
+# gateway6 = "fe80::1" # 可选：接管前 IPv6 网关；Windows scope 根据 interface 推断
+# interface = "en0" # 接管前物理接口；Linux eth0；Windows Ethernet/中文别名/索引；托管 routes 时必填
+# 全局 IPv4 接管变体：将上方 routes/bypass 两行替换为下面两行，不能重复定义同名键：
+# routes = ["0.0.0.0/1", "128.0.0.0/1"]
+# bypass = ["203.0.113.8/32", "8.8.8.8/32"] # 必须替换为实际节点 IP / 被接管范围内的 DNS
+# 非空 bypass 必须配置 gateway 或 interface；公网节点通常需 gateway。
+# 先安装 bypass 再安装接管路由；被接管的节点 IP 未被 bypass 覆盖时拒绝运行，防止自环。
+# DNS 也应走原出口；局域网 DNS 若已有更具体的物理接口路由，不必再重复添加 bypass。
+# 直连规则的 TCP/UDP 绑定 interface；使用域名节点时需维护 DNS 变化后的 bypass。
+# 此处 IPv4 routes 不接管 IPv6；IPv6 需对应路由、绕过和网关，不能用 IPv4 网关套用。
+# 只提供真实 IP 路由，没有 Fake-IP、域名嗅探或 DNS 劫持；UDP 分片/超 MTU 边界尚未完整验收。
+# 节点/规则切换及同设备路由更新保留协议栈；MTU/地址/设备名变更涉及设备重建。
+# 修改 MTU 需新设备名；接管路由冲突时先关闭旧 TUN 或由外部管理路由。设备重建可能中断连接。
+
+# Linux TPROXY：CAP_NET_ADMIN/CAP_NET_RAW；TCP/UDP；另需内核支持、透明转发规则及策略路由。
+# [tproxy]
+# listen = "0.0.0.0:7893" # 必填、端口非零；IPv6 变体 [::]:7893（IPv6-only，需对应 IPv6 规则）
+# 不会自动修改防火墙；应排除 Astra 自身出站和保留网段，避免捕获循环。
+# 网关 LAN 接管的 nftables、fwmark、ip rule / ip route 及撤销示例见 docs/PROXY_MODES.md。
+# 该网关示例不接管本机 OUTPUT；本机接管需另外配置回送及进程排除策略。
+
+# Linux NAT REDIRECT：仅 TCP，通过 SO_ORIGINAL_DST 恢复目标；UDP 使用 TPROXY。
+# [redirect]
+# listen = "0.0.0.0:7894" # 必填、端口非零；IPv6 变体 [::]:7894
+# 需自行配置 NAT PREROUTING 的 TCP redirect 规则；不要将同一批流量同时送入两种透明模式。
+# macOS 配置检查拒绝 TPROXY/REDIRECT；使用原生 TUN。详细权限与实测边界见 docs/PROXY_MODES.md。
+
+# ---------- 热切换、热重载与运维示例（以下均为操作命令/环境变量，不是 TOML 字段） ----------
+# 自动：将顶层 watch_config 设为 true；无效文件保留旧配置，修正内容后自动重试。
+# 信号：kill -HUP <Proxy-Core-PID>，重读当前文件；失败写日志并保留旧配置。
+# TUI：Ctrl-S 保存或 c 选择另一配置时热应用；R 手动重载；r 完整重启；e 编辑。
+# 候选先校验和准备新增资源，成功后才切换；解析失败、端口占用、权限不足会拒绝候选。
+# 已接受的 TCP/SOCKS5 UDP 关联保留原配置，新连接/新关联使用新配置；TUN/TPROXY 新 UDP flow 用新配置。
+# TCP/UDP 限额跨配置版本共享；降低额度不强制断开既有流。关闭接管模式/重建设备可能中断对应流。
+# 管理 IPC（socket 0600，父目录应仅当前用户可访问）：
+# ASTRA_CONTROL_SOCKET=/tmp/astra-proxy-control.sock ./target/release/astra-proxy example_proxy.toml
+# ./target/release/astra-proxy --reload /tmp/astra-proxy-control.sock
+# ./target/release/astra-proxy --switch /tmp/astra-proxy-control.sock /absolute/path/to/other-proxy.toml
+# --switch 成功后记住新路径，之后的 SIGHUP/文件监测针对新文件；相对 CA 路径相对新配置所在目录。
+# 每个 core 使用不同 ASTRA_CONTROL_SOCKET；不要给同时启动双 core 的 Python 启动器统一设置同一个值。
+# 系统代理异常退出恢复：确认旧 core 停止后执行：
+# ./target/release/astra-proxy --restore-system-proxy /absolute/path/to/example_proxy.system-proxy-state.toml
+# 无管理 socket 时恢复文件在初始配置旁；有管理 socket 时在 socket 旁，将扩展名替换为 .system-proxy-state.toml。
+# 正常恢复会删除文件，失败保留供重试；不要直接删除尚未恢复的文件。
+# 日志：ASTRA_LOG_LEVEL=info（trace/debug/info/warn/error）；未设时读 RUST_LOG，两者均未设则默认 info。
+# TUI 按 l 打开实时日志；日志页 l 选择显示级别、L 热改 core 记录级别、f 过滤、/ 搜索。
+# 上述日志级别是环境变量/运行操作，不存在 log_level TOML 配置字段。
+# Mihomo YAML 离线导入（转换不自动接管系统代理/TUN；检查输出与跳过提示后再应用）：
+# ./target/release/astra-convert configs/mihomo-example.yaml --check
+# ./target/release/astra-convert configs/mihomo-example.yaml -o converted --select Proxy=vless-reality
+# 转换输出 converted/proxy.toml 与 converted/rule.toml；已有文件不覆盖，代理组仅固定选择。
+# 完整模式操作见 docs/PROXY_MODES.md；转换见 docs/MIHOMO_CONVERTER.md；IPC v2 不可与旧程序混用。
+
+# ---------- 配置语法与协议公共字段 ----------
+# [[outbounds]] 是数组；tag 在本文件必须唯一，对应规则 action="proxy:TAG"。
+# kind 可取 native / socks5 / http / trojan_tls / vless_tls。
+# kind=native 的字段放在 [outbounds.config]：
+# protocol/server/port：协议枚举、主机名或裸 IP（IPv6 不加 []）、非零端口。
+# uuid：VLESS/VMess/TUIC；password：Trojan/SS/Hysteria2/TUIC。
+# cipher：VMess 或 SS；flow：仅 VLESS，空/省略或 xtls-rprx-vision。
+# encryption：仅 VLESS，默认 none；支持 mlkem768x25519plus.native/xorpub/random.0rtt/1rtt.KEY。
+# cert_pin_sha256：TLS 表内的服务端证书 SHA-256（64 位十六进制），不同于 fingerprint。
+# pin 替代 CA 验证，不可与 ca_file/REALITY 合用；TUIC/HY2 不使用此字段。
+# mux：仅 VLESS/VMess，smux/yamux/h2mux/muxcool（省略则不复用）。
+# obfs_password/pin_sha256：仅 Hysteria2。
+# tuic_udp_mode/tuic_idle_timeout_secs/congestion_control：仅 TUIC。
+# 不要把不相关字段复制到其他协议；示例按有效组合分别列出。
+# TLS/transport 为嵌套表，不存在顶层全局 TLS 或全局 transport。
+# [outbounds.config.tls] 全部字段：
+# server_name：证书校验名/SNI；ca_file：附加 PEM CA，路径相对本配置文件。
+# fingerprint：chrome/chrome120/firefox/firefox120/safari/safari16/ios/android/edge/random；
+#              省略使用默认 TLS 后端。TUIC 不支持此字段；HY2 不使用它。
+# reality_public_key：服务端 32 字节 X25519 公钥的 base64url（不带 =）。
+# reality_short_id：偶数长度十六进制，最多 16 字符；空串表示全零，需要与服务端一致。
+# REALITY 仅 TCP/gRPC/XHTTP；不要混用 ca_file 和 REALITY 作为证书验证替代选项。
+# [outbounds.config.transport] 全部字段：
+# kind=tcp/ws/grpc/http_upgrade/xhttp（默认 tcp）；path 默认 /，必须以 / 开头。
+# host 默认 tls.server_name，否则 server；service_name 默认 GunService（仅 gRPC）。
+# mode 仅 XHTTP：stream-one（默认）/stream-up/packet-up/auto，当前仅 HTTP/2。
+# auto：普通 TLS 选 packet-up，REALITY 选 stream-one；不是轮流尝试模式。
+# headers：额外 HTTP 头，最多 64 个；仅 WS/HTTPUpgrade/XHTTP，不能用于 TCP/gRPC。
+# 无 TLS 的 VMess/VLESS 传输仅适用于明确需要该配置的服务端/可信链路。
+
+# socks5-plain
+[[outbounds]]
+kind = "socks5"
+tag = "socks5-plain"
+server = "127.0.0.1:1081"
+
+# socks5-auth
+[[outbounds]]
+kind = "socks5"
+tag = "socks5-auth"
+server = "127.0.0.1:1081"
+username = "replace-user"
+password = "replace-password"
+
+# http-plain
+[[outbounds]]
+kind = "http"
+tag = "http-plain"
+server = "127.0.0.1:1081"
+
+# http-auth
+[[outbounds]]
+kind = "http"
+tag = "http-auth"
+server = "127.0.0.1:1081"
+username = "replace-user"
+password = "replace-password"
+# SOCKS5/HTTP 的 server 使用 host:port，IPv6 例 [::1]:1081。
+# 认证字段必须同时设置或同时省略；各为非空且最多 255 字节。HTTP 使用 Basic。
+# HTTP 上游仅支持 TCP，SOCKS5 上游支持 TCP/UDP。
+
+# ---------- vless-plain-tcp ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-plain-tcp"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-tls ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-tls-ws ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-ws"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "ws"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-tls-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-grpc"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# ---------- vless-tls-http_upgrade ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-http_upgrade"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "http_upgrade"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-tls-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-xhttp-stream-one"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-tls-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-xhttp-stream-up"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-tls-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-tls-xhttp-packet-up"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-reality-tcp ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-reality-tcp"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-reality-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-reality-grpc"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# ---------- vless-reality-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-reality-xhttp-stream-one"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-reality-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-reality-xhttp-stream-up"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vless-reality-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-reality-xhttp-packet-up"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-plain-tcp ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-plain-tcp"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-tls ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+cipher = "auto"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-tls-ws ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-ws"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "ws"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-tls-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-grpc"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# ---------- vmess-tls-http_upgrade ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-http_upgrade"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "http_upgrade"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-tls-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-xhttp-stream-one"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-tls-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-xhttp-stream-up"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-tls-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-tls-xhttp-packet-up"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- vmess-reality-tcp ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-reality-tcp"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "tcp"
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- vmess-reality-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-reality-grpc"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- vmess-reality-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-reality-xhttp-stream-one"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- vmess-reality-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-reality-xhttp-stream-up"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- vmess-reality-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-reality-xhttp-packet-up"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- trojan-tls ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- trojan-tls-ws ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-ws"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "ws"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- trojan-tls-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-grpc"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# ---------- trojan-tls-http_upgrade ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-http_upgrade"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "http_upgrade"
+host = "node.example.com"
+path = "/astra-path"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- trojan-tls-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-xhttp-stream-one"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- trojan-tls-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-xhttp-stream-up"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- trojan-tls-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-tls-xhttp-packet-up"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- trojan-reality-tcp ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-reality-tcp"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "tcp"
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- trojan-reality-grpc ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-reality-grpc"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "grpc"
+host = "node.example.com"
+service_name = "astra-service"
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- trojan-reality-xhttp-stream-one ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-reality-xhttp-stream-one"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-one"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- trojan-reality-xhttp-stream-up ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-reality-xhttp-stream-up"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "stream-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# 下项是代码可组合配置；本版 REALITY 互通记录以 VLESS 为主，需确认服务端支持。
+
+# ---------- trojan-reality-xhttp-packet-up ----------
+[[outbounds]]
+kind = "native"
+tag = "trojan-reality-xhttp-packet-up"
+[outbounds.config]
+protocol = "trojan"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "xhttp"
+host = "node.example.com"
+path = "/astra-path"
+mode = "packet-up"
+[outbounds.config.transport.headers]
+"X-Astra-Example" = "replace-or-remove" # 服务端必须允许此头；可删除该 headers 表
+
+# ---------- vmess-aes-128-gcm ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-aes-128-gcm"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+cipher = "aes-128-gcm"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-chacha20-poly1305 ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-chacha20-poly1305"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+cipher = "chacha20-poly1305"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# 下项是 Vision TLS/REALITY + TCP；HTTP 隧道 + Encryption 示例见文件末尾。Vision 不能与 mux 叠加。
+
+# ---------- vless-vision-tls ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-vision-tls"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+flow = "xtls-rprx-vision"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# 下项是 Vision TLS/REALITY + TCP；HTTP 隧道 + Encryption 示例见文件末尾。Vision 不能与 mux 叠加。
+
+# ---------- vless-vision-reality ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-vision-reality"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+flow = "xtls-rprx-vision"
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+reality_public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 占位公钥，必须替换
+reality_short_id = "0123456789abcdef"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-mux-smux ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-mux-smux"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "smux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-mux-yamux ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-mux-yamux"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "yamux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-mux-h2mux ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-mux-h2mux"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "h2mux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vless-mux-muxcool ----------
+[[outbounds]]
+kind = "native"
+tag = "vless-mux-muxcool"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "muxcool"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-mux-smux ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-mux-smux"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "smux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-mux-yamux ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-mux-yamux"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "yamux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-mux-h2mux ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-mux-h2mux"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "h2mux"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- vmess-mux-muxcool ----------
+[[outbounds]]
+kind = "native"
+tag = "vmess-mux-muxcool"
+[outbounds.config]
+protocol = "vmess"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+mux = "muxcool"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+# fingerprint = "chrome" # 可选；所有支持值见文件顶部
+[outbounds.config.transport]
+kind = "tcp"
+
+# SS 只支持自身 TCP/UDP；不能叠加本配置的 TLS/HTTP 传输/mux。
+# SS2022 密码为 base64 PSK：AES128 16 字节，其余下面两种 32 字节。
+
+# ---------- ss-aes-128-gcm ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-aes-128-gcm"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+cipher = "aes-128-gcm"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- ss-aes-256-gcm ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-aes-256-gcm"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+cipher = "aes-256-gcm"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- ss-chacha20-ietf-poly1305 ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-chacha20-ietf-poly1305"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+cipher = "chacha20-ietf-poly1305"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- ss-2022-blake3-aes-128-gcm ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-2022-blake3-aes-128-gcm"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "AAECAwQFBgcICQoLDA0ODw=="
+cipher = "2022-blake3-aes-128-gcm"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- ss-2022-blake3-aes-256-gcm ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-2022-blake3-aes-256-gcm"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+cipher = "2022-blake3-aes-256-gcm"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- ss-2022-blake3-chacha20-poly1305 ----------
+[[outbounds]]
+kind = "native"
+tag = "ss-2022-blake3-chacha20-poly1305"
+[outbounds.config]
+protocol = "shadowsocks"
+server = "node.example.com"
+port = 443
+password = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+cipher = "2022-blake3-chacha20-poly1305"
+[outbounds.config.transport]
+kind = "tcp"
+
+# 旧 SS stream-cipher 兼容（未逐一做真实服务端验收，不建议新部署）：
+# 在任意 SS 节点只替换 cipher，password 使用普通字符串；无需新增其他字段。
+# plain（别名 none）；table（空 cipher 也映射 table）；rc4；rc4-md5；chacha20-ietf；
+# aes-{128,192,256}-ctr / -cfb / -cfb128（-cfb 别名）/ -cfb1 / -cfb8 / -ofb；
+# camellia-{128,192,256}-ctr / -cfb / -cfb128（-cfb 别名）/ -cfb1 / -cfb8 / -ofb。
+# 当前构建未启用 extra cipher：CCM/GCM-SIV/xchacha20/sm4/SS2022 chacha8 等不列为可用。
+
+# Hysteria2 自带 QUIC；transport.kind=tcp 只是公共字段的默认占位，不代表底层走 TCP。
+# 不支持 ca_file、REALITY、mux、HTTP 传输；省略 pin 时验证系统根证书。
+
+# ---------- hysteria2-system-roots ----------
+[[outbounds]]
+kind = "native"
+tag = "hysteria2-system-roots"
+[outbounds.config]
+protocol = "hysteria2"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- hysteria2-pin ----------
+[[outbounds]]
+kind = "native"
+tag = "hysteria2-pin"
+[outbounds.config]
+protocol = "hysteria2"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+pin_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+[outbounds.config.tls]
+server_name = "node.example.com"
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- hysteria2-salamander ----------
+[[outbounds]]
+kind = "native"
+tag = "hysteria2-salamander"
+[outbounds.config]
+protocol = "hysteria2"
+server = "node.example.com"
+port = 443
+password = "replace-password"
+obfs_password = "replace-obfs-password"
+[outbounds.config.tls]
+server_name = "node.example.com"
+[outbounds.config.transport]
+kind = "tcp"
+# pin_sha256 可与 obfs_password 同时使用；pin 是服务端叶证书 DER 的 SHA-256 十六进制，非公钥指纹。
+
+# TUIC v5 自带 QUIC + TLS；必须设置 TLS。禁止 TLS fingerprint/REALITY/mux/HTTP 传输。
+# native=QUIC datagram（可分片）；quic=单向 QUIC stream；ALPN 固定 h3。
+# tuic_idle_timeout_secs 默认 15，范围 3..3600；活跃时每 timeout/3 心跳。
+
+# ---------- tuic-native-cubic ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-native-cubic"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "native"
+tuic_idle_timeout_secs = 15
+congestion_control = "cubic"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- tuic-native-bbr ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-native-bbr"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "native"
+tuic_idle_timeout_secs = 15
+congestion_control = "bbr"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- tuic-native-new_reno ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-native-new_reno"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "native"
+tuic_idle_timeout_secs = 15
+congestion_control = "new_reno"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- tuic-quic-cubic ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-quic-cubic"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "quic"
+tuic_idle_timeout_secs = 15
+congestion_control = "cubic"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- tuic-quic-bbr ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-quic-bbr"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "quic"
+tuic_idle_timeout_secs = 15
+congestion_control = "bbr"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- tuic-quic-new_reno ----------
+[[outbounds]]
+kind = "native"
+tag = "tuic-quic-new_reno"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-password"
+tuic_udp_mode = "quic"
+tuic_idle_timeout_secs = 15
+congestion_control = "new_reno"
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "certs/private-ca.pem" # 使用自签/私有 CA 时取消注释并提供文件
+[outbounds.config.transport]
+kind = "tcp"
+
+# ---------- 兼容旧版配置：仅 TCP，新增节点优先使用 native ----------
+[[outbounds]]
+kind = "trojan_tls"
+tag = "legacy-trojan-tls"
+server = "node.example.com:443"
+sni = "node.example.com"
+password = "replace-password"
+
+[[outbounds]]
+kind = "vless_tls"
+tag = "legacy-vless-tls"
+server = "node.example.com:443"
+sni = "node.example.com"
+uuid = "00000000-0000-0000-0000-000000000001"
+
+# 尚未暴露的 TOML 配置：入站账号、DNS/Fake-IP、自动故障切换、全局 UDP 开关、
+# ALPN、TLS insecure/skip_verify、HY2 带宽/端口跳跃、mux 池大小/填充等未向本版 TOML 暴露。
+# 不要将其他项目同名字段直接复制到这里，未知字段会被拒绝。
+# XHTTP packet-up 无独立上传 EOF；Xray 空包/大包与半关闭边界见兼容性说明。
+
+# ---------- VLESS Encryption + Vision + XHTTP auto ----------
+# 此节点同时演示 encryption、flow、客户端 TLS 指纹、服务端证书 pin 和 XHTTP auto。
+# encryption 原字符串放在 [outbounds.config]，不要填入 TLS/REALITY 公钥或证书指纹字段。
+# Vision 叠加 HTTP 传输时必须启用 native/xorpub VLESS Encryption。
+# Vision DIRECT 在 Encryption 记录层与其下方 HTTP 隧道之间切换，不绕过 HTTP/TLS。
+[[outbounds]]
+kind = "native"
+tag = "vless-encryption-vision-xhttp-auto"
+[outbounds.config]
+protocol = "vless"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+flow = "xtls-rprx-vision"
+encryption = "mlkem768x25519plus.native.0rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA" # 示例公钥，需替换
+[outbounds.config.tls]
+server_name = "node.example.com"
+fingerprint = "chrome"
+cert_pin_sha256 = "1111111111111111111111111111111111111111111111111111111111111111" # 需替换
+[outbounds.config.transport]
+kind = "xhttp"
+path = "/your-path"
+mode = "auto"
+
+# ---------- Rule Core 完整模板（注释附录，不是 Proxy Core 字段） ----------
+# 使用规则模式：将以下 BEGIN/END 之间每行最前面的 "# " 去掉，另存为 rule.toml。
+# 把上方 standalone 改为 false，删除 standalone_outbound，启动 astra-rule rule.toml。
+# rule_socket 与 rule.toml 的 socket 保持一致；也可直接由 astra-tui 管理配置。
+# BEGIN RULE CONFIG
+# # Astra 0.1.0：全部规则设置与匹配类型示例。
+# # 配套 example_proxy.toml；两端 UDS 路径必须一致。
+# # 校验：target/release/astra-rule --check example_rule.toml
+# # 规则按本文件出现顺序，第一条匹配生效；不是按“精确 > 后缀 > CIDR”等固定优先级。
+# # 不支持 include、规则集合引用、正则、GeoIP、进程规则或订阅；支持配置热切换/热重载。
+# # ---------- 全部顶层设置 ----------
+# watch_config = false # 默认 false；true：每秒监测当前文件内容，支持原子替换，编译成功后热应用
+# # 失败保留旧规则；同一份无效内容不重复刷日志，修正内容后重试。也可 SIGHUP/TUI/管理 IPC 重载。
+# # 这是本规则核心独立的开关，与 example_proxy.toml.watch_config 分别生效。
+# socket = "/tmp/astra-rule.sock"
+# # 全部 action：direct / block / proxy:TAG；区分大小写。
+# # TAG 为 example_proxy.toml 中唯一出站标签。默认使用 VLESS TLS 占位节点，运行前替换节点值。
+# default_action = "proxy:vless-tls"
+# # default_action = "direct" # 选择直连默认策略时替换上一行，不能同时重复定义
+# # default_action = "block"  # 未匹配请求全部拒绝
+# 
+# # ---------- domain_exact：域名精确匹配 ----------
+# [[rules]]
+# kind = "domain_exact"
+# value = "blocked.example"
+# action = "block"
+# 
+# # 精确规则放在更宽的后缀前，以便覆盖。
+# [[rules]]
+# kind = "domain_exact"
+# value = "direct.example.com"
+# action = "direct"
+# 
+# # ---------- domain_suffix：按标签边界匹配域名及其子域 ----------
+# # example.com 与 a.example.com 命中；notexample.com 不命中。
+# # 域名会规范化大小写；国际化域名建议填写 ASCII/Punycode。
+# [[rules]]
+# kind = "domain_suffix"
+# value = "example.com"
+# action = "proxy:vless-tls-xhttp-stream-one"
+# 
+# # ---------- ip_cidr：IPv4 / IPv6 ----------
+# # 只对客户端明确发送的 IP 目标匹配；不会主动解析域名来匹配 CIDR。
+# [[rules]]
+# kind = "ip_cidr"
+# value = "127.0.0.0/8"
+# action = "direct"
+# 
+# [[rules]]
+# kind = "ip_cidr"
+# value = "::1/128"
+# action = "direct"
+# 
+# [[rules]]
+# kind = "ip_cidr"
+# value = "192.168.0.0/16"
+# action = "direct"
+# 
+# [[rules]]
+# kind = "ip_cidr"
+# value = "fc00::/7"
+# action = "direct"
+# 
+# # ---------- port：单个端口，以字符串填写，范围 1..65535 ----------
+# # 不接受 "80,443" 或 "1000-2000"；多个端口分别写规则。
+# # 端口规则不区分 TCP/UDP；本版没有单条规则的多条件 AND。
+# [[rules]]
+# kind = "port"
+# value = "25"
+# action = "block"
+# 
+# [[rules]]
+# kind = "port"
+# value = "8443"
+# action = "proxy:trojan-tls"
+# 
+# # ---------- network：udp / tcp ----------
+# # UDP 目标可交由 TUIC；此前域名/IP/端口规则若命中，仍优先生效。
+# [[rules]]
+# kind = "network"
+# value = "udp"
+# action = "proxy:tuic-native-cubic"
+# 
+# # 此处 TCP 兜底；因为 network 只有 tcp/udp，上述 UDP + 此条 TCP 覆盖所有请求，
+# # 因此当前 default_action 不会被走到。要实际使用 default_action，删除此条 TCP 兜底，
+# # 或按需要也删除 UDP 兜底。
+# [[rules]]
+# kind = "network"
+# value = "tcp"
+# action = "proxy:vless-tls"
+# 
+# # 其他出站只需将任一 action 的 TAG 替换成 example_proxy.toml 对应标签，例如：
+# # proxy:socks5-auth / proxy:http-auth / proxy:ss-aes-256-gcm
+# # proxy:vmess-chacha20-poly1305 / proxy:hysteria2-salamander / proxy:tuic-quic-bbr
+# # proxy:vless-vision-reality / proxy:vless-mux-h2mux
+# # action 不能直接写协议名；不存在的 TAG 会导致连接失败，不会静默直连。
+# # ---------- 修改规则、切换文件和缓存行为 ----------
+# # 不需重启：watch_config=true 自动应用；也可 kill -HUP <Rule-Core-PID> 重读当前文件。
+# # TUI Ctrl-S 保存/c 切换文件时热应用；R 手动重载，r 仍为完整重启。
+# # 独立管理 socket 示例（与 Proxy Core 的管理 socket、上方路由 socket 均不同）：
+# # ASTRA_CONTROL_SOCKET=/tmp/astra-rule-control.sock ./target/release/astra-rule example_rule.toml
+# # ./target/release/astra-rule --reload /tmp/astra-rule-control.sock
+# # ./target/release/astra-rule --switch /tmp/astra-rule-control.sock /absolute/path/to/other-rule.toml
+# # --switch 成功后记住新配置路径；之后的 SIGHUP 和文件监测读新文件。
+# # socket 也可热切换：先绑定新路径，再提交；旧路径不可用，新建代理 IPC 需同步更新 rule_socket。
+# # 新配置会先编译索引、准备 socket，语法错误/动作无效/路径占用等均拒绝候选并保留旧规则。
+# # 既有持久 IPC 连接在后续路由请求时读取新规则，不需为了规则更新断开连接。
+# # 规则版本通过独立订阅通道推送给代理，决策缓存按版本隔离；不是固定等待默认 5 秒 TTL。
+# # 推送有短暂异步传播延迟；规则服务断连后不继续使用旧版本缓存，已有 TCP/UDP 数据流保持原出口。
+# # Proxy Core standalone=true 时完全不访问本规则核心，也无需启动本规则核心或提供此文件。
+# # TUN/TPROXY/REDIRECT 目标通常是 IP，域名规则不会自动解析/嗅探 IP 还原域名；可按 IP/端口/network 路由。
+# # 规则动作仅支持 direct/block/proxy:TAG；没有 mode/tun/system_proxy 等字段，它们放在代理配置中。
+# # 启动记录级别可用 ASTRA_LOG_LEVEL=info；也可在 TUI 日志页 L 动态修改，不是本文件的 TOML 字段。
+# # 更多模式、权限、设备重建限制和验收边界见 docs/PROXY_MODES.md；新旧 IPC 版本不可混用。
+# END RULE CONFIG

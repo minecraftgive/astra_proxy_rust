@@ -1,0 +1,195 @@
+# SERVER ONLY：完整服务端示例；不能交给 astra-proxy。
+# 删除不用的监听整段，替换所有占位凭据、域名和证书后部署。
+# 校验：astra-server-core --config server.example.toml --check
+# 运行：astra-server-core --config server.example.toml
+# TUI：astra-server-tui --config server.example.toml
+# 生成测试证书：astra-server-core --generate-cert tls localhost
+# 随机凭据最小配置：astra-server-core --init server.toml
+# --status / --reload / --stop 管理核心；多实例分别指定 --control PATH。
+# TLS 路径相对本配置目录；公网使用实际域名证书，核心不自动续期。
+allow_private_targets = false # 本地互通测试按需改 true
+max_connections = 1024 # 1..65536，含复用子流
+max_udp_flows = 512 # 1..65536
+handshake_timeout_secs = 10 # >0
+connect_timeout_secs = 8 # >0
+idle_timeout_secs = 120 # >0
+shutdown_timeout_secs = 10 # 0..300
+ deny_cidrs = ["169.254.0.0/16", "fe80::/10"] # 始终优先拒绝
+
+# 每个 tag 和监听地址唯一；可重复 users 表添加用户。
+# 公网明文需显式 allow_plaintext=true；协议认证不替代 TLS。
+
+[[listeners]]
+tag = "socks5-auth"
+protocol = "socks5"
+listen = "127.0.0.1:21080"
+transport = "tcp"
+udp = true
+allow_plaintext = false # 回环 SOCKS5/HTTP 允许无 TLS；HTTP 仅带认证 CONNECT
+[[listeners.users]]
+name = "replace-user"
+password = "replace-socks5-password"
+
+[[listeners]]
+tag = "http-connect"
+protocol = "http"
+listen = "127.0.0.1:28080"
+transport = "tcp"
+udp = false
+allow_plaintext = false # 回环 SOCKS5/HTTP 允许无 TLS；HTTP 仅带认证 CONNECT
+[[listeners.users]]
+name = "replace-user"
+password = "replace-http-password"
+
+[[listeners]]
+tag = "shadowsocks"
+protocol = "shadowsocks"
+listen = "0.0.0.0:28388"
+transport = "tcp"
+udp = true
+cipher = "aes-256-gcm"
+password = "replace-ss-password"
+multiplex = false # 当前 Astra 客户端不暴露 SS Mux
+# 其他 cipher：aes-128-gcm / chacha20-ietf-poly1305 /
+# 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305
+# SS2022 password 是标准 Base64 随机密钥：AES128 为 16 字节，其他 32 字节。
+# SS 不配置 users/TLS/HTTP 传输；一个监听对应一把密钥。
+
+[[listeners]]
+tag = "vmess-grpc-mux"
+protocol = "vmess"
+listen = "0.0.0.0:24444"
+transport = "grpc"
+udp = true
+service_name = "astra-service" # gRPC 专用
+multiplex = true # 接受 sing-mux smux/yamux/h2mux；VLESS 还接受 Mux.Cool TCP/UDP/XUDP
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+uuid = "11111111-2222-4333-8444-555555555555"
+# 请求选择 AES-128-GCM / ChaCha20-Poly1305，无需监听级 cipher。
+
+[[listeners]]
+tag = "vless-vision"
+protocol = "vless"
+listen = "0.0.0.0:24443"
+transport = "tcp"
+udp = true
+flow = "xtls-rprx-vision" # 与客户端一致；普通 VLESS 删除此行
+multiplex = false # 当前 Astra 客户端不支持 Vision + Mux
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+uuid = "11111111-2222-4333-8444-555555555555"
+
+# VLESS Encryption 可选：以下表属于本监听，取消各行开头的 "# " 后启用。
+# astra-server-core --generate-decryption-keys x25519（或 mlkem768 / hybrid）
+# server_private_keys 只用于服务端；client_public_keys 只交给客户端。
+# [listeners.decryption]
+# private_keys = ["REPLACE_SERVER_PRIVATE_KEY"] # 1..8；hybrid 顺序原样保留
+# mode = "native" # native / xorpub / random，与客户端 encryption 字符串一致
+# ticket_lifetime_secs = 0 # 0 禁用恢复；1..3600 时客户端可用 0rtt
+# 客户端 encryption = "mlkem768x25519plus.native.1rtt.CLIENT_PUBLIC_KEY"
+# 多个公钥按私钥链顺序用点连接；此密钥与 REALITY 密钥分别生成。
+# Vision + HTTP 传输需 native/xorpub 解密层，不使用 random。
+
+[[listeners]]
+tag = "vless-xhttp-mux"
+protocol = "vless"
+listen = "0.0.0.0:24445"
+transport = "xhttp"
+udp = true
+path = "/astra-path"
+multiplex = true # 接受 sing-mux smux/yamux/h2mux；VLESS 还接受 Mux.Cool TCP/UDP/XUDP
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+uuid = "11111111-2222-4333-8444-555555555555"
+# HTTP/2 stream-one / stream-up / packet-up 自动识别，没有服务端 mode 字段。
+# packet-up 没有上传 EOF；下载断开/空闲超时回收。会话按来源 IP 绑定。
+# XUDP 关联限于当前认证会话，不提供跨连接 GlobalID 恢复或 full-cone。
+
+[[listeners]]
+tag = "trojan-ws"
+protocol = "trojan"
+listen = "0.0.0.0:24446"
+transport = "ws"
+udp = true
+path = "/astra-path"
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+password = "replace-trojan-password"
+# 可启用 multiplex=true；当前 Astra 客户端未暴露 Trojan Mux。
+
+[[listeners]]
+tag = "hysteria2-salamander"
+protocol = "hysteria2"
+listen = "0.0.0.0:24447"
+transport = "tcp"
+udp = true
+obfs_password = "replace-salamander-password" # 删除此行使用普通 HY2
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+password = "replace-hysteria2-password"
+# 实际使用 QUIC/UDP，transport 保持 tcp；TLS 必填。TUIC 自动接受 native/quic UDP。
+
+[[listeners]]
+tag = "tuic-v5"
+protocol = "tuic"
+listen = "0.0.0.0:24448"
+transport = "tcp"
+udp = true
+[listeners.tls]
+certificate = "tls/cert.pem"
+private_key = "tls/key.pem"
+[[listeners.users]]
+name = "replace-user"
+uuid = "11111111-2222-4333-8444-555555555555"
+password = "replace-tuic-password"
+# 实际使用 QUIC/UDP，transport 保持 tcp；TLS 必填。TUIC 自动接受 native/quic UDP。
+
+# ---------- VLESS / VMess / Trojan 传输替换方式 ----------
+# 替换监听的 transport，删除无关 path / service_name，勿重复定义同名键。
+# tcp：无 path/service_name；ws、http_upgrade、xhttp：path="/astra-path"；
+# grpc：service_name="astra-service"。WS/HTTP Upgrade 使用 HTTP/1.1，gRPC/XHTTP 使用 HTTP/2。
+# host、headers、fingerprint、ca_file、mux 类型、XHTTP mode 是客户端字段。
+
+# ---------- REALITY 完整可选监听：取消下面各行开头的 "# " 后启用 ----------
+# astra-server-core --generate-reality-keys
+# server_private_key 仅放服务端，client_public_key 交给客户端 reality_public_key。
+# REALITY 仅 VLESS，替代 tls 表，不可同时配置 tls/reality。
+# 目标应支持 TLS1.3 / X25519，允许的 SNI 与目标证书一致，双方时钟同步。
+# [[listeners]]
+# tag = "vless-reality-vision"
+# protocol = "vless"
+# listen = "0.0.0.0:24449"
+# transport = "tcp" # 可选 grpc / xhttp，并设置相应 service_name/path
+# udp = true
+# flow = "xtls-rprx-vision" # 普通 VLESS 删除此行
+# multiplex = false
+# [listeners.reality]
+# private_key = "REPLACE_SERVER_PRIVATE_KEY"
+# server_names = ["cover.example.com"]
+# short_ids = ["0123456789abcdef"] # 偶数长度十六进制，最多 16 字符
+# target = "cover.example.com:443" # 固定伪装回落地址
+# max_time_diff_secs = 60
+# [[listeners.users]]
+# name = "replace-user"
+# uuid = "11111111-2222-4333-8444-555555555555"
+# 可再添加 [listeners.decryption]，格式同前，密钥分别生成。
+
+# --reload 失败保留旧配置，既有连接保持原配置。
+# 地址/协议/监听顺序/UDP 开关/额度或 QUIC/SS 配置变化需要重启。
+# TUI：s 启动、x 停止、l 重载、v 校验、e 编辑、q 退出保留核心、Q 停止后退出。

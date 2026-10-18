@@ -29,8 +29,20 @@ pub enum Kind {
 impl Kind {
     pub fn binary(self) -> &'static str {
         match self {
-            Self::Proxy => "astra-proxy",
-            Self::Rule => "astra-rule",
+            Self::Proxy => {
+                if cfg!(windows) {
+                    "astra-proxy.exe"
+                } else {
+                    "astra-proxy"
+                }
+            }
+            Self::Rule => {
+                if cfg!(windows) {
+                    "astra-rule.exe"
+                } else {
+                    "astra-rule"
+                }
+            }
         }
     }
 }
@@ -107,13 +119,13 @@ impl Reply {
     }
 }
 pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Reply> {
-    let mut stream = tokio::net::UnixStream::connect(socket).await?;
     let seconds = if matches!(action, Action::Shutdown) {
         2400
     } else {
         180
     };
     tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
+        let mut stream = astra_ipc::platform::LocalStream::connect(socket).await?;
         astra_ipc::send_management(
             &mut stream,
             &Request {

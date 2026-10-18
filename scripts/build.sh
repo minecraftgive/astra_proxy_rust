@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and distribute all three native Astra executables on the current host.
+# Build and distribute the native Astra client executables on the current host.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,7 +14,7 @@ usage() {
 Usage: scripts/build.sh [options]
 
 Build astra-proxy, astra-rule and astra-tui together, then create and verify
-one distribution archive containing all three executables.
+one distribution archive containing four client executables.
 
   --debug             Use the debug profile (default: release)
   --build-only        Build and test without creating an archive
@@ -24,7 +24,7 @@ one distribution archive containing all three executables.
   -h, --help          Show this help
 
 Requires Rust, CMake, Clang/C++, libclang and Python 3 at build time.
-The three distributed Rust executables do not require Python at runtime.
+The distributed Rust executables do not require Python at runtime.
 CARGO_TARGET_DIR and PYTHON may override build output and Python interpreter.
 HELP
 }
@@ -93,7 +93,7 @@ if [[ "$profile" == release ]]; then cargo_profile=(--release); fi
 # Explicit --target avoids a .cargo/config.toml default silently changing the platform.
 bin_dir="$target_dir/$host_target/$profile"
 printf 'Building astra-proxy, astra-rule and astra-tui (%s, %s)…\n' "$profile" "$host_target"
-cargo build --locked --workspace --bins --target "$host_target" "${cargo_profile[@]}"
+cargo build --locked -p astra-proxy -p astra-rule -p astra-tui -p astra-convert --bins --target "$host_target" "${cargo_profile[@]}"
 for binary in astra-proxy astra-rule astra-tui; do
     if [[ ! -x "$bin_dir/$binary" ]]; then
         printf 'Expected executable is missing: %s\n' "$bin_dir/$binary" >&2
@@ -101,16 +101,16 @@ for binary in astra-proxy astra-rule astra-tui; do
     fi
 done
 if [[ "$skip_tests" == false ]]; then
-    cargo test --locked --workspace --target "$host_target" "${cargo_profile[@]}"
+    cargo test --locked -p astra-ipc -p astra-proxy -p astra-rule -p astra-tui -p astra-convert --target "$host_target" "${cargo_profile[@]}"
     cargo test --locked -p astra-tui --target "$host_target" "${cargo_profile[@]}" live_ -- --ignored
 fi
 if [[ "$build_only" == true ]]; then
-    printf 'Built all three executables in %s\n' "$bin_dir"
+    printf 'Built four client executables in %s\n' "$bin_dir"
     exit 0
 fi
 "$python" "$ROOT/scripts/package_release.py" --bin-dir "$bin_dir" --output-dir "$output_dir" --label "$label"
-archive="$output_dir/astra-$label-$("$python" -c 'import platform; print(platform.system().lower() + "-" + platform.machine())').tar.gz"
+archive="$output_dir/astra-client-$label-$("$python" -c 'import platform; print(platform.system().lower() + "-" + platform.machine())').tar.gz"
 if [[ "$skip_tests" == false ]]; then
-    "$python" "$ROOT/scripts/package_regression.py" "$archive" --report "$archive.verification.json"
+    "$python" "$ROOT/scripts/package_regression.py" "$archive" --report "$ROOT/.test-tools/$(basename "$archive").verification.json"
 fi
-printf '\nDistribution: %s\nChecksum:     %s.sha256\n' "$archive" "$archive"
+printf '\nDistribution: %s\n' "$archive"

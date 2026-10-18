@@ -1,0 +1,19 @@
+# SERVER ONLY. Insert a server_private_key from --generate-reality-keys.
+# Client configuration belongs in configs/client/ and uses the public key.
+allow_private_targets = false
+
+[[listeners]]
+tag = "vless-reality-inbound"
+protocol = "vless"
+listen = "0.0.0.0:24443"
+# flow = "xtls-rprx-vision" # Enable on both ends for Vision.
+# multiplex = true         # Use with ordinary VLESS; client Vision+Mux is unavailable.
+[listeners.reality]
+private_key = "REPLACE_WITH_SERVER_PRIVATE_KEY"
+server_names = ["www.example.com"]
+short_ids = ["0123456789abcdef"]
+target = "www.example.com:443"
+max_time_diff_secs = 60
+[[listeners.users]]
+name = "replace-me"
+uuid = "11111111-2222-4333-8444-555555555555"

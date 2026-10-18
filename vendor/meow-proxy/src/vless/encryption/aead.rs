@@ -357,7 +357,7 @@ impl Aead {
     /// Only the server seals at `MaxNonce` (the client reads it via
     /// [`Self::open_max`]), so this is exercised solely by the reference test
     /// server today.
-    #[cfg(test)]
+    #[cfg(any(test,feature="vless-server"))]
     pub(crate) fn seal_max(&self, plaintext: &[u8]) -> Vec<u8> {
         self.encrypt(&MAX_NONCE, plaintext, &[])
     }

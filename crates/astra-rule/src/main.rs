@@ -1,12 +1,12 @@
+use astra_ipc::platform::{LocalListener as UnixListener, LocalStream as UnixStream};
 mod engine;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use astra_ipc::{RouteAction, RouteRequest, RouteResponse, API_VERSION};
 use engine::{RuleConfig, RuleEngine};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tokio::{
     io::AsyncReadExt,
-    net::{UnixListener, UnixStream},
     sync::{watch, Mutex},
 };
 struct Generation {
@@ -15,11 +15,12 @@ struct Generation {
 }
 struct Bound {
     listener: UnixListener,
+    #[cfg_attr(windows, allow(dead_code))]
     path: PathBuf,
 }
 impl Drop for Bound {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        astra_ipc::platform::remove_socket(&self.path);
     }
 }
 fn bind(path: &str) -> Result<Bound> {
@@ -29,7 +30,7 @@ fn bind(path: &str) -> Result<Bound> {
         listener,
         path: path.into(),
     };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    astra_ipc::platform::set_private(astra_ipc::platform::endpoint_path(path), 0o600)?;
     Ok(bound)
 }
 struct State {
@@ -78,6 +79,15 @@ async fn main() -> Result<()> {
     astra_ipc::logging::init()?;
     let mut args = std::env::args().skip(1);
     let first = args.next();
+    if first.as_deref() == Some("--stop") {
+        let socket = args.next().context("expected management socket")?;
+        astra_ipc::control::request(
+            std::path::Path::new(&socket),
+            astra_ipc::control::Command::Stop,
+        )
+        .await?;
+        return Ok(());
+    }
     if matches!(first.as_deref(), Some("--reload" | "--switch")) {
         let socket = args.next().context("expected management socket")?;
         let path = if first.as_deref() == Some("--switch") {

@@ -1,18 +1,20 @@
 use crate::protocol::*;
 use anyhow::{bail, Context, Result};
 use astra_ipc::control::{self, Command};
+use astra_ipc::platform::LocalListener as UnixListener;
+use astra_ipc::platform::{set_private, DirBuilderExt, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::{
-    net::UnixListener,
     process::{Child, Command as Process},
     time::{sleep, timeout},
 };
@@ -38,13 +40,17 @@ pub struct Manager {
 }
 const CONFIG_LIMIT: usize = 480 * 1024;
 
+fn core_process(path: PathBuf) -> Process {
+    astra_ipc::platform::background_core(path)
+}
+
 pub fn private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     anyhow::ensure!(
         !fs::symlink_metadata(path)?.file_type().is_symlink(),
         "State directory cannot be a symlink"
     );
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    set_private(path, 0o700)?;
     Ok(())
 }
 
@@ -62,8 +68,10 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(&tmp)?;
     let result = (|| {
+        set_private(&tmp, 0o600)?;
         file.write_all(data)?;
         file.sync_all()?;
+        drop(file);
         fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -89,10 +97,10 @@ fn ensure_config(kind: Kind, path: &Path) -> Result<bool> {
             return Err(error).with_context(|| format!("Inspect configuration {}", path.display()))
         }
     }
-    use std::os::unix::fs::DirBuilderExt;
     let parent = path
         .parent()
         .context("Configuration needs a parent directory")?;
+    let parent_existed = parent.exists();
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -111,6 +119,10 @@ fn ensure_config(kind: Kind, path: &Path) -> Result<bool> {
                 .with_context(|| format!("Create default configuration {}", path.display()))
         }
     };
+    if !parent_existed {
+        set_private(parent, 0o700)?;
+    }
+    set_private(path, 0o600)?;
     let template = match kind {
         Kind::Proxy => include_str!("../../../configs/proxy.toml"),
         Kind::Rule => include_str!("../../../configs/rule.toml"),
@@ -180,7 +192,7 @@ impl Manager {
         read_config(path)?;
         let output = timeout(
             Duration::from_secs(20),
-            Process::new(self.bin.join(kind.binary()))
+            core_process(self.bin.join(kind.binary()))
                 .arg("--check")
                 .arg(path)
                 .env_remove("ASTRA_CONTROL_SOCKET")
@@ -217,7 +229,7 @@ impl Manager {
             .mode(0o600)
             .open(self.log(name))?;
         let config = read_config(&instance.config)?;
-        let child = Process::new(self.bin.join(instance.kind.binary()))
+        let child = core_process(self.bin.join(instance.kind.binary()))
             .arg(&instance.config)
             .env("ASTRA_CONTROL_SOCKET", &socket)
             .env("ASTRA_LOG_LEVEL", self.level(name).as_str())
@@ -635,10 +647,11 @@ impl Manager {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        astra_ipc::platform::remove_socket(&self.0);
     }
 }
 
@@ -647,7 +660,7 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
     let socket = home.join("manager.sock");
     let listener = UnixListener::bind(&socket).context("Manager socket exists or path is too long; never remove a socket belonging to a running manager")?;
     let _guard = SocketGuard(socket.clone());
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    set_private(&socket, 0o600)?;
     let mut manager = Manager::load(home, bin)?;
     let mut followers = tokio::task::JoinSet::new();
     let signal = astra_ipc::shutdown_signal();
@@ -702,7 +715,7 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
-            let path = PathBuf::from("/tmp").join(format!(
+            let path = std::env::temp_dir().join(format!(
                 "at-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -730,6 +743,7 @@ mod tests {
                     "socket"
                 })
                 .is_some());
+            #[cfg(unix)]
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -759,10 +773,12 @@ mod tests {
         atomic_write(&path, b"old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&temp.0).unwrap().permissions().mode() & 0o777,
             0o700
@@ -780,7 +796,9 @@ mod tests {
             }
             sleep(Duration::from_millis(10)).await;
         }
-        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut stream = astra_ipc::platform::LocalStream::connect(&socket)
+            .await
+            .unwrap();
         astra_ipc::send_management(
             &mut stream,
             &Request {
@@ -866,7 +884,7 @@ mod tests {
             LogEvent::Waiting
         ));
         call(&socket, Action::Start("rules".into())).await.unwrap();
-        async fn until(stream: &mut tokio::net::UnixStream, needle: &str) -> String {
+        async fn until(stream: &mut astra_ipc::platform::LocalStream, needle: &str) -> String {
             timeout(Duration::from_secs(5), async {
                 let mut output = String::new();
                 loop {
@@ -898,7 +916,9 @@ mod tests {
         .unwrap();
         assert_eq!(pid, call(&socket, Action::List).await.unwrap().rows[0].pid);
         let route = PathBuf::from(rule_config["socket"].as_str().unwrap());
-        let mut bad = tokio::net::UnixStream::connect(&route).await.unwrap();
+        let mut bad = astra_ipc::platform::LocalStream::connect(&route)
+            .await
+            .unwrap();
         bad.write_all(&[0, 0, 0, 0]).await.unwrap();
         drop(bad);
         let text = until(&mut stream, "IPC peer disconnected").await;
@@ -914,7 +934,9 @@ mod tests {
         .await
         .unwrap();
         let previous = fs::metadata(home.join("rules.log")).unwrap().len();
-        let mut bad = tokio::net::UnixStream::connect(&route).await.unwrap();
+        let mut bad = astra_ipc::platform::LocalStream::connect(&route)
+            .await
+            .unwrap();
         bad.write_all(&[0, 0, 0, 0]).await.unwrap();
         drop(bad);
         sleep(Duration::from_millis(250)).await;

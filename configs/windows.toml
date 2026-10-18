@@ -1,0 +1,29 @@
+# Windows template. Replace the upstream before use. Both system modes start disabled.
+standalone = true
+watch_config = true
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+
+# Current-user Windows LAN HTTP/HTTPS proxy; no administrator required.
+# [system_proxy]
+
+# Wintun requires administrator and the matching signed wintun.dll beside the EXE.
+# [tun]
+# name = "Astra"
+# address = "198.18.0.1"
+# prefix = 30
+# mtu = 1500
+# interface = "Ethernet" # Actual physical adapter alias or numeric interface index.
+# gateway = "192.168.1.1" # Actual original IPv4 gateway.
+# routes = ["0.0.0.0/1", "128.0.0.0/1"]
+# bypass = ["203.0.113.8/32", "8.8.8.8/32"] # Actual node IPs and original DNS.
+# Optional IPv6 (requires a working physical IPv6 gateway):
+# ipv6_address = "fd00:198:18::1"
+# ipv6_prefix = 126
+# gateway6 = "fe80::1" # Link-local scope is inferred from interface.
+# Add ::/1, 8000::/1 to routes and each IPv6 node/DNS host to bypass.
+
+[[outbounds]]
+kind = "socks5"
+tag = "edge"
+server = "203.0.113.8:1080" # Placeholder; replace with your real upstream.
