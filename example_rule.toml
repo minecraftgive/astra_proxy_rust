@@ -1,0 +1,109 @@
+# Astra 0.1.0：全部规则设置与匹配类型示例。
+# 配套 example_proxy.toml；两端 UDS 路径必须一致。
+# 校验：target/release/astra-rule --check example_rule.toml
+# 规则按本文件出现顺序，第一条匹配生效；不是按“精确 > 后缀 > CIDR”等固定优先级。
+# 不支持 include、规则集合引用、正则、GeoIP、进程规则或订阅；支持配置热切换/热重载。
+# ---------- 全部顶层设置 ----------
+watch_config = false # 默认 false；true：每秒监测当前文件内容，支持原子替换，编译成功后热应用
+# 失败保留旧规则；同一份无效内容不重复刷日志，修正内容后重试。也可 SIGHUP/TUI/管理 IPC 重载。
+# 这是本规则核心独立的开关，与 example_proxy.toml.watch_config 分别生效。
+socket = "/tmp/astra-rule.sock"
+# 全部 action：direct / block / proxy:TAG；区分大小写。
+# TAG 为 example_proxy.toml 中唯一出站标签。默认使用 VLESS TLS 占位节点，运行前替换节点值。
+default_action = "proxy:vless-tls"
+# default_action = "direct" # 选择直连默认策略时替换上一行，不能同时重复定义
+# default_action = "block"  # 未匹配请求全部拒绝
+
+# ---------- domain_exact：域名精确匹配 ----------
+[[rules]]
+kind = "domain_exact"
+value = "blocked.example"
+action = "block"
+
+# 精确规则放在更宽的后缀前，以便覆盖。
+[[rules]]
+kind = "domain_exact"
+value = "direct.example.com"
+action = "direct"
+
+# ---------- domain_suffix：按标签边界匹配域名及其子域 ----------
+# example.com 与 a.example.com 命中；notexample.com 不命中。
+# 域名会规范化大小写；国际化域名建议填写 ASCII/Punycode。
+[[rules]]
+kind = "domain_suffix"
+value = "example.com"
+action = "proxy:vless-tls-xhttp-stream-one"
+
+# ---------- ip_cidr：IPv4 / IPv6 ----------
+# 只对客户端明确发送的 IP 目标匹配；不会主动解析域名来匹配 CIDR。
+[[rules]]
+kind = "ip_cidr"
+value = "127.0.0.0/8"
+action = "direct"
+
+[[rules]]
+kind = "ip_cidr"
+value = "::1/128"
+action = "direct"
+
+[[rules]]
+kind = "ip_cidr"
+value = "192.168.0.0/16"
+action = "direct"
+
+[[rules]]
+kind = "ip_cidr"
+value = "fc00::/7"
+action = "direct"
+
+# ---------- port：单个端口，以字符串填写，范围 1..65535 ----------
+# 不接受 "80,443" 或 "1000-2000"；多个端口分别写规则。
+# 端口规则不区分 TCP/UDP；本版没有单条规则的多条件 AND。
+[[rules]]
+kind = "port"
+value = "25"
+action = "block"
+
+[[rules]]
+kind = "port"
+value = "8443"
+action = "proxy:trojan-tls"
+
+# ---------- network：udp / tcp ----------
+# UDP 目标可交由 TUIC；此前域名/IP/端口规则若命中，仍优先生效。
+[[rules]]
+kind = "network"
+value = "udp"
+action = "proxy:tuic-native-cubic"
+
+# 此处 TCP 兜底；因为 network 只有 tcp/udp，上述 UDP + 此条 TCP 覆盖所有请求，
+# 因此当前 default_action 不会被走到。要实际使用 default_action，删除此条 TCP 兜底，
+# 或按需要也删除 UDP 兜底。
+[[rules]]
+kind = "network"
+value = "tcp"
+action = "proxy:vless-tls"
+
+# 其他出站只需将任一 action 的 TAG 替换成 example_proxy.toml 对应标签，例如：
+# proxy:socks5-auth / proxy:http-auth / proxy:ss-aes-256-gcm
+# proxy:vmess-chacha20-poly1305 / proxy:hysteria2-salamander / proxy:tuic-quic-bbr
+# proxy:vless-vision-reality / proxy:vless-mux-h2mux
+# action 不能直接写协议名；不存在的 TAG 会导致连接失败，不会静默直连。
+# ---------- 修改规则、切换文件和缓存行为 ----------
+# 不需重启：watch_config=true 自动应用；也可 kill -HUP <Rule-Core-PID> 重读当前文件。
+# TUI Ctrl-S 保存/c 切换文件时热应用；R 手动重载，r 仍为完整重启。
+# 独立管理 socket 示例（与 Proxy Core 的管理 socket、上方路由 socket 均不同）：
+# ASTRA_CONTROL_SOCKET=/tmp/astra-rule-control.sock ./target/release/astra-rule example_rule.toml
+# ./target/release/astra-rule --reload /tmp/astra-rule-control.sock
+# ./target/release/astra-rule --switch /tmp/astra-rule-control.sock /absolute/path/to/other-rule.toml
+# --switch 成功后记住新配置路径；之后的 SIGHUP 和文件监测读新文件。
+# socket 也可热切换：先绑定新路径，再提交；旧路径不可用，新建代理 IPC 需同步更新 rule_socket。
+# 新配置会先编译索引、准备 socket，语法错误/动作无效/路径占用等均拒绝候选并保留旧规则。
+# 既有持久 IPC 连接在后续路由请求时读取新规则，不需为了规则更新断开连接。
+# 规则版本通过独立订阅通道推送给代理，决策缓存按版本隔离；不是固定等待默认 5 秒 TTL。
+# 推送有短暂异步传播延迟；规则服务断连后不继续使用旧版本缓存，已有 TCP/UDP 数据流保持原出口。
+# Proxy Core standalone=true 时完全不访问本规则核心，也无需启动本规则核心或提供此文件。
+# TUN/TPROXY/REDIRECT 目标通常是 IP，域名规则不会自动解析/嗅探 IP 还原域名；可按 IP/端口/network 路由。
+# 规则动作仅支持 direct/block/proxy:TAG；没有 mode/tun/system_proxy 等字段，它们放在代理配置中。
+# 启动记录级别可用 ASTRA_LOG_LEVEL=info；也可在 TUI 日志页 L 动态修改，不是本文件的 TOML 字段。
+# 更多模式、权限、设备重建限制和验收边界见 docs/PROXY_MODES.md；新旧 IPC 版本不可混用。

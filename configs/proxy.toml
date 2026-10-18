@@ -1,0 +1,31 @@
+# Default to loopback. Do NOT bind publicly without an auth/firewall layer.
+rule_socket = "/tmp/astra-rule.sock"
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+ipc_connections = 8
+decision_timeout_ms = 500
+connect_timeout_secs = 8
+max_connections = 4096
+decision_cache_ttl_secs = 5
+
+# Example upstream SOCKS5. Set rules to "proxy:edge" to route through it.
+# [[outbounds]]
+# kind = "socks5"
+# tag = "edge"
+# server = "127.0.0.1:7890"
+
+# Basic Trojan over verified TLS, TCP only:
+# [[outbounds]]
+# kind = "trojan_tls"
+# tag = "trojan"
+# server = "your.server.example:443"
+# sni = "your.server.example"
+# password = "password"
+
+# Basic VLESS over verified TLS, TCP only; NOT Reality / Vision:
+# [[outbounds]]
+# kind = "vless_tls"
+# tag = "vless"
+# server = "your.server.example:443"
+# sni = "your.server.example"
+# uuid = "00000000-0000-0000-0000-000000000001"

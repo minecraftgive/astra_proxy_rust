@@ -1,0 +1,386 @@
+{
+  "scope": "macOS arm64 first-release functional gate; known peer/mode limitations documented separately",
+  "binary_sha256": {
+    "astra-rule": "d61c1dde03bf5b29b997d0083d3c86dbdf75c959b17ef2999da27116783a0c31",
+    "astra-proxy": "fdf98ec0142dff8197515c03c89ca13e4846d286d7ab8eccca0a2458fe87c8fa"
+  },
+  "steps": [
+    {
+      "name": "workspace tests",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace"
+      ],
+      "exit_code": 0,
+      "seconds": 0.24,
+      "output": "warning: use of deprecated method `boring::aead::AeadCtxRef::seal_in_place`: Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `seal_in_place_mut` instead.\n  --> vendor/meow-proxy/src/aead.rs:65:14\n   |\n65 |             .seal_in_place(nonce, data, tag, ad)\n   |              ^^^^^^^^^^^^^\n   |\n   = note: `#[warn(deprecated)]` on by default\n\nwarning: use of deprecated method `boring::aead::AeadCtxRef::open_in_place`: Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `open_in_place_mut` instead.\n  --> vendor/meow-proxy/src/aead.rs:79:14\n   |\n79 |             .open_in_place(nonce, data, tag, ad)\n   |              ^^^^^^^^^^^^^\n\nwarning: `meow-proxy` (lib) generated 2 warnings\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/astra_ipc-b70c774e40962be1)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running unittests src/main.rs (target/debug/deps/astra_proxy-8602c63224c964ea)\n\nrunning 15 tests\ntest outbound::tests::sock5_domain_is_encoded_with_length ... ok\ntest tuic::tests::udp_framing_validates_lengths_and_addresses ... ok\ntest udp::tests::udp_headers_reject_truncation_fragments_and_preserve_empty_payloads ... ok\ntest outbound::vless_stream::tests::rejects_truncated_and_invalid_headers ... ok\ntest rule_client::tests::busy_channel_does_not_block_an_idle_channel ... ok\ntest tuic::tests::fragmented_udp_reorders_and_rejects_conflicts_without_unbounded_buffers ... ok\ntest outbound::vless_stream::tests::client_first_and_fragmented_response_with_addons ... ok\ntest xhttp::tests::rejected_upload_fails_download_and_releases_connection ... ok\ntest native::tests::closing_socks_udp_closes_upstream_control_connection ... ok\ntest xhttp::tests::response_survives_upload_half_close ... ok\ntest xhttp::packet_tests::rejected_post_fails_flush_and_read ... ok\ntest xhttp::tests::cancel_pending_download_then_drop_releases_http_tasks ... ok\ntest xhttp::packet_tests::packet_upload_flushes_all_sequences_and_refuses_fake_half_close ... ok\ntest rule_client::tests::timeout_discards_channel_and_returns_capacity ... ok\ntest xhttp::packet_tests::cancelling_pending_post_releases_http_connection ... ok\n\ntest result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n\n     Running unittests src/main.rs (target/debug/deps/astra_rule-8184d5d41b7662db)\n\nrunning 4 tests\ntest engine::tests::benchmark_mixed_rules ... ignored, manual benchmark; run cargo test -p astra-rule --release -- --ignored --nocapture\ntest engine::tests::domain_suffix_respects_label_boundaries ... ok\ntest engine::tests::earliest_rule_wins_across_indices ... ok\ntest engine::tests::cidr_v4_and_v6 ... ok\n\ntest result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Doc-tests astra_ipc\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "workspace lint",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 0.23,
+      "output": "warning: use of deprecated method `boring::aead::AeadCtxRef::seal_in_place`: Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `seal_in_place_mut` instead.\n  --> vendor/meow-proxy/src/aead.rs:65:14\n   |\n65 |             .seal_in_place(nonce, data, tag, ad)\n   |              ^^^^^^^^^^^^^\n   |\n   = note: `#[warn(deprecated)]` on by default\n\nwarning: use of deprecated method `boring::aead::AeadCtxRef::open_in_place`: Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `open_in_place_mut` instead.\n  --> vendor/meow-proxy/src/aead.rs:79:14\n   |\n79 |             .open_in_place(nonce, data, tag, ad)\n   |              ^^^^^^^^^^^^^\n\nwarning: `meow-proxy` (lib) generated 2 warnings\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s\n"
+    },
+    {
+      "name": "TCP matrix",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release"
+      ],
+      "exit_code": 0,
+      "seconds": 65.96,
+      "output": "PASS socks-plain 65536 bytes + close after echo\nPASS socks-auth 65536 bytes + close after echo\nPASS http-plain 65536 bytes + close after echo\nPASS http-auth 65536 bytes + close after echo\nPASS ss-plain 65536 bytes + close after echo\nPASS sing-shadowsocks 65536 bytes + close after echo\nPASS sing-vmess 65536 bytes + close after echo\nPASS vmess-tls 65536 bytes + close after echo\nPASS trojan-tls 65536 bytes + close after echo\nPASS vless-tls 65536 bytes + close after echo\nPASS vless-ws 65536 bytes + close after echo\nPASS vless-grpc 65536 bytes + close after echo\nPASS vless-httpupgrade 65536 bytes + close after echo\nPASS vless-xhttp:packet-up 65536 bytes + close after echo\nPASS vless-xhttp:stream-up 65536 bytes + close after echo\nPASS vless-xhttp:stream-one 65536 bytes + close after echo\nPASS vless-reality 65536 bytes + close after echo\nPASS vless-reality-grpc 65536 bytes + close after echo\nPASS vless-reality-xhttp:stream-one 65536 bytes + close after echo\nPASS vless-reality-xhttp:stream-up 65536 bytes + close after echo\nPASS vless-reality-xhttp:packet-up 65536 bytes + close after echo\nPASS vless-vision 65536 bytes + close after echo\nPASS sing-hysteria2 65536 bytes + close after echo\nPASS sing-tuic 65536 bytes + close after echo\n"
+    },
+    {
+      "name": "UDP basic matrix",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--udp",
+        "--case",
+        "socks-plain",
+        "--case",
+        "socks-auth",
+        "--case",
+        "ss-plain",
+        "--case",
+        "sing-shadowsocks",
+        "--case",
+        "vmess-tls",
+        "--case",
+        "trojan-tls",
+        "--case",
+        "vless-tls",
+        "--case",
+        "vless-ws",
+        "--case",
+        "vless-grpc",
+        "--case",
+        "vless-httpupgrade",
+        "--case",
+        "vless-xhttp:stream-one",
+        "--case",
+        "vless-xhttp:stream-up",
+        "--case",
+        "vless-xhttp:packet-up",
+        "--case",
+        "vless-reality",
+        "--case",
+        "sing-hysteria2",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 12.08,
+      "output": "PASS socks-plain UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS socks-auth UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS ss-plain UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS sing-shadowsocks UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vmess-tls UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS trojan-tls UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-tls UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-ws UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-grpc UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-httpupgrade UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-xhttp:stream-one UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-xhttp:stream-up UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-xhttp:packet-up UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS vless-reality UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS sing-hysteria2 UDP IPv4/IPv6/domain, 1..4096 bytes\nPASS sing-tuic UDP IPv4/IPv6/domain, 1..4096 bytes\n"
+    },
+    {
+      "name": "UDP full edge peers",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--udp-edge",
+        "--case",
+        "sing-socks-plain",
+        "--case",
+        "sing-socks-auth",
+        "--case",
+        "sing-trojan",
+        "--case",
+        "sing-vless",
+        "--case",
+        "sing-vmess",
+        "--case",
+        "sing-shadowsocks-aead",
+        "--case",
+        "sing-shadowsocks"
+      ],
+      "exit_code": 0,
+      "seconds": 2.84,
+      "output": "PASS sing-socks-plain UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-socks-auth UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-trojan UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-vless UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-vmess UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-shadowsocks-aead UDP IPv4/IPv6/domain, 0..8192 bytes\nPASS sing-shadowsocks UDP IPv4/IPv6/domain, 0..8192 bytes\n"
+    },
+    {
+      "name": "TUIC datagram edges",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--udp-edge",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 1.56,
+      "output": "PASS sing-tuic UDP IPv4/IPv6/domain, 0..8192 bytes\n"
+    },
+    {
+      "name": "TUIC stream edges",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--udp-edge",
+        "--case",
+        "sing-tuic",
+        "--tuic-udp-mode",
+        "quic"
+      ],
+      "exit_code": 0,
+      "seconds": 1.57,
+      "output": "PASS sing-tuic UDP IPv4/IPv6/domain, 0..8192 bytes\n"
+    },
+    {
+      "name": "Hysteria2 empty and 4096",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--udp-size",
+        "0",
+        "--udp-size",
+        "4096",
+        "--case",
+        "sing-hysteria2"
+      ],
+      "exit_code": 0,
+      "seconds": 1.56,
+      "output": "PASS sing-hysteria2 UDP IPv4/IPv6/domain, [0, 4096] bytes\n"
+    },
+    {
+      "name": "native credential rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--fault",
+        "credential",
+        "--case",
+        "vless-tls",
+        "--case",
+        "vmess-tls",
+        "--case",
+        "trojan-tls",
+        "--case",
+        "ss-plain",
+        "--case",
+        "sing-shadowsocks",
+        "--case",
+        "sing-hysteria2",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 17.62,
+      "output": "PASS vless-tls credential rejected without application data\nPASS vmess-tls credential rejected without application data\nPASS trojan-tls credential rejected without application data\nPASS ss-plain credential no application data during 15-second probe (silent peer)\nPASS sing-shadowsocks credential rejected without application data\nPASS sing-hysteria2 credential rejected without application data\nPASS sing-tuic credential rejected without application data\n"
+    },
+    {
+      "name": "SNI rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--fault",
+        "server-name",
+        "--case",
+        "vless-tls",
+        "--case",
+        "vmess-tls",
+        "--case",
+        "trojan-tls",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 1.55,
+      "output": "PASS vless-tls server-name rejected without application data\nPASS vmess-tls server-name rejected without application data\nPASS trojan-tls server-name rejected without application data\nPASS sing-tuic server-name rejected without application data\n"
+    },
+    {
+      "name": "untrusted CA rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--fault",
+        "untrusted-ca",
+        "--case",
+        "vless-tls",
+        "--case",
+        "vmess-tls",
+        "--case",
+        "trojan-tls",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 1.55,
+      "output": "PASS vless-tls untrusted-ca rejected without application data\nPASS vmess-tls untrusted-ca rejected without application data\nPASS trojan-tls untrusted-ca rejected without application data\nPASS sing-tuic untrusted-ca rejected without application data\n"
+    },
+    {
+      "name": "Hysteria2 pin rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--fault",
+        "pin",
+        "--case",
+        "sing-hysteria2"
+      ],
+      "exit_code": 0,
+      "seconds": 1.05,
+      "output": "PASS sing-hysteria2 pin rejected without application data\n"
+    },
+    {
+      "name": "upstream credential rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--bad-auth",
+        "--case",
+        "socks-auth",
+        "--case",
+        "http-auth"
+      ],
+      "exit_code": 0,
+      "seconds": 0.55,
+      "output": "PASS socks-auth invalid upstream credentials rejected\nPASS http-auth invalid upstream credentials rejected\n"
+    },
+    {
+      "name": "REALITY key rejection",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--bad-reality",
+        "--case",
+        "vless-reality"
+      ],
+      "exit_code": 0,
+      "seconds": 7.57,
+      "output": "PASS vless-reality wrong REALITY public key rejected\n"
+    },
+    {
+      "name": "Vision TLS 1.3 raw switch",
+      "command": [
+        "/Users/Nothing/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--case",
+        "vless-vision",
+        "--tls-payload",
+        "--payload-bytes",
+        "8388608"
+      ],
+      "exit_code": 0,
+      "seconds": 8.07,
+      "output": "PASS vless-vision 8388608 bytes over verified inner TLS 1.3 + raw read/write switch\n"
+    },
+    {
+      "name": "native half-close with sing-box",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release",
+        "--trailer",
+        "--payload-bytes",
+        "8388608",
+        "--case",
+        "sing-vless",
+        "--case",
+        "sing-vmess",
+        "--case",
+        "sing-tuic"
+      ],
+      "exit_code": 0,
+      "seconds": 1.58,
+      "output": "PASS sing-vless 8388608 bytes + early upload EOF + response trailer\nPASS sing-vmess 8388608 bytes + early upload EOF + response trailer\nPASS sing-tuic 8388608 bytes + early upload EOF + response trailer\n"
+    },
+    {
+      "name": "Xray half-close isolation",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/half_close_diagnostic.py"
+      ],
+      "exit_code": 0,
+      "seconds": 1.68,
+      "output": "xray: 65536-byte echo verified; after TCP write EOF received 0 of 24 trailer bytes (Astra absent)\nsing-box: 65536-byte echo verified; after TCP write EOF received 24 of 24 trailer bytes (Astra absent)\nCONFIRMED reference-server difference: Xray closes without trailing response; sing-box preserves it\n"
+    },
+    {
+      "name": "core_regression",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/core_regression.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release"
+      ],
+      "exit_code": 0,
+      "seconds": 0.71,
+      "output": "PASS max_connections=1: both idle-listener paths\nPASS rule outage/restart: fail closed, established TCP survives, SIGTERM cleans socket\n"
+    },
+    {
+      "name": "udp_regression",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/udp_regression.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release"
+      ],
+      "exit_code": 0,
+      "seconds": 3.97,
+      "output": "PASS UDP direct: 0..8192 bytes, network rules/cache separation, endpoint isolation, fragment rejection, flow limits, control-close cleanup, idle expiry\n"
+    },
+    {
+      "name": "tuic_regression",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/tuic_regression.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release"
+      ],
+      "exit_code": 0,
+      "seconds": 17.61,
+      "output": "PASS TUIC 20 batches of 32 concurrent TCP streams + UDP share one QUIC connection\nPASS TUIC reconnects after server restart\nPASS TUIC rejects password\nPASS TUIC rejects server-name\nPASS TUIC rejects untrusted-certificate\n"
+    },
+    {
+      "name": "mux_regression",
+      "command": [
+        "/Users/Nothing/Downloads/astra-dual-core/.build-tools/bin/python3",
+        "scripts/mux_regression.py",
+        "--bin-dir",
+        "/Users/Nothing/Downloads/astra-dual-core/target/release"
+      ],
+      "exit_code": 0,
+      "seconds": 12.34,
+      "output": "PASS vless/smux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vless/yamux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vless/h2mux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vless/muxcool: 65 TCP streams, UDP IPv4/IPv6/domain, 5 physical connections\nPASS vmess/smux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vmess/yamux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vmess/h2mux: 65 TCP streams, UDP IPv4/IPv6/domain, 4 physical connections\nPASS vmess/muxcool: 65 TCP streams, UDP IPv4/IPv6/domain, 5 physical connections\n"
+    }
+  ],
+  "passed": true
+}

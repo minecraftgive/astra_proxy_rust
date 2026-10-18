@@ -1,0 +1,77 @@
+{
+  "binary_sha256": {
+    "astra-rule": "d61c1dde03bf5b29b997d0083d3c86dbdf75c959b17ef2999da27116783a0c31",
+    "astra-proxy": "fdf98ec0142dff8197515c03c89ca13e4846d286d7ab8eccca0a2458fe87c8fa"
+  },
+  "passed": true,
+  "steps": [
+    {
+      "name": "VMess codec patches",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "vendor/meow-proxy/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "vmess,mux",
+        "--lib",
+        "vmess::"
+      ],
+      "exit_code": 0,
+      "seconds": 0.36,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running unittests src/lib.rs (vendor/meow-proxy/target/debug/deps/meow_proxy-de342e061f611876)\n\nrunning 14 tests\ntest vmess::kdf::tests::kdf_matches_single_and_multi_segment_reference_vectors ... ok\ntest vmess::tests::support_udp_follows_mux_capability ... ok\ntest vmess::tests::support_udp_reports_implemented_udp ... ok\ntest vmess::header::tests::header_wire_format_matches_protocol ... ok\ntest vmess::body::tests::body_wire_format_matches_protocol ... ok\ntest vmess::conn::tests::forwards_request_body_before_response_header_arrives ... ok\ntest vmess::conn::tests::drop_releases_silent_upstream_transport ... ok\ntest vmess::tests::connect_over_writes_vmess_request_for_metadata ... ok\ntest vmess::conn::tests::write_half_close_keeps_read_side_open ... ok\ntest vmess::conn::tests::upstream_truncated_record_aborts_write_side ... ok\ntest vmess::tests::connect_over_carries_full_duplex_vmess_exchange ... ok\ntest vmess::packet::tests::client_first_packets_keep_boundaries_and_drain_short_buffers ... ok\ntest vmess::packet::tests::canceled_partial_header_and_write_retire_session ... ok\ntest vmess::conn::tests::upstream_half_close_keeps_write_side_open ... ok\n\ntest result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.07s\n\n"
+    },
+    {
+      "name": "Hysteria2 codec patches",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "vendor/meow-proxy/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "hysteria2",
+        "--lib",
+        "hysteria2::"
+      ],
+      "exit_code": 0,
+      "seconds": 20.21,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (vendor/meow-proxy/target/debug/deps/meow_proxy-924615a80a89f6e5)\n\nrunning 37 tests\ntest hysteria2::client::tests::parses_bracketed_ipv6_server_target ... ok\ntest hysteria2::client::tests::remember_prefers_errno_over_context_only_errors ... ok\ntest hysteria2::client::tests::parses_domain_server_target ... ok\ntest hysteria2::auth::tests::rejects_truncated_or_duplicate_auth_headers ... ok\ntest hysteria2::auth::tests::handles_body_and_extensions_but_rejects_invalid_framing ... ok\ntest hysteria2::auth::tests::validates_auth_status_and_udp_header ... ok\ntest hysteria2::obfs::tests::hop_ports_expansion_bounded ... ok\ntest hysteria2::obfs::tests::hop_ports_parse_ranges ... ok\ntest hysteria2::obfs::tests::hop_state_clamps_absurd_interval ... ok\ntest hysteria2::obfs::tests::salamander_round_trip ... ok\ntest hysteria2::proto::tests::quic_varint_round_trip_boundaries ... ok\ntest hysteria2::proto::tests::tcp_request_layout_starts_with_frame_type ... ok\ntest hysteria2::proto::tests::tcp_response_error_status_is_reported ... ok\ntest hysteria2::proto::tests::tcp_response_parse_needs_more_then_completes ... ok\ntest hysteria2::proto::tests::udp_message_round_trip ... ok\ntest hysteria2::tls::tests::a_pin_overrides_skip_cert_verify ... ok\ntest hysteria2::tls::tests::a_pin_replaces_hostname_validation ... ok\ntest hysteria2::driver::tests::cancelling_authentication_releases_the_driver_socket ... ok\ntest hysteria2::tls::tests::builds_config_for_insecure ... ok\ntest hysteria2::tls::tests::parses_sha256_pin_variants ... ok\ntest hysteria2::tls::tests::plain_config_keeps_the_webpki_roots ... ok\ntest hysteria2::driver::tests::raw_udp_round_trip_without_http3_datagrams ... ok\ntest hysteria2::tls::tests::rejects_invalid_sha256_pin ... ok\ntest hysteria2::tls::tests::skip_cert_verify_without_a_pin_accepts_anything ... ok\ntest hysteria2::udp::tests::defragger_reassembles_in_order ... ok\ntest hysteria2::udp::tests::reassembly_bounds_duplicates_conflicts_and_expiry ... ok\ntest hysteria2::tls::tests::appending_pinned_certificate_does_not_authenticate_another_leaf ... ok\ntest hysteria2::driver::tests::dropping_the_client_releases_an_authenticated_driver ... ok\ntest hysteria2::driver::tests::terminal_write_failure_reaches_both_halves ... ok\ntest hysteria2::tls::tests::production_quic_config_pin_matrix ... ok\ntest hysteria2::driver::tests::reset_releases_the_cached_connection_and_reconnects ... ok\ntest hysteria2::driver::tests::write_budget_survives_draining_the_command_channel ... ok\ntest hysteria2::driver::tests::stream_limit_retries_the_intact_tcp_request ... ok\ntest hysteria2::driver::tests::non_fast_open_waits_and_reports_remote_errors ... ok\ntest hysteria2::driver::tests::stalled_peer_backpressures_and_resuming_preserves_payload ... ok\ntest hysteria2::driver::tests::non_fast_open_response_timeout_is_bounded ... ok\ntest hysteria2::driver::tests::keepalive_preserves_an_idle_tcp_stream ... ok\n\ntest result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 251 filtered out; finished in 20.05s\n\n"
+    },
+    {
+      "name": "Hysteria2 Salamander TCP",
+      "command": [
+        "python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "target/release",
+        "--case",
+        "sing-hysteria2",
+        "--hy2-obfs"
+      ],
+      "exit_code": 0,
+      "seconds": 1.05,
+      "output": "PASS sing-hysteria2 65536 bytes + close after echo\n"
+    },
+    {
+      "name": "Hysteria2 Salamander UDP",
+      "command": [
+        "python3",
+        "scripts/protocol_matrix.py",
+        "--bin-dir",
+        "target/release",
+        "--case",
+        "sing-hysteria2",
+        "--hy2-obfs",
+        "--udp-size",
+        "0",
+        "--udp-size",
+        "4096"
+      ],
+      "exit_code": 0,
+      "seconds": 1.52,
+      "output": "PASS sing-hysteria2 UDP IPv4/IPv6/domain, [0, 4096] bytes\n"
+    }
+  ]
+}

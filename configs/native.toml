@@ -1,0 +1,22 @@
+rule_socket = "/tmp/astra-rule.sock"
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+connect_timeout_secs = 15
+shutdown_timeout_secs = 10
+
+# Matching rule: action = "proxy:edge"
+[[outbounds]]
+kind = "native"
+tag = "edge"
+[outbounds.config]
+protocol = "vless"
+server = "your.server.example"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+[outbounds.config.tls]
+server_name = "your.server.example"
+fingerprint = "chrome"
+[outbounds.config.transport]
+kind = "xhttp"
+path = "/your-path"
+mode = "stream-one"

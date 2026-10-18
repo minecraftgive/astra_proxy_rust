@@ -1,0 +1,151 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "logical_cpus": 12,
+  "python": "3.9.6",
+  "binary_sha256": {
+    "astra-proxy": "fdf98ec0142dff8197515c03c89ca13e4846d286d7ab8eccca0a2458fe87c8fa",
+    "astra-rule": "d61c1dde03bf5b29b997d0083d3c86dbdf75c959b17ef2999da27116783a0c31"
+  },
+  "connections_per_round": 300,
+  "rounds": 3,
+  "scope": "Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.",
+  "results": [
+    {
+      "rules": 1000,
+      "cache": "disabled",
+      "concurrency": 1,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 0.368,
+        "p95": 0.572,
+        "p99": 1.069
+      },
+      "echo_ms": {
+        "p50": 0.475,
+        "p95": 0.679,
+        "p99": 1.208
+      },
+      "completed_per_second_median": 1453.1
+    },
+    {
+      "rules": 1000,
+      "cache": "disabled",
+      "concurrency": 32,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 11.171,
+        "p95": 21.412,
+        "p99": 24.685
+      },
+      "echo_ms": {
+        "p50": 12.236,
+        "p95": 23.229,
+        "p99": 26.081
+      },
+      "completed_per_second_median": 1771.5
+    },
+    {
+      "rules": 1000,
+      "cache": "warm",
+      "concurrency": 1,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 0.365,
+        "p95": 2.028,
+        "p99": 2.386
+      },
+      "echo_ms": {
+        "p50": 0.472,
+        "p95": 2.132,
+        "p99": 2.594
+      },
+      "completed_per_second_median": 1001.1
+    },
+    {
+      "rules": 1000,
+      "cache": "warm",
+      "concurrency": 32,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 7.897,
+        "p95": 13.15,
+        "p99": 15.176
+      },
+      "echo_ms": {
+        "p50": 8.994,
+        "p95": 14.43,
+        "p99": 16.698
+      },
+      "completed_per_second_median": 2442.5
+    },
+    {
+      "rules": 10000,
+      "cache": "disabled",
+      "concurrency": 1,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 1.267,
+        "p95": 1.942,
+        "p99": 2.056
+      },
+      "echo_ms": {
+        "p50": 1.374,
+        "p95": 2.048,
+        "p99": 2.166
+      },
+      "completed_per_second_median": 729.7
+    },
+    {
+      "rules": 10000,
+      "cache": "disabled",
+      "concurrency": 32,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 5.868,
+        "p95": 9.738,
+        "p99": 11.341
+      },
+      "echo_ms": {
+        "p50": 6.756,
+        "p95": 10.864,
+        "p99": 12.796
+      },
+      "completed_per_second_median": 3098.2
+    },
+    {
+      "rules": 10000,
+      "cache": "warm",
+      "concurrency": 1,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 1.035,
+        "p95": 1.708,
+        "p99": 1.821
+      },
+      "echo_ms": {
+        "p50": 1.143,
+        "p95": 1.814,
+        "p99": 1.927
+      },
+      "completed_per_second_median": 778.5
+    },
+    {
+      "rules": 10000,
+      "cache": "warm",
+      "concurrency": 32,
+      "samples": 900,
+      "setup_ms": {
+        "p50": 4.682,
+        "p95": 37.878,
+        "p99": 46.389
+      },
+      "echo_ms": {
+        "p50": 5.644,
+        "p95": 41.174,
+        "p99": 48.142
+      },
+      "completed_per_second_median": 3372.9
+    }
+  ]
+}

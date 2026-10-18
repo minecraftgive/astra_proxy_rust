@@ -1,0 +1,20 @@
+# Replace the server, UUID, password and TLS server name with your node values.
+rule_socket = "/tmp/astra-rule.sock"
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+
+[[outbounds]]
+kind = "native"
+tag = "edge"
+[outbounds.config]
+protocol = "tuic"
+server = "node.example.com"
+port = 443
+uuid = "00000000-0000-0000-0000-000000000001"
+password = "replace-with-your-password"
+tuic_idle_timeout_secs = 15 # 3..3600; heartbeats run every one-third of this while active
+tuic_udp_mode = "native" # native: QUIC datagrams; quic: unidirectional streams
+congestion_control = "cubic" # cubic, bbr, new_reno
+[outbounds.config.tls]
+server_name = "node.example.com"
+# ca_file = "private-ca.pem" # Optional; path relative to this configuration.

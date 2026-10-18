@@ -1,0 +1,55 @@
+# 离线转换示例，所有节点均为占位数据。
+mixed-port: 7890
+port: 7891
+allow-lan: false
+mode: rule
+dns:
+  enable: true # 无对应配置，忽略
+proxies:
+  - name: vless-reality
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000001
+    tls: true
+    servername: example.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      short-id: abcd
+  - name: vmess-ws
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    alterId: 0
+    cipher: auto
+    tls: true
+    network: ws
+    ws-opts:
+      path: /ws
+      headers: {Host: cdn.example.com}
+  - {name: trojan, type: trojan, server: example.com, port: 443, password: placeholder}
+  - {name: ss, type: ss, server: example.com, port: 8388, cipher: aes-128-gcm, password: placeholder}
+  - name: hysteria2
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: placeholder
+    obfs: salamander
+    obfs-password: placeholder
+  - {name: socks, type: socks5, server: '::1', port: 1081}
+  - {name: tuic, type: tuic, server: example.com, port: 443, uuid: 00000000-0000-0000-0000-000000000003, password: placeholder, udp-relay-mode: native, congestion-controller: bbr}
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [vless-reality, vmess-ws, trojan, ss, hysteria2, socks, tuic, DIRECT]
+rules:
+  - DOMAIN,blocked.example,REJECT
+  - DOMAIN-SUFFIX,example.org,Proxy
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - DST-PORT,53,DIRECT
+  - NETWORK,UDP,Proxy
+  - GEOIP,CN,DIRECT # 无对应规则，忽略
+  - MATCH,Proxy

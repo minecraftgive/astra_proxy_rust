@@ -1,0 +1,2 @@
+https://raw.githubusercontent.com/paritytech/yamux/cc3d0e89f615ef4f329f7a246c95a8ff1e8cc12d/
+Retrieved from the crate source commit recorded in .cargo_vcs_info.json.

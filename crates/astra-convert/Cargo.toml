@@ -1,0 +1,13 @@
+[package]
+name = "astra-convert"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_yaml = "0.9"
+ipnet = "2"
+uuid = "1"

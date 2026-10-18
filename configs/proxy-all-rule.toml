@@ -1,0 +1,3 @@
+# Use with a proxy configuration containing outbound tag "edge".
+socket = "/tmp/astra-rule.sock"
+default_action = "proxy:edge"

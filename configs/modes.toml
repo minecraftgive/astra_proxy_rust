@@ -1,0 +1,35 @@
+# 代理模式与热重载示例。先替换出站地址；表存在即启用，删除整表即可关闭。
+standalone = true
+watch_config = true
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+
+# macOS：自动发现启用的网络服务；Linux：当前用户的 GNOME 会话。
+# [system_proxy]
+# services = ["Wi-Fi"] # 仅 macOS；省略/[] 自动发现全部启用服务
+
+# 原生 Rust TUN，Linux/macOS 均需管理员权限。
+# [tun]
+# name = "utun20" # macOS；Linux 示例 astra0；省略则自动分配
+# address = "198.18.0.1"
+# prefix = 30
+# mtu = 1500
+# routes = [] # 空列表只创建设备，路由由外部管理
+# 全局 IPv4 接管示例：以下网关、物理接口、节点 IP、DNS 必须替换。
+# routes = ["0.0.0.0/1", "128.0.0.0/1"]
+# bypass = ["203.0.113.8/32", "8.8.8.8/32"]
+# gateway = "192.168.1.1"
+# interface = "en0" # Linux 示例 eth0；直连规则也绑定此物理接口
+
+# Linux TPROXY 接收 TCP/UDP；还需 nftables/策略路由，见 docs/PROXY_MODES.md。
+# [tproxy]
+# listen = "0.0.0.0:7893"
+
+# Linux NAT REDIRECT，仅 TCP；与 TPROXY 使用不同端口。
+# [redirect]
+# listen = "0.0.0.0:7894"
+
+[[outbounds]]
+kind = "socks5"
+tag = "edge"
+server = "203.0.113.8:1080"

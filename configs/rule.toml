@@ -1,0 +1,34 @@
+socket = "/tmp/astra-rule.sock"
+default_action = "direct"
+
+# First matching rule wins, even across different rule categories.
+[[rules]]
+kind = "domain_suffix"
+value = "ads.example"
+action = "block"
+
+[[rules]]
+kind = "domain_exact"
+value = "blocked.test"
+action = "block"
+
+# Example: uncomment after defining proxy outbound 'edge' in proxy.toml.
+# [[rules]]
+# kind = "domain_suffix"
+# value = "example.com"
+# action = "proxy:edge"
+
+# [[rules]]
+# kind = "ip_cidr"
+# value = "203.0.113.0/24"
+# action = "block"
+
+# [[rules]]
+# kind = "port"
+# value = "25"
+# action = "block"
+
+# [[rules]]
+# kind = "network"
+# value = "udp"
+# action = "block"

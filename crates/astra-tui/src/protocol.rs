@@ -1,0 +1,136 @@
+pub use astra_ipc::logging::LogLevel;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogCursor {
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub enum LogEvent {
+    Data {
+        bytes: Vec<u8>,
+        cursor: LogCursor,
+        reset: bool,
+        skip_prefix: bool,
+    },
+    Waiting,
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Proxy,
+    Rule,
+}
+impl Kind {
+    pub fn binary(self) -> &'static str {
+        match self {
+            Self::Proxy => "astra-proxy",
+            Self::Rule => "astra-rule",
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Instance {
+    pub name: String,
+    pub kind: Kind,
+    pub config: PathBuf,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Row {
+    pub instance: Instance,
+    pub pid: Option<u32>,
+    pub state: String,
+    pub uptime: u64,
+    pub changed: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Action {
+    List,
+    Add(Instance),
+    Remove(String),
+    Start(String),
+    Stop(String),
+    Restart(String),
+    Reload(String),
+    SetConfig(String, PathBuf),
+    Read(String),
+    Save {
+        name: String,
+        original: String,
+        text: String,
+    },
+    CloneConfig(String, PathBuf),
+    Validate(String),
+    Logs(String),
+    Shutdown,
+    /// Returns the default document only when a missing file was created.
+    PrepareConfig(String),
+    Create {
+        name: String,
+        kind: Kind,
+    },
+    FollowLogs {
+        name: String,
+        cursor: Option<LogCursor>,
+    },
+    GetLogLevel(String),
+    SetLogLevel {
+        name: String,
+        level: LogLevel,
+    },
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Request {
+    pub version: u16,
+    pub action: Action,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Reply {
+    pub version: u16,
+    pub error: Option<String>,
+    pub rows: Vec<Row>,
+    pub text: String,
+}
+impl Reply {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            version: astra_ipc::API_VERSION,
+            error: None,
+            rows: vec![],
+            text: text.into(),
+        }
+    }
+}
+pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Reply> {
+    let mut stream = tokio::net::UnixStream::connect(socket).await?;
+    let seconds = if matches!(action, Action::Shutdown) {
+        2400
+    } else {
+        180
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
+        astra_ipc::send_management(
+            &mut stream,
+            &Request {
+                version: astra_ipc::API_VERSION,
+                action,
+            },
+        )
+        .await?;
+        let reply: Reply = astra_ipc::receive_management(&mut stream).await?;
+        anyhow::ensure!(
+            reply.version == astra_ipc::API_VERSION,
+            "Unsupported manager version"
+        );
+        if let Some(error) = &reply.error {
+            anyhow::bail!("{error}");
+        }
+        Ok(reply)
+    })
+    .await?
+}
