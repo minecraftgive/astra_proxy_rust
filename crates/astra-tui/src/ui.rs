@@ -68,7 +68,7 @@ impl Prompt {
             Self::Remove(_) => t("Remove instance? Configuration is kept."),
             Self::Shutdown => t("Stop all instances?"),
             Self::Discard => t("Discard changes?"),
-            Self::Import => t("Import TOML / YAML · paste or drop a file path"),
+            Self::Import => t("Import config or proxy share links"),
             Self::ImportConfirm { .. } => t("Replace editor draft?"),
             Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
         }
@@ -77,6 +77,7 @@ impl Prompt {
 
 #[derive(Clone, Copy)]
 enum Operation {
+    UpdateSubscriptions,
     Start,
     Stop,
     Restart,
@@ -97,6 +98,7 @@ impl Operation {
             Self::Stop => "Stop",
             Self::Restart => "Restart",
             Self::Reload => "Reload",
+            Self::UpdateSubscriptions => "Update subscriptions",
             Self::Edit => "Edit",
             Self::Logs => "Logs",
             Self::Bind => "Startup bindings",
@@ -207,6 +209,9 @@ struct Ui {
     diagnostics: Option<crate::diagnostics::View>,
     explanation: Option<crate::explanation::View>,
     vim_g: bool,
+    help_scroll: Option<u16>,
+    operation_steps: Vec<String>,
+    operation_result: Option<String>,
 }
 impl std::ops::Deref for Ui {
     type Target = Session;
@@ -314,6 +319,9 @@ impl Ui {
             diagnostics: None,
             explanation: None,
             vim_g: false,
+            help_scroll: None,
+            operation_steps: Vec::new(),
+            operation_result: None,
         }
     }
     fn index(&self) -> usize {
@@ -350,6 +358,9 @@ impl Ui {
         operations.insert(operations.len() - 2, Operation::Bind);
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
+            if row.pid.is_some() {
+                operations.push(Operation::UpdateSubscriptions);
+            }
         }
         if row.instance.kind == Kind::Rule && row.pid.is_some() {
             operations.push(Operation::Explain);
@@ -433,6 +444,7 @@ impl Ui {
             } else {
                 Action::Start(name)
             }),
+            Operation::UpdateSubscriptions => Some(Action::UpdateSubscriptions(name)),
             Operation::Reload => {
                 if running {
                     Some(Action::Reload(name))
@@ -553,10 +565,17 @@ impl Ui {
             self.input.clear();
             self.prefilled_input = false;
         }
-        self.input
-            .extend(text.chars().filter(|character| !character.is_control()));
+        let links =
+            matches!(self.prompt, Some(Prompt::Import)) && astra_convert::share::is_share(text);
+        self.input.extend(
+            text.chars()
+                .filter(|character| !character.is_control() || (links && *character == '\n')),
+        );
     }
     fn paste(&mut self, text: &str) {
+        if self.help_scroll.is_some() {
+            return;
+        }
         if self.recovery.is_some()
             || self.menu.is_some()
             || self.binding_picker.is_some()
@@ -710,11 +729,22 @@ impl Ui {
                 request: crate::explanation::request(&input)?,
             }),
             Prompt::Import => {
-                let path = crate::import::path(&input, &self.working_dir)?;
+                let share = astra_convert::share::is_share(&input);
                 let editor = self.editor.as_ref().context("Missing editor")?;
-                let imported = crate::import::load(&path, self.kind, &editor.text())?;
+                let (imported, label) = if share {
+                    (
+                        crate::import::links(&input, self.kind, &editor.text())?,
+                        t("Import node links").to_owned(),
+                    )
+                } else {
+                    let path = crate::import::path(&input, &self.working_dir)?;
+                    (
+                        crate::import::load(&path, self.kind, &editor.text())?,
+                        path.display().to_string(),
+                    )
+                };
                 if editor.text() != editor.original || !imported.warnings.is_empty() {
-                    let mut notices = vec![path.display().to_string()];
+                    let mut notices = vec![label];
                     if editor.text() != editor.original {
                         notices.push(t("Unsaved draft will be replaced").into());
                     }
@@ -742,6 +772,33 @@ impl Ui {
         })
     }
     fn key(&mut self, key: event::KeyEvent) -> Input {
+        if self.help_scroll.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            return Input::Quit;
+        }
+        if let Some(scroll) = &mut self.help_scroll {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.help_scroll = None,
+                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        if key.code == KeyCode::Char('?')
+            && self.prompt.is_none()
+            && self.recovery.is_none()
+            && self.editor.as_ref().is_none_or(Editor::browsing)
+            && self.viewer.as_ref().is_none_or(logs::Viewer::browsing)
+        {
+            self.help_scroll = Some(0);
+            return Input::Idle;
+        }
         if self.recovery.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.recover_key(key.code);
         }
@@ -1042,11 +1099,76 @@ impl Ui {
         }
         Input::Idle
     }
+    fn operation_text(&self) -> String {
+        if self.operation_steps.is_empty()
+            || self
+                .operation_result
+                .as_ref()
+                .is_some_and(|result| result != &self.message)
+        {
+            return t(&self.message).to_owned();
+        }
+        self.operation_steps.join("\n")
+    }
+    fn progress(
+        &mut self,
+        text: String,
+        terminal: &mut Option<&mut Terminal<CrosstermBackend<Stdout>>>,
+    ) {
+        if terminal.is_some() {
+            self.operation_steps
+                .push(format!("{}. {}", self.operation_steps.len() + 1, text));
+            if let Some(terminal) = terminal.as_deref_mut() {
+                let _ = self.draw(terminal);
+            }
+        }
+    }
     async fn execute(
+        &mut self,
+        socket: &std::path::Path,
+        action: Action,
+        origin: Option<(Prompt, String)>,
+    ) -> bool {
+        self.execute_inner(socket, action, origin, None).await
+    }
+    async fn execute_user(
+        &mut self,
+        socket: &std::path::Path,
+        action: Action,
+        origin: Option<(Prompt, String)>,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> bool {
+        self.operation_steps.clear();
+        self.operation_result = None;
+        self.message.clear();
+        let mut display = Some(&mut *terminal);
+        self.progress(
+            format!("{}: {}", t("Working…"), action_description(&action)),
+            &mut display,
+        );
+        let quit = self
+            .execute_inner(socket, action, origin, Some(&mut *terminal))
+            .await;
+        let result = if self.recovery.is_some() {
+            t("Operation failed; see details above").to_owned()
+        } else if self.editor.is_some() && self.message.is_empty() {
+            t("Ready for editing").to_owned()
+        } else if self.message.is_empty() {
+            t("Completed").to_owned()
+        } else {
+            t(&self.message).to_owned()
+        };
+        self.operation_steps
+            .push(format!("{}. {}", self.operation_steps.len() + 1, result));
+        self.operation_result = Some(self.message.clone());
+        quit
+    }
+    async fn execute_inner(
         &mut self,
         socket: &std::path::Path,
         mut action: Action,
         mut origin: Option<(Prompt, String)>,
+        mut terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>,
     ) -> bool {
         if let Action::Diagnostics(name) = &action {
             self.diagnostics = Some(crate::diagnostics::View::start(socket, name.clone()));
@@ -1081,6 +1203,7 @@ impl Ui {
         loop {
             // A missing configuration must be edited before a start/validation proceeds.
             if let Action::Start(name) | Action::Restart(name) | Action::Validate(name) = &action {
+                self.progress(t("Checking saved configuration").to_owned(), &mut terminal);
                 match call(socket, Action::PrepareConfig(name.clone())).await {
                     Ok(reply) if !reply.text.is_empty() => {
                         self.editor =
@@ -1096,6 +1219,14 @@ impl Ui {
                     }
                 }
             }
+            self.progress(
+                format!(
+                    "{} · {}",
+                    action_description(&action),
+                    t("Waiting for manager confirmation")
+                ),
+                &mut terminal,
+            );
             let reply = match call(socket, action.clone()).await {
                 Ok(reply) => reply,
                 Err(error) => {
@@ -1187,7 +1318,45 @@ impl Ui {
             }
         }
     }
+    async fn refresh_subscription_nodes(&mut self, socket: &std::path::Path) {
+        if self.kind != Kind::Proxy {
+            return;
+        }
+        let Some(name) = self.editor.as_ref().map(|e| e.name.clone()) else {
+            return;
+        };
+        if !self
+            .details
+            .get(&name)
+            .is_some_and(|d| d.subscription_nodes_supported)
+        {
+            if let Some(path) = self
+                .rows
+                .iter()
+                .find(|row| row.instance.name == name)
+                .map(|row| row.instance.config.clone())
+            {
+                if let Ok(Ok(nodes)) =
+                    tokio::task::spawn_blocking(move || crate::subscription_view::read(&path)).await
+                {
+                    if let Some(editor) = &mut self.editor {
+                        editor.set_subscription_nodes(nodes);
+                    }
+                }
+            }
+            return;
+        }
+        if let Ok(nodes) = call(socket, Action::SubscriptionNodes(name))
+            .await
+            .and_then(|r| Ok(serde_json::from_str(&r.text)?))
+        {
+            if let Some(editor) = &mut self.editor {
+                editor.set_subscription_nodes(nodes);
+            }
+        }
+    }
     async fn refresh_node_tags(&mut self, socket: &std::path::Path) {
+        self.refresh_subscription_nodes(socket).await;
         if self.kind != Kind::Rule {
             return;
         }
@@ -1215,16 +1384,109 @@ impl Ui {
         terminal.draw(|frame| self.render(frame))?;
         Ok(())
     }
+    fn selection_status(&self) -> String {
+        let Some(row) = self.selected() else {
+            return String::new();
+        };
+        let mut lines = vec![
+            row.instance.config.display().to_string(),
+            format!("{}: {}", t("State"), t(&row.state)),
+            format!(
+                "PID {} · {} {}",
+                row.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                t("Uptime"),
+                uptime(row.uptime)
+            ),
+        ];
+        if let Some(details) = self.details.get(&row.instance.name) {
+            if !details.modes.is_empty() {
+                lines.push(
+                    details
+                        .modes
+                        .iter()
+                        .map(|mode| t(mode))
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                );
+            }
+            lines.extend(details.listeners.iter().cloned());
+            if !details.bindings.is_empty() {
+                lines.push(format!(
+                    "{}: {}",
+                    t("Startup bindings"),
+                    details.bindings.join(", ")
+                ));
+            }
+            lines.push(format!(
+                "{}: {}",
+                t("Log level"),
+                details.log_level.as_str().to_uppercase()
+            ));
+            lines.push(if row.instance.kind == Kind::Rule {
+                tr!("{} rules", details.rules)
+            } else {
+                tr!(
+                    "{} outbounds: {}",
+                    details.outbound_count,
+                    details.outbounds.join(", ")
+                )
+            });
+        }
+        lines.join("\n")
+    }
+    fn help_page(&self) -> crate::help::Page {
+        use crate::help::Page;
+        if self.recovery.is_some() {
+            Page::Recovery
+        } else if self.menu.is_some() {
+            Page::Menu
+        } else if self.binding_picker.is_some() {
+            Page::Bindings
+        } else if self.explanation.is_some() {
+            Page::Route
+        } else if self.diagnostics.is_some() {
+            Page::Diagnostics
+        } else if self.viewer.is_some() {
+            Page::Logs
+        } else if let Some(editor) = &self.editor {
+            if editor.subscription_page() {
+                Page::Subscriptions
+            } else if self.kind == Kind::Rule {
+                Page::RuleEditor
+            } else {
+                Page::ProxyEditor
+            }
+        } else {
+            Page::Instances
+        }
+    }
     fn render(&self, f: &mut Frame<'_>) {
         let overview = self.editor.is_none() && self.viewer.is_none() && self.recovery.is_none();
+        let operation_text = self.operation_text();
+        let operation_height = if operation_text.is_empty() {
+            0
+        } else {
+            (Paragraph::new(operation_text.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(f.area().width.saturating_sub(2).max(1)) as u16
+                + 2)
+            .min((f.area().height / 3).max(3))
+        };
         let detail_height = if self.prompt.is_some() {
             3
         } else if overview {
-            4
-        } else if self.message.is_empty() {
-            0
+            (Paragraph::new(self.selection_status())
+                .wrap(Wrap { trim: false })
+                .line_count(f.area().width.max(1)) as u16)
+                .min(
+                    (f.area().height / 2)
+                        .min(f.area().height.saturating_sub(operation_height + 8))
+                        .max(1),
+                )
         } else {
-            1
+            0
         };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1232,6 +1494,7 @@ impl Ui {
                 Constraint::Length(3),
                 Constraint::Min(3),
                 Constraint::Length(detail_height),
+                Constraint::Length(operation_height),
                 Constraint::Length(2),
             ])
             .split(f.area());
@@ -1357,54 +1620,30 @@ impl Ui {
                 format!("{}\n> {}▏", prompt.title(), self.input)
             }
         } else if overview {
-            if let Some(row) = self.selected() {
-                let metadata = self.details.get(&row.instance.name);
-                let summary = metadata
-                    .map(|details| {
-                        if row.instance.kind == Kind::Rule {
-                            tr!("{} rules", details.rules)
-                        } else if details.outbounds.is_empty() {
-                            t("No outbounds").to_owned()
-                        } else {
-                            tr!(
-                                "{} outbounds: {}",
-                                details.outbound_count.max(details.outbounds.len()),
-                                format!(
-                                    "{}{}",
-                                    details.outbounds.join(", "),
-                                    if details.outbound_count > details.outbounds.len() {
-                                        " …"
-                                    } else {
-                                        ""
-                                    }
-                                )
-                            )
-                        }
-                    })
-                    .unwrap_or_default();
-                let level = metadata
-                    .map(|details| details.log_level.as_str().to_uppercase())
-                    .unwrap_or_default();
-                format!(
-                    "{}\nPID {}  ·  {} {}  ·  {} {}\n{}  {}",
-                    row.instance.config.display(),
-                    row.pid
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "—".into()),
-                    t("Uptime"),
-                    uptime(row.uptime),
-                    t("Log level"),
-                    level,
-                    summary,
-                    t(&self.message)
-                )
-            } else {
-                t(&self.message).to_owned()
-            }
+            self.selection_status()
         } else {
-            t(&self.message).to_owned()
+            String::new()
         };
         f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[2]);
+        if operation_height > 0 {
+            let operation_rows = Paragraph::new(operation_text.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(chunks[3].width.saturating_sub(2).max(1));
+            let operation_scroll = operation_rows
+                .saturating_sub(chunks[3].height.saturating_sub(2) as usize)
+                .min(u16::MAX as usize) as u16;
+            f.render_widget(
+                Paragraph::new(operation_text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((operation_scroll, 0))
+                    .block(
+                        Block::default()
+                            .title(t("Operation status"))
+                            .borders(Borders::ALL),
+                    ),
+                chunks[3],
+            );
+        }
         let help = if self.recovery.is_some() {
             t("c retry · b cancel · ↑↓ scroll")
         } else if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
@@ -1412,26 +1651,18 @@ impl Ui {
         } else if self.prompt.is_some() {
             t("Enter confirm · Esc cancel · Ctrl-U clear")
         } else if self.viewer.is_some() {
-            t("hjkl scroll · gg/G first/follow · / search · v level\nf filter · m memory · L capture · Space pause · Esc back")
+            t("↑↓ scroll · Space pause · w wrap · Esc back · ? all operations")
         } else if self.editor.is_some() {
-            if self.kind == Kind::Rule {
-                t("hjkl navigate · gg/G ends · zM/zR fold/open · Ctrl-S save\nn add · r rename set · e toggle set · Ctrl-T query")
-            } else {
-                t("hjkl navigate · gg/G ends · Ctrl-S save · Esc back\nn add · d delete · K/J move · Ctrl-O import · F2 reveal")
-            }
+            t("↑↓ select · Enter edit · Ctrl-S save · ? all operations")
         } else {
-            if self.kind == Kind::Proxy {
-                t("j/k move · h/l tabs · gg/G ends · Enter actions\nn add · e edit · L logs · t test · q quit · Q stop all")
-            } else {
-                t("j/k move · h/l tabs · gg/G ends · Enter actions\nn add · e edit · L logs · t query · q quit · Q stop all")
-            }
+            t("↑↓ select · Enter actions · e edit · q quit · ? all operations")
         };
         f.render_widget(
             Paragraph::new(help).style(Style::default().fg(Color::Gray)),
-            chunks[3],
+            chunks[4],
         );
         if let Some(Prompt::ImportConfirm { notices, .. }) = &self.prompt {
-            let popup = f.area().inner(ratatui::layout::Margin::new(3, 3));
+            let popup = crate::help::popup(f.area(), notices);
             f.render_widget(Clear, popup);
             f.render_widget(
                 Paragraph::new(notices.as_str())
@@ -1460,7 +1691,7 @@ impl Ui {
             };
             let area = f.area();
             let width = area.width.saturating_sub(4).min(64);
-            let height = (height as u16).min(area.height.saturating_sub(2));
+            let height = (height as u16).min(18).min(area.height.saturating_sub(2));
             let popup = ratatui::layout::Rect::new(
                 area.x + area.width.saturating_sub(width) / 2,
                 area.y + area.height.saturating_sub(height) / 2,
@@ -1526,7 +1757,44 @@ impl Ui {
                 &mut state,
             );
         }
+        if let Some(scroll) = self.help_scroll {
+            let text = crate::help::text(self.help_page());
+            let popup = crate::help::popup(f.area(), &text);
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .block(
+                        Block::default()
+                            .title(t("Page operations"))
+                            .title_bottom(t("↑↓ scroll · ? / Esc close"))
+                            .borders(Borders::ALL),
+                    ),
+                popup,
+            );
+        }
     }
+}
+
+fn action_description(action: &Action) -> String {
+    let (label, name) = match action {
+        Action::Start(name) => ("Start", name.as_str()),
+        Action::Stop(name) => ("Stop", name.as_str()),
+        Action::Restart(name) => ("Restart", name.as_str()),
+        Action::Reload(name) => ("Reload", name.as_str()),
+        Action::Validate(name) => ("Validate", name.as_str()),
+        Action::Read(name) => ("Edit", name.as_str()),
+        Action::Save { name, .. } => ("Save", name.as_str()),
+        Action::UpdateSubscriptions(name) => ("Update subscriptions", name.as_str()),
+        Action::BindStart { name, .. } => ("Startup bindings", name.as_str()),
+        Action::Remove(name) => ("Remove", name.as_str()),
+        Action::SetConfig(name, _) => ("Config path", name.as_str()),
+        Action::CloneConfig(name, _) => ("Copy config", name.as_str()),
+        Action::Shutdown => ("Stop all", ""),
+        _ => ("Processing request", ""),
+    };
+    format!("{} {}", t(label), name).trim().to_owned()
 }
 
 fn uptime(seconds: u64) -> String {
@@ -1612,6 +1880,15 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             }
             refreshed = Instant::now();
         }
+        if refreshed.elapsed() > Duration::from_secs(2)
+            && ui.editor.is_some()
+            && ui.prompt.is_none()
+            && ui.recovery.is_none()
+            && ui.help_scroll.is_none()
+        {
+            ui.refresh_subscription_nodes(&socket).await;
+            refreshed = Instant::now();
+        }
         ui.draw(&mut terminal)?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
@@ -1627,9 +1904,9 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         let quit = match input {
             Input::Quit => true,
             Input::Run(action, origin) => {
-                ui.message = "Working…".into();
-                ui.draw(&mut terminal)?;
-                let quit = ui.execute(&socket, action, origin).await;
+                let quit = ui
+                    .execute_user(&socket, action, origin, &mut terminal)
+                    .await;
                 refreshed = Instant::now() - Duration::from_secs(3);
                 quit
             }
@@ -1730,6 +2007,87 @@ mod tests {
         ui.editor =
             Some(Editor::new("proxy".into(), "standalone=true\n".into()).with_kind(Kind::Proxy));
         ui
+    }
+    #[test]
+    fn operation_results_and_steps_render_separately_from_instance_details() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Simplified,
+            crate::i18n::Language::Traditional,
+        ] {
+            crate::i18n::with_language(language, || {
+                let mut ui = sample_ui(true);
+                ui.message = "Stopped".into();
+                let details = ui.selection_status();
+                assert!(!details.contains(t("Stopped")));
+                assert_eq!(ui.operation_text(), t("Stopped"));
+                ui.operation_steps = vec![
+                    format!("1. {}", t("Working…")),
+                    format!("2. {}", t("Waiting for manager confirmation")),
+                    format!("3. {}", t("Stopped")),
+                ];
+                ui.operation_result = Some(ui.message.clone());
+                assert_eq!(ui.operation_text().lines().count(), 3);
+                let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+                terminal.draw(|frame| ui.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let status_row = (0..30)
+                    .find(|y| {
+                        (0..110)
+                            .map(|x| buffer[(x, *y)].symbol())
+                            .collect::<String>()
+                            .replace(' ', "")
+                            .contains(&t("Operation status").replace(' ', ""))
+                    })
+                    .unwrap();
+                let result_row = (0..30)
+                    .find(|y| {
+                        (0..110)
+                            .map(|x| buffer[(x, *y)].symbol())
+                            .collect::<String>()
+                            .replace(' ', "")
+                            .contains(&format!("3.{}", t("Stopped").replace(' ', "")))
+                    })
+                    .unwrap();
+                assert!(result_row > status_row);
+                ui.message = "Started".into();
+                assert_eq!(ui.operation_text(), t("Started"));
+            });
+        }
+    }
+    #[test]
+    fn help_overlay_preserves_state_and_does_not_capture_question_marks_in_inputs() {
+        let mut ui = sample_ui(true);
+        let selected = ui.selections;
+        assert!(matches!(ui.key(key('?')), Input::Idle));
+        assert_eq!(ui.help_scroll, Some(0));
+        assert!(matches!(ui.key(key('j')), Input::Idle));
+        assert_eq!(ui.help_scroll, Some(1));
+        assert_eq!(ui.selections, selected);
+        ui.key(key('?'));
+        assert!(ui.help_scroll.is_none());
+        ui.prompt(Prompt::AddName);
+        ui.key(key('?'));
+        assert!(ui.help_scroll.is_none());
+        assert_eq!(ui.input, "?");
+        ui.prompt = None;
+        ui.key(key('?'));
+        use ratatui::{backend::TestBackend, Terminal};
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Simplified,
+            crate::i18n::Language::Traditional,
+        ] {
+            crate::i18n::with_language(language, || {
+                for (width, height) in [(100, 30), (36, 12), (12, 7)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|frame| ui.render(frame)).unwrap();
+                }
+            });
+        }
+        ui.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.help_scroll.is_none());
     }
     #[test]
     fn vim_list_navigation_and_log_shortcut_leave_prompt_text_intact() {

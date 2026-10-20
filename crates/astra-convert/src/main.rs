@@ -8,7 +8,7 @@ use std::{
 
 const HELP: &str = "astra-convert — 转换 Clash/Mihomo YAML 或订阅为 Astra TOML
 
-用法: astra-convert INPUT.yaml|URL [选项]
+用法: astra-convert INPUT.yaml|URL|vless://... [选项]
   --subscribe URL       本地 YAML 绑定订阅 URL（URL 输入自动绑定）
   --include-config      订阅额外导入代理组和规则（默认仅节点）
   --interval SECONDS    节点更新间隔，默认 3600，最小 60
@@ -103,6 +103,7 @@ fn run() -> Result<()> {
         }
     }
     let input = input.context("请指定 mihomo YAML 文件；使用 --help 查看用法")?;
+    let share = astra_convert::share::is_share(&input);
     let remote = input.starts_with("https://") || input.starts_with("http://");
     if remote {
         ensure!(subscribe.is_none(), "URL 输入不可再指定 --subscribe");
@@ -117,7 +118,9 @@ fn run() -> Result<()> {
         }
         .validate()?;
     }
-    let text = if remote {
+    let text = if share {
+        input.clone()
+    } else if remote {
         subscription::download(&input, &user_agent)?
     } else if input == "-" {
         let mut text = String::new();
@@ -127,7 +130,7 @@ fn run() -> Result<()> {
         fs::read_to_string(&input).context("无法读取输入文件")?
     };
     if options.base_dir.as_os_str().is_empty() {
-        options.base_dir = if input == "-" || remote {
+        options.base_dir = if input == "-" || remote || share {
             std::env::current_dir()?
         } else {
             fs::canonicalize(&input)?
@@ -138,21 +141,26 @@ fn run() -> Result<()> {
     }
     let output = match output {
         Some(output) => output,
-        None if input == "-" || remote => std::env::current_dir()?,
+        None if input == "-" || remote || share => std::env::current_dir()?,
         None => std::path::absolute(&input)?
             .parent()
             .context("input has no parent")?
             .to_path_buf(),
     };
-    let source_label = if remote {
+    let source_label = if share {
+        "<node-links>".to_owned()
+    } else if remote {
         "<subscription>".to_owned()
     } else if input == "-" {
         "<stdin>".to_owned()
     } else {
         std::path::absolute(&input)?.display().to_string()
     };
-    let nodes_only = subscribe.is_some() && !include_config;
-    let mut result = if nodes_only {
+    let nodes_only =
+        share || astra_convert::share::is_share(&text) || (subscribe.is_some() && !include_config);
+    let mut result = if share || astra_convert::share::is_share(&text) {
+        astra_convert::share::convert_links(&text, &options)
+    } else if nodes_only {
         subscription::convert_nodes(&text, &options, &user_agent, false)
     } else {
         subscription::convert_clash(&text, &options, &user_agent)

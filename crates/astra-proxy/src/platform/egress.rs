@@ -242,6 +242,7 @@ mod tests {
                 base: source.into(),
                 effective: format!("{source}\n# cached nodes\n"),
                 ownership: Default::default(),
+                subscriptions: Default::default(),
             },
         )
         .unwrap();

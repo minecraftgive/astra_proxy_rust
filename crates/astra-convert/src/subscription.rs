@@ -259,6 +259,9 @@ fn convert_nodes_with(
     import_groups: bool,
     download: &dyn Fn(&str, &str) -> Result<String>,
 ) -> Result<Converted> {
+    if crate::share::is_share(input) {
+        return crate::share::convert_links(input, options);
+    }
     let mut root: Y = serde_yaml::from_str(input).context("invalid Clash YAML")?;
     root.apply_merge()?;
     let root = root

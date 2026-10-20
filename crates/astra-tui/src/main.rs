@@ -4,12 +4,14 @@ mod diagnostics;
 mod editor;
 mod explanation;
 mod external_editor;
+mod help;
 mod i18n;
 mod import;
 mod log_stream;
 mod logs;
 mod manager;
 mod protocol;
+mod subscription_view;
 mod ui;
 use anyhow::{Context, Result};
 use std::{

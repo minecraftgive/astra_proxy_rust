@@ -154,3 +154,61 @@ astra-convert "https://example.com/clash?token=YOUR_TOKEN" -o configs/subscribed
 成功结果写入配置旁的 `*.subscription-cache.json`，保存节点、归属及对应配置。重启时先校验并恢复缓存，再检查订阅，断网时仍可使用最新成功节点。缓存损坏或本地配置发生改变时忽略旧缓存，重新从当前配置和链接建立状态。缓存文件包含节点凭据，权限与本地配置同样需要妥善保管。保存缓存失败会记录提示，不丢弃已经可用的运行节点。
 
 每份 YAML/响应上限为 8 MiB，最多展开 32 个 providers、4096 个节点；核心仍校验自身节点与组的容量限制。HTTP 请求有超时、证书校验和有限重定向；更新日志不输出订阅链接或凭据。订阅的 interval 统一控制其中 providers 的检查周期。
+
+
+## 多订阅与手动刷新
+
+推荐使用具名订阅，最多 32 个，每个来源分别保存链接、周期和节点归属：
+
+```toml
+[subscriptions.home]
+url = "https://example.com/home-clash"
+interval = 3600
+
+[subscriptions.backup]
+url = "https://example.net/backup-clash"
+interval = 7200
+```
+
+旧的 `[subscription]` 继续兼容，也可以与具名订阅同时使用；`__legacy__` 为内部保留名称。默认仍仅导入节点。本地节点、其他订阅的节点与新节点重名时，本次来源更新被拒绝，不覆盖已有条目。各来源按自己的周期检查，单个来源失败时保留其成功列表并继续更新其他来源。
+
+TUI 编辑代理配置中的「订阅列表」，选中后按 `n` 输入订阅名称，再填写 URL；选中订阅后按 `d` 可删除，Ctrl+S 保存。保存运行中实例会热重载，并触发新增或修改链接的首次检查；停止的实例在下次启动时检查。外部直接修改文件时，启用 `watch_config = true` 可自动检测，否则手动热重载。
+
+运行中代理实例的操作菜单提供「立即更新订阅」，后台排队检查全部来源，无需重新启动核心，也不会重载本地监听。命令行可调用：
+
+```powershell
+astra-proxy --update-subscriptions "实例的管理 socket 路径"
+```
+
+触发成功表示已排队，实际下载/校验结果见核心日志。刷新期间核心管理接口保持可响应；重复触发合并为待处理轮次，各来源不同时执行重叠更新。保存配置后当前实现会重新检查全部来源，而不只检查改变的链接。
+
+
+## VLESS 分享链接导入
+
+代理配置编辑页按 Ctrl+O 后粘贴 `vless://...`，也可在浏览配置时直接粘贴链接。支持每行一个节点的链接列表。节点追加到当前草稿，现有节点、组、订阅和监听设置保留；Ctrl+S 校验并保存。名称冲突会报错，不覆盖原节点。规则核心不接受节点链接。
+
+converter 支持直接将链接作为输入（包含 `&` 时须加引号），也可通过标准输入读取，每行一个链接。Proxy Core 的节点订阅同样支持返回 VLESS 链接列表。
+
+```powershell
+astra-convert "vless://UUID@server.example:443?security=tls&sni=server.example&type=xhttp&path=%2Fproxy&mode=auto#my-node" -o imported
+```
+
+支持 UUID、百分号编码的节点名称、IPv6、VLESS encryption、Vision flow、TLS/REALITY、SNI、客户端指纹 `fp`、证书 SHA-256 指纹 `pcs`、REALITY `pbk`/`sid`，以及 TCP、WebSocket、gRPC、HTTP Upgrade、XHTTP。`pcs` 映射为 `cert_pin_sha256`，与客户端指纹 `fp` 不同。XHTTP path/host/mode 按原值导入。未知参数、重复参数、不支持的 TLS 设置和不安全证书跳过选项会明确拒绝，避免静默改变节点行为。导入不发起节点连通性测试；解析错误不输出原始链接。
+
+
+## 更多协议分享链接
+
+导入入口现支持 `vmess://`、`trojan://`、`ss://`、`tuic://`、`hysteria2://`/`hy2://`、`socks://`/`socks5://`，以及已有的 `vless://`。在代理配置编辑页 Ctrl+O 粘贴，或直接粘贴到浏览状态，追加到草稿；也可导入包含每行一个链接的文本文件。converter 支持直接输入、文件和 stdin；Proxy Core 节点订阅使用相同解析器。支持标准和 URL-safe Base64（有/无 padding）的混合协议订阅列表。
+
+| 协议 | 支持格式与主要参数 |
+| --- | --- |
+| VMess | Base64 JSON v2，字符串/数字端口，UUID、AEAD cipher、TLS、SNI、WebSocket/gRPC 等已有传输 |
+| Trojan | URI password、TLS/SNI、客户端指纹、证书 pin、已有 TCP/WS/gRPC/XHTTP/HTTP Upgrade 传输 |
+| Shadowsocks | SIP002 Base64 用户信息或明文 method:password；兼容旧版整个地址 Base64；AEAD-2022 明文用户信息；密码中的冒号和百分号编码保留 |
+| TUIC | UUID:password、SNI、congestion_control、udp_relay_mode |
+| Hysteria2 | hy2 别名、auth/user:pass、默认 443、SNI、salamander obfs/obfs-password、pinSHA256 |
+| SOCKS5 | 无认证、明文 username:password 或 Base64 用户信息、IPv4/IPv6 |
+
+导入支持不代表核心新增了协议能力：旧版 VMess alterId、SS 插件、Hysteria1、Hysteria2 Gecko/端口跳跃/ECH、AnyTLS/WireGuard、TLS 不安全跳过和自定义 ALPN 等当前无法正确执行的选项会拒绝，不会默默丢弃。有效导入不会自动联网测试节点；未知查询参数、混合列表中的错误和重名节点使本次导入失败，不留下半份草稿。
+
+格式核对来源：[Shadowsocks SIP002](https://shadowsocks.org/doc/sip002.html)、[Hysteria2 URI Scheme](https://hysteria.network/docs/developers/URI-Scheme/)、[v2rayN VMess 分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)、[TUIC 导入实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/TuicFmt.cs)、[Trojan 导入实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/TrojanFmt.cs)。

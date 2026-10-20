@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,8 @@ pub struct Settings {
     mode: Mode,
     #[serde(default = "default_memory_lines")]
     memory_lines: usize,
+    #[serde(default)]
+    wrap: bool,
 }
 fn default_memory_lines() -> usize {
     5000
@@ -48,6 +50,7 @@ impl Default for Settings {
             follow: true,
             mode: Mode::Browse,
             memory_lines: default_memory_lines(),
+            wrap: false,
         }
     }
 }
@@ -85,6 +88,7 @@ pub struct Viewer {
     horizontal: u16,
     status: String,
     viewport_height: Cell<usize>,
+    viewport_width: Cell<u16>,
     source: std::path::PathBuf,
     vim_g: bool,
 }
@@ -114,6 +118,7 @@ impl Viewer {
             horizontal: 0,
             status: t("连接中").into(),
             viewport_height: Cell::new(10),
+            viewport_width: Cell::new(80),
             source: Default::default(),
             vim_g: false,
         }
@@ -254,7 +259,7 @@ impl Viewer {
                 self.bytes -= line.text.len();
                 self.dropped += 1;
                 if self.matches(&line) {
-                    self.top = self.top.saturating_sub(1);
+                    self.top = self.top.saturating_sub(self.row_count(&line));
                 }
             }
         }
@@ -274,6 +279,40 @@ impl Viewer {
             .iter()
             .filter(|line| self.matches(line))
             .collect()
+    }
+    #[cfg(test)]
+    fn test_screen(&self, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| self.render(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+    pub fn browsing(&self) -> bool {
+        matches!(self.settings.mode, Mode::Browse)
+    }
+    fn row_count(&self, record: &Record) -> usize {
+        if self.settings.wrap {
+            Paragraph::new(record.text.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(self.viewport_width.get().max(1))
+                .max(1)
+        } else {
+            1
+        }
+    }
+    fn display_len(&self) -> usize {
+        self.visible()
+            .iter()
+            .map(|record| self.row_count(record))
+            .sum()
     }
     pub fn key(&mut self, mut key: KeyEvent) -> Command {
         match &mut self.settings.mode {
@@ -377,6 +416,11 @@ impl Viewer {
         match key.code {
             KeyCode::Esc => return Command::Close,
             KeyCode::Char('r') => return Command::Reconnect,
+            KeyCode::Char('w') => {
+                self.settings.wrap = !self.settings.wrap;
+                self.horizontal = 0;
+                self.top = 0;
+            }
             KeyCode::Char('/') => self.settings.mode = Mode::Search(self.settings.search.clone()),
             KeyCode::Char('f') => self.settings.mode = Mode::Filter(self.settings.filter.clone()),
             KeyCode::Char('m') => self.settings.mode = Mode::MemoryLimit(String::new()),
@@ -396,8 +440,7 @@ impl Viewer {
             KeyCode::Char(' ') => {
                 if self.settings.follow {
                     self.top = self
-                        .visible()
-                        .len()
+                        .display_len()
                         .saturating_sub(self.viewport_height.get());
                 }
                 self.settings.follow = !self.settings.follow;
@@ -405,8 +448,7 @@ impl Viewer {
             KeyCode::Up | KeyCode::PageUp => {
                 if self.settings.follow {
                     self.top = self
-                        .visible()
-                        .len()
+                        .display_len()
                         .saturating_sub(self.viewport_height.get());
                 }
                 self.settings.follow = false;
@@ -417,13 +459,12 @@ impl Viewer {
             KeyCode::Down | KeyCode::PageDown => {
                 if self.settings.follow {
                     self.top = self
-                        .visible()
-                        .len()
+                        .display_len()
                         .saturating_sub(self.viewport_height.get());
                 }
                 self.settings.follow = false;
                 self.top = (self.top + if key.code == KeyCode::Down { 1 } else { 10 })
-                    .min(self.visible().len().saturating_sub(1));
+                    .min(self.display_len().saturating_sub(1));
             }
             KeyCode::Home => {
                 self.settings.follow = false;
@@ -454,7 +495,14 @@ impl Viewer {
         let at = if self.settings.follow {
             lines.len() - 1
         } else {
-            self.top.min(lines.len() - 1)
+            let mut offset = 0;
+            lines
+                .iter()
+                .position(|record| {
+                    offset += self.row_count(record);
+                    offset > self.top
+                })
+                .unwrap_or(lines.len() - 1)
         };
         let found = (1..=lines.len())
             .map(|step| {
@@ -466,26 +514,38 @@ impl Viewer {
             })
             .find(|i| lines[*i].text.to_lowercase().contains(&query));
         if let Some(found) = found {
-            self.top = found;
+            self.top = lines
+                .iter()
+                .take(found)
+                .map(|record| self.row_count(record))
+                .sum();
             self.settings.follow = false;
         }
     }
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let parts = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(2), Constraint::Length(5)])
+            .constraints([Constraint::Min(2), Constraint::Length(8)])
             .split(area);
         let visible = self.visible();
         let height = parts[0].height.saturating_sub(2) as usize;
         self.viewport_height.set(height.max(1));
+        self.viewport_width
+            .set(parts[0].width.saturating_sub(2).max(1));
         let top = if self.settings.follow {
-            visible.len().saturating_sub(height)
+            self.display_len().saturating_sub(height)
         } else {
-            self.top.min(visible.len().saturating_sub(1))
+            self.top.min(self.display_len().saturating_sub(1))
         };
+        let mut skip = 0;
+        let mut offset = top;
+        while skip < visible.len() && offset >= self.row_count(visible[skip]) {
+            offset -= self.row_count(visible[skip]);
+            skip += 1;
+        }
         let lines: Vec<Line> = visible
             .iter()
-            .skip(top)
+            .skip(skip)
             .take(height)
             .map(|line| {
                 let color = match line.level {
@@ -524,14 +584,18 @@ impl Viewer {
                 .unwrap_or(t("全部").into()),
             self.capture_level.as_str()
         );
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((0, self.horizontal))
-                .block(Block::default().title(title).borders(Borders::ALL)),
-            parts[0],
-        );
+        let paragraph =
+            Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+        let paragraph = if self.settings.wrap {
+            paragraph
+                .wrap(Wrap { trim: false })
+                .scroll((offset.min(u16::MAX as usize) as u16, 0))
+        } else {
+            paragraph.scroll((0, self.horizontal))
+        };
+        frame.render_widget(paragraph, parts[0]);
         let status = tr!(
-            "{} · {}/{} lines · limit {} · released {}\n过滤: {}  搜索: {}\nLocal log: {}",
+            "{}\n{}/{} lines · limit {} · released {}\n过滤: {}\n搜索: {}\nLocal log: {}",
             self.status,
             visible.len(),
             self.records.len(),
@@ -542,7 +606,14 @@ impl Viewer {
             self.source.display()
         );
         frame.render_widget(
-            Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(format!(
+                "{}\n{}: {}",
+                status,
+                t("Log wrap"),
+                t(if self.settings.wrap { "On" } else { "Off" })
+            ))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL)),
             parts[1],
         );
         match &self.settings.mode {
@@ -651,6 +722,45 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapping_preserves_unicode_tail_navigation_search_and_settings() {
+        let mut view = Viewer::new("test".into(), Settings::default());
+        view.records.push_back(Record {
+            text: format!("INFO {}TAIL", "中文長字串".repeat(12)),
+            level: Some(LogLevel::Info),
+        });
+        view.records.push_back(Record {
+            text: "INFO END".into(),
+            level: Some(LogLevel::Info),
+        });
+        view.key(key('w'));
+        let screen = view.test_screen(30, 24);
+        assert!(
+            screen.contains("TAIL") && screen.contains("INFO END"),
+            "{screen}"
+        );
+        assert!(view.display_len() > view.visible().len());
+        let total = view.display_len();
+        view.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            view.top,
+            total
+                .saturating_sub(view.viewport_height.get())
+                .saturating_sub(1)
+        );
+        view.settings.search = "END".into();
+        view.jump(false);
+        assert_eq!(view.top, view.row_count(&view.records[0]));
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&view.settings).unwrap()).unwrap();
+        assert!(restored.wrap);
+        view.key(key('w'));
+        assert!(!view.settings.wrap);
+        assert_eq!(view.display_len(), 2);
+        for width in [10, 30, 80] {
+            view.test_screen(width, 12);
+        }
+    }
     #[test]
     fn vim_log_navigation_preserves_search_input_and_level_selection() {
         let mut view = Viewer::new("proxy".into(), Settings::default());
@@ -887,7 +997,8 @@ mod tests {
         assert!(text.contains("INFO ready"));
         assert!(!text.contains("ERROR failed"));
         // Wide CJK cells include a trailing blank cell in TestBackend buffers.
-        assert!(text.replace(' ', "").contains("过滤：ready搜索：INFO"));
+        assert!(text.replace(' ', "").contains("过滤:ready"));
+        assert!(text.replace(' ', "").contains("搜索:INFO"));
         view.key(key('L'));
         terminal
             .draw(|frame| view.render(frame, frame.area()))

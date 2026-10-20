@@ -19,6 +19,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub watch_config: bool,
     pub subscription: Option<astra_convert::subscription::Subscription>,
+    #[serde(default)]
+    pub subscriptions: BTreeMap<String, astra_convert::subscription::Subscription>,
     pub system_proxy: Option<crate::mode_config::SystemProxy>,
     pub tun: Option<crate::mode_config::Tun>,
     pub tproxy: Option<crate::mode_config::Transparent>,
@@ -102,10 +104,34 @@ impl ProxyConfig {
         }))
     }
 
+    pub fn subscription_sources(
+        &self,
+    ) -> BTreeMap<String, astra_convert::subscription::Subscription> {
+        let mut sources = self.subscriptions.clone();
+        if let Some(legacy) = &self.subscription {
+            sources.insert("__legacy__".into(), legacy.clone());
+        }
+        sources
+    }
     pub fn validate(&self) -> Result<HashMap<String, OutboundConfig>> {
-        if let Some(subscription) = &self.subscription {
+        anyhow::ensure!(
+            self.subscriptions.len() <= 32,
+            "at most 32 subscriptions allowed"
+        );
+        for (name, subscription) in self.subscription_sources() {
+            anyhow::ensure!(
+                !name.is_empty()
+                    && !name.chars().any(char::is_control)
+                    && name.len() <= 64
+                    && (name != "__legacy__" || self.subscription.is_some()),
+                "invalid subscription name"
+            );
             subscription.validate()?;
         }
+        anyhow::ensure!(
+            !self.subscriptions.contains_key("__legacy__"),
+            "reserved subscription name"
+        );
         self.standalone_tag()?;
         crate::mode_config::validate(self)?;
         if !self.standalone && self.rule_socket.is_empty() {

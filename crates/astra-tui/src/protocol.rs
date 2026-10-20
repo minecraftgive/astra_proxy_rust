@@ -76,6 +76,12 @@ pub struct InstanceDetails {
     pub diagnostics_supported: bool,
     pub node_tags_supported: bool,
     pub explanation_supported: bool,
+    pub subscription_nodes_supported: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubscriptionNodes {
+    pub url: String,
+    pub tags: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
@@ -122,6 +128,8 @@ pub enum Action {
         name: String,
         request: astra_ipc::RouteRequest,
     },
+    UpdateSubscriptions(String),
+    SubscriptionNodes(String),
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {

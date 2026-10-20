@@ -820,6 +820,13 @@ impl Manager {
                 );
                 Ok(Reply::text(json))
             }
+            Action::SubscriptionNodes(name) => {
+                let instance = self.instance(&name)?;
+                anyhow::ensure!(instance.kind == Kind::Proxy, "Select a proxy instance");
+                Ok(Reply::text(serde_json::to_string(
+                    &crate::subscription_view::read(&instance.config)?,
+                )?))
+            }
             Action::ExplainRoute { name, request } => {
                 anyhow::ensure!(
                     self.instance(&name)?.kind == Kind::Rule,
@@ -890,6 +897,16 @@ impl Manager {
             Action::Stop(name) => {
                 self.stop(&name).await?;
                 Ok(Reply::text("Stopped"))
+            }
+            Action::UpdateSubscriptions(name) => {
+                anyhow::ensure!(
+                    self.instance(&name)?.kind == Kind::Proxy,
+                    "Select a proxy instance"
+                );
+                anyhow::ensure!(self.running.contains_key(&name), "Not running");
+                astra_ipc::control::request(&self.socket(&name), Command::UpdateSubscriptions)
+                    .await?;
+                Ok(Reply::text("Subscription update scheduled"))
             }
             Action::Reload(name) => {
                 let i = self.instance(&name)?;
@@ -1054,6 +1071,7 @@ impl Manager {
         }
         let mut details = InstanceDetails {
             node_tags_supported: true,
+            subscription_nodes_supported: true,
             diagnostics_supported: true,
             explanation_supported: true,
             bindings: if instance.kind == Kind::Rule {

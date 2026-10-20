@@ -167,6 +167,8 @@ pub(crate) struct Editor {
     form: Form,
     #[serde(default)]
     node_tags: Vec<String>,
+    #[serde(default)]
+    subscription_nodes: std::collections::BTreeMap<String, crate::protocol::SubscriptionNodes>,
 }
 
 #[derive(Clone)]
@@ -232,6 +234,10 @@ enum Row {
 }
 #[derive(Clone)]
 enum FlatRow {
+    Info {
+        path: Path,
+        label: String,
+    },
     Field {
         path: Path,
         spec: Spec,
@@ -265,7 +271,8 @@ enum FlatRow {
 impl FlatRow {
     fn path(&self) -> Path {
         match self {
-            Self::Field { path, .. }
+            Self::Info { path, .. }
+            | Self::Field { path, .. }
             | Self::Collection { path, .. }
             | Self::Section { path, .. }
             | Self::AddHeader { path } => path.clone(),
@@ -387,7 +394,7 @@ fn replace_field(table: &mut dyn TableLike, key: &str, mut item: Item) {
 }
 // Encoding respects parsed source positions, which must follow the new logical order
 // after moving an array item (including all of that item's nested tables).
-fn position_tables(table: &mut Table, position: &mut isize) {
+pub(crate) fn position_tables(table: &mut Table, position: &mut isize) {
     table.set_position(*position);
     *position += 1;
     for (_, item) in table.iter_mut() {
@@ -636,6 +643,15 @@ impl Editor {
         let doc = self.document()?;
         self.focus_field(&doc, &self.form.path.clone(), "enabled");
         Ok(())
+    }
+    pub fn set_subscription_nodes(
+        &mut self,
+        nodes: std::collections::BTreeMap<String, crate::protocol::SubscriptionNodes>,
+    ) {
+        self.subscription_nodes = nodes;
+    }
+    pub fn subscription_page(&self) -> bool {
+        self.document().ok().and_then(|doc|self.visible_rows(&doc).get(self.form.selected).map(FlatRow::path)).is_some_and(|path|matches!(path.first(),Some(Part::Key(key)) if matches!(key.as_str(),"subscription"|"subscriptions")))
     }
     pub fn set_node_tags(&mut self, tags: Vec<String>) {
         self.node_tags = tags;
@@ -895,6 +911,7 @@ impl Editor {
         let mut candidate = Self::new(self.name.clone(), text);
         candidate.kind = self.kind;
         candidate.node_tags = self.node_tags.clone();
+        candidate.subscription_nodes = self.subscription_nodes.clone();
         candidate.document()?;
         candidate.original = self.original.clone();
         *self = candidate;
@@ -1058,7 +1075,9 @@ impl Editor {
                     },
                 ]
             }
-        } else if last_key(path) == Some("subscription") {
+        } else if last_key(path) == Some("subscription")
+            || (path.len() == 2 && path.first() == Some(&Part::Key("subscriptions".into())))
+        {
             vec![
                 text("url", t("Subscription URL"), "", true),
                 number("interval", t("Update interval (seconds)"), 3600, 60, 604800),
@@ -1430,7 +1449,7 @@ impl Editor {
                     ("redirect", "REDIRECT (TCP)"),
                     ("outbounds", t("出站节点")),
                     ("proxy_groups", t("Proxy groups")),
-                    ("subscription", t("Subscription")),
+                    ("subscriptions", t("Subscriptions")),
                 ]
             } else {
                 vec![
@@ -1458,7 +1477,9 @@ impl Editor {
         );
         if let Some(table) = table {
             for (key, item) in table.iter() {
-                if last_key(path) == Some("subscription")
+                if (last_key(path) == Some("subscription")
+                    || (path.len() == 2
+                        && path.first() == Some(&Part::Key("subscriptions".into()))))
                     && matches!(key, "managed_nodes" | "managed_groups")
                 {
                     continue;
@@ -1638,12 +1659,62 @@ impl Editor {
                             _ => &label,
                         };
                         self.flatten_table(doc, &child, field_prefix, output);
-                        if key == "headers" {
+                        if key == "headers" || (path.is_empty() && key == "subscriptions") {
                             output.push(FlatRow::AddHeader { path: child });
                         }
                     }
                 }
                 Row::Entry { .. } => {}
+            }
+        }
+        let source = if path == [Part::Key("subscription".into())] {
+            Some("__legacy__")
+        } else if path.len() == 2 && path.first() == Some(&Part::Key("subscriptions".into())) {
+            last_key(path)
+        } else {
+            None
+        };
+        if let Some(source) = source {
+            let url = table_at(doc.as_table(), path)
+                .and_then(|v| v.get("url"))
+                .and_then(Item::as_str)
+                .unwrap_or_default();
+            let nodes = self
+                .subscription_nodes
+                .get(source)
+                .map(|v| {
+                    if v.url == url {
+                        v.tags.clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_else(|| {
+                    table_at(doc.as_table(), path)
+                        .and_then(|v| v.get("managed_nodes"))
+                        .and_then(Item::as_array)
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+            output.push(FlatRow::Info {
+                path: path.to_vec(),
+                label: tr!("Subscription nodes ({})", nodes.len()),
+            });
+            if nodes.is_empty() {
+                output.push(FlatRow::Info {
+                    path: path.to_vec(),
+                    label: t("No nodes available · save and update subscription").into(),
+                });
+            }
+            for node in nodes {
+                output.push(FlatRow::Info {
+                    path: path.to_vec(),
+                    label: format!("  • {node}"),
+                });
             }
         }
     }
@@ -2169,7 +2240,7 @@ impl Editor {
                 self.form.selected =
                     (self.form.selected + 1).min(self.visible_rows(&doc).len().saturating_sub(1));
             }
-            FlatRow::Section { .. } => {}
+            FlatRow::Info { .. } | FlatRow::Section { .. } => {}
         }
         Ok(())
     }
@@ -2405,6 +2476,28 @@ impl Editor {
                 KeyCode::Esc => self.cancel_input(),
                 KeyCode::Enter => {
                     let key = input.text.trim().to_owned();
+                    if last_key(&self.form.path) == Some("subscriptions") {
+                        anyhow::ensure!(
+                            !key.is_empty() && key.len() <= 64 && key != "__legacy__",
+                            t("Enter a subscription name")
+                        );
+                        let mut doc = self.document()?;
+                        let table = table_at_mut(doc.as_table_mut(), &self.form.path)?;
+                        anyhow::ensure!(
+                            table.get(&key).is_none(),
+                            t("Subscription name already exists")
+                        );
+                        let mut source = Table::new();
+                        source["url"] = value("");
+                        source["interval"] = value(3600);
+                        table.insert(&key, Item::Table(source));
+                        self.update(doc);
+                        self.cancel_input();
+                        self.form.path.push(Part::Key(key));
+                        self.focus_field(&self.document()?, &self.form.path.clone(), "url");
+                        self.enter(false)?;
+                        return Ok(());
+                    }
                     if last_key(&self.form.path) == Some("proxy_groups") {
                         anyhow::ensure!(
                             !key.is_empty()
@@ -2653,6 +2746,11 @@ impl Editor {
             }
             KeyCode::Char('n') => {
                 let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
+                if path.first() == Some(&Part::Key("subscriptions".into())) {
+                    self.form.path = vec![Part::Key("subscriptions".into())];
+                    self.form.mode = Mode::Header(TextInput::default());
+                    return Ok(());
+                }
                 if path.first() == Some(&Part::Key("proxy_groups".into())) {
                     self.form.path = vec![Part::Key("proxy_groups".into())];
                     self.form.mode = Mode::Header(TextInput::default());
@@ -2798,7 +2896,7 @@ impl Editor {
         let rows = self.visible_rows(&doc);
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(4)])
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
         let expanded_groups = if self.is_proxy(&doc) {
             expanded_proxy_groups(&doc).ok()
@@ -2998,8 +3096,16 @@ impl Editor {
                             Style::default().fg(Color::Gray),
                         )
                     }
-                    FlatRow::AddHeader { .. } => (
-                        t("  ＋ 新增请求头（Enter）").into(),
+                    FlatRow::Info { label, .. } => {
+                        (label.clone(), Style::default().fg(Color::Cyan))
+                    }
+                    FlatRow::AddHeader { path } => (
+                        t(if last_key(path) == Some("subscriptions") {
+                            "  + Add subscription (Enter)"
+                        } else {
+                            "  ＋ 新增请求头（Enter）"
+                        })
+                        .into(),
                         Style::default().fg(Color::Cyan),
                     ),
                 };
@@ -3045,16 +3151,20 @@ impl Editor {
             Some(FlatRow::Section { path, .. }) if last_key(path) == Some("tls") => {
                 t("Enter 启用/关闭 TLS；字段始终平铺；d 删除本分组参数").into()
             }
-            Some(FlatRow::AddHeader { .. }) => {
-                t("Enter 新增请求头；已有请求头直接在上方修改").into()
-            }
+            Some(FlatRow::AddHeader { path }) => t(if last_key(path) == Some("subscriptions") {
+                "Enter add subscription · n add · d remove · Ctrl-S save and update"
+            } else {
+                "Enter 新增请求头；已有请求头直接在上方修改"
+            })
+            .into(),
             _ => t("全部参数在同一页；↑↓ 选择，Enter 编辑，n 新增，Ctrl-S 校验保存").into(),
         };
         frame.render_widget(
-            Paragraph::new(format!(
-                "{}\n{hint}",
-                t("F4 external editor · F5 read external changes · Ctrl-S save")
-            ))
+            Paragraph::new(if self.browsing() {
+                t("Enter edit · Ctrl-S save · ? all operations").to_owned()
+            } else {
+                hint
+            })
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL)),
             sections[1],
@@ -3070,9 +3180,13 @@ impl Editor {
                 _ => 7,
             };
             let popup = Rect {
-                x: area.x + 2.min(area.width / 2),
+                x: area.x
+                    + area
+                        .width
+                        .saturating_sub(area.width.saturating_sub(4).min(76))
+                        / 2,
                 y: area.y + area.height.saturating_sub(height) / 2,
-                width: area.width.saturating_sub(4),
+                width: area.width.saturating_sub(4).min(76),
                 height: height.min(area.height),
             };
             frame.render_widget(Clear, popup);
@@ -3104,7 +3218,7 @@ impl Editor {
                     let mut state = ListState::default().with_selected(Some(*selected));
                     frame.render_stateful_widget(List::new(OUTBOUND_KINDS.iter().map(|s|ListItem::new(*s))).highlight_symbol("› ").highlight_style(Style::default().bg(Color::Blue)).block(Block::default().title(t("新增出站节点 · ↑↓ 选择 · Enter 确认 · Esc 取消")).borders(Borders::ALL)),popup,&mut state);
                 }
-                Mode::Header(input) => frame.render_widget(Paragraph::new(if last_key(&self.form.path)==Some("proxy_groups") {tr!("Proxy group name: {}▏\nEnter confirm · Esc cancel", input.text)} else if self.form.rename_rule_set.is_some() {tr!("Rename rule set: {}▏\nEnter confirm · Esc cancel",input.text)}else if last_key(&self.form.path)==Some("rule_sets") {tr!("规则集名称：{}▏\nEnter 创建 · Esc 取消",input.text)}else{tr!("请求头名称：{}▏\nEnter 继续设置值 · Esc 取消",input.text)}).block(Block::default().title(if last_key(&self.form.path)==Some("proxy_groups") {t("Proxy groups")}else if last_key(&self.form.path)==Some("rule_sets"){t("规则集")}else{t("新增请求头")}).borders(Borders::ALL)),popup),
+                Mode::Header(input) => frame.render_widget(Paragraph::new(if last_key(&self.form.path)==Some("subscriptions") {tr!("Subscription name: {}▏\nEnter confirm · Esc cancel", input.text)} else if last_key(&self.form.path)==Some("proxy_groups") {tr!("Proxy group name: {}▏\nEnter confirm · Esc cancel", input.text)} else if self.form.rename_rule_set.is_some() {tr!("Rename rule set: {}▏\nEnter confirm · Esc cancel",input.text)}else if last_key(&self.form.path)==Some("rule_sets") {tr!("规则集名称：{}▏\nEnter 创建 · Esc 取消",input.text)}else{tr!("请求头名称：{}▏\nEnter 继续设置值 · Esc 取消",input.text)}).block(Block::default().title(if last_key(&self.form.path)==Some("subscriptions") {t("Subscriptions")} else if last_key(&self.form.path)==Some("proxy_groups") {t("Proxy groups")}else if last_key(&self.form.path)==Some("rule_sets"){t("规则集")}else{t("新增请求头")}).borders(Borders::ALL)),popup),
                 Mode::Delete{..} => frame.render_widget(Paragraph::new(t("删除所选条目/分组？\n只修改草稿，Ctrl-S 后写入配置。\ny 确认删除 · n / Esc 取消")).wrap(Wrap{trim:false}).block(Block::default().title(t("确认删除")).borders(Borders::ALL).style(Style::default().fg(Color::Yellow))),popup),
                 Mode::Browse => {}
             }
@@ -3165,6 +3279,50 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
+    fn subscription_nodes_are_read_only_source_scoped_and_hide_after_draft_url_change() {
+        let mut editor=Editor::new("proxy".into(),"standalone=true\n[subscriptions.a]\nurl='https://example.com/a'\n[subscriptions.b]\nurl='https://example.com/b'\n".into());
+        let original = editor.text();
+        editor.set_subscription_nodes(
+            [
+                (
+                    "a".into(),
+                    crate::protocol::SubscriptionNodes {
+                        url: "https://example.com/a".into(),
+                        tags: vec!["a-node".into()],
+                    },
+                ),
+                (
+                    "b".into(),
+                    crate::protocol::SubscriptionNodes {
+                        url: "https://example.com/b".into(),
+                        tags: vec!["b-node".into()],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let doc = editor.document().unwrap();
+        let rows = editor.visible_rows(&doc);
+        let at=rows.iter().position(|row|matches!(row,FlatRow::Info {path,label} if label.contains("a-node") && path==&vec![Part::Key("subscriptions".into()),Part::Key("a".into())])).unwrap();
+        editor.form.selected = at;
+        assert!(editor.subscription_page());
+        press(&mut editor, KeyCode::Enter);
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.text(), original);
+        assert!(matches!(editor.form.mode, Mode::Browse));
+        let mut doc = editor.document().unwrap();
+        doc["subscriptions"]["a"]["url"] = value("https://example.com/new");
+        editor.update(doc);
+        let rows = editor.visible_rows(&editor.document().unwrap());
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row,FlatRow::Info {label,..} if label.contains("a-node"))));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row,FlatRow::Info {label,..} if label.contains("b-node"))));
+    }
+    #[test]
     fn rule_set_management_renames_references_toggles_and_blocks_dangling_deletion() {
         let mut editor = Editor::new("rules".into(), "socket='r'\ndefault_action='direct'\nrules=[{kind='rule_set',value='ads',action='block'},{kind='rule_set',value='ads',action='direct'}]\n[rule_sets.ads]\nbehavior='domain'\npayload=['+.ads.test']\n[rule_sets.other]\npayload=[]\n".into());
         let original = editor.text();
@@ -3212,6 +3370,38 @@ mod tests {
                     .unwrap();
             });
         }
+    }
+    #[test]
+    fn subscription_list_creates_multiple_named_sources_and_keeps_ownership_internal() {
+        let mut editor = Editor::new("proxy".into(), "socks5_listen='127.0.0.1:1080'\n".into())
+            .with_kind(CoreKind::Proxy);
+        for name in ["primary", "backup"] {
+            let doc = editor.document().unwrap();
+            editor.form.selected = editor.visible_rows(&doc).iter().position(|row| matches!(row, FlatRow::AddHeader { path } if last_key(path) == Some("subscriptions"))).unwrap();
+            press(&mut editor, KeyCode::Enter);
+            editor.paste(name);
+            press(&mut editor, KeyCode::Enter);
+            assert!(matches!(&editor.form.mode, Mode::Field { key, .. } if key == "url"));
+            editor.paste(&format!("https://example.com/{name}"));
+            press(&mut editor, KeyCode::Enter);
+        }
+        let doc = editor.document().unwrap();
+        assert_eq!(
+            doc["subscriptions"]["primary"]["url"].as_str(),
+            Some("https://example.com/primary")
+        );
+        assert_eq!(
+            doc["subscriptions"]["backup"]["interval"].as_integer(),
+            Some(3600)
+        );
+        assert!(editor
+            .visible_rows(&doc)
+            .iter()
+            .any(|row| matches!(row, FlatRow::Field { spec, .. } if spec.key == "import_groups")));
+        let mut saved: Editor =
+            serde_json::from_str(&serde_json::to_string(&editor).unwrap()).unwrap();
+        saved.normalize();
+        assert_eq!(saved.text(), editor.text());
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

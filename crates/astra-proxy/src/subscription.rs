@@ -119,6 +119,8 @@ pub(crate) struct Cache {
     pub base: String,
     pub effective: String,
     pub ownership: Subscription,
+    #[serde(default)]
+    pub subscriptions: std::collections::BTreeMap<String, Subscription>,
 }
 fn path(config: &Path) -> PathBuf {
     config.with_extension("subscription-cache.json")
@@ -143,7 +145,7 @@ pub(crate) fn read(config: &Path, base: &str) -> Option<Cache> {
     load().ok()
 }
 pub(crate) fn cached_app(config: &Path, original: App) -> App {
-    if original.config.subscription.is_none() {
+    if original.config.subscription_sources().is_empty() {
         return original;
     }
     if let Some(cache) = read(config, &original.source_text) {
@@ -253,6 +255,7 @@ mod tests {
             base: base.into(),
             effective: effective.clone(),
             ownership: settings,
+            subscriptions: Default::default(),
         };
         save(&config, &cache).unwrap();
         save(&config, &cache).unwrap();

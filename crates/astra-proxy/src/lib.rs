@@ -349,7 +349,11 @@ pub async fn run() -> Result<()> {
     if first.as_deref() == Some("--configure-egress") {
         let path = std::fs::canonicalize(args.next().context("expected config path")?)?;
         let mut app = App::load(&path)?;
-        let tun = app.config.tun.as_mut().context("configuration has no TUN")?;
+        let tun = app
+            .config
+            .tun
+            .as_mut()
+            .context("configuration has no TUN")?;
         egress::prepare_interface(tun)?;
         egress::persist_interface(&path, &app.source_text, tun)?;
         println!("TUN physical egress: {}", tun.interface.as_deref().unwrap());
@@ -368,6 +372,16 @@ pub async fn run() -> Result<()> {
         system_proxy::recover(std::path::Path::new(
             &args.next().context("expected recovery file path")?,
         ))?;
+        return Ok(());
+    }
+    if first.as_deref() == Some("--update-subscriptions") {
+        let socket = args.next().context("expected management socket")?;
+        astra_ipc::control::request(
+            std::path::Path::new(&socket),
+            astra_ipc::control::Command::UpdateSubscriptions,
+        )
+        .await?;
+        println!("Subscription update scheduled");
         return Ok(());
     }
     if matches!(first.as_deref(), Some("--reload" | "--switch")) {

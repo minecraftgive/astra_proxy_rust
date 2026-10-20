@@ -235,19 +235,22 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let first = crate::subscription::cached_app(&path, App::load(&path)?);
     state.apply(path, first).await?;
     let state = Arc::new(Mutex::new(state));
+    let refresh = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let subscription_worker = {
+        let refresh = refresh.clone();
         let state = state.clone();
         let current = current.clone();
         tokio::spawn(async move {
             let mut generation = 0;
+            let mut requested = 0;
             let mut effective = String::new();
-            let mut ownership = None;
-            let mut due = tokio::time::Instant::now();
+            let mut ownership = std::collections::BTreeMap::new();
+            let mut due = std::collections::BTreeMap::new();
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let (revision, path, base, settings) = {
                     let state = state.lock().await;
-                    let settings = state.current.load().config.subscription.clone();
+                    let settings = state.current.load().config.subscription_sources();
                     (
                         state.generation,
                         state.path.clone(),
@@ -255,27 +258,45 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                         settings,
                     )
                 };
-                let Some(settings) = settings else {
+                if settings.is_empty() {
                     continue;
-                };
+                }
                 if revision != generation {
                     generation = revision;
                     effective = base.clone();
-                    ownership = Some(settings.clone());
+                    ownership = settings.clone();
                     if let Some(cache) = crate::subscription::read(&path, &base) {
                         if App::from_text(&path, cache.effective.clone()).is_ok() {
                             effective = cache.effective;
-                            ownership = Some(cache.ownership);
+                            ownership = cache.subscriptions;
+                            if ownership.is_empty() {
+                                ownership.insert("__legacy__".into(), cache.ownership);
+                            }
                         }
                     }
-                    due = tokio::time::Instant::now();
+                    due.clear();
                 }
-                if tokio::time::Instant::now() < due {
+                let request = refresh.load(std::sync::atomic::Ordering::Relaxed);
+                if request != requested {
+                    due.clear();
+                    requested = request;
+                }
+                let Some((source, settings)) = settings
+                    .iter()
+                    .find(|(name, _)| {
+                        due.get(*name)
+                            .is_none_or(|time| tokio::time::Instant::now() >= *time)
+                    })
+                    .map(|(name, settings)| (name.clone(), settings.clone()))
+                else {
                     continue;
-                }
-                due = tokio::time::Instant::now() + Duration::from_secs(settings.interval);
+                };
+                due.insert(
+                    source.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(settings.interval),
+                );
                 let previous = effective.clone();
-                let mut managed = ownership.clone().unwrap_or(settings.clone());
+                let mut managed = ownership.get(&source).cloned().unwrap_or(settings.clone());
                 let source_path = path.clone();
                 let download_app = current.load_full();
                 let download_runtime = tokio::runtime::Handle::current();
@@ -312,14 +333,16 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                             generation = state.generation;
                             effective = text;
                             tracing::info!(
+                                subscription = %source,
                                 nodes = managed.managed_nodes.len(),
                                 "subscription updated"
                             );
-                            ownership = Some(managed);
+                            ownership.insert(source.clone(), managed);
                             let cache = crate::subscription::Cache {
                                 base: state.text.clone(),
                                 effective: effective.clone(),
-                                ownership: ownership.clone().unwrap(),
+                                ownership: ownership.get("__legacy__").cloned().unwrap_or_default(),
+                                subscriptions: ownership.clone(),
                             };
                             let cache_path = state.path.clone();
                             // Serialize after commit; a cache failure cannot discard valid nodes.
@@ -338,11 +361,11 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                             }
                         }
                         Err(_) => {
-                            tracing::warn!("subscription apply failed; previous nodes retained")
+                            tracing::warn!(subscription = %source, "subscription apply failed; previous nodes retained")
                         }
                     },
                     _ => tracing::warn!(
-                        "subscription download or validation failed; previous nodes retained"
+                        subscription = %source, "subscription download or validation failed; previous nodes retained"
                     ),
                 }
             }
@@ -384,7 +407,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
             }
         })
     };
-    let service = control.run_with_snapshot(
+    let service = control.run_with_updates(
         |path| {
             let state = state.clone();
             async move {
@@ -406,6 +429,26 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                     path: state.path.clone(),
                     text: state.text.clone(),
                 })
+            }
+        },
+        |_| async { Err("Route explanation is not supported by Proxy Core".into()) },
+        || {
+            let refresh = refresh.clone();
+            let state = state.clone();
+            async move {
+                if state
+                    .lock()
+                    .await
+                    .current
+                    .load()
+                    .config
+                    .subscription_sources()
+                    .is_empty()
+                {
+                    return Err("No subscriptions configured".into());
+                }
+                refresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
             }
         },
     );

@@ -18,3 +18,7 @@ uuid = "1"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2"
 regex = "1"
+percent-encoding = "2"
+
+base64 = "0.22"
+serde_json = "1"

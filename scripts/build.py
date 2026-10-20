@@ -84,6 +84,7 @@ def main():
             run([sys.executable, ROOT/'scripts/ruleset_regression.py', '--bin-dir', binaries])
             run([sys.executable, ROOT/'scripts/proxy_groups_regression.py', '--bin-dir', binaries])
             run([sys.executable, ROOT/'scripts/subscription_regression.py', '--bin-dir', binaries])
+            run([sys.executable, ROOT/'scripts/multi_subscription_regression.py', '--bin-dir', binaries])
     if args.build_only:
         print(f'Built client executables in {binaries}')
         return

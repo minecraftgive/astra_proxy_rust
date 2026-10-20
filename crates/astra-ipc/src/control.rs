@@ -12,6 +12,7 @@ pub enum Command {
     SetLogLevel(crate::logging::LogLevel),
     GetConfig,
     ExplainRoute(crate::RouteRequest),
+    UpdateSubscriptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,9 +140,9 @@ impl Control {
 
     pub async fn run_with_handlers<F, Fut, G, SnapshotFuture, H, ExplainFuture>(
         &self,
-        mut reload: F,
-        mut snapshot: G,
-        mut explain: H,
+        reload: F,
+        snapshot: G,
+        explain: H,
     ) -> io::Result<()>
     where
         F: FnMut(Option<PathBuf>) -> Fut,
@@ -150,6 +151,28 @@ impl Control {
         SnapshotFuture: std::future::Future<Output = Result<ConfigSnapshot, String>>,
         H: FnMut(crate::RouteRequest) -> ExplainFuture,
         ExplainFuture: std::future::Future<Output = Result<RouteExplanation, String>>,
+    {
+        self.run_with_updates(reload, snapshot, explain, || async {
+            Err("Subscription updates are not supported by this core".into())
+        })
+        .await
+    }
+    pub async fn run_with_updates<F, Fut, G, SnapshotFuture, H, ExplainFuture, U, UpdateFuture>(
+        &self,
+        mut reload: F,
+        mut snapshot: G,
+        mut explain: H,
+        mut update: U,
+    ) -> io::Result<()>
+    where
+        F: FnMut(Option<PathBuf>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+        G: FnMut() -> SnapshotFuture,
+        SnapshotFuture: std::future::Future<Output = Result<ConfigSnapshot, String>>,
+        H: FnMut(crate::RouteRequest) -> ExplainFuture,
+        ExplainFuture: std::future::Future<Output = Result<RouteExplanation, String>>,
+        U: FnMut() -> UpdateFuture,
+        UpdateFuture: std::future::Future<Output = Result<(), String>>,
     {
         let signal = crate::shutdown_signal();
         tokio::pin!(signal);
@@ -186,6 +209,7 @@ impl Control {
                         let stop = matches!(request.command, Command::Stop);
                         let error = match request.command {
                             Command::Reload { path } => reload(path).await.err(),
+                            Command::UpdateSubscriptions => update().await.err(),
                             Command::SetLogLevel(level) => crate::logging::set_level(level).err().map(|e|e.to_string()),
                             _ => None,
                         };

@@ -1,4 +1,5 @@
 //! Offline mihomo YAML -> Astra TOML conversion, independent of the proxy core.
+pub mod share;
 mod source;
 pub mod subscription;
 use anyhow::{bail, ensure, Context, Result};

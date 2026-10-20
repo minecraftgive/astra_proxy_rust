@@ -1639,3 +1639,11 @@ include_all = true
 # user_agent = "clash.meta/astra"
 # import_groups = false
 # 核心自动维护下载节点缓存；已有手动节点保留。
+
+# 多订阅可替代上面的单订阅段；每个名称对应一个独立更新来源。
+# [subscriptions.primary]
+# url = "https://example.com/clash"
+# interval = 3600
+# [subscriptions.backup]
+# url = "https://example.net/clash"
+# interval = 7200

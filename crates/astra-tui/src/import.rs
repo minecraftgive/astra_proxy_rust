@@ -36,6 +36,60 @@ pub struct Imported {
     pub warnings: Vec<String>,
 }
 
+pub fn links(input: &str, kind: Kind, current: &str) -> Result<Imported> {
+    ensure!(
+        kind == Kind::Proxy,
+        t("Configuration does not match this core")
+    );
+    ensure!(input.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    let converted = astra_convert::share::convert_links(input, &Default::default())?;
+    let imported: toml_edit::DocumentMut = converted.proxy.parse()?;
+    let mut doc: toml_edit::DocumentMut = current.parse()?;
+    let incoming = imported
+        .get("outbounds")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .context("No imported nodes")?;
+    let groups = doc_group_names(current)?;
+    let existing = doc
+        .entry("outbounds")
+        .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
+        .as_array_of_tables_mut()
+        .context("Invalid outbounds")?;
+    for node in incoming {
+        let tag = node
+            .get("tag")
+            .and_then(toml_edit::Item::as_str)
+            .context("Missing tag")?;
+        ensure!(
+            !existing
+                .iter()
+                .any(|n| n.get("tag").and_then(toml_edit::Item::as_str) == Some(tag))
+                && groups.iter().all(|n| n != tag),
+            t("Proxy target name already exists")
+        );
+        existing.push(node.clone());
+    }
+    // Imported tables carry positions from another document. Reassign them so
+    // each node's config/TLS/transport tables follow their own array entry.
+    crate::editor::position_tables(doc.as_table_mut(), &mut 0);
+    let text = doc.to_string();
+    text.parse::<toml_edit::DocumentMut>()
+        .context(t("Invalid configuration"))?;
+    ensure!(text.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    Ok(Imported {
+        text,
+        warnings: vec![],
+    })
+}
+fn doc_group_names(current: &str) -> Result<Vec<String>> {
+    let doc: toml::Value = toml::from_str(current)?;
+    Ok(doc
+        .get("proxy_groups")
+        .and_then(toml::Value::as_table)
+        .map(|v| v.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 pub fn load(path: &Path, kind: Kind, current: &str) -> Result<Imported> {
     ensure!(path.is_file(), t("Choose one TOML or YAML file"));
     let mut bytes = Vec::new();
@@ -45,6 +99,9 @@ pub fn load(path: &Path, kind: Kind, current: &str) -> Result<Imported> {
     ensure!(bytes.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
     let source = String::from_utf8(bytes).context(t("Configuration must be UTF-8"))?;
     let source = source.trim_start_matches('\u{feff}');
+    if astra_convert::share::is_share(source) {
+        return links(source, kind, current);
+    }
     let base = path.parent().context("Missing import directory")?;
     let yaml = path
         .extension()
@@ -171,6 +228,43 @@ pub(crate) mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn share_links_append_without_replacing_draft_or_local_settings() {
+        let link = "vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&sni=example.com&type=xhttp&mode=auto&path=%2Fhello#new-node";
+        let current = "# keep comment\nstandalone=true\nstandalone_outbound='PROXY'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='local'\nserver='localhost:1234'\n[subscriptions.local]\nurl='https://example.com/sub'\n";
+        let imported = links(link, Kind::Proxy, current).unwrap();
+        assert!(imported.text.contains("# keep comment"));
+        let doc: toml::Value = toml::from_str(&imported.text).unwrap();
+        assert_eq!(doc["outbounds"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            doc["subscriptions"]["local"]["url"].as_str(),
+            Some("https://example.com/sub")
+        );
+        assert!(links(link, Kind::Proxy, &imported.text).is_err());
+        assert!(links(link, Kind::Rule, current).is_err());
+    }
+    #[test]
+    fn appended_native_nodes_keep_nested_tables_with_their_node() {
+        let link = "vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&sni=example.com&type=xhttp&mode=auto&path=%2Fhello#first";
+        let current = "standalone=true\n[[outbounds]]\nkind='native'\ntag='existing'\n[outbounds.config]\nprotocol='vless'\nserver='old.example:443'\n[outbounds.config.tls]\nenabled=true\nserver_name='old.example'\n";
+        let first = links(link, Kind::Proxy, current).unwrap();
+        let second = links(&link.replace("#first", "#second"), Kind::Proxy, &first.text).unwrap();
+        let doc: toml::Value = toml::from_str(&second.text).unwrap();
+        let nodes = doc["outbounds"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(
+            nodes[0]["config"]["server"].as_str(),
+            Some("old.example:443")
+        );
+        for (node, tag) in nodes[1..].iter().zip(["first", "second"]) {
+            assert_eq!(node["tag"].as_str(), Some(tag));
+            assert_eq!(
+                node["config"]["tls"]["server_name"].as_str(),
+                Some("example.com")
+            );
+            assert_eq!(node["config"]["transport"]["path"].as_str(), Some("/hello"));
         }
     }
     #[test]
