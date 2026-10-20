@@ -1,0 +1,187 @@
+{
+  "runs": [
+    {
+      "scenario": "geoip_only",
+      "version": "before",
+      "repeat": 0,
+      "private_mib": 25.625,
+      "working_mib": 29.9140625,
+      "peak_private_mib": 120.671875,
+      "peak_working_mib": 105.6796875,
+      "ready_ms": 1529.446900007315
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "after",
+      "repeat": 0,
+      "private_mib": 3.0625,
+      "working_mib": 8.578125,
+      "peak_private_mib": 27.90234375,
+      "peak_working_mib": 24.234375,
+      "ready_ms": 1028.1480999983614
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "before",
+      "repeat": 1,
+      "private_mib": 25.44140625,
+      "working_mib": 29.52734375,
+      "peak_private_mib": 120.67578125,
+      "peak_working_mib": 104.99609375,
+      "ready_ms": 716.2494000076549
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "after",
+      "repeat": 1,
+      "private_mib": 3.015625,
+      "working_mib": 8.12890625,
+      "peak_private_mib": 27.83203125,
+      "peak_working_mib": 23.7734375,
+      "ready_ms": 221.74559999257326
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "before",
+      "repeat": 2,
+      "private_mib": 25.62890625,
+      "working_mib": 29.453125,
+      "peak_private_mib": 120.734375,
+      "peak_working_mib": 105.20703125,
+      "ready_ms": 761.987499994575
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "after",
+      "repeat": 2,
+      "private_mib": 3.76171875,
+      "working_mib": 8.09375,
+      "peak_private_mib": 27.8046875,
+      "peak_working_mib": 23.75,
+      "ready_ms": 229.61080000095535
+    },
+    {
+      "scenario": "full_rules",
+      "version": "before",
+      "repeat": 0,
+      "private_mib": 52.3671875,
+      "working_mib": 56.71875,
+      "peak_private_mib": 152.83984375,
+      "peak_working_mib": 129.140625,
+      "ready_ms": 1443.2199000002583
+    },
+    {
+      "scenario": "full_rules",
+      "version": "after",
+      "repeat": 0,
+      "private_mib": 31.29296875,
+      "working_mib": 35.98828125,
+      "peak_private_mib": 77.16015625,
+      "peak_working_mib": 68.69140625,
+      "ready_ms": 606.8919000099413
+    },
+    {
+      "scenario": "full_rules",
+      "version": "before",
+      "repeat": 1,
+      "private_mib": 53.13671875,
+      "working_mib": 57.0078125,
+      "peak_private_mib": 152.91796875,
+      "peak_working_mib": 129.40625,
+      "ready_ms": 1155.2132000069832
+    },
+    {
+      "scenario": "full_rules",
+      "version": "after",
+      "repeat": 1,
+      "private_mib": 32.0625,
+      "working_mib": 36.328125,
+      "peak_private_mib": 77.1328125,
+      "peak_working_mib": 68.6484375,
+      "ready_ms": 626.5971999964677
+    },
+    {
+      "scenario": "full_rules",
+      "version": "before",
+      "repeat": 2,
+      "private_mib": 53.19140625,
+      "working_mib": 56.98828125,
+      "peak_private_mib": 152.77734375,
+      "peak_working_mib": 128.875,
+      "ready_ms": 1119.5724999997765
+    },
+    {
+      "scenario": "full_rules",
+      "version": "after",
+      "repeat": 2,
+      "private_mib": 30.93359375,
+      "working_mib": 35.78515625,
+      "peak_private_mib": 76.98828125,
+      "peak_working_mib": 68.62109375,
+      "ready_ms": 568.9996000000974
+    }
+  ],
+  "medians": [
+    {
+      "scenario": "geoip_only",
+      "version": "before",
+      "ready_ms": 761.987,
+      "private_mib": 25.625,
+      "working_mib": 29.527,
+      "peak_private_mib": 120.676,
+      "peak_working_mib": 105.207
+    },
+    {
+      "scenario": "geoip_only",
+      "version": "after",
+      "ready_ms": 229.611,
+      "private_mib": 3.062,
+      "working_mib": 8.129,
+      "peak_private_mib": 27.832,
+      "peak_working_mib": 23.773
+    },
+    {
+      "scenario": "full_rules",
+      "version": "before",
+      "ready_ms": 1155.213,
+      "private_mib": 53.137,
+      "working_mib": 56.988,
+      "peak_private_mib": 152.84,
+      "peak_working_mib": 129.141
+    },
+    {
+      "scenario": "full_rules",
+      "version": "after",
+      "ready_ms": 606.892,
+      "private_mib": 31.293,
+      "working_mib": 35.988,
+      "peak_private_mib": 77.133,
+      "peak_working_mib": 68.648
+    }
+  ],
+  "metadata": {
+    "date": "2026-10-20",
+    "timezone": "Asia/Hong_Kong",
+    "platform": "Windows x64",
+    "logical_processors": 32,
+    "build": "cargo build --release -p astra-rule",
+    "rounds": 3,
+    "settle_seconds": 1,
+    "readiness_poll_seconds": 0.01,
+    "network_updates": false,
+    "workload": "startup and idle; no route request load",
+    "source_rules": 114,
+    "geoip_categories": [
+      "CN",
+      "TELEGRAM"
+    ],
+    "geoip_total_cidrs": 1060863,
+    "geoip_selected_cidrs": 10021,
+    "hashes": {
+      "before": "2fbac54a27de63a92a691a8a0c88c3a72edeef4458579018bf079a3c5413b416",
+      "after": "bccf4f1c3305bca17f790ed04b7a764b00fa9f6a4824448830b74e0e4266322e",
+      "geoip.dat": "010bfc2e353c5e34e23156004944444ca260bae999e73171bdd7974056557959",
+      "geosite.dat": "8eaa34ea818f716cd9f525da37af65119305d32ff60040fd28d35db97e4a963e"
+    }
+  }
+}

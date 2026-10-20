@@ -31,6 +31,109 @@ fn check(code: u32) -> Result<()> {
     }
 }
 
+/// Choose a live hardware adapter with a default route. Never select a
+/// virtual adapter merely because it has a lower metric or a split route.
+pub fn physical_default_interface(exclude: Option<&str>) -> Result<String> {
+    let mut pointer = std::ptr::null_mut();
+    check(unsafe { GetIpForwardTable2(AF_UNSPEC, &mut pointer) })?;
+    let table = RouteTable(pointer);
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table.0).Table.as_ptr(), (*table.0).NumEntries as usize)
+    };
+    let mut candidates = Vec::new();
+    for route in rows {
+        if route.DestinationPrefix.PrefixLength != 0 {
+            continue;
+        }
+        let mut adapter = MIB_IF_ROW2 {
+            InterfaceIndex: route.InterfaceIndex,
+            ..Default::default()
+        };
+        if unsafe { GetIfEntry2(&mut adapter) } != 0
+            || adapter.OperStatus != windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp
+            || adapter.InterfaceAndOperStatusFlags._bitfield & 1 == 0
+        {
+            continue;
+        }
+        let alias = String::from_utf16_lossy(
+            &adapter.Alias[..adapter
+                .Alias
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(adapter.Alias.len())],
+        );
+        if exclude.is_some_and(|name| name == alias || name == route.InterfaceIndex.to_string()) {
+            continue;
+        }
+        let family = unsafe { route.DestinationPrefix.Prefix.si_family };
+        let mut interface = MIB_IPINTERFACE_ROW::default();
+        unsafe { InitializeIpInterfaceEntry(&mut interface) };
+        interface.Family = family;
+        interface.InterfaceIndex = route.InterfaceIndex;
+        if unsafe { GetIpInterfaceEntry(&mut interface) } != 0 {
+            continue;
+        }
+        // Prefer the IPv4 default; IPv6-only networks still have a candidate.
+        candidates.push((
+            family != AF_INET,
+            u64::from(route.Metric) + u64::from(interface.Metric),
+            route.InterfaceIndex,
+            alias,
+        ));
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, _, name)| name)
+        .context("no active physical default route; configure tun.interface explicitly")
+}
+
+pub fn interface_alias(interface: &str) -> Result<String> {
+    let mut row = MIB_IF_ROW2 {
+        InterfaceIndex: interface_index(interface)?,
+        ..Default::default()
+    };
+    check(unsafe { GetIfEntry2(&mut row) })?;
+    Ok(String::from_utf16_lossy(
+        &row.Alias[..row
+            .Alias
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(row.Alias.len())],
+    ))
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    #[test]
+    fn discovered_default_is_live_hardware_and_can_be_excluded() {
+        // A disconnected CI host may legitimately have no physical default.
+        let Ok(alias) = physical_default_interface(None) else {
+            return;
+        };
+        let index = interface_index(&alias).unwrap();
+        let mut row = MIB_IF_ROW2 {
+            InterfaceIndex: index,
+            ..Default::default()
+        };
+        check(unsafe { GetIfEntry2(&mut row) }).unwrap();
+        assert_ne!(row.InterfaceAndOperStatusFlags._bitfield & 1, 0);
+        assert_eq!(
+            row.OperStatus,
+            windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp
+        );
+        assert_eq!(interface_alias(&index.to_string()).unwrap(), alias);
+        assert_ne!(
+            physical_default_interface(Some(&alias)).ok(),
+            Some(alias.clone())
+        );
+        eprintln!("physical egress: {alias} (index {index})");
+    }
+}
+
 pub fn bind_socket(socket: &impl AsRawSocket, interface: &str, ipv4: bool) -> Result<()> {
     let index = interface_index(interface)?;
     // Windows IP_UNICAST_IF takes network byte order; IPV6_UNICAST_IF takes host order.

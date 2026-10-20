@@ -34,11 +34,14 @@ pub struct State {
     system: system_proxy::Guard,
     system_journal: PathBuf,
     group_worker: Option<GroupWorker>,
+    outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
 }
 impl State {
     async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
         let old = self.current.load_full();
-        tun::validate_egress(&candidate.config).await?;
+        if let Some(tun) = &mut candidate.config.tun {
+            crate::egress::prepare_interface(tun)?;
+        }
         let mut keys = vec![];
         if let Some(addr) = &candidate.config.socks5_listen {
             keys.push(Key(Inbound::Socks5, addr.clone()));
@@ -104,7 +107,16 @@ impl State {
         let replace_system = candidate.config.system_proxy != old.config.system_proxy
             || (candidate.config.system_proxy.is_some()
                 && (self.listeners.is_empty() || system_listener_changed));
-        let text = candidate.source_text.clone();
+        let mut text = candidate.source_text.clone();
+        // All protocols share this binding. A rejected reload drops the new
+        // owner and restores the previous owner; old sessions keep their sockets.
+        let outbound_interface = candidate
+            .config
+            .tun
+            .as_ref()
+            .and_then(|tun| tun.interface.as_deref())
+            .map(meow_common::outbound_iface::install_outbound_interface)
+            .transpose()?;
         if replace_system {
             self.system
                 .restore()
@@ -134,10 +146,22 @@ impl State {
             client.start_observer();
         }
         // Prepare first; disconnect sessions only once the entire reload can commit.
+        if let Some(tun) = &candidate.config.tun {
+            match crate::egress::persist_interface(&path, &text, tun) {
+                Ok(saved) => {
+                    text = saved;
+                    candidate.source_text = text.clone();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "physical egress is active but could not be saved")
+                }
+            }
+        }
         self.group_worker.take();
         candidate.groups.inherit(&old, &candidate.config);
         candidate.groups.committed(&old, &candidate.config);
         self.current.store(Arc::new(candidate));
+        self.outbound_interface = outbound_interface;
         self.group_worker.take();
         if self
             .current
@@ -203,6 +227,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         current: current.clone(),
         listeners: HashMap::new(),
         group_worker: None,
+        outbound_interface: None,
         tunnel: None,
         tproxy_udp: None,
         system: Default::default(),
@@ -212,6 +237,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let state = Arc::new(Mutex::new(state));
     let subscription_worker = {
         let state = state.clone();
+        let current = current.clone();
         tokio::spawn(async move {
             let mut generation = 0;
             let mut effective = String::new();
@@ -251,10 +277,19 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                 let previous = effective.clone();
                 let mut managed = ownership.clone().unwrap_or(settings.clone());
                 let source_path = path.clone();
+                let download_app = current.load_full();
+                let download_runtime = tokio::runtime::Handle::current();
                 let result = tokio::task::spawn_blocking(move || -> Result<_> {
-                    let converted = astra_convert::subscription::fetch(
+                    let converted = astra_convert::subscription::fetch_with(
                         &settings,
                         source_path.parent().context("config has no parent")?,
+                        &|url, agent| {
+                            download_runtime.block_on(crate::subscription::download(
+                                &download_app,
+                                url,
+                                agent,
+                            ))
+                        },
                     )?;
                     let text = astra_convert::subscription::merge(
                         &previous,

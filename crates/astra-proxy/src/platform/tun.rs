@@ -157,53 +157,6 @@ impl Routes {
         Ok(())
     }
 }
-pub async fn validate_egress(config: &crate::config::ProxyConfig) -> Result<()> {
-    let Some(tun) = &config.tun else {
-        return Ok(());
-    };
-    if tun.routes.is_empty() {
-        return Ok(());
-    }
-    let routes: Vec<ipnet::IpNet> = tun
-        .routes
-        .iter()
-        .map(|cidr| cidr.parse())
-        .collect::<std::result::Result<_, _>>()?;
-    let bypass: Vec<ipnet::IpNet> = tun
-        .bypass
-        .iter()
-        .map(|cidr| cidr.parse())
-        .collect::<std::result::Result<_, _>>()?;
-    for outbound in &config.outbounds {
-        let endpoint = match outbound {
-            crate::config::OutboundConfig::Native { config, .. } => tokio::time::timeout(
-                std::time::Duration::from_secs(8),
-                tokio::net::lookup_host((config.server.as_str(), config.port)),
-            )
-            .await??
-            .collect::<Vec<_>>(),
-            crate::config::OutboundConfig::Socks5 { server, .. }
-            | crate::config::OutboundConfig::Http { server, .. }
-            | crate::config::OutboundConfig::TrojanTls { server, .. }
-            | crate::config::OutboundConfig::VlessTls { server, .. } => tokio::time::timeout(
-                std::time::Duration::from_secs(8),
-                tokio::net::lookup_host(server),
-            )
-            .await??
-            .collect::<Vec<_>>(),
-        };
-        for address in endpoint {
-            let captured_prefix = routes
-                .iter()
-                .filter(|net| net.contains(&address.ip()))
-                .map(ipnet::IpNet::prefix_len)
-                .max();
-            ensure!(address.ip().is_loopback() || captured_prefix.is_none() || bypass.iter().any(|net| net.contains(&address.ip()) && Some(net.prefix_len()) > captured_prefix),
-                "TUN would recapture outbound {} at {}; add its IP/CIDR to tun.bypass via the original gateway", outbound.tag(), address.ip());
-        }
-    }
-    Ok(())
-}
 pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> {
     #[cfg(windows)]
     ensure!(astra_ipc::elevation::is_elevated()?,
@@ -375,11 +328,32 @@ async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Re
         });
     }
     let reader_device = device.clone();
+    let reader_current = current.clone();
     let (raw_send, mut raw_receive) = mpsc::channel::<Vec<u8>>(256);
     jobs.spawn(async move {
         let mut packet = vec![0; 65536];
+        let mut warned_scope = false;
+        let mut self_exclusion = super::tun_ingress::SelfExclusion::default();
         loop {
             let count = reader_device.recv(&mut packet).await?;
+            // Consult the active generation: same-device reload keeps this reader.
+            let has_egress_interface = reader_current
+                .load()
+                .config
+                .tun
+                .as_ref()
+                .is_some_and(|tun| tun.interface.is_some());
+            if !super::tun_ingress::accepts(&packet[..count], has_egress_interface) {
+                if !warned_scope {
+                    tracing::warn!("TUN dropped invalid or unscoped IPv6 link-local traffic; configure tun.interface with the physical egress to forward link-local traffic safely");
+                    warned_scope = true;
+                }
+                continue;
+            }
+            if self_exclusion.excludes(&packet[..count]).await {
+                tracing::debug!(target: "astra_route", phase = "self_excluded", "TUN excluded a proxy-core packet before stack allocation");
+                continue;
+            }
             sink.send(packet[..count].to_vec()).await?;
         }
         #[allow(unreachable_code)]

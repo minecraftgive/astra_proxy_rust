@@ -200,3 +200,33 @@ fn http_provider_download_and_error_redaction() {
     assert!(!format!("{error:#}").contains("secret"));
     thread.join().unwrap();
 }
+
+#[test]
+fn injected_download_covers_subscription_and_nested_http_provider() {
+    use astra_convert::subscription::{fetch_with, Subscription};
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = fetch_with(
+        &Subscription {
+            url: "https://subscription.test/list".into(),
+            ..Default::default()
+        },
+        std::path::Path::new("."),
+        &|url, _agent| {
+            calls.borrow_mut().push(url.to_owned());
+            Ok(if url.ends_with("/list") {
+                "proxy-providers: {p: {type: http, url: 'https://provider.test/nodes'}}".into()
+            } else {
+                source("remote")
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(result.nodes, 1);
+    assert_eq!(
+        *calls.borrow(),
+        [
+            "https://subscription.test/list",
+            "https://provider.test/nodes"
+        ]
+    );
+}

@@ -101,6 +101,14 @@ fn matches(spec: &Y, node: &Y) -> Result<bool> {
 }
 /// Expand provider membership before the ordinary converter validates protocols/groups.
 pub fn convert_clash(input: &str, options: &Options, user_agent: &str) -> Result<Converted> {
+    convert_clash_with(input, options, user_agent, &download)
+}
+fn convert_clash_with(
+    input: &str,
+    options: &Options,
+    user_agent: &str,
+    download: &dyn Fn(&str, &str) -> Result<String>,
+) -> Result<Converted> {
     let mut root: Y = serde_yaml::from_str(input).context("invalid Clash YAML")?;
     root.apply_merge()?;
     ensure!(root.is_mapping(), "Clash configuration must be a mapping");
@@ -242,6 +250,15 @@ pub fn convert_nodes(
     user_agent: &str,
     import_groups: bool,
 ) -> Result<Converted> {
+    convert_nodes_with(input, options, user_agent, import_groups, &download)
+}
+fn convert_nodes_with(
+    input: &str,
+    options: &Options,
+    user_agent: &str,
+    import_groups: bool,
+    download: &dyn Fn(&str, &str) -> Result<String>,
+) -> Result<Converted> {
     let mut root: Y = serde_yaml::from_str(input).context("invalid Clash YAML")?;
     root.apply_merge()?;
     let root = root
@@ -256,12 +273,25 @@ pub fn convert_nodes(
             nodes.insert(Y::String(key.into()), value.clone());
         }
     }
-    convert_clash(&serde_yaml::to_string(&nodes)?, options, user_agent)
+    convert_clash_with(
+        &serde_yaml::to_string(&nodes)?,
+        options,
+        user_agent,
+        download,
+    )
 }
 pub fn fetch(config: &Subscription, base_dir: &Path) -> Result<Converted> {
+    fetch_with(config, base_dir, &download)
+}
+/// Let the embedding core supply its protected network path, including providers.
+pub fn fetch_with(
+    config: &Subscription,
+    base_dir: &Path,
+    download: &dyn Fn(&str, &str) -> Result<String>,
+) -> Result<Converted> {
     config.validate()?;
     let text = download(&config.url, &config.user_agent)?;
-    convert_nodes(
+    convert_nodes_with(
         &text,
         &Options {
             base_dir: base_dir.into(),
@@ -269,6 +299,7 @@ pub fn fetch(config: &Subscription, base_dir: &Path) -> Result<Converted> {
         },
         &config.user_agent,
         config.import_groups,
+        download,
     )
 }
 /// Replace only subscription-owned nodes/groups, preserving local runtime settings.

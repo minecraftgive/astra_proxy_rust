@@ -63,7 +63,7 @@ pub(crate) async fn trojan_stream(
         bail!("not a Trojan outbound");
     };
     use tokio::io::AsyncWriteExt;
-    let tcp = tokio::net::TcpStream::connect((server.as_str(), *port)).await?;
+    let tcp = crate::egress::connect((server.as_str(), *port)).await?;
     tcp.set_nodelay(true)?;
     let mut stream = transport.connect(Box::new(tcp)).await?;
     let header = request(password_hash, command, target)?;

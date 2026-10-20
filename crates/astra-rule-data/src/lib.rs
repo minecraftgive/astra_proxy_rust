@@ -322,15 +322,28 @@ pub fn load_resource(
     limit: u64,
     validate: impl Fn(&[u8]) -> Result<()>,
 ) -> Result<Vec<u8>> {
+    load_resource_with(base, path, url, interval, limit, validate).map(|(bytes, ())| bytes)
+}
+
+/// Preserve the validated value alongside its bytes, including on update fallback.
+/// Callers can reuse a parsed index instead of decoding the resource a second time.
+pub fn load_resource_with<T>(
+    base: &Path,
+    path: &str,
+    url: Option<&str>,
+    interval: u64,
+    limit: u64,
+    decode: impl Fn(&[u8]) -> Result<T>,
+) -> Result<(Vec<u8>, T)> {
     let path = resolve(base, path);
-    let read = || -> Result<Vec<u8>> {
+    let read = || -> Result<(Vec<u8>, T)> {
         let mut data = Vec::new();
         fs::File::open(&path)?
             .take(limit + 1)
             .read_to_end(&mut data)?;
         ensure!(data.len() as u64 <= limit, "resource exceeds size limit");
-        validate(&data)?;
-        Ok(data)
+        let parsed = decode(&data)?;
+        Ok((data, parsed))
     };
     let Some(url) = url else {
         return read().with_context(|| format!("load resource {}", path.display()));
@@ -345,7 +358,7 @@ pub fn load_resource(
     if fresh && cached.is_some() {
         return Ok(cached.unwrap());
     }
-    let update = (|| -> Result<Vec<u8>> {
+    let update = (|| -> Result<(Vec<u8>, T)> {
         let response = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(15))
             .redirects(3)
@@ -359,7 +372,7 @@ pub fn load_resource(
             .take(limit + 1)
             .read_to_end(&mut data)?;
         ensure!(data.len() as u64 <= limit, "download exceeds size limit");
-        validate(&data).context("downloaded resource is invalid")?;
+        let parsed = decode(&data).context("downloaded resource is invalid")?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -383,7 +396,7 @@ pub fn load_resource(
             let _ = fs::remove_file(&temporary);
         }
         result?;
-        Ok(data)
+        Ok((data, parsed))
     })();
     match (update, cached) {
         (Ok(data), _) => Ok(data),
@@ -398,6 +411,43 @@ pub fn load_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parsed_resource_reuses_validation_and_keeps_cached_value_on_invalid_update() {
+        use std::{cell::Cell, net::TcpListener};
+        let dir =
+            std::env::temp_dir().join(format!("astra-parsed-resource-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cache"), b"42").unwrap();
+        let calls = Cell::new(0);
+        let decode = |bytes: &[u8]| -> Result<u32> {
+            calls.set(calls.get() + 1);
+            Ok(std::str::from_utf8(bytes)?.parse()?)
+        };
+        let (bytes, value) = load_resource_with(&dir, "cache", None, 0, 100, decode).unwrap();
+        assert_eq!((bytes.as_slice(), value), (b"42".as_slice(), 42));
+        assert_eq!(calls.get(), 1);
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/resource", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+                .unwrap();
+        });
+        let (bytes, value) = load_resource_with(&dir, "cache", Some(&url), 0, 100, decode).unwrap();
+        worker.join().unwrap();
+        assert_eq!((bytes.as_slice(), value), (b"42".as_slice(), 42));
+        assert_eq!(calls.get(), 3); // one cached decode and one rejected candidate
+        assert_eq!(fs::read(dir.join("cache")).unwrap(), b"42");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn provider_errors_keep_entry_and_original_text_line_context() {
         let source = RuleSet {

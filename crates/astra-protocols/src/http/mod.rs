@@ -12,7 +12,7 @@ pub async fn http_connect(
     target: &Target,
 ) -> Result<Stream> {
     use base64::Engine;
-    let mut tcp = TcpStream::connect(server).await?;
+    let mut tcp = crate::egress::connect(server).await?;
     tcp.set_nodelay(true)?;
     if target.host.bytes().any(|b| b <= 32 || b == 127) {
         bail!("invalid HTTP destination");

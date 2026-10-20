@@ -11,6 +11,32 @@ pub(crate) async fn lookup(
     source: SocketAddr,
     destination: SocketAddr,
 ) -> Option<ProcessInfo> {
+    bounded_lookup(network, source, destination, resolve).await
+}
+
+pub(crate) async fn is_self(network: Network, source: SocketAddr, destination: SocketAddr) -> bool {
+    bounded_lookup(
+        network,
+        source,
+        destination,
+        |network, source, destination| {
+            #[cfg(windows)]
+            let pid = windows::owner_pid(network, source, destination);
+            #[cfg(not(windows))]
+            let pid = resolve(network, source, destination).map(|process| process.pid);
+            pid.map(|pid| pid == std::process::id())
+        },
+    )
+    .await
+    .unwrap_or(false)
+}
+
+async fn bounded_lookup<T: Send + 'static>(
+    network: Network,
+    source: SocketAddr,
+    destination: SocketAddr,
+    resolve: impl FnOnce(Network, SocketAddr, SocketAddr) -> Option<T> + Send + 'static,
+) -> Option<T> {
     static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let limit = LIMIT
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
@@ -144,14 +170,14 @@ mod windows {
         let first = pids.next()?;
         (first != 0 && pids.all(|pid| pid == first)).then_some(first)
     }
-    pub(super) fn resolve(
+    pub(super) fn owner_pid(
         network: Network,
         source: SocketAddr,
         destination: SocketAddr,
-    ) -> Option<ProcessInfo> {
+    ) -> Option<u32> {
         let source = SocketAddr::new(source.ip().to_canonical(), source.port());
         let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
-        let pid = match (network, source.is_ipv4()) {
+        match (network, source.is_ipv4()) {
             (Network::Tcp, true) => unique(
                 table::<MIB_TCPROW_OWNER_PID>(network, true)?
                     .into_iter()
@@ -195,7 +221,15 @@ mod windows {
                         .map(|row| row.dwOwningPid),
                 )
             }
-        }?;
+        }
+    }
+
+    pub(super) fn resolve(
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> Option<ProcessInfo> {
+        let pid = owner_pid(network, source, destination)?;
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {

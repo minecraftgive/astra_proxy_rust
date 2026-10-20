@@ -21,7 +21,7 @@ pub async fn open(target: &Target, outbound: Option<&OutboundConfig>) -> Result<
     match outbound {
         Some(OutboundConfig::Native { .. }) => bail!("native outbound was not initialized"),
         None => {
-            let stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
+            let stream = crate::egress::connect((target.host.as_str(), target.port)).await?;
             stream.set_nodelay(true)?;
             Ok(Box::new(stream))
         }
@@ -53,7 +53,7 @@ pub(crate) async fn tls_connect(
     server: &str,
     sni: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect(server)
+    let tcp = crate::egress::connect(server)
         .await
         .context("TLS endpoint TCP connect")?;
     tcp.set_nodelay(true)?;

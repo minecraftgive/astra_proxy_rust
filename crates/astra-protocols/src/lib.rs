@@ -2,6 +2,7 @@
 pub mod accept;
 pub mod config;
 pub mod datagram;
+pub mod egress;
 pub mod http;
 pub mod hysteria2;
 pub mod native;

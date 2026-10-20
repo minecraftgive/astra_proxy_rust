@@ -91,26 +91,15 @@ enum GeoDatabase {
     Dat(astra_rule_data::geoip::Database),
 }
 impl GeoDatabase {
-    fn decode(bytes: Vec<u8>) -> Result<Self> {
-        if maxminddb::Reader::from_source(bytes.as_slice()).is_ok() {
-            Ok(Self::Mmdb(maxminddb::Reader::from_source(bytes)?))
+    fn decode(bytes: &[u8], categories: &[String]) -> Result<Self> {
+        if maxminddb::Reader::from_source(bytes).is_ok() {
+            Ok(Self::Mmdb(maxminddb::Reader::from_source(bytes.to_vec())?))
         } else {
             Ok(Self::Dat(
-                astra_rule_data::geoip::Database::decode(&bytes)
+                astra_rule_data::geoip::Database::decode_selected(bytes, categories)
                     .context("expected a valid MMDB or geoip.dat database")?,
             ))
         }
-    }
-    fn validate_categories(&self, rules: &[RuleSpec]) -> Result<()> {
-        for rule in rules.iter().filter(|r| r.kind == "geoip") {
-            let name = astra_rule_data::geoip::category(&rule.value)?;
-            if name != "LAN" {
-                if let Self::Dat(db) = self {
-                    db.group(&name)?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -368,23 +357,25 @@ impl RuleEngine {
             }
             rules = expanded;
         }
-        let needs_geoip = rules
+        let geoip_categories = rules
             .iter()
-            .any(|r| r.kind == "geoip" && !r.value.eq_ignore_ascii_case("LAN"));
-        let geoip = if needs_geoip {
+            .filter(|r| r.kind == "geoip" && !r.value.eq_ignore_ascii_case("LAN"))
+            .map(|r| astra_rule_data::geoip::category(&r.value))
+            .collect::<Result<Vec<_>>>()?;
+        let geoip = if !geoip_categories.is_empty() {
             let path = config
                 .geoip_database
                 .as_deref()
                 .context("GEOIP rules require geoip_database (MMDB or geoip.dat)")?;
-            let bytes = astra_rule_data::load_resource(
+            let (_, database) = astra_rule_data::load_resource_with(
                 base,
                 path,
                 config.geoip_url.as_deref(),
                 config.geoip_interval,
                 128 * 1024 * 1024,
-                |bytes| GeoDatabase::decode(bytes.to_vec())?.validate_categories(&rules),
+                |bytes| GeoDatabase::decode(bytes, &geoip_categories),
             )?;
-            Some(GeoDatabase::decode(bytes)?)
+            Some(database)
         } else {
             None
         };

@@ -194,10 +194,18 @@ pub(crate) async fn open(
         match action {
             RouteAction::Block => bail!("UDP blocked"),
             RouteAction::Direct => {
-                let destination = tokio::net::lookup_host((target.host.as_str(), target.port))
+                let mut destination = tokio::net::lookup_host((target.host.as_str(), target.port))
                     .await?
                     .next()
                     .context("UDP destination has no addresses")?;
+                let interface = app
+                    .config
+                    .tun
+                    .as_ref()
+                    .and_then(|tun| tun.interface.as_deref());
+                if app.config.tun.is_some() {
+                    destination = crate::egress::scoped_destination(destination, interface)?;
+                }
                 let socket = UdpSocket::bind(if destination.is_ipv4() {
                     "0.0.0.0:0"
                 } else {
@@ -209,10 +217,7 @@ pub(crate) async fn open(
                     if destination.ip().is_loopback() {
                         None
                     } else {
-                        app.config
-                            .tun
-                            .as_ref()
-                            .and_then(|tun| tun.interface.as_deref())
+                        interface
                     },
                     destination.is_ipv4(),
                 )?;

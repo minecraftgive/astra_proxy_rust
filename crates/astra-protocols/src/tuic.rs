@@ -161,13 +161,20 @@ impl Client {
             .collect();
         let mut last_error = None;
         for address in addresses {
-            let bind: SocketAddr = if address.is_ipv4() {
-                "0.0.0.0:0"
+            let bind: SocketAddr = if address.ip().is_loopback() {
+                SocketAddr::new(address.ip(), 0)
+            } else if address.is_ipv4() {
+                "0.0.0.0:0".parse()?
             } else {
-                "[::]:0"
-            }
-            .parse()?;
-            let mut endpoint = quinn::Endpoint::client(bind)?;
+                "[::]:0".parse()?
+            };
+            let socket = meow_common::bind_udp(bind).await?.into_std()?;
+            let mut endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )?;
             endpoint.set_default_client_config(self.config.clone());
             let connection = match tokio::time::timeout(
                 Duration::from_secs(5),

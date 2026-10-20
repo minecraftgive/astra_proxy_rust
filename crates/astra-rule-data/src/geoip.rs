@@ -1,6 +1,9 @@
 //! V2Ray GeoIPList protobuf and indexed IP category matching.
 use anyhow::{ensure, Context, Result};
-use prost::Message;
+use prost::{
+    encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType},
+    Message,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -79,53 +82,115 @@ impl Group {
 pub struct Database {
     groups: HashMap<String, Group>,
 }
+
+// Decode metadata without materializing the repeated CIDR messages.
+#[derive(Clone, PartialEq, Message)]
+struct GroupMetadata {
+    #[prost(string, tag = "1")]
+    country_code: String,
+    #[prost(bool, tag = "3")]
+    inverse_match: bool,
+}
+
+fn visit_messages(
+    mut bytes: &[u8],
+    field: u32,
+    mut visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        let (tag, wire) = decode_key(&mut bytes)?;
+        if tag == field {
+            ensure!(
+                wire == WireType::LengthDelimited,
+                "invalid GEOIP message wire type"
+            );
+            let len = decode_varint(&mut bytes)?;
+            ensure!(len <= bytes.len() as u64, "truncated GEOIP message");
+            let (message, rest) = bytes.split_at(len as usize);
+            visit(message)?;
+            bytes = rest;
+        } else {
+            skip_field(wire, tag, &mut bytes, DecodeContext::default())?;
+        }
+    }
+    Ok(())
+}
+
 impl Database {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let list = GeoIpList::decode(bytes).context("invalid geoip.dat protobuf")?;
-        ensure!(!list.entry.is_empty(), "geoip.dat contains no groups");
+        Self::decode_filtered(bytes, None)
+    }
+
+    /// Validate the entire database, but retain indexes only for requested categories.
+    /// Stream individual CIDRs so unused groups do not create a temporary object graph.
+    pub fn decode_selected(bytes: &[u8], categories: &[String]) -> Result<Self> {
+        let selected = categories
+            .iter()
+            .map(|name| category(name))
+            .collect::<Result<HashSet<_>>>()?;
+        let database = Self::decode_filtered(bytes, Some(&selected))?;
+        for name in &selected {
+            database.group(name)?;
+        }
+        Ok(database)
+    }
+
+    fn decode_filtered(bytes: &[u8], selected: Option<&HashSet<String>>) -> Result<Self> {
         let mut groups = HashMap::new();
+        let mut seen = HashSet::new();
         let mut count = 0usize;
-        for group in list.entry {
+        let mut cidr = Cidr::default();
+        visit_messages(bytes, 1, |bytes| {
+            let group = GroupMetadata::decode(bytes)?;
             let key = category(&group.country_code)?;
-            count += group.cidr.len();
-            ensure!(count <= 5_000_000, "geoip.dat exceeds CIDR limit");
+            ensure!(seen.insert(key.clone()), "duplicate GEOIP category");
+            let retain = selected.is_none_or(|names| names.contains(&key));
             let mut v4: BTreeMap<u8, HashSet<u32>> = BTreeMap::new();
             let mut v6: BTreeMap<u8, HashSet<u128>> = BTreeMap::new();
-            for cidr in group.cidr {
+            visit_messages(bytes, 2, |bytes| {
+                count += 1;
+                ensure!(count <= 5_000_000, "geoip.dat exceeds CIDR limit");
+                cidr.clear();
+                cidr.merge(bytes)?;
                 match cidr.ip.len() {
                     4 => {
                         ensure!(cidr.prefix <= 32, "invalid IPv4 prefix in GEOIP {key}");
-                        let ip = Ipv4Addr::from(<[u8; 4]>::try_from(cidr.ip.as_slice())?);
-                        let bits = cidr.prefix as u8;
-                        v4.entry(bits)
-                            .or_default()
-                            .insert(u32::from(ip) & mask4(bits));
+                        if retain {
+                            let ip = Ipv4Addr::from(<[u8; 4]>::try_from(cidr.ip.as_slice())?);
+                            let bits = cidr.prefix as u8;
+                            v4.entry(bits)
+                                .or_default()
+                                .insert(u32::from(ip) & mask4(bits));
+                        }
                     }
                     16 => {
                         ensure!(cidr.prefix <= 128, "invalid IPv6 prefix in GEOIP {key}");
-                        let ip = Ipv6Addr::from(<[u8; 16]>::try_from(cidr.ip.as_slice())?);
-                        let bits = cidr.prefix as u8;
-                        v6.entry(bits)
-                            .or_default()
-                            .insert(u128::from(ip) & mask6(bits));
+                        if retain {
+                            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(cidr.ip.as_slice())?);
+                            let bits = cidr.prefix as u8;
+                            v6.entry(bits)
+                                .or_default()
+                                .insert(u128::from(ip) & mask6(bits));
+                        }
                     }
                     _ => anyhow::bail!("invalid IP bytes in GEOIP {key}"),
                 }
+                Ok(())
+            })?;
+            if retain {
+                groups.insert(
+                    key,
+                    Group {
+                        v4: v4.into_iter().collect(),
+                        v6: v6.into_iter().collect(),
+                        inverse: group.inverse_match,
+                    },
+                );
             }
-            ensure!(
-                groups
-                    .insert(
-                        key,
-                        Group {
-                            v4: v4.into_iter().collect(),
-                            v6: v6.into_iter().collect(),
-                            inverse: group.inverse_match
-                        }
-                    )
-                    .is_none(),
-                "duplicate GEOIP category"
-            );
-        }
+            Ok(())
+        })
+        .context("invalid geoip.dat protobuf")?;
+        ensure!(!seen.is_empty(), "geoip.dat contains no groups");
         Ok(Self { groups })
     }
     pub fn group(&self, name: &str) -> Result<&Group> {
@@ -175,6 +240,91 @@ mod tests {
                 assert_eq!(group.contains(ip.parse().unwrap()), inverse);
             }
             assert!(db.group("missing").is_err());
+        }
+    }
+
+    #[test]
+    fn selected_categories_keep_matching_semantics_without_other_indexes() {
+        for inverse in [false, true] {
+            let mut list = GeoIpList::decode(data(inverse).as_slice()).unwrap();
+            let mut unused = list.entry[0].clone();
+            unused.country_code = "unused".into();
+            list.entry.push(unused);
+            let bytes = list.encode_to_vec();
+            let full = Database::decode(&bytes).unwrap();
+            let selected =
+                Database::decode_selected(&bytes, &["TeLeGrAm".into(), "telegram".into()]).unwrap();
+            assert_eq!(selected.groups.len(), 1);
+            assert!(selected.group("unused").is_err());
+            for ip in [
+                "149.154.160.1",
+                "::ffff:149.154.160.1",
+                "2001:db8::1",
+                "149.154.176.1",
+                "2001:db9::1",
+            ] {
+                let ip = ip.parse().unwrap();
+                assert_eq!(
+                    selected.matches("TELEGRAM", ip),
+                    full.matches("TELEGRAM", ip)
+                );
+            }
+            assert!(Database::decode_selected(&bytes, &["missing".into()]).is_err());
+            assert!(Database::decode_selected(&bytes, &["bad/name".into()]).is_err());
+            assert!(Database::decode_selected(&bytes, &[])
+                .unwrap()
+                .groups
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_loading_still_validates_unselected_groups() {
+        let original = GeoIpList::decode(data(false).as_slice()).unwrap();
+        for (name, ip, prefix) in [
+            ("TELEGRAM", vec![1, 2, 3, 4], 24), // duplicate, including case
+            ("bad/name", vec![1, 2, 3, 4], 24),
+            ("unused", vec![1, 2, 3, 4], 33),
+            ("unused", vec![0; 16], 129),
+            ("unused", vec![1, 2, 3], 24),
+        ] {
+            let mut list = original.clone();
+            list.entry.push(GeoIp {
+                country_code: name.into(),
+                inverse_match: false,
+                cidr: vec![Cidr { ip, prefix }],
+            });
+            assert!(
+                Database::decode_selected(&list.encode_to_vec(), &["telegram".into()]).is_err(),
+                "{name}, prefix {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_messages_handle_unknown_fields_order_and_truncation() {
+        // CIDR precedes metadata, and unknown fields occur at each level.
+        let mut cidr = Cidr {
+            ip: vec![10, 0, 0, 0],
+            prefix: 8,
+        }
+        .encode_to_vec();
+        cidr.extend_from_slice(&[0x48, 1]);
+        let mut group = vec![0x12, cidr.len() as u8];
+        group.extend(cidr);
+        group.extend_from_slice(&[0x0a, 2, b'C', b'N', 0x18, 1, 0x48, 1]);
+        let mut bytes = vec![0x0a, group.len() as u8];
+        bytes.extend(group);
+        let end = bytes.len();
+        bytes.extend_from_slice(&[0x48, 1]);
+        let db = Database::decode_selected(&bytes, &["cn".into()]).unwrap();
+        assert!(!db.matches("CN", "10.1.2.3".parse().unwrap()));
+        assert!(db.matches("CN", "11.1.2.3".parse().unwrap()));
+        for len in 0..end {
+            assert!(Database::decode_selected(&bytes[..len], &["cn".into()]).is_err());
+        }
+        for bytes in [vec![0x08, 1], vec![0x0a, 0xff], vec![0x0a, 2, 0x10, 1]] {
+            assert!(Database::decode_selected(&bytes, &[]).is_err());
         }
     }
     #[test]

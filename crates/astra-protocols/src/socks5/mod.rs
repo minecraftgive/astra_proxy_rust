@@ -11,7 +11,7 @@ pub async fn socks5(
     password: Option<&str>,
     target: &Target,
 ) -> Result<Stream> {
-    let mut tcp = TcpStream::connect(server).await?;
+    let mut tcp = crate::egress::connect(server).await?;
     tcp.set_nodelay(true)?;
     let method = if username.is_some() { 2 } else { 0 };
     tcp.write_all(&[5, 1, method]).await?;
