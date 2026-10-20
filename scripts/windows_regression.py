@@ -106,18 +106,35 @@ def main():
                 # A forced launcher exit would leave its child bound here.
                 with socket.socket() as probe:
                     probe.bind(('127.0.0.1', port))
-            rules.write_text('socket='+json.dumps(route.as_posix())+'\ndefault_action="block"\n', encoding='utf-8')
-            subprocess.run([str(binaries/executable('astra-rule')), '--reload', str(rule_control)], check=True, timeout=10)
-            denied, status = socks_connect(sp, '127.0.0.1', echo.server_address[1])
-            denied.close()
-            assert status == 2, 'reloaded policy was not applied'
+            def reload_rules(settings):
+                rules.write_text('socket='+json.dumps(route.as_posix())+'\ndefault_action="block"\n'+settings, encoding='utf-8')
+                subprocess.run([str(binaries/executable('astra-rule')), '--reload', str(rule_control)], check=True, timeout=10)
+
+            def expect_local_status(expected, message):
+                client, status = socks_connect(sp, '127.0.0.1', echo.server_address[1])
+                with client:
+                    assert status == expected, f'{message}: expected {expected}, got {status}'
+                    if status == 0:
+                        client.sendall(b'local-default')
+                        assert exact(client, 13) == b'local-default'
+
+            # Local DIRECT precedes the default action, while explicit rules
+            # precede local DIRECT. Cache is disabled above, so each request
+            # observes the acknowledged reload without waiting for a push.
+            reload_rules('')
+            expect_local_status(0, 'local DIRECT default was not preserved after reload')
+            reload_rules('[[rules]]\nkind="ip_cidr"\nvalue="127.0.0.0/8"\naction="block"\n')
+            expect_local_status(2, 'reloaded explicit local block was not applied')
+            reload_rules('direct_local=false\n')
+            expect_local_status(2, 'reloaded default block with local DIRECT disabled was not applied')
             # Failed candidate reload retains the working proxy configuration.
             proxy.write_text('invalid = [', encoding='utf-8')
             result = subprocess.run([str(binaries/executable('astra-proxy')), '--reload', str(proxy_control)], capture_output=True, timeout=10)
             assert result.returncode != 0
             assert app.poll() is None
+            expect_local_status(2, 'failed proxy reload changed the active policy')
         assert not route.exists(), 'routing endpoint was not cleaned up'
-    print('PASS native Windows IPC, Unicode/long paths, SOCKS/HTTP, 64 KiB TCP+EOF, UDP 0..8192, standalone launcher+shutdown, reload+rollback')
+    print('PASS native Windows IPC, Unicode/long paths, SOCKS/HTTP, 64 KiB TCP+EOF, UDP 0..8192, standalone launcher+shutdown, local DIRECT+explicit block+opt-out, reload+rollback')
 
 
 if __name__ == '__main__':

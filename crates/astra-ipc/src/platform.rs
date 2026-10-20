@@ -43,6 +43,32 @@ pub fn remove_socket(path: &Path) {
     let _ = path;
 }
 
+/// Startup recovery for an IPC marker left by an unclean exit.
+/// A first-instance pipe reservation proves no server owns this endpoint;
+/// permission errors and live pipes must never be treated as stale markers.
+pub fn recover_stale_endpoint(path: &Path) -> io::Result<bool> {
+    #[cfg(windows)]
+    return windows::recover_stale_manager_endpoint(path);
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
+/// Compatibility alias for manager startup recovery.
+pub fn recover_stale_manager_endpoint(path: &Path) -> io::Result<bool> {
+    recover_stale_endpoint(path)
+}
+
+/// Bind a core endpoint, recovering only abandoned empty Windows markers.
+/// Live/inaccessible pipes and non-marker files are never replaced.
+pub fn bind_listener(path: &Path) -> io::Result<LocalListener> {
+    #[cfg(windows)]
+    recover_stale_endpoint(path)?;
+    LocalListener::bind(path)
+}
+
 pub fn validate_state_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if path.as_os_str().len() + 30 >= 104 {
@@ -309,6 +335,35 @@ mod windows {
         name: String,
         marker: PathBuf,
     }
+    pub(super) fn recover_stale_manager_endpoint(path: &Path) -> io::Result<bool> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+        let marker = endpoint_path(path);
+        let metadata = match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() || metadata.len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC endpoint is not an empty regular marker file",
+            ));
+        }
+        // Serialize recoveries through the marker itself. Allow our unlink but
+        // deny other readers/writers until the pipe reservation is released.
+        let marker_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(&marker)?;
+        // Keep the reservation alive through removal. This also protects live
+        // servers from older versions that do not keep a marker handle open.
+        let reservation = server(&pipe_name(&marker)?, true)?;
+        std::fs::remove_file(&marker)?;
+        drop(reservation);
+        drop(marker_handle);
+        Ok(true)
+    }
     impl LocalListener {
         pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
             let marker = endpoint_path(path);
@@ -449,6 +504,49 @@ pub async fn file_identity(file: &tokio::fs::File) -> io::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn recovering_bind_handles_stale_markers_without_replacing_live_endpoints() {
+        let directory =
+            std::env::temp_dir().join(format!("astra-core-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rule.sock");
+        std::fs::write(&path, b"").unwrap();
+        let listener = bind_listener(&path).unwrap();
+        assert!(path.exists());
+        assert!(bind_listener(&path).is_err());
+        assert!(path.exists());
+        drop(listener);
+        std::fs::write(&path, b"preserve").unwrap();
+        assert!(bind_listener(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_recovery_only_removes_abandoned_empty_markers() {
+        let directory =
+            std::env::temp_dir().join(format!("astra-manager-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("manager.sock");
+        assert!(!recover_stale_manager_endpoint(&path).unwrap());
+        std::fs::write(&path, b"preserve this file").unwrap();
+        assert!(recover_stale_manager_endpoint(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve this file");
+        std::fs::remove_file(&path).unwrap();
+        let listener = LocalListener::bind(&path).unwrap();
+        assert!(recover_stale_manager_endpoint(&path).is_err());
+        assert!(path.exists());
+        drop(listener);
+        // An unclean process exit leaves just this marker, with no pipe server.
+        std::fs::write(&path, b"").unwrap();
+        assert!(recover_stale_manager_endpoint(&path).unwrap());
+        assert!(!path.exists());
+        let listener = LocalListener::bind(&path).unwrap();
+        drop(listener);
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn named_pipe_accept_cancellation_concurrency_and_cleanup() {

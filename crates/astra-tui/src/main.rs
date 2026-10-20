@@ -1,5 +1,11 @@
 use astra_ipc::platform::OpenOptionsExt;
+mod availability;
+mod diagnostics;
 mod editor;
+mod explanation;
+mod external_editor;
+mod i18n;
+mod import;
 mod log_stream;
 mod logs;
 mod manager;
@@ -15,6 +21,7 @@ use std::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    i18n::init()?;
     let mut home = astra_ipc::platform::home_dir()?.join(".astra/tui");
     let mut bin = std::env::current_exe()?
         .parent()
@@ -25,6 +32,9 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--lang" => {
+                args.next().context("--lang requires en, zh-CN or zh-TW")?;
+            }
             "--state-dir" => {
                 home = PathBuf::from(args.next().context("--state-dir requires a path")?)
             }
@@ -32,7 +42,7 @@ async fn main() -> Result<()> {
             "--manager" => daemon = true,
             "--shutdown" => shutdown = true,
             "--help" | "-h" => {
-                println!("astra-tui [--state-dir DIR] [--bin-dir DIR]\n  --manager   Run the IPC manager in foreground\n  --shutdown  Drain all managed cores and stop the manager\n\nDefault: {}\nCore executables beside astra-tui.\nQuitting the TUI leaves the manager and cores running.", home.display());
+                println!("astra-tui [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
                 return Ok(());
             }
             _ => anyhow::bail!("Unknown argument: {arg}"),
@@ -47,18 +57,18 @@ async fn main() -> Result<()> {
         return manager::serve(home, bin).await;
     }
     if shutdown {
-        println!(
-            "{}",
-            protocol::call(&socket, protocol::Action::Shutdown)
-                .await?
-                .text
-        );
+        let reply = protocol::call(&socket, protocol::Action::Shutdown).await?;
+        println!("{}", i18n::t(&reply.text));
         return Ok(());
     }
     if protocol::call(&socket, protocol::Action::List)
         .await
         .is_err()
     {
+        if socket.exists() {
+            astra_ipc::platform::recover_stale_manager_endpoint(&socket)
+                .with_context(|| format!("Manager endpoint is unavailable and could not be safely recovered: {}. Inspect {} and running cores", socket.display(), home.join("manager.log").display()))?;
+        }
         anyhow::ensure!(!socket.exists(), "Manager socket is present but unavailable. Inspect manager.log and running cores before removing a stale socket.");
         let log = OpenOptions::new()
             .create(true)

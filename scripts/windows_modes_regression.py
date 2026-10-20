@@ -5,9 +5,11 @@ import contextlib
 import ctypes as C
 from ctypes import wintypes as W
 import http.server
+import hashlib
 import json
 import os
 import pathlib
+import platform
 import socket
 import socketserver
 import ssl
@@ -201,7 +203,7 @@ class Core:
         self.log_path = directory/(name+'.log')
         self.log = self.log_path.open('w', encoding='utf-8')
         self.child = subprocess.Popen([self.binary, str(self.config)], stdout=self.log, stderr=subprocess.STDOUT,
-                                      env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(self.control), ASTRA_LOG_LEVEL='debug'),
+                                      env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(self.control), ASTRA_LOG_LEVEL=getattr(args,'log_level','debug')),
                                       **process_flags())
 
     def ready(self):
@@ -260,7 +262,7 @@ def system_proxy(args, directory):
             assert body == b'astra-system-proxy:/wininet'+bytes(range(256))*256
             assert (1, 'system-proxy.astra.invalid', origin.server_port) in server.hits
             checks.append('actual WinINet PRECONFIG HTTP, 64 KiB streaming, takeover settings')
-            certs = directory/'tls'
+            certs = args.test_cert_dir.resolve() if args.test_cert_dir else directory/'tls'
             if not certs.exists():
                 subprocess.run([str(args.bin_dir/'astra-server-core.exe'),'--generate-cert',str(certs),'localhost'],check=True,capture_output=True,timeout=10)
             with http.server.ThreadingHTTPServer(('127.0.0.1',0),Origin) as secure:
@@ -371,12 +373,22 @@ routes={json.dumps(list(prefixes))}
                         assert received == data and peer[0] == host and peer[1] == 18082
                 checks.append(f'{host}: native TCP 1..1MiB + EOF; UDP 0..1200')
                 print('PASS',checks[-1],flush=True)
-            assert core.command('--reload').returncode == 0
-            assert powershell(query) == '2'
+            with socket.create_connection((targets[0], 18081), timeout=5) as existing:
+                existing.sendall(b'before-reload')
+                assert exact(existing,13) == b'before-reload'
+                assert core.command('--reload').returncode == 0
+                assert powershell(query) == '2'
+                existing.sendall(b'after-reload')
+                assert exact(existing,12) == b'after-reload'
+                core.config.write_text(config.replace('mtu=1500','mtu=1279'),encoding='utf-8')
+                assert core.command('--reload').returncode != 0
+                existing.sendall(b'rollback')
+                assert exact(existing,8) == b'rollback'
+                core.config.write_text(config,encoding='utf-8')
             with socket.create_connection((targets[0], 18081), timeout=5) as stream:
                 stream.sendall(b'reloaded')
                 assert exact(stream,8) == b'reloaded'
-            checks.append('same-adapter reload preserves owned routes and traffic')
+            checks.append('same-adapter reload preserves owned routes and existing TCP; invalid reload rolls back')
         finally:
             core.close()
         assert powershell(query) == '0', 'owned routes leaked'
@@ -391,11 +403,14 @@ def main():
     parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/debug')
     parser.add_argument('--output-dir', type=pathlib.Path, required=True)
     parser.add_argument('--interface')
+    parser.add_argument('--test-cert-dir', type=pathlib.Path, help='existing temporary test certificate directory; avoids invoking a certificate generator')
     args = parser.parse_args()
     args.bin_dir = args.bin_dir.resolve()
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    report = {'mode':args.mode, 'passed':False}
+    report = {'mode':args.mode, 'passed':False, 'platform':platform.platform(),
+              'program':str(args.bin_dir/'astra-proxy.exe'),
+              'program_sha256':hashlib.sha256((args.bin_dir/'astra-proxy.exe').read_bytes()).hexdigest()}
     try:
         report['checks'] = (system_proxy if args.mode == 'system-proxy' else tun)(args,directory)
         report['passed'] = True

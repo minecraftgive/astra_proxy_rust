@@ -1,0 +1,3071 @@
+{
+  "date": "2026-10-19",
+  "runs": [
+    {
+      "mode": "normal",
+      "passed": true,
+      "profile": "release",
+      "platform": "Windows-11-10.0.26340-SP0",
+      "logical_cpus": 32,
+      "binary_sha256": "3bf0c63678938e4f9c544ee49b0014aaa96b868624d1c9ef44f0c9208968bd01",
+      "seconds_per_case": 3.0,
+      "rounds": 3,
+      "results": [
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 5.421875,
+              "cpu_percent_one_core": 175.36032898905373,
+              "private_start_mib": 0.71875,
+              "private_end_mib": 0.73046875,
+              "peak_private_mib": 1.16796875,
+              "peak_working_mib": 4.98046875
+            },
+            "load_generator": {
+              "cpu_seconds": 9.65625,
+              "cpu_percent_one_core": 312.3132084012542,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.38671875,
+              "peak_working_mib": 5.14453125
+            }
+          },
+          "messages": 67449,
+          "bytes_one_direction": 4316736,
+          "seconds": 3.0005212,
+          "messages_per_second": 22479.094631959273,
+          "mib_per_second_one_direction": 1.3720150532201705,
+          "latency_p50_ms": 0.118,
+          "latency_p95_ms": 0.1886,
+          "latency_p99_ms": 0.42010000000000003,
+          "latency_samples": 4218
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.078125,
+              "cpu_percent_one_core": 193.8404029782081,
+              "private_start_mib": 0.73046875,
+              "private_end_mib": 0.73828125,
+              "peak_private_mib": 1.1640625,
+              "peak_working_mib": 5.00390625
+            },
+            "load_generator": {
+              "cpu_seconds": 10.609375,
+              "cpu_percent_one_core": 338.34867255065114,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.98046875,
+              "peak_working_mib": 5.6953125
+            }
+          },
+          "messages": 50259,
+          "bytes_one_direction": 3293773824,
+          "seconds": 3.0007507,
+          "messages_per_second": 16748.80888972216,
+          "mib_per_second_one_direction": 1046.800555607635,
+          "latency_p50_ms": 0.2155,
+          "latency_p95_ms": 0.28150000000000003,
+          "latency_p99_ms": 0.318,
+          "latency_samples": 3143
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 5.25,
+              "cpu_percent_one_core": 167.33260794914727,
+              "private_start_mib": 0.73828125,
+              "private_end_mib": 0.99609375,
+              "peak_private_mib": 1.16796875,
+              "peak_working_mib": 5.01171875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.890625,
+              "cpu_percent_one_core": 124.00541481945734,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.33203125,
+              "peak_working_mib": 13.10546875
+            }
+          },
+          "messages": 2862,
+          "bytes_one_direction": 3001024512,
+          "seconds": 3.00997,
+          "messages_per_second": 950.8400415950989,
+          "mib_per_second_one_direction": 950.8400415950989,
+          "latency_p50_ms": 2.7199,
+          "latency_p95_ms": 12.8724,
+          "latency_p99_ms": 17.3606,
+          "latency_samples": 180
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.9375,
+              "cpu_percent_one_core": 93.64533141761697,
+              "private_start_mib": 0.99609375,
+              "private_end_mib": 0.99609375,
+              "peak_private_mib": 1.16015625,
+              "peak_working_mib": 5.00390625
+            },
+            "proxy": {
+              "cpu_seconds": 8.609375,
+              "cpu_percent_one_core": 274.4605192080157,
+              "private_start_mib": 3.53125,
+              "private_end_mib": 3.7734375,
+              "peak_private_mib": 3.7734375,
+              "peak_working_mib": 12.21484375
+            },
+            "load_generator": {
+              "cpu_seconds": 5.703125,
+              "cpu_percent_one_core": 181.81141472037336,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2109375,
+              "peak_working_mib": 5.09765625
+            }
+          },
+          "messages": 37934,
+          "bytes_one_direction": 2427776,
+          "seconds": 3.0005625,
+          "messages_per_second": 12642.296236122394,
+          "mib_per_second_one_direction": 0.7716245261305172,
+          "latency_p50_ms": 0.2812,
+          "latency_p95_ms": 0.4372,
+          "latency_p99_ms": 0.5084,
+          "latency_samples": 2373
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.953125,
+              "cpu_percent_one_core": 94.15162993069033,
+              "private_start_mib": 0.99609375,
+              "private_end_mib": 0.99609375,
+              "peak_private_mib": 1.16796875,
+              "peak_working_mib": 5.01171875
+            },
+            "proxy": {
+              "cpu_seconds": 9.828125,
+              "cpu_percent_one_core": 313.3406096635144,
+              "private_start_mib": 3.7734375,
+              "private_end_mib": 3.921875,
+              "peak_private_mib": 3.921875,
+              "peak_working_mib": 12.31640625
+            },
+            "load_generator": {
+              "cpu_seconds": 3.640625,
+              "cpu_percent_one_core": 116.07052790397275,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.671875,
+              "peak_working_mib": 5.5078125
+            }
+          },
+          "messages": 10655,
+          "bytes_one_direction": 698286080,
+          "seconds": 3.0015399,
+          "messages_per_second": 3549.8445314686637,
+          "mib_per_second_one_direction": 221.86528321679148,
+          "latency_p50_ms": 0.9997,
+          "latency_p95_ms": 1.4073,
+          "latency_p99_ms": 3.317,
+          "latency_samples": 668
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.265625,
+              "cpu_percent_one_core": 72.23678072893989,
+              "private_start_mib": 0.99609375,
+              "private_end_mib": 0.74609375,
+              "peak_private_mib": 1.16796875,
+              "peak_working_mib": 5.01171875
+            },
+            "proxy": {
+              "cpu_seconds": 10.265625,
+              "cpu_percent_one_core": 327.30734440630005,
+              "private_start_mib": 3.921875,
+              "private_end_mib": 3.921875,
+              "peak_private_mib": 3.921875,
+              "peak_working_mib": 12.32421875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.109375,
+              "cpu_percent_one_core": 99.13875424178646,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.3359375,
+              "peak_working_mib": 13.078125
+            }
+          },
+          "messages": 724,
+          "bytes_one_direction": 759169024,
+          "seconds": 3.0141081,
+          "messages_per_second": 240.20372726512363,
+          "mib_per_second_one_direction": 240.20372726512363,
+          "latency_p50_ms": 16.0561,
+          "latency_p95_ms": 24.4569,
+          "latency_p99_ms": 33.3159,
+          "latency_samples": 48
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.984375,
+              "cpu_percent_one_core": 222.83260742746145,
+              "private_start_mib": 0.74609375,
+              "private_end_mib": 0.8203125,
+              "peak_private_mib": 1.4140625,
+              "peak_working_mib": 5.12890625
+            },
+            "load_generator": {
+              "cpu_seconds": 7.078125,
+              "cpu_percent_one_core": 225.82364913789718,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.29296875,
+              "peak_working_mib": 5.32421875
+            }
+          },
+          "messages": 95900,
+          "bytes_one_direction": 6137600,
+          "seconds": 3.0007692,
+          "messages_per_second": 31958.472514313995,
+          "mib_per_second_one_direction": 1.950590363422485,
+          "latency_p50_ms": 0.1194,
+          "latency_p95_ms": 0.18660000000000002,
+          "latency_p99_ms": 0.2122,
+          "latency_samples": 5995
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.875,
+              "cpu_percent_one_core": 219.3798465195372,
+              "private_start_mib": 0.8203125,
+              "private_end_mib": 0.8203125,
+              "peak_private_mib": 1.40234375,
+              "peak_working_mib": 5.16015625
+            },
+            "load_generator": {
+              "cpu_seconds": 7.109375,
+              "cpu_percent_one_core": 226.85870492361232,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.28125,
+              "peak_working_mib": 5.12109375
+            }
+          },
+          "messages": 92780,
+          "bytes_one_direction": 111336000,
+          "seconds": 3.0007228,
+          "messages_per_second": 30919.21719660343,
+          "mib_per_second_one_direction": 35.384235988544575,
+          "latency_p50_ms": 0.12459999999999999,
+          "latency_p95_ms": 0.1897,
+          "latency_p99_ms": 0.2203,
+          "latency_samples": 5799
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.73289849189212,
+              "private_start_mib": 0.8203125,
+              "private_end_mib": 0.8203125,
+              "peak_private_mib": 1.40625,
+              "peak_working_mib": 5.1640625
+            },
+            "proxy": {
+              "cpu_seconds": 7.484375,
+              "cpu_percent_one_core": 238.7292673350381,
+              "private_start_mib": 3.921875,
+              "private_end_mib": 4.29296875,
+              "peak_private_mib": 4.5390625,
+              "peak_working_mib": 13.3359375
+            },
+            "load_generator": {
+              "cpu_seconds": 2.453125,
+              "cpu_percent_one_core": 78.2473798989582,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.11328125
+            }
+          },
+          "messages": 36106,
+          "bytes_one_direction": 2310784,
+          "seconds": 3.0006124,
+          "messages_per_second": 12032.877022037235,
+          "mib_per_second_one_direction": 0.7344285291770773,
+          "latency_p50_ms": 0.3227,
+          "latency_p95_ms": 0.5003,
+          "latency_p99_ms": 0.6091,
+          "latency_samples": 2258
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.234375,
+              "cpu_percent_one_core": 72.67279945136619,
+              "private_start_mib": 0.8203125,
+              "private_end_mib": 1.33203125,
+              "peak_private_mib": 1.4140625,
+              "peak_working_mib": 5.171875
+            },
+            "proxy": {
+              "cpu_seconds": 6.5,
+              "cpu_percent_one_core": 211.41178022215618,
+              "private_start_mib": 4.29296875,
+              "private_end_mib": 4.2421875,
+              "peak_private_mib": 4.734375,
+              "peak_working_mib": 13.71875
+            },
+            "load_generator": {
+              "cpu_seconds": 2.03125,
+              "cpu_percent_one_core": 66.0661813194238,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.19921875,
+              "peak_working_mib": 5.09765625
+            }
+          },
+          "messages": 29027,
+          "bytes_one_direction": 34832400,
+          "seconds": 3.0008391,
+          "messages_per_second": 9672.961139435967,
+          "mib_per_second_one_direction": 11.06982552273098,
+          "latency_p50_ms": 0.3359,
+          "latency_p95_ms": 0.7208,
+          "latency_p99_ms": 2.3587000000000002,
+          "latency_samples": 1816
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 7.046875,
+              "cpu_percent_one_core": 224.9271447512646,
+              "private_start_mib": 1.33203125,
+              "private_end_mib": 0.96875,
+              "peak_private_mib": 1.33203125,
+              "peak_working_mib": 5.12890625
+            },
+            "load_generator": {
+              "cpu_seconds": 12.078125,
+              "cpu_percent_one_core": 385.51814388631385,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.51171875,
+              "peak_working_mib": 5.29296875
+            }
+          },
+          "messages": 79821,
+          "bytes_one_direction": 5108544,
+          "seconds": 3.0006392,
+          "messages_per_second": 26601.332142831434,
+          "mib_per_second_one_direction": 1.6236164637958639,
+          "latency_p50_ms": 0.1212,
+          "latency_p95_ms": 0.1838,
+          "latency_p99_ms": 0.21919999999999998,
+          "latency_samples": 4990
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.21875,
+              "cpu_percent_one_core": 198.57740187098977,
+              "private_start_mib": 0.96875,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.13671875,
+              "peak_working_mib": 5.0859375
+            },
+            "load_generator": {
+              "cpu_seconds": 10.515625,
+              "cpu_percent_one_core": 335.7854056763219,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.703125,
+              "peak_working_mib": 5.5625
+            }
+          },
+          "messages": 53598,
+          "bytes_one_direction": 3512598528,
+          "seconds": 3.0007944,
+          "messages_per_second": 17861.27033561513,
+          "mib_per_second_one_direction": 1116.3293959759455,
+          "latency_p50_ms": 0.1968,
+          "latency_p95_ms": 0.2682,
+          "latency_p99_ms": 0.308,
+          "latency_samples": 3352
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 4.359375,
+              "cpu_percent_one_core": 139.15573094815278,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.13671875,
+              "peak_working_mib": 5.09765625
+            },
+            "load_generator": {
+              "cpu_seconds": 3.25,
+              "cpu_percent_one_core": 103.74334063518201,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.21484375,
+              "peak_working_mib": 13.0390625
+            }
+          },
+          "messages": 2856,
+          "bytes_one_direction": 2994733056,
+          "seconds": 3.0045387,
+          "messages_per_second": 950.5618949091919,
+          "mib_per_second_one_direction": 950.5618949091919,
+          "latency_p50_ms": 2.4411,
+          "latency_p95_ms": 12.3788,
+          "latency_p99_ms": 18.8835,
+          "latency_samples": 180
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.9375,
+              "cpu_percent_one_core": 93.75681133258199,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.13671875,
+              "peak_working_mib": 5.09765625
+            },
+            "proxy": {
+              "cpu_seconds": 9.046875,
+              "cpu_percent_one_core": 288.7510306466222,
+              "private_start_mib": 4.2421875,
+              "private_end_mib": 4.25,
+              "peak_private_mib": 4.25,
+              "peak_working_mib": 13.234375
+            },
+            "load_generator": {
+              "cpu_seconds": 5.671875,
+              "cpu_percent_one_core": 181.0304389028046,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.1953125,
+              "peak_working_mib": 5.04296875
+            }
+          },
+          "messages": 41852,
+          "bytes_one_direction": 2678528,
+          "seconds": 3.0006316,
+          "messages_per_second": 13947.730204534271,
+          "mib_per_second_one_direction": 0.8513018923665937,
+          "latency_p50_ms": 0.2529,
+          "latency_p95_ms": 0.3925,
+          "latency_p99_ms": 0.4613,
+          "latency_samples": 2618
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.296875,
+              "cpu_percent_one_core": 105.22852051904341,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1015625
+            },
+            "proxy": {
+              "cpu_seconds": 9.28125,
+              "cpu_percent_one_core": 296.2357402289658,
+              "private_start_mib": 4.25,
+              "private_end_mib": 4.25,
+              "peak_private_mib": 4.25,
+              "peak_working_mib": 13.234375
+            },
+            "load_generator": {
+              "cpu_seconds": 3.125,
+              "cpu_percent_one_core": 99.74267347776627,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.6640625,
+              "peak_working_mib": 5.5703125
+            }
+          },
+          "messages": 9931,
+          "bytes_one_direction": 650838016,
+          "seconds": 3.0015121,
+          "messages_per_second": 3308.665655554079,
+          "mib_per_second_one_direction": 206.79160347212994,
+          "latency_p50_ms": 1.0413,
+          "latency_p95_ms": 1.4517,
+          "latency_p99_ms": 4.4988,
+          "latency_samples": 622
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.0,
+              "cpu_percent_one_core": 63.80472080285264,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1015625
+            },
+            "proxy": {
+              "cpu_seconds": 10.296875,
+              "cpu_percent_one_core": 328.4946172584367,
+              "private_start_mib": 4.25,
+              "private_end_mib": 4.25,
+              "peak_private_mib": 4.25,
+              "peak_working_mib": 13.234375
+            },
+            "load_generator": {
+              "cpu_seconds": 3.5,
+              "cpu_percent_one_core": 111.65826140499213,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.25,
+              "peak_working_mib": 13.11328125
+            }
+          },
+          "messages": 692,
+          "bytes_one_direction": 725614592,
+          "seconds": 3.0114937,
+          "messages_per_second": 229.7863017279432,
+          "mib_per_second_one_direction": 229.7863017279432,
+          "latency_p50_ms": 16.7572,
+          "latency_p95_ms": 21.9827,
+          "latency_p99_ms": 30.5615,
+          "latency_samples": 44
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.96875,
+              "cpu_percent_one_core": 222.42778761180367,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.30859375,
+              "peak_working_mib": 5.16015625
+            },
+            "load_generator": {
+              "cpu_seconds": 6.875,
+              "cpu_percent_one_core": 219.43548553630853,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.25390625,
+              "peak_working_mib": 5.23046875
+            }
+          },
+          "messages": 89390,
+          "bytes_one_direction": 5720960,
+          "seconds": 3.0006463,
+          "messages_per_second": 29790.248854055208,
+          "mib_per_second_one_direction": 1.818252493533643,
+          "latency_p50_ms": 0.1311,
+          "latency_p95_ms": 0.1923,
+          "latency_p99_ms": 0.22910000000000003,
+          "latency_samples": 5588
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.84375,
+              "cpu_percent_one_core": 218.5227672545071,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.30859375,
+              "peak_working_mib": 5.16015625
+            },
+            "load_generator": {
+              "cpu_seconds": 6.921875,
+              "cpu_percent_one_core": 221.0173193921156,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.26171875,
+              "peak_working_mib": 5.2890625
+            }
+          },
+          "messages": 90135,
+          "bytes_one_direction": 108162000,
+          "seconds": 3.0007121,
+          "messages_per_second": 30037.870010921743,
+          "mib_per_second_one_direction": 34.37561417875871,
+          "latency_p50_ms": 0.1278,
+          "latency_p95_ms": 0.19560000000000002,
+          "latency_p99_ms": 0.2309,
+          "latency_samples": 5636
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.6875,
+              "cpu_percent_one_core": 85.7798764846248,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.3046875,
+              "peak_working_mib": 5.15625
+            },
+            "proxy": {
+              "cpu_seconds": 7.984375,
+              "cpu_percent_one_core": 254.8460283932748,
+              "private_start_mib": 4.25,
+              "private_end_mib": 4.265625,
+              "peak_private_mib": 4.80078125,
+              "peak_working_mib": 13.75390625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.1875,
+              "cpu_percent_one_core": 69.82082969678763,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2109375,
+              "peak_working_mib": 5.31640625
+            }
+          },
+          "messages": 39961,
+          "bytes_one_direction": 2557504,
+          "seconds": 3.0007376,
+          "messages_per_second": 13317.059112399565,
+          "mib_per_second_one_direction": 0.8128087837157938,
+          "latency_p50_ms": 0.2899,
+          "latency_p95_ms": 0.4625,
+          "latency_p99_ms": 0.5595,
+          "latency_samples": 2499
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.83141884575534,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.3125,
+              "peak_working_mib": 5.1640625
+            },
+            "proxy": {
+              "cpu_seconds": 7.734375,
+              "cpu_percent_one_core": 246.99730318463185,
+              "private_start_mib": 4.265625,
+              "private_end_mib": 4.28125,
+              "peak_private_mib": 4.81640625,
+              "peak_working_mib": 13.78515625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.4375,
+              "cpu_percent_one_core": 77.8415743369749,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.3046875
+            }
+          },
+          "messages": 37043,
+          "bytes_one_direction": 44451600,
+          "seconds": 3.0008768,
+          "messages_per_second": 12344.058909715988,
+          "mib_per_second_one_direction": 14.126654330882248,
+          "latency_p50_ms": 0.3157,
+          "latency_p95_ms": 0.4783,
+          "latency_p99_ms": 0.5923,
+          "latency_samples": 2317
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 7.125,
+              "cpu_percent_one_core": 225.92520413960054,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1015625
+            },
+            "load_generator": {
+              "cpu_seconds": 11.53125,
+              "cpu_percent_one_core": 365.64210669961665,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.375,
+              "peak_working_mib": 5.21484375
+            }
+          },
+          "messages": 74499,
+          "bytes_one_direction": 4767936,
+          "seconds": 3.000901,
+          "messages_per_second": 24825.54406160017,
+          "mib_per_second_one_direction": 1.515230960791026,
+          "latency_p50_ms": 0.1261,
+          "latency_p95_ms": 0.1877,
+          "latency_p99_ms": 0.2676,
+          "latency_samples": 4659
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.015625,
+              "cpu_percent_one_core": 181.71408569203604,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.13671875,
+              "peak_working_mib": 5.09765625
+            },
+            "load_generator": {
+              "cpu_seconds": 10.109375,
+              "cpu_percent_one_core": 305.3740608902528,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.94140625,
+              "peak_working_mib": 5.7578125
+            }
+          },
+          "messages": 44038,
+          "bytes_one_direction": 2886074368,
+          "seconds": 3.0006916,
+          "messages_per_second": 14675.950037651319,
+          "mib_per_second_one_direction": 917.2468773532074,
+          "latency_p50_ms": 0.2327,
+          "latency_p95_ms": 0.3058,
+          "latency_p99_ms": 0.3675,
+          "latency_samples": 2755
+        },
+        {
+          "case": "baseline-upstream",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 4.03125,
+              "cpu_percent_one_core": 128.0138631273191,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1015625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.796875,
+              "cpu_percent_one_core": 88.81581976662837,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.20703125,
+              "peak_working_mib": 13.07421875
+            }
+          },
+          "messages": 2210,
+          "bytes_one_direction": 2317352960,
+          "seconds": 3.0067749,
+          "messages_per_second": 735.0068008084011,
+          "mib_per_second_one_direction": 735.0068008084011,
+          "latency_p50_ms": 2.6837,
+          "latency_p95_ms": 12.2173,
+          "latency_p99_ms": 14.921999999999999,
+          "latency_samples": 141
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.90625,
+              "cpu_percent_one_core": 92.69414491631396,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1171875
+            },
+            "proxy": {
+              "cpu_seconds": 8.734375,
+              "cpu_percent_one_core": 278.58079036677157,
+              "private_start_mib": 4.28125,
+              "private_end_mib": 4.28125,
+              "peak_private_mib": 4.28125,
+              "peak_working_mib": 13.28515625
+            },
+            "load_generator": {
+              "cpu_seconds": 4.96875,
+              "cpu_percent_one_core": 158.4770864698271,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.09375
+            }
+          },
+          "messages": 37648,
+          "bytes_one_direction": 2409472,
+          "seconds": 3.000746,
+          "messages_per_second": 12546.213508240951,
+          "mib_per_second_one_direction": 0.7657601018213471,
+          "latency_p50_ms": 0.2877,
+          "latency_p95_ms": 0.438,
+          "latency_p99_ms": 0.5268,
+          "latency_samples": 2355
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.25,
+              "cpu_percent_one_core": 103.58096940308805,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1171875
+            },
+            "proxy": {
+              "cpu_seconds": 9.265625,
+              "cpu_percent_one_core": 295.3053598847655,
+              "private_start_mib": 4.28125,
+              "private_end_mib": 4.28125,
+              "peak_private_mib": 4.28125,
+              "peak_working_mib": 13.28515625
+            },
+            "load_generator": {
+              "cpu_seconds": 3.671875,
+              "cpu_percent_one_core": 117.0265760082966,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.67578125,
+              "peak_working_mib": 5.55859375
+            }
+          },
+          "messages": 9744,
+          "bytes_one_direction": 638582784,
+          "seconds": 3.0016703,
+          "messages_per_second": 3246.192628151067,
+          "mib_per_second_one_direction": 202.88703925944168,
+          "latency_p50_ms": 1.0895,
+          "latency_p95_ms": 1.5855000000000001,
+          "latency_p99_ms": 4.0945,
+          "latency_samples": 610
+        },
+        {
+          "case": "astra-socks",
+          "transport": "socks",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.171875,
+              "cpu_percent_one_core": 69.3022877804228,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.72265625,
+              "peak_private_mib": 1.140625,
+              "peak_working_mib": 5.1171875
+            },
+            "proxy": {
+              "cpu_seconds": 9.703125,
+              "cpu_percent_one_core": 309.61669576721266,
+              "private_start_mib": 4.28125,
+              "private_end_mib": 4.28125,
+              "peak_private_mib": 4.28125,
+              "peak_working_mib": 13.28515625
+            },
+            "load_generator": {
+              "cpu_seconds": 3.125,
+              "cpu_percent_one_core": 99.71552198621985,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.21484375,
+              "peak_working_mib": 13.01953125
+            }
+          },
+          "messages": 720,
+          "bytes_one_direction": 754974720,
+          "seconds": 3.014728,
+          "messages_per_second": 238.82751611422324,
+          "mib_per_second_one_direction": 238.82751611422324,
+          "latency_p50_ms": 15.868899999999998,
+          "latency_p95_ms": 24.2833,
+          "latency_p99_ms": 34.6459,
+          "latency_samples": 47
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 6.6875,
+              "cpu_percent_one_core": 213.40307234054262,
+              "private_start_mib": 0.72265625,
+              "private_end_mib": 0.73046875,
+              "peak_private_mib": 1.3203125,
+              "peak_working_mib": 5.1875
+            },
+            "load_generator": {
+              "cpu_seconds": 6.8125,
+              "cpu_percent_one_core": 217.3919148141976,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.28515625,
+              "peak_working_mib": 5.33984375
+            }
+          },
+          "messages": 99106,
+          "bytes_one_direction": 6342784,
+          "seconds": 3.0006976,
+          "messages_per_second": 33027.653303018604,
+          "mib_per_second_one_direction": 2.015847979920569,
+          "latency_p50_ms": 0.1144,
+          "latency_p95_ms": 0.183,
+          "latency_p99_ms": 0.2086,
+          "latency_samples": 6196
+        },
+        {
+          "case": "baseline-upstream-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 7.09375,
+              "cpu_percent_one_core": 233.9138342387762,
+              "private_start_mib": 0.73046875,
+              "private_end_mib": 1.3203125,
+              "peak_private_mib": 1.3203125,
+              "peak_working_mib": 5.1875
+            },
+            "load_generator": {
+              "cpu_seconds": 7.234375,
+              "cpu_percent_one_core": 238.55089262676952,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.29296875,
+              "peak_working_mib": 5.17578125
+            }
+          },
+          "messages": 94051,
+          "bytes_one_direction": 112861200,
+          "seconds": 3.0006754,
+          "messages_per_second": 31343.276916923438,
+          "mib_per_second_one_direction": 35.8695338252145,
+          "latency_p50_ms": 0.1218,
+          "latency_p95_ms": 0.1864,
+          "latency_p99_ms": 0.2157,
+          "latency_samples": 5880
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.7410615170221,
+              "private_start_mib": 1.3203125,
+              "private_end_mib": 0.78125,
+              "peak_private_mib": 1.3671875,
+              "peak_working_mib": 5.234375
+            },
+            "proxy": {
+              "cpu_seconds": 7.859375,
+              "cpu_percent_one_core": 250.7153851991694,
+              "private_start_mib": 4.28125,
+              "private_end_mib": 4.34765625,
+              "peak_private_mib": 4.7890625,
+              "peak_working_mib": 13.78125
+            },
+            "load_generator": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.7410615170221,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.21875,
+              "peak_working_mib": 5.33203125
+            }
+          },
+          "messages": 36422,
+          "bytes_one_direction": 2331008,
+          "seconds": 3.0008157,
+          "messages_per_second": 12137.366516710774,
+          "mib_per_second_one_direction": 0.7408060618109603,
+          "latency_p50_ms": 0.3214,
+          "latency_p95_ms": 0.5069,
+          "latency_p99_ms": 0.6239,
+          "latency_samples": 2278
+        },
+        {
+          "case": "astra-socks-udp",
+          "transport": "socks-udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.328125,
+              "cpu_percent_one_core": 74.28123522549221,
+              "private_start_mib": 0.78125,
+              "private_end_mib": 0.75390625,
+              "peak_private_mib": 1.36328125,
+              "peak_working_mib": 5.2109375
+            },
+            "proxy": {
+              "cpu_seconds": 7.421875,
+              "cpu_percent_one_core": 236.80259551750868,
+              "private_start_mib": 4.34765625,
+              "private_end_mib": 4.3515625,
+              "peak_private_mib": 4.7890625,
+              "peak_working_mib": 13.78515625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.75627548611882,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.203125,
+              "peak_working_mib": 5.33984375
+            }
+          },
+          "messages": 31801,
+          "bytes_one_direction": 38161200,
+          "seconds": 3.0008007,
+          "messages_per_second": 10597.50485928639,
+          "mib_per_second_one_direction": 12.127881842750233,
+          "latency_p50_ms": 0.36479999999999996,
+          "latency_p95_ms": 0.5668,
+          "latency_p99_ms": 0.7158000000000001,
+          "latency_samples": 1989
+        }
+      ],
+      "scope": "Local native echo through plaintext SOCKS; TCP sizes are application messages, not IP packets. Four persistent connections, one outstanding request each. Native upstream and generator CPU recorded separately. WinINet HTTP creates new requests and includes Python origin/driver overhead; not directly comparable to persistent TCP. No allocation stack sampling.",
+      "restored": true
+    },
+    {
+      "mode": "system-proxy",
+      "passed": true,
+      "profile": "release",
+      "platform": "Windows-11-10.0.26340-SP0",
+      "logical_cpus": 32,
+      "binary_sha256": "3bf0c63678938e4f9c544ee49b0014aaa96b868624d1c9ef44f0c9208968bd01",
+      "seconds_per_case": 3.0,
+      "rounds": 3,
+      "results": [
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.21875,
+              "cpu_percent_one_core": 102.56600957181823,
+              "private_start_mib": 0.70703125,
+              "private_end_mib": 0.98046875,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.08203125
+            },
+            "proxy": {
+              "cpu_seconds": 9.046875,
+              "cpu_percent_one_core": 288.28019195185806,
+              "private_start_mib": 4.4765625,
+              "private_end_mib": 4.78125,
+              "peak_private_mib": 4.78125,
+              "peak_working_mib": 17.4453125
+            },
+            "load_generator": {
+              "cpu_seconds": 5.9375,
+              "cpu_percent_one_core": 189.19943513248026,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.20703125,
+              "peak_working_mib": 5.046875
+            }
+          },
+          "messages": 39916,
+          "bytes_one_direction": 2554624,
+          "seconds": 3.0005781,
+          "messages_per_second": 13302.769889575613,
+          "mib_per_second_one_direction": 0.8119366387680428,
+          "latency_p50_ms": 0.2685,
+          "latency_p95_ms": 0.4049,
+          "latency_p99_ms": 0.5125000000000001,
+          "latency_samples": 2496
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.4375,
+              "cpu_percent_one_core": 109.65178103201383,
+              "private_start_mib": 0.98046875,
+              "private_end_mib": 1.0546875,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.08203125
+            },
+            "proxy": {
+              "cpu_seconds": 9.296875,
+              "cpu_percent_one_core": 296.55822597294645,
+              "private_start_mib": 4.78125,
+              "private_end_mib": 4.8125,
+              "peak_private_mib": 4.8125,
+              "peak_working_mib": 17.4921875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.40625,
+              "cpu_percent_one_core": 108.65494665899551,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.671875,
+              "peak_working_mib": 5.52734375
+            }
+          },
+          "messages": 9795,
+          "bytes_one_direction": 641925120,
+          "seconds": 3.002196,
+          "messages_per_second": 3262.611768185688,
+          "mib_per_second_one_direction": 203.9132355116055,
+          "latency_p50_ms": 1.0548,
+          "latency_p95_ms": 1.5726,
+          "latency_p99_ms": 6.3235,
+          "latency_samples": 613
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.953125,
+              "cpu_percent_one_core": 62.22482093428042,
+              "private_start_mib": 1.0546875,
+              "private_end_mib": 0.984375,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.05859375
+            },
+            "proxy": {
+              "cpu_seconds": 9.890625,
+              "cpu_percent_one_core": 315.1064932111961,
+              "private_start_mib": 4.8125,
+              "private_end_mib": 4.83203125,
+              "peak_private_mib": 4.83203125,
+              "peak_working_mib": 17.51171875
+            },
+            "load_generator": {
+              "cpu_seconds": 2.59375,
+              "cpu_percent_one_core": 82.6345622007244,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.33984375,
+              "peak_working_mib": 13.14453125
+            }
+          },
+          "messages": 677,
+          "bytes_one_direction": 709885952,
+          "seconds": 3.0202479,
+          "messages_per_second": 224.15378552204274,
+          "mib_per_second_one_direction": 224.15378552204274,
+          "latency_p50_ms": 16.7818,
+          "latency_p95_ms": 31.853600000000004,
+          "latency_p99_ms": 35.9835,
+          "latency_samples": 44
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.1875,
+              "cpu_percent_one_core": 101.66397534881031,
+              "private_start_mib": 0.984375,
+              "private_end_mib": 0.73828125,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.12109375
+            },
+            "proxy": {
+              "cpu_seconds": 9.28125,
+              "cpu_percent_one_core": 296.02157528035946,
+              "private_start_mib": 4.83203125,
+              "private_end_mib": 4.8515625,
+              "peak_private_mib": 4.8515625,
+              "peak_working_mib": 17.5390625
+            },
+            "load_generator": {
+              "cpu_seconds": 5.375,
+              "cpu_percent_one_core": 171.43337019603305,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.07421875
+            }
+          },
+          "messages": 39432,
+          "bytes_one_direction": 2523648,
+          "seconds": 3.0007084,
+          "messages_per_second": 13140.8969961893,
+          "mib_per_second_one_direction": 0.8020567014275696,
+          "latency_p50_ms": 0.2698,
+          "latency_p95_ms": 0.42729999999999996,
+          "latency_p99_ms": 0.4881,
+          "latency_samples": 2468
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 3.328125,
+              "cpu_percent_one_core": 106.16156034275261,
+              "private_start_mib": 0.73828125,
+              "private_end_mib": 0.74609375,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.13671875
+            },
+            "proxy": {
+              "cpu_seconds": 9.375,
+              "cpu_percent_one_core": 299.04664885282426,
+              "private_start_mib": 4.8515625,
+              "private_end_mib": 4.8515625,
+              "peak_private_mib": 4.8515625,
+              "peak_working_mib": 17.5390625
+            },
+            "load_generator": {
+              "cpu_seconds": 3.359375,
+              "cpu_percent_one_core": 107.15838250559536,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.66015625,
+              "peak_working_mib": 5.52734375
+            }
+          },
+          "messages": 9844,
+          "bytes_one_direction": 645136384,
+          "seconds": 3.0008709,
+          "messages_per_second": 3280.3810387177937,
+          "mib_per_second_one_direction": 205.0238149198621,
+          "latency_p50_ms": 1.0744,
+          "latency_p95_ms": 1.6789,
+          "latency_p99_ms": 7.05,
+          "latency_samples": 617
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.0625,
+              "cpu_percent_one_core": 65.81476670844249,
+              "private_start_mib": 0.74609375,
+              "private_end_mib": 0.80859375,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.07421875
+            },
+            "proxy": {
+              "cpu_seconds": 10.09375,
+              "cpu_percent_one_core": 322.0934794973776,
+              "private_start_mib": 4.8515625,
+              "private_end_mib": 4.88671875,
+              "peak_private_mib": 4.88671875,
+              "peak_working_mib": 17.57421875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.015625,
+              "cpu_percent_one_core": 96.22916647522271,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.3203125,
+              "peak_working_mib": 13.15625
+            }
+          },
+          "messages": 701,
+          "bytes_one_direction": 735051776,
+          "seconds": 3.0158361,
+          "messages_per_second": 232.43968728937224,
+          "mib_per_second_one_direction": 232.43968728937224,
+          "latency_p50_ms": 16.1353,
+          "latency_p95_ms": 20.665699999999998,
+          "latency_p99_ms": 29.6343,
+          "latency_samples": 45
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.515625,
+              "cpu_percent_one_core": 81.23059708800689,
+              "private_start_mib": 0.80859375,
+              "private_end_mib": 0.80859375,
+              "peak_private_mib": 1.2578125,
+              "peak_working_mib": 5.15234375
+            },
+            "proxy": {
+              "cpu_seconds": 7.265625,
+              "cpu_percent_one_core": 234.61010960200747,
+              "private_start_mib": 4.88671875,
+              "private_end_mib": 4.90234375,
+              "peak_private_mib": 4.90234375,
+              "peak_working_mib": 17.59765625
+            },
+            "load_generator": {
+              "cpu_seconds": 4.265625,
+              "cpu_percent_one_core": 137.7388385405334,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.44140625,
+              "peak_working_mib": 5.203125
+            }
+          },
+          "messages": 33003,
+          "bytes_one_direction": 2112192,
+          "seconds": 3.0019099,
+          "messages_per_second": 10994.000852590547,
+          "mib_per_second_one_direction": 0.6710205598504972,
+          "latency_p50_ms": 0.2727,
+          "latency_p95_ms": 0.4845,
+          "latency_p99_ms": 1.3256,
+          "latency_samples": 2065
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.8125,
+              "cpu_percent_one_core": 89.44897143701107,
+              "private_start_mib": 0.80859375,
+              "private_end_mib": 0.9921875,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.09375
+            },
+            "proxy": {
+              "cpu_seconds": 9.546875,
+              "cpu_percent_one_core": 303.629564155632,
+              "private_start_mib": 4.90234375,
+              "private_end_mib": 4.9140625,
+              "peak_private_mib": 4.9140625,
+              "peak_working_mib": 17.60546875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.859375,
+              "cpu_percent_one_core": 122.74386636078741,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.87109375,
+              "peak_working_mib": 5.6796875
+            }
+          },
+          "messages": 10048,
+          "bytes_one_direction": 658505728,
+          "seconds": 3.014983,
+          "messages_per_second": 3332.688774696242,
+          "mib_per_second_one_direction": 208.29304841851513,
+          "latency_p50_ms": 1.0304,
+          "latency_p95_ms": 1.4935,
+          "latency_p99_ms": 2.5979,
+          "latency_samples": 630
+        },
+        {
+          "case": "system-connect",
+          "transport": "connect",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.21875,
+              "cpu_percent_one_core": 70.78302116065178,
+              "private_start_mib": 0.9921875,
+              "private_end_mib": 0.7421875,
+              "peak_private_mib": 1.22265625,
+              "peak_working_mib": 5.08984375
+            },
+            "proxy": {
+              "cpu_seconds": 10.234375,
+              "cpu_percent_one_core": 326.4991469030065,
+              "private_start_mib": 4.9140625,
+              "private_end_mib": 4.9140625,
+              "peak_private_mib": 4.9140625,
+              "peak_working_mib": 17.609375
+            },
+            "load_generator": {
+              "cpu_seconds": 2.796875,
+              "cpu_percent_one_core": 89.22648442082162,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.203125,
+              "peak_working_mib": 13.0234375
+            }
+          },
+          "messages": 701,
+          "bytes_one_direction": 735051776,
+          "seconds": 3.0134948,
+          "messages_per_second": 232.62027862135352,
+          "mib_per_second_one_direction": 232.62027862135352,
+          "latency_p50_ms": 16.4161,
+          "latency_p95_ms": 27.5212,
+          "latency_p99_ms": 33.427699999999994,
+          "latency_samples": 44
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "messages": 2712,
+          "seconds": 3.0200881000000663,
+          "messages_per_second": 897.9870487883915,
+          "mib_per_second_one_direction": 0.054808779833275846,
+          "latency_p50_ms": 4.1049999999813735,
+          "latency_p95_ms": 5.508400001417613,
+          "latency_p99_ms": 14.3114999991667,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 3.671875,
+              "cpu_percent_one_core": 121.58171809623433,
+              "private_start_mib": 4.9140625,
+              "private_end_mib": 5.8359375,
+              "peak_private_mib": 5.8359375,
+              "peak_working_mib": 19.046875
+            },
+            "upstream": {
+              "cpu_seconds": 4.78125,
+              "cpu_percent_one_core": 158.31491803169234,
+              "private_start_mib": 0.7421875,
+              "private_end_mib": 1.12109375,
+              "peak_private_mib": 1.484375,
+              "peak_working_mib": 5.47265625
+            },
+            "python_driver": {
+              "cpu_seconds": 6.96875,
+              "cpu_percent_one_core": 230.7465798762575,
+              "private_start_mib": 70.40234375,
+              "private_end_mib": 72.94921875,
+              "peak_private_mib": 73.2421875,
+              "peak_working_mib": 42.77734375
+            }
+          }
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "messages": 556,
+          "seconds": 3.0275871000012557,
+          "messages_per_second": 183.64459275168974,
+          "mib_per_second_one_direction": 183.64459275168974,
+          "latency_p50_ms": 21.497599998838268,
+          "latency_p95_ms": 25.342599999930826,
+          "latency_p99_ms": 28.48699999958626,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 7.21875,
+              "cpu_percent_one_core": 238.43244674932743,
+              "private_start_mib": 5.8359375,
+              "private_end_mib": 6.47265625,
+              "peak_private_mib": 6.47265625,
+              "peak_working_mib": 19.76171875
+            },
+            "upstream": {
+              "cpu_seconds": 4.453125,
+              "cpu_percent_one_core": 147.08495091679288,
+              "private_start_mib": 1.12109375,
+              "private_end_mib": 1.12109375,
+              "peak_private_mib": 1.49609375,
+              "peak_working_mib": 5.5
+            },
+            "python_driver": {
+              "cpu_seconds": 6.734375,
+              "cpu_percent_one_core": 222.43373278995696,
+              "private_start_mib": 72.94921875,
+              "private_end_mib": 73.2109375,
+              "peak_private_mib": 82.63671875,
+              "peak_working_mib": 51.73046875
+            }
+          }
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "messages": 2663,
+          "seconds": 3.0207491000001028,
+          "messages_per_second": 881.5694093891841,
+          "mib_per_second_one_direction": 0.05380672664728907,
+          "latency_p50_ms": 4.336199999670498,
+          "latency_p95_ms": 5.773500000941567,
+          "latency_p99_ms": 7.406700000501587,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 3.828125,
+              "cpu_percent_one_core": 126.72767162290539,
+              "private_start_mib": 6.47265625,
+              "private_end_mib": 6.47265625,
+              "peak_private_mib": 6.47265625,
+              "peak_working_mib": 19.765625
+            },
+            "upstream": {
+              "cpu_seconds": 4.5625,
+              "cpu_percent_one_core": 151.03869434240153,
+              "private_start_mib": 1.12109375,
+              "private_end_mib": 1.10546875,
+              "peak_private_mib": 1.46875,
+              "peak_working_mib": 5.54296875
+            },
+            "python_driver": {
+              "cpu_seconds": 6.65625,
+              "cpu_percent_one_core": 220.35097188309263,
+              "private_start_mib": 73.2109375,
+              "private_end_mib": 75.01171875,
+              "peak_private_mib": 75.01171875,
+              "peak_working_mib": 43.23046875
+            }
+          }
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "messages": 551,
+          "seconds": 3.030270700000983,
+          "messages_per_second": 181.83193996490849,
+          "mib_per_second_one_direction": 181.83193996490849,
+          "latency_p50_ms": 21.667000000888947,
+          "latency_p95_ms": 25.861100000838633,
+          "latency_p99_ms": 31.391100001201266,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 6.734375,
+              "cpu_percent_one_core": 222.23674604377143,
+              "private_start_mib": 6.47265625,
+              "private_end_mib": 6.48046875,
+              "peak_private_mib": 6.48046875,
+              "peak_working_mib": 19.765625
+            },
+            "upstream": {
+              "cpu_seconds": 4.765625,
+              "cpu_percent_one_core": 157.26730288480346,
+              "private_start_mib": 1.10546875,
+              "private_end_mib": 1.1875,
+              "peak_private_mib": 1.5625,
+              "peak_working_mib": 5.5703125
+            },
+            "python_driver": {
+              "cpu_seconds": 6.71875,
+              "cpu_percent_one_core": 221.7211155425098,
+              "private_start_mib": 75.01171875,
+              "private_end_mib": 73.96875,
+              "peak_private_mib": 83.046875,
+              "peak_working_mib": 52.1484375
+            }
+          }
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "messages": 2606,
+          "seconds": 3.02148230000239,
+          "messages_per_second": 862.490572921092,
+          "mib_per_second_one_direction": 0.05264224688239087,
+          "latency_p50_ms": 4.37919999967562,
+          "latency_p95_ms": 6.2063000004854985,
+          "latency_p99_ms": 9.386999998241663,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 3.65625,
+              "cpu_percent_one_core": 121.0084864636509,
+              "private_start_mib": 6.48046875,
+              "private_end_mib": 6.484375,
+              "peak_private_mib": 6.484375,
+              "peak_working_mib": 19.65625
+            },
+            "upstream": {
+              "cpu_seconds": 4.796875,
+              "cpu_percent_one_core": 158.75899719803772,
+              "private_start_mib": 1.1875,
+              "private_end_mib": 1.12109375,
+              "peak_private_mib": 1.46875,
+              "peak_working_mib": 5.53515625
+            },
+            "python_driver": {
+              "cpu_seconds": 6.53125,
+              "cpu_percent_one_core": 216.160458725667,
+              "private_start_mib": 73.96875,
+              "private_end_mib": 74.01953125,
+              "peak_private_mib": 74.3203125,
+              "peak_working_mib": 43.5390625
+            }
+          }
+        },
+        {
+          "case": "system-wininet-http",
+          "transport": "HTTP-new-request",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "messages": 531,
+          "seconds": 3.028859199999715,
+          "messages_per_second": 175.31353058605362,
+          "mib_per_second_one_direction": 175.31353058605362,
+          "latency_p50_ms": 22.052500000427244,
+          "latency_p95_ms": 27.87979999993695,
+          "latency_p99_ms": 31.200500001432374,
+          "usage": {
+            "proxy": {
+              "cpu_seconds": 7.390625,
+              "cpu_percent_one_core": 244.00688549671426,
+              "private_start_mib": 6.484375,
+              "private_end_mib": 6.63671875,
+              "peak_private_mib": 6.63671875,
+              "peak_working_mib": 19.90625
+            },
+            "upstream": {
+              "cpu_seconds": 5.21875,
+              "cpu_percent_one_core": 172.3008451498997,
+              "private_start_mib": 1.12109375,
+              "private_end_mib": 1.125,
+              "peak_private_mib": 1.5,
+              "peak_working_mib": 5.52734375
+            },
+            "python_driver": {
+              "cpu_seconds": 7.015625,
+              "cpu_percent_one_core": 231.62598644402684,
+              "private_start_mib": 74.01953125,
+              "private_end_mib": 74.703125,
+              "peak_private_mib": 85.5625,
+              "peak_working_mib": 54.98828125
+            }
+          }
+        }
+      ],
+      "scope": "Local native echo through plaintext SOCKS; TCP sizes are application messages, not IP packets. Four persistent connections, one outstanding request each. Native upstream and generator CPU recorded separately. WinINet HTTP creates new requests and includes Python origin/driver overhead; not directly comparable to persistent TCP. No allocation stack sampling.",
+      "restored": true
+    },
+    {
+      "mode": "tun",
+      "passed": true,
+      "profile": "release",
+      "platform": "Windows-11-10.0.26340-SP0",
+      "logical_cpus": 32,
+      "binary_sha256": "3bf0c63678938e4f9c544ee49b0014aaa96b868624d1c9ef44f0c9208968bd01",
+      "seconds_per_case": 3.0,
+      "rounds": 3,
+      "results": [
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.046875,
+              "cpu_percent_one_core": 66.7125589319191,
+              "private_start_mib": 1.02734375,
+              "private_end_mib": 1.3125,
+              "peak_private_mib": 1.4765625,
+              "peak_working_mib": 5.2265625
+            },
+            "proxy": {
+              "cpu_seconds": 5.0625,
+              "cpu_percent_one_core": 164.9990007171129,
+              "private_start_mib": 9.1171875,
+              "private_end_mib": 9.01953125,
+              "peak_private_mib": 13.625,
+              "peak_working_mib": 25.04296875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.25,
+              "cpu_percent_one_core": 105.92528441098605,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.1796875,
+              "peak_working_mib": 5.0390625
+            }
+          },
+          "messages": 21521,
+          "bytes_one_direction": 1377344,
+          "seconds": 3.0007825,
+          "messages_per_second": 7171.796023203948,
+          "mib_per_second_one_direction": 0.4377316908693816,
+          "latency_p50_ms": 0.4202,
+          "latency_p95_ms": 0.6471,
+          "latency_p99_ms": 1.5832000000000002,
+          "latency_samples": 1347
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.65625,
+              "cpu_percent_one_core": 20.95715954212977,
+              "private_start_mib": 1.3125,
+              "private_end_mib": 1.3125,
+              "peak_private_mib": 1.48046875,
+              "peak_working_mib": 5.24609375
+            },
+            "proxy": {
+              "cpu_seconds": 5.453125,
+              "cpu_percent_one_core": 174.1440161953164,
+              "private_start_mib": 9.01953125,
+              "private_end_mib": 9.26171875,
+              "peak_private_mib": 13.69140625,
+              "peak_working_mib": 25.69140625
+            },
+            "load_generator": {
+              "cpu_seconds": 0.71875,
+              "cpu_percent_one_core": 22.95307949852308,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.66015625,
+              "peak_working_mib": 5.52734375
+            }
+          },
+          "messages": 2961,
+          "bytes_one_direction": 194052096,
+          "seconds": 3.0016436,
+          "messages_per_second": 986.4595516936122,
+          "mib_per_second_one_direction": 61.65372198085076,
+          "latency_p50_ms": 3.3268,
+          "latency_p95_ms": 16.5363,
+          "latency_p99_ms": 44.244400000000006,
+          "latency_samples": 188
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.3125,
+              "cpu_percent_one_core": 10.091595844914348,
+              "private_start_mib": 1.3125,
+              "private_end_mib": 1.3125,
+              "peak_private_mib": 1.48046875,
+              "peak_working_mib": 5.24609375
+            },
+            "proxy": {
+              "cpu_seconds": 4.734375,
+              "cpu_percent_one_core": 152.88767705045237,
+              "private_start_mib": 9.26171875,
+              "private_end_mib": 9.53125,
+              "peak_private_mib": 14.15234375,
+              "peak_working_mib": 26.046875
+            },
+            "load_generator": {
+              "cpu_seconds": 0.96875,
+              "cpu_percent_one_core": 31.28394711923448,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.19921875,
+              "peak_working_mib": 13.06640625
+            }
+          },
+          "messages": 138,
+          "bytes_one_direction": 144703488,
+          "seconds": 3.0454095,
+          "messages_per_second": 45.31410307874852,
+          "mib_per_second_one_direction": 45.31410307874852,
+          "latency_p50_ms": 72.89959999999999,
+          "latency_p95_ms": 112.50250000000001,
+          "latency_p99_ms": 112.50250000000001,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.921875,
+              "cpu_percent_one_core": 61.34024644362367,
+              "private_start_mib": 1.3125,
+              "private_end_mib": 1.65234375,
+              "peak_private_mib": 1.65234375,
+              "peak_working_mib": 5.31640625
+            },
+            "proxy": {
+              "cpu_seconds": 5.6875,
+              "cpu_percent_one_core": 181.5272333778782,
+              "private_start_mib": 9.53125,
+              "private_end_mib": 9.9375,
+              "peak_private_mib": 9.9375,
+              "peak_working_mib": 21.97265625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.015625,
+              "cpu_percent_one_core": 64.33245358721507,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.19921875,
+              "peak_working_mib": 5.09765625
+            }
+          },
+          "messages": 37211,
+          "bytes_one_direction": 2381504,
+          "seconds": 3.0007294,
+          "messages_per_second": 12400.651654894307,
+          "mib_per_second_one_direction": 0.7568757113582951,
+          "latency_p50_ms": 0.3149,
+          "latency_p95_ms": 0.457,
+          "latency_p99_ms": 0.5223,
+          "latency_samples": 2327
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.046875,
+              "cpu_percent_one_core": 67.45756233429444,
+              "private_start_mib": 1.65234375,
+              "private_end_mib": 2.3046875,
+              "peak_private_mib": 2.3046875,
+              "peak_working_mib": 5.74609375
+            },
+            "proxy": {
+              "cpu_seconds": 6.484375,
+              "cpu_percent_one_core": 213.70143792925342,
+              "private_start_mib": 9.9375,
+              "private_end_mib": 10.5234375,
+              "peak_private_mib": 10.5234375,
+              "peak_working_mib": 22.38671875
+            },
+            "load_generator": {
+              "cpu_seconds": 1.984375,
+              "cpu_percent_one_core": 65.39778943859079,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2109375,
+              "peak_working_mib": 5.1328125
+            }
+          },
+          "messages": 36969,
+          "bytes_one_direction": 44362800,
+          "seconds": 3.0005226,
+          "messages_per_second": 12320.85370728419,
+          "mib_per_second_one_direction": 14.100098084202795,
+          "latency_p50_ms": 0.32239999999999996,
+          "latency_p95_ms": 0.4516,
+          "latency_p99_ms": 0.5171,
+          "latency_samples": 2313
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.15625,
+              "cpu_percent_one_core": 68.82086314724923,
+              "private_start_mib": 2.3046875,
+              "private_end_mib": 2.34765625,
+              "peak_private_mib": 2.78125,
+              "peak_working_mib": 6.1015625
+            },
+            "proxy": {
+              "cpu_seconds": 6.265625,
+              "cpu_percent_one_core": 199.97946465251408,
+              "private_start_mib": 10.5234375,
+              "private_end_mib": 10.30078125,
+              "peak_private_mib": 14.58203125,
+              "peak_working_mib": 26.4296875
+            },
+            "load_generator": {
+              "cpu_seconds": 4.171875,
+              "cpu_percent_one_core": 133.15340913272135,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.17578125,
+              "peak_working_mib": 5.0703125
+            }
+          },
+          "messages": 30511,
+          "bytes_one_direction": 1952704,
+          "seconds": 3.0007903,
+          "messages_per_second": 10167.654834128196,
+          "mib_per_second_one_direction": 0.6205844014970823,
+          "latency_p50_ms": 0.3665,
+          "latency_p95_ms": 0.4943,
+          "latency_p99_ms": 0.5680999999999999,
+          "latency_samples": 1909
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.09375,
+              "cpu_percent_one_core": 2.9927065108730693,
+              "private_start_mib": 2.34765625,
+              "private_end_mib": 2.296875,
+              "peak_private_mib": 2.80078125,
+              "peak_working_mib": 6.1171875
+            },
+            "proxy": {
+              "cpu_seconds": 0.625,
+              "cpu_percent_one_core": 19.951376739153794,
+              "private_start_mib": 10.30078125,
+              "private_end_mib": 10.13671875,
+              "peak_private_mib": 14.5859375,
+              "peak_working_mib": 26.5703125
+            },
+            "load_generator": {
+              "cpu_seconds": 0.0625,
+              "cpu_percent_one_core": 1.9951376739153797,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.8125,
+              "peak_working_mib": 5.62890625
+            }
+          },
+          "messages": 268,
+          "bytes_one_direction": 17563648,
+          "seconds": 3.032931,
+          "messages_per_second": 88.36336863581796,
+          "mib_per_second_one_direction": 5.522710539738623,
+          "latency_p50_ms": 45.041,
+          "latency_p95_ms": 50.9553,
+          "latency_p99_ms": 50.9553,
+          "latency_samples": 20
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.453125,
+              "cpu_percent_one_core": 14.462238516738365,
+              "private_start_mib": 2.296875,
+              "private_end_mib": 2.296875,
+              "peak_private_mib": 2.703125,
+              "peak_working_mib": 6.06640625
+            },
+            "proxy": {
+              "cpu_seconds": 6.1875,
+              "cpu_percent_one_core": 197.48436043546184,
+              "private_start_mib": 10.13671875,
+              "private_end_mib": 10.3359375,
+              "peak_private_mib": 15.19921875,
+              "peak_working_mib": 27.203125
+            },
+            "load_generator": {
+              "cpu_seconds": 0.984375,
+              "cpu_percent_one_core": 31.41796643291438,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.20703125,
+              "peak_working_mib": 13.05078125
+            }
+          },
+          "messages": 170,
+          "bytes_one_direction": 178257920,
+          "seconds": 3.0321426,
+          "messages_per_second": 56.06596470759654,
+          "mib_per_second_one_direction": 56.06596470759654,
+          "latency_p50_ms": 85.87060000000001,
+          "latency_p95_ms": 105.88680000000001,
+          "latency_p99_ms": 105.88680000000001,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.15625,
+              "cpu_percent_one_core": 71.1122851852272,
+              "private_start_mib": 2.296875,
+              "private_end_mib": 2.87890625,
+              "peak_private_mib": 2.87890625,
+              "peak_working_mib": 6.1328125
+            },
+            "proxy": {
+              "cpu_seconds": 6.65625,
+              "cpu_percent_one_core": 219.52053252831,
+              "private_start_mib": 10.3359375,
+              "private_end_mib": 10.7265625,
+              "peak_private_mib": 10.7265625,
+              "peak_working_mib": 22.76171875
+            },
+            "load_generator": {
+              "cpu_seconds": 2.09375,
+              "cpu_percent_one_core": 69.05105952768437,
+              "private_start_mib": 0.37109375,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.203125,
+              "peak_working_mib": 5.07421875
+            }
+          },
+          "messages": 38351,
+          "bytes_one_direction": 2454464,
+          "seconds": 3.000562,
+          "messages_per_second": 12781.272308320908,
+          "mib_per_second_one_direction": 0.7801069524121648,
+          "latency_p50_ms": 0.3024,
+          "latency_p95_ms": 0.4379,
+          "latency_p99_ms": 0.4956,
+          "latency_samples": 2399
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 1,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.3125,
+              "cpu_percent_one_core": 73.84863039453063,
+              "private_start_mib": 2.87890625,
+              "private_end_mib": 3.48828125,
+              "peak_private_mib": 3.48828125,
+              "peak_working_mib": 6.5
+            },
+            "proxy": {
+              "cpu_seconds": 6.671875,
+              "cpu_percent_one_core": 213.06327823286878,
+              "private_start_mib": 10.7265625,
+              "private_end_mib": 11.16015625,
+              "peak_private_mib": 11.16015625,
+              "peak_working_mib": 23.09765625
+            },
+            "load_generator": {
+              "cpu_seconds": 1.90625,
+              "cpu_percent_one_core": 60.87522235224823,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.23046875,
+              "peak_working_mib": 5.33984375
+            }
+          },
+          "messages": 37315,
+          "bytes_one_direction": 44778000,
+          "seconds": 3.0006516,
+          "messages_per_second": 12435.632313994734,
+          "mib_per_second_one_direction": 14.231451775354081,
+          "latency_p50_ms": 0.3123,
+          "latency_p95_ms": 0.4535,
+          "latency_p99_ms": 0.5308,
+          "latency_samples": 2333
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.625,
+              "cpu_percent_one_core": 83.79924650267004,
+              "private_start_mib": 3.48828125,
+              "private_end_mib": 3.50390625,
+              "peak_private_mib": 3.97265625,
+              "peak_working_mib": 6.84765625
+            },
+            "proxy": {
+              "cpu_seconds": 6.578125,
+              "cpu_percent_one_core": 209.99692129538147,
+              "private_start_mib": 11.16015625,
+              "private_end_mib": 11.1796875,
+              "peak_private_mib": 15.4765625,
+              "peak_working_mib": 27.2109375
+            },
+            "load_generator": {
+              "cpu_seconds": 3.4375,
+              "cpu_percent_one_core": 109.73710851540123,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.17578125,
+              "peak_working_mib": 5.02734375
+            }
+          },
+          "messages": 30919,
+          "bytes_one_direction": 1978816,
+          "seconds": 3.0006525,
+          "messages_per_second": 10304.092193281294,
+          "mib_per_second_one_direction": 0.628911877031329,
+          "latency_p50_ms": 0.36210000000000003,
+          "latency_p95_ms": 0.4875,
+          "latency_p99_ms": 0.5597,
+          "latency_samples": 1934
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.015625,
+              "cpu_percent_one_core": 32.44208698168299,
+              "private_start_mib": 3.50390625,
+              "private_end_mib": 3.50390625,
+              "peak_private_mib": 3.96484375,
+              "peak_working_mib": 6.8515625
+            },
+            "proxy": {
+              "cpu_seconds": 5.640625,
+              "cpu_percent_one_core": 180.17836000596247,
+              "private_start_mib": 11.1796875,
+              "private_end_mib": 11.61328125,
+              "peak_private_mib": 15.54296875,
+              "peak_working_mib": 27.55859375
+            },
+            "load_generator": {
+              "cpu_seconds": 0.765625,
+              "cpu_percent_one_core": 24.456342493884105,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.6484375,
+              "peak_working_mib": 5.57421875
+            }
+          },
+          "messages": 2816,
+          "bytes_one_direction": 184549376,
+          "seconds": 3.0012409,
+          "messages_per_second": 938.2785633769018,
+          "mib_per_second_one_direction": 58.642410211056365,
+          "latency_p50_ms": 3.1465,
+          "latency_p95_ms": 10.7463,
+          "latency_p99_ms": 42.4188,
+          "latency_samples": 179
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.640625,
+              "cpu_percent_one_core": 20.278885521498296,
+              "private_start_mib": 3.50390625,
+              "private_end_mib": 3.8125,
+              "peak_private_mib": 3.984375,
+              "peak_working_mib": 6.86328125
+            },
+            "proxy": {
+              "cpu_seconds": 5.390625,
+              "cpu_percent_one_core": 170.63940255894906,
+              "private_start_mib": 11.61328125,
+              "private_end_mib": 11.27734375,
+              "peak_private_mib": 16.203125,
+              "peak_working_mib": 28.17578125
+            },
+            "load_generator": {
+              "cpu_seconds": 1.015625,
+              "cpu_percent_one_core": 32.14945265603389,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.1953125,
+              "peak_working_mib": 13.03515625
+            }
+          },
+          "messages": 151,
+          "bytes_one_direction": 158334976,
+          "seconds": 3.0806476,
+          "messages_per_second": 49.01566800435078,
+          "mib_per_second_one_direction": 49.01566800435078,
+          "latency_p50_ms": 87.1254,
+          "latency_p95_ms": 355.7783,
+          "latency_p99_ms": 355.7783,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.921875,
+              "cpu_percent_one_core": 63.38656259949368,
+              "private_start_mib": 3.8125,
+              "private_end_mib": 4.1484375,
+              "peak_private_mib": 4.1484375,
+              "peak_working_mib": 6.9453125
+            },
+            "proxy": {
+              "cpu_seconds": 6.375,
+              "cpu_percent_one_core": 210.25786618368633,
+              "private_start_mib": 11.27734375,
+              "private_end_mib": 12.2734375,
+              "peak_private_mib": 12.2734375,
+              "peak_working_mib": 23.5546875
+            },
+            "load_generator": {
+              "cpu_seconds": 1.6875,
+              "cpu_percent_one_core": 55.65649398979933,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.19921875,
+              "peak_working_mib": 5.08203125
+            }
+          },
+          "messages": 39264,
+          "bytes_one_direction": 2512896,
+          "seconds": 3.0005177,
+          "messages_per_second": 13085.741837150303,
+          "mib_per_second_one_direction": 0.7986902976776308,
+          "latency_p50_ms": 0.296,
+          "latency_p95_ms": 0.4224,
+          "latency_p99_ms": 0.5055,
+          "latency_samples": 2456
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.765625,
+              "cpu_percent_one_core": 57.40534194402753,
+              "private_start_mib": 4.1484375,
+              "private_end_mib": 4.7578125,
+              "peak_private_mib": 4.7578125,
+              "peak_working_mib": 7.32421875
+            },
+            "proxy": {
+              "cpu_seconds": 5.328125,
+              "cpu_percent_one_core": 173.23204958330433,
+              "private_start_mib": 12.2734375,
+              "private_end_mib": 12.67578125,
+              "peak_private_mib": 12.67578125,
+              "peak_working_mib": 23.86328125
+            },
+            "load_generator": {
+              "cpu_seconds": 1.484375,
+              "cpu_percent_one_core": 48.261128183032,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.18359375,
+              "peak_working_mib": 5.0390625
+            }
+          },
+          "messages": 29706,
+          "bytes_one_direction": 35647200,
+          "seconds": 3.0005124,
+          "messages_per_second": 9900.30902721815,
+          "mib_per_second_one_direction": 11.330004532491476,
+          "latency_p50_ms": 0.3278,
+          "latency_p95_ms": 0.5191,
+          "latency_p99_ms": 1.683,
+          "latency_samples": 1858
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.5,
+              "cpu_percent_one_core": 79.84753592098639,
+              "private_start_mib": 4.7578125,
+              "private_end_mib": 5.01953125,
+              "peak_private_mib": 5.1953125,
+              "peak_working_mib": 7.671875
+            },
+            "proxy": {
+              "cpu_seconds": 6.21875,
+              "cpu_percent_one_core": 198.62074560345363,
+              "private_start_mib": 12.67578125,
+              "private_end_mib": 13.09375,
+              "peak_private_mib": 16.35546875,
+              "peak_working_mib": 27.87109375
+            },
+            "load_generator": {
+              "cpu_seconds": 4.265625,
+              "cpu_percent_one_core": 136.23985816518302,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.18359375,
+              "peak_working_mib": 5.0390625
+            }
+          },
+          "messages": 31931,
+          "bytes_one_direction": 2043584,
+          "seconds": 3.0006788,
+          "messages_per_second": 10641.25890448521,
+          "mib_per_second_one_direction": 0.6494908999319586,
+          "latency_p50_ms": 0.3499,
+          "latency_p95_ms": 0.4776,
+          "latency_p99_ms": 0.5425,
+          "latency_samples": 1997
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.046875,
+              "cpu_percent_one_core": 1.497112799999827,
+              "private_start_mib": 5.01953125,
+              "private_end_mib": 4.7578125,
+              "peak_private_mib": 5.1953125,
+              "peak_working_mib": 7.671875
+            },
+            "proxy": {
+              "cpu_seconds": 0.859375,
+              "cpu_percent_one_core": 27.447067999996825,
+              "private_start_mib": 13.09375,
+              "private_end_mib": 11.890625,
+              "peak_private_mib": 16.390625,
+              "peak_working_mib": 28.0234375
+            },
+            "load_generator": {
+              "cpu_seconds": 0.125,
+              "cpu_percent_one_core": 3.992300799999539,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.66015625,
+              "peak_working_mib": 5.4921875
+            }
+          },
+          "messages": 273,
+          "bytes_one_direction": 17891328,
+          "seconds": 3.0409371,
+          "messages_per_second": 89.77495785756305,
+          "mib_per_second_one_direction": 5.610934866097691,
+          "latency_p50_ms": 44.67659999999999,
+          "latency_p95_ms": 49.4334,
+          "latency_p99_ms": 49.4334,
+          "latency_samples": 20
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.796875,
+              "cpu_percent_one_core": 25.4572757669066,
+              "private_start_mib": 4.7578125,
+              "private_end_mib": 4.7578125,
+              "peak_private_mib": 5.1953125,
+              "peak_working_mib": 7.671875
+            },
+            "proxy": {
+              "cpu_seconds": 6.921875,
+              "cpu_percent_one_core": 221.1288855831299,
+              "private_start_mib": 11.890625,
+              "private_end_mib": 12.1015625,
+              "peak_private_mib": 16.78125,
+              "peak_working_mib": 28.8359375
+            },
+            "load_generator": {
+              "cpu_seconds": 0.875,
+              "cpu_percent_one_core": 27.953087116603324,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 9.19140625,
+              "peak_working_mib": 13.08984375
+            }
+          },
+          "messages": 170,
+          "bytes_one_direction": 178257920,
+          "seconds": 3.0463512,
+          "messages_per_second": 55.804465355143556,
+          "mib_per_second_one_direction": 55.804465355143556,
+          "latency_p50_ms": 83.12469999999999,
+          "latency_p95_ms": 105.1486,
+          "latency_p99_ms": 105.1486,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.5625,
+              "cpu_percent_one_core": 84.56526638361463,
+              "private_start_mib": 4.7578125,
+              "private_end_mib": 5.36328125,
+              "peak_private_mib": 5.36328125,
+              "peak_working_mib": 7.73046875
+            },
+            "proxy": {
+              "cpu_seconds": 6.140625,
+              "cpu_percent_one_core": 202.64725419975943,
+              "private_start_mib": 12.1015625,
+              "private_end_mib": 12.67578125,
+              "peak_private_mib": 12.67578125,
+              "peak_working_mib": 24.46875
+            },
+            "load_generator": {
+              "cpu_seconds": 1.984375,
+              "cpu_percent_one_core": 65.48651726048206,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2109375,
+              "peak_working_mib": 5.0625
+            }
+          },
+          "messages": 39168,
+          "bytes_one_direction": 2506752,
+          "seconds": 3.000525,
+          "messages_per_second": 13053.71559977004,
+          "mib_per_second_one_direction": 0.7967355712750268,
+          "latency_p50_ms": 0.29540000000000005,
+          "latency_p95_ms": 0.42939999999999995,
+          "latency_p99_ms": 0.5109,
+          "latency_samples": 2451
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 2,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.4375,
+              "cpu_percent_one_core": 77.88695549586494,
+              "private_start_mib": 5.36328125,
+              "private_end_mib": 5.9609375,
+              "peak_private_mib": 5.9609375,
+              "peak_working_mib": 8.1171875
+            },
+            "proxy": {
+              "cpu_seconds": 5.71875,
+              "cpu_percent_one_core": 182.73478020183694,
+              "private_start_mib": 12.67578125,
+              "private_end_mib": 12.75,
+              "peak_private_mib": 12.75,
+              "peak_working_mib": 24.78125
+            },
+            "load_generator": {
+              "cpu_seconds": 2.046875,
+              "cpu_percent_one_core": 65.40507160229684,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.23046875,
+              "peak_working_mib": 5.09375
+            }
+          },
+          "messages": 38926,
+          "bytes_one_direction": 46711200,
+          "seconds": 3.0006205,
+          "messages_per_second": 12972.650156859223,
+          "mib_per_second_one_direction": 14.846019924384182,
+          "latency_p50_ms": 0.3034,
+          "latency_p95_ms": 0.42939999999999995,
+          "latency_p99_ms": 0.49450000000000005,
+          "latency_samples": 2435
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.5,
+              "cpu_percent_one_core": 79.8450265522833,
+              "private_start_mib": 5.9609375,
+              "private_end_mib": 6.0,
+              "peak_private_mib": 6.4375,
+              "peak_working_mib": 8.4765625
+            },
+            "proxy": {
+              "cpu_seconds": 6.15625,
+              "cpu_percent_one_core": 196.61837788499764,
+              "private_start_mib": 12.75,
+              "private_end_mib": 12.70703125,
+              "peak_private_mib": 16.89453125,
+              "peak_working_mib": 28.796875
+            },
+            "load_generator": {
+              "cpu_seconds": 3.109375,
+              "cpu_percent_one_core": 99.30725177440236,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.1953125,
+              "peak_working_mib": 5.05859375
+            }
+          },
+          "messages": 31952,
+          "bytes_one_direction": 2044928,
+          "seconds": 3.0008587,
+          "messages_per_second": 10647.618963198765,
+          "mib_per_second_one_direction": 0.6498790871092996,
+          "latency_p50_ms": 0.3484,
+          "latency_p95_ms": 0.47659999999999997,
+          "latency_p99_ms": 0.5345000000000001,
+          "latency_samples": 1998
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 1.1875,
+              "cpu_percent_one_core": 37.93003032135315,
+              "private_start_mib": 6.0,
+              "private_end_mib": 6.265625,
+              "peak_private_mib": 6.4375,
+              "peak_working_mib": 8.4765625
+            },
+            "proxy": {
+              "cpu_seconds": 5.75,
+              "cpu_percent_one_core": 183.6611994507626,
+              "private_start_mib": 12.70703125,
+              "private_end_mib": 13.0625,
+              "peak_private_mib": 17.046875,
+              "peak_working_mib": 29.02734375
+            },
+            "load_generator": {
+              "cpu_seconds": 0.671875,
+              "cpu_percent_one_core": 21.460411892344545,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.65234375,
+              "peak_working_mib": 5.49609375
+            }
+          },
+          "messages": 2825,
+          "bytes_one_direction": 185139200,
+          "seconds": 3.0204414,
+          "messages_per_second": 935.2937620309402,
+          "mib_per_second_one_direction": 58.455860126933764,
+          "latency_p50_ms": 3.2902,
+          "latency_p95_ms": 37.1887,
+          "latency_p99_ms": 46.7966,
+          "latency_samples": 179
+        },
+        {
+          "case": "tun-v4",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.59375,
+              "cpu_percent_one_core": 18.95237404859653,
+              "private_start_mib": 6.265625,
+              "private_end_mib": 6.265625,
+              "peak_private_mib": 6.43359375,
+              "peak_working_mib": 8.47265625
+            },
+            "proxy": {
+              "cpu_seconds": 6.3125,
+              "cpu_percent_one_core": 201.49366093771044,
+              "private_start_mib": 13.0625,
+              "private_end_mib": 13.2265625,
+              "peak_private_mib": 17.55078125,
+              "peak_working_mib": 29.62109375
+            },
+            "load_generator": {
+              "cpu_seconds": 1.203125,
+              "cpu_percent_one_core": 38.40349478268244,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.30859375,
+              "peak_working_mib": 13.13671875
+            }
+          },
+          "messages": 159,
+          "bytes_one_direction": 166723584,
+          "seconds": 3.0277054,
+          "messages_per_second": 52.51501681768642,
+          "mib_per_second_one_direction": 52.51501681768642,
+          "latency_p50_ms": 75.1093,
+          "latency_p95_ms": 115.5993,
+          "latency_p99_ms": 115.5993,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.09375,
+              "cpu_percent_one_core": 69.0632223291065,
+              "private_start_mib": 6.265625,
+              "private_end_mib": 6.609375,
+              "peak_private_mib": 6.609375,
+              "peak_working_mib": 8.5390625
+            },
+            "proxy": {
+              "cpu_seconds": 5.984375,
+              "cpu_percent_one_core": 197.39712053767005,
+              "private_start_mib": 13.2265625,
+              "private_end_mib": 13.9296875,
+              "peak_private_mib": 13.9296875,
+              "peak_working_mib": 25.08984375
+            },
+            "load_generator": {
+              "cpu_seconds": 1.90625,
+              "cpu_percent_one_core": 62.878456150380536,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.2265625,
+              "peak_working_mib": 5.0703125
+            }
+          },
+          "messages": 34979,
+          "bytes_one_direction": 2238656,
+          "seconds": 3.0006271,
+          "messages_per_second": 11657.229917039675,
+          "mib_per_second_one_direction": 0.7115008494286911,
+          "latency_p50_ms": 0.32239999999999996,
+          "latency_p95_ms": 0.46890000000000004,
+          "latency_p99_ms": 0.9152,
+          "latency_samples": 2188
+        },
+        {
+          "case": "tun-v4-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.171875,
+              "cpu_percent_one_core": 68.95285851602834,
+              "private_start_mib": 6.609375,
+              "private_end_mib": 7.22265625,
+              "peak_private_mib": 7.22265625,
+              "peak_working_mib": 8.92578125
+            },
+            "proxy": {
+              "cpu_seconds": 5.390625,
+              "cpu_percent_one_core": 171.14198696424302,
+              "private_start_mib": 13.9296875,
+              "private_end_mib": 13.94140625,
+              "peak_private_mib": 13.94140625,
+              "peak_working_mib": 25.37109375
+            },
+            "load_generator": {
+              "cpu_seconds": 1.78125,
+              "cpu_percent_one_core": 56.55126525774986,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.19140625,
+              "peak_working_mib": 5.09765625
+            }
+          },
+          "messages": 32298,
+          "bytes_one_direction": 38757600,
+          "seconds": 3.000557,
+          "messages_per_second": 10764.001483724522,
+          "mib_per_second_one_direction": 12.318422108144212,
+          "latency_p50_ms": 0.3185,
+          "latency_p95_ms": 0.47409999999999997,
+          "latency_p99_ms": 1.2695,
+          "latency_samples": 2021
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.0,
+              "cpu_percent_one_core": 65.66384837433729,
+              "private_start_mib": 7.22265625,
+              "private_end_mib": 7.2421875,
+              "peak_private_mib": 7.69140625,
+              "peak_working_mib": 9.26953125
+            },
+            "proxy": {
+              "cpu_seconds": 5.125,
+              "cpu_percent_one_core": 168.26361145923929,
+              "private_start_mib": 13.94140625,
+              "private_end_mib": 13.03125,
+              "peak_private_mib": 17.33203125,
+              "peak_working_mib": 29.1171875
+            },
+            "load_generator": {
+              "cpu_seconds": 2.703125,
+              "cpu_percent_one_core": 88.74879506844024,
+              "private_start_mib": 0.359375,
+              "private_end_mib": 0.0703125,
+              "peak_private_mib": 1.29296875,
+              "peak_working_mib": 5.12109375
+            }
+          },
+          "messages": 24251,
+          "bytes_one_direction": 1552064,
+          "seconds": 3.0006653,
+          "messages_per_second": 8081.87437632581,
+          "mib_per_second_one_direction": 0.4932784653519171,
+          "latency_p50_ms": 0.35209999999999997,
+          "latency_p95_ms": 0.5411,
+          "latency_p99_ms": 1.1737,
+          "latency_samples": 1517
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 65536,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.125,
+              "cpu_percent_one_core": 3.9881967244086365,
+              "private_start_mib": 7.2421875,
+              "private_end_mib": 7.2421875,
+              "peak_private_mib": 7.76171875,
+              "peak_working_mib": 9.28125
+            },
+            "proxy": {
+              "cpu_seconds": 0.640625,
+              "cpu_percent_one_core": 20.439508212594262,
+              "private_start_mib": 13.03125,
+              "private_end_mib": 13.10546875,
+              "peak_private_mib": 17.43359375,
+              "peak_working_mib": 29.3359375
+            },
+            "load_generator": {
+              "cpu_seconds": 0.0625,
+              "cpu_percent_one_core": 1.9940983622043182,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.65625,
+              "peak_working_mib": 5.53125
+            }
+          },
+          "messages": 267,
+          "bytes_one_direction": 17498112,
+          "seconds": 3.0406692,
+          "messages_per_second": 87.80961769863029,
+          "mib_per_second_one_direction": 5.488101106164393,
+          "latency_p50_ms": 44.3405,
+          "latency_p95_ms": 48.5535,
+          "latency_p99_ms": 48.5535,
+          "latency_samples": 20
+        },
+        {
+          "case": "tun-v6",
+          "transport": "tcp",
+          "message_bytes": 1048576,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 0.703125,
+              "cpu_percent_one_core": 22.439117110383382,
+              "private_start_mib": 7.2421875,
+              "private_end_mib": 7.2421875,
+              "peak_private_mib": 7.703125,
+              "peak_working_mib": 9.28125
+            },
+            "proxy": {
+              "cpu_seconds": 6.0,
+              "cpu_percent_one_core": 191.48046600860488,
+              "private_start_mib": 13.10546875,
+              "private_end_mib": 13.92578125,
+              "peak_private_mib": 17.984375,
+              "peak_working_mib": 30.05859375
+            },
+            "load_generator": {
+              "cpu_seconds": 1.203125,
+              "cpu_percent_one_core": 38.395822611100456,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 9.19921875,
+              "peak_working_mib": 13.04296875
+            }
+          },
+          "messages": 171,
+          "bytes_one_direction": 179306496,
+          "seconds": 3.043023,
+          "messages_per_second": 56.19412012331159,
+          "mib_per_second_one_direction": 56.19412012331159,
+          "latency_p50_ms": 72.9606,
+          "latency_p95_ms": 117.8774,
+          "latency_p99_ms": 117.8774,
+          "latency_samples": 12
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 64,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.40625,
+              "cpu_percent_one_core": 79.33238742200462,
+              "private_start_mib": 7.2421875,
+              "private_end_mib": 7.2421875,
+              "peak_private_mib": 7.2421875,
+              "peak_working_mib": 8.97265625
+            },
+            "proxy": {
+              "cpu_seconds": 6.125,
+              "cpu_percent_one_core": 201.93698616510267,
+              "private_start_mib": 13.92578125,
+              "private_end_mib": 13.9296875,
+              "peak_private_mib": 13.9296875,
+              "peak_working_mib": 25.53515625
+            },
+            "load_generator": {
+              "cpu_seconds": 2.1875,
+              "cpu_percent_one_core": 72.12035220182239,
+              "private_start_mib": 0.36328125,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.18359375,
+              "peak_working_mib": 5.0625
+            }
+          },
+          "messages": 31846,
+          "bytes_one_direction": 2038144,
+          "seconds": 3.0004631,
+          "messages_per_second": 10613.694932625567,
+          "mib_per_second_one_direction": 0.6478085286026347,
+          "latency_p50_ms": 0.373,
+          "latency_p95_ms": 0.5175,
+          "latency_p99_ms": 0.6328,
+          "latency_samples": 1993
+        },
+        {
+          "case": "tun-v6-udp",
+          "transport": "udp",
+          "message_bytes": 1200,
+          "concurrency": 4,
+          "round": 3,
+          "usage": {
+            "upstream": {
+              "cpu_seconds": 2.109375,
+              "cpu_percent_one_core": 69.62403893657734,
+              "private_start_mib": 7.2421875,
+              "private_end_mib": 7.2421875,
+              "peak_private_mib": 7.2421875,
+              "peak_working_mib": 8.97265625
+            },
+            "proxy": {
+              "cpu_seconds": 6.84375,
+              "cpu_percent_one_core": 225.89132632756207,
+              "private_start_mib": 13.9296875,
+              "private_end_mib": 13.984375,
+              "peak_private_mib": 13.984375,
+              "peak_working_mib": 25.578125
+            },
+            "load_generator": {
+              "cpu_seconds": 1.453125,
+              "cpu_percent_one_core": 47.9632268229755,
+              "private_start_mib": 0.3671875,
+              "private_end_mib": 0.07421875,
+              "peak_private_mib": 1.26171875,
+              "peak_working_mib": 5.171875
+            }
+          },
+          "messages": 36025,
+          "bytes_one_direction": 43230000,
+          "seconds": 3.0004584,
+          "messages_per_second": 12006.498740325813,
+          "mib_per_second_one_direction": 13.740347374335265,
+          "latency_p50_ms": 0.32699999999999996,
+          "latency_p95_ms": 0.4684,
+          "latency_p99_ms": 0.5427000000000001,
+          "latency_samples": 2254
+        }
+      ],
+      "scope": "Local native echo through plaintext SOCKS; TCP sizes are application messages, not IP packets. Four persistent connections, one outstanding request each. Native upstream and generator CPU recorded separately. WinINet HTTP creates new requests and includes Python origin/driver overhead; not directly comparable to persistent TCP. No allocation stack sampling.",
+      "restored": true
+    }
+  ],
+  "initial_tun_attempt": {
+    "passed": false,
+    "completed_cases": 23,
+    "error": "RuntimeError('Error: Os { code: 10060, kind: TimedOut, message: \"A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.\" }\\n')",
+    "note": "Excluded from aggregate. Native test upstream had a 30-second timeout on idle UDP TCP control; removed before full TUN retest. This correlation alone does not prove the cause of the single initial UDP timeout."
+  }
+}

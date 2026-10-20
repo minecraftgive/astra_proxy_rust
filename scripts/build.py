@@ -65,7 +65,7 @@ def main():
     profile = ['--profile', 'dev'] if args.debug else ['--release']
     target = ['--target', host]
     binaries = pathlib.Path(metadata['target_directory']) / host / ('debug' if args.debug else 'release')
-    client_packages = [item for name in ('astra-ipc','astra-rule','astra-proxy','astra-tui','astra-convert') for item in ('-p',name)]
+    client_packages = [item for name in ('astra-ipc','astra-rule-data','astra-rule','astra-proxy','astra-tui','astra-convert') for item in ('-p',name)]
     run(['cargo', 'build', '--locked', *client_packages, '--bins', *target, *profile])
     if os.name == 'nt':
         arch = {'amd64':'amd64', 'x86_64':'amd64', 'arm64':'arm64', 'aarch64':'arm64', 'x86':'x86', 'i686':'x86'}.get(platform.machine().lower())
@@ -81,6 +81,9 @@ def main():
         run(['cargo', 'test', '--locked', '-p', 'astra-tui', *target, *profile, 'live_', '--', '--ignored'])
         if os.name == 'nt':
             run([sys.executable, ROOT/'scripts/windows_regression.py', '--bin-dir', binaries])
+            run([sys.executable, ROOT/'scripts/ruleset_regression.py', '--bin-dir', binaries])
+            run([sys.executable, ROOT/'scripts/proxy_groups_regression.py', '--bin-dir', binaries])
+            run([sys.executable, ROOT/'scripts/subscription_regression.py', '--bin-dir', binaries])
     if args.build_only:
         print(f'Built client executables in {binaries}')
         return

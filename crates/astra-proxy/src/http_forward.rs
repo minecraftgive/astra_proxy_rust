@@ -82,7 +82,12 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
-async fn forward(mut request: Request<Incoming>, app: Arc<App>) -> Response<Body> {
+async fn forward(
+    mut request: Request<Incoming>,
+    app: Arc<App>,
+    source: Option<std::net::SocketAddr>,
+    destination: Option<std::net::SocketAddr>,
+) -> Response<Body> {
     if request.method() == http::Method::CONNECT || request.headers().contains_key(header::UPGRADE)
     {
         return response(
@@ -113,7 +118,16 @@ async fn forward(mut request: Request<Incoming>, app: Arc<App>) -> Response<Body
     if target.host.is_empty() || target.port == 0 {
         return response(StatusCode::BAD_REQUEST, "Invalid destination");
     }
-    let action = match app.route(&target, Inbound::HttpConnect).await {
+    let action = match app
+        .route_connection(
+            &target,
+            Inbound::HttpConnect,
+            astra_ipc::Network::Tcp,
+            source,
+            destination,
+        )
+        .await
+    {
         Ok(RouteAction::Block) => {
             return response(StatusCode::FORBIDDEN, "Blocked by routing policy")
         }
@@ -123,7 +137,10 @@ async fn forward(mut request: Request<Incoming>, app: Arc<App>) -> Response<Body
             return response(StatusCode::SERVICE_UNAVAILABLE, "Routing unavailable");
         }
     };
-    let remote = match app.connect(&target, &action).await {
+    let remote = match app
+        .connect_tracked(&target, &action, Inbound::HttpConnect, source)
+        .await
+    {
         Ok(remote) => remote,
         Err(error) => {
             tracing::debug!(%error, "HTTP forward connect failed");
@@ -180,6 +197,8 @@ async fn forward(mut request: Request<Incoming>, app: Arc<App>) -> Response<Body
 }
 
 pub async fn handle(client: tokio::net::TcpStream, app: Arc<App>) -> anyhow::Result<()> {
+    let source = client.peer_addr().ok();
+    let destination = client.local_addr().ok();
     hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
         .half_close(true)
@@ -191,7 +210,7 @@ pub async fn handle(client: tokio::net::TcpStream, app: Arc<App>) -> anyhow::Res
             TokioIo::new(client),
             service_fn(move |request| {
                 let app = app.clone();
-                async move { Ok::<_, Infallible>(forward(request, app).await) }
+                async move { Ok::<_, Infallible>(forward(request, app, source, destination).await) }
             }),
         )
         .await?;

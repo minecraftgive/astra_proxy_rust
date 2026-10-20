@@ -205,6 +205,9 @@ pub async fn validate_egress(config: &crate::config::ProxyConfig) -> Result<()> 
     Ok(())
 }
 pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> {
+    #[cfg(windows)]
+    ensure!(astra_ipc::elevation::is_elevated()?,
+        "Enabling Windows TUN requires administrator permission; restart this proxy instance to request UAC elevation (the current configuration is retained)");
     // Reuse the same native device when its identity/address is unchanged. Routes
     // are reference-counted so a candidate can share existing owned routes safely.
     let existing_device = previous
@@ -221,9 +224,11 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
         if let Some(device) = existing_device {
             return Ok::<_, anyhow::Error>(device);
         }
+        #[cfg(not(windows))]
         let mut builder = tun_rs::DeviceBuilder::new()
             .ipv4(device_config.address, device_config.prefix, None)
             .mtu(device_config.mtu);
+        #[cfg(not(windows))]
         if let Some(address) = device_config.ipv6_address {
             builder = builder.ipv6(address, device_config.ipv6_prefix);
         }
@@ -232,19 +237,43 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
             let library = std::env::var_os("ASTRA_WINTUN_DLL").map(std::path::PathBuf::from)
                 .unwrap_or(std::env::current_exe()?.with_file_name("wintun.dll"));
             let library = std::fs::canonicalize(library).context("Windows TUN requires a trusted, matching-architecture wintun.dll beside astra-proxy.exe, or ASTRA_WINTUN_DLL")?;
-            builder = builder.wintun_file(library.to_str().context("Wintun DLL path must be UTF-8")?.to_owned()).metric(5).delete_driver(false);
+            // Acquire the Wintun session before changing any adapter settings.
+            // tun-rs opens a matching named Wintun adapter, or creates a new one.
+            let mut builder = tun_rs::DeviceBuilder::new()
+                .wintun_file(library.to_str().context("Wintun DLL path must be UTF-8")?.to_owned())
+                .delete_driver(false);
             if let Some(name) = &device_config.name {
-                // tun-rs opens an existing named adapter; do not mutate an adapter
-                // owned by another application (same-device reload reuses our Arc).
-                anyhow::ensure!(super::windows_network::interface_index(name).is_err(), "Windows TUN name already belongs to an existing adapter; choose an unused name");
+                builder = builder.name(name);
             }
+            let existing = device_config.name.as_deref().is_some_and(|name|
+                super::windows_network::interface_index(name).is_ok());
+            let device = builder.build_async().with_context(|| {
+                if existing {
+                    format!("open existing Windows TUN {:?}; the adapter must be Wintun and available for a new session", device_config.name.as_deref().unwrap_or_default())
+                } else {
+                    "create Windows TUN device (requires administrator and Wintun)".to_owned()
+                }
+            })?;
+            device.set_mtu(device_config.mtu).context("configure Windows TUN MTU")?;
+            device.set_metric(5).context("configure Windows TUN metric")?;
+            device.set_network_address(device_config.address, device_config.prefix, None)
+                .context("configure Windows TUN IPv4 address")?;
+            if let Some(address) = device_config.ipv6_address {
+                device.add_address_v6(address, device_config.ipv6_prefix)
+                    .context("configure Windows TUN IPv6 address")?;
+            }
+            tracing::info!(name = %device.name()?, reused = existing, "Windows TUN session opened");
+            Ok(Arc::new(device))
         }
-        if let Some(name) = &device_config.name {
-            builder = builder.name(name);
+        #[cfg(not(windows))]
+        {
+            if let Some(name) = &device_config.name {
+                builder = builder.name(name);
+            }
+            Ok(Arc::new(builder.build_async().context(
+                "create native TUN device (Unix requires root/CAP_NET_ADMIN)",
+            )?))
         }
-        Ok(Arc::new(builder.build_async().context(
-            "create native TUN device (Windows requires administrator and Wintun; Unix requires root/CAP_NET_ADMIN)",
-        )?))
     })
     .await??;
     let name = device.name()?;
@@ -399,8 +428,8 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                     let _permit = permit;
                     let target = Target {host: destination.ip().to_string(), port: destination.port()};
                     let result: Result<()> = async {
-                        let action = app.route(&target, Inbound::Tun).await?;
-                        let mut remote = app.connect(&target, &action).await?;
+                        let action = app.route_connection(&target, Inbound::Tun, astra_ipc::Network::Tcp, Some(source), Some(destination)).await?;
+                        let mut remote = app.connect_tracked(&target, &action, Inbound::Tun, Some(source)).await?;
                         tokio::io::copy_bidirectional(&mut stream, &mut remote).await?;
                         Ok(())
                     }.await;

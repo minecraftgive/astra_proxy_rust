@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -19,17 +19,61 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Registry {
     #[serde(default)]
     instances: Vec<Instance>,
     #[serde(default)]
     log_levels: HashMap<String, LogLevel>,
+    #[serde(default)]
+    start_bindings: HashMap<String, Vec<String>>,
 }
 struct Running {
-    child: Child,
+    child: ManagedChild,
     config: String,
     config_path: PathBuf,
+}
+enum ManagedChild {
+    Normal(Child),
+    #[cfg(windows)]
+    Elevated(astra_ipc::elevation::ElevatedChild),
+}
+impl ManagedChild {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Normal(child) => child.id(),
+            #[cfg(windows)]
+            Self::Elevated(child) => child.id(),
+        }
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Normal(child) => child.try_wait(),
+            #[cfg(windows)]
+            Self::Elevated(child) => child.try_wait(),
+        }
+    }
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Normal(child) => child.start_kill(),
+            #[cfg(windows)]
+            Self::Elevated(child) => child.start_kill(),
+        }
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Normal(child) => child.wait().await,
+            #[cfg(windows)]
+            Self::Elevated(child) => child.wait().await,
+        }
+    }
+    async fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Normal(child) => child.kill().await,
+            #[cfg(windows)]
+            Self::Elevated(child) => child.kill().await,
+        }
+    }
 }
 pub struct Manager {
     home: PathBuf,
@@ -39,6 +83,82 @@ pub struct Manager {
     exits: HashMap<String, String>,
 }
 const CONFIG_LIMIT: usize = 480 * 1024;
+
+async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if socket.exists() {
+        match astra_ipc::platform::recover_stale_endpoint(socket) {
+            Ok(true) => eprintln!("Recovered stale control endpoint: {}", socket.display()),
+            Ok(false) => {}
+            Err(error) => {
+                if let Ok(status) = control::request(socket, Command::Status).await {
+                    bail!("Control endpoint {} belongs to running core PID {}; it is not owned by this manager", socket.display(), status.pid);
+                }
+                return Err(error).with_context(|| format!(
+                    "Control endpoint could not be safely recovered: {}; it may be active or inaccessible; the marker was retained", socket.display()));
+            }
+        }
+    }
+    anyhow::ensure!(
+        !socket.exists(),
+        "Control socket exists: {}; check for an orphaned core before removing it",
+        socket.display()
+    );
+    Ok(())
+}
+
+struct DiagnosticPlan {
+    executable: PathBuf,
+    config_path: PathBuf,
+    text: String,
+    running: bool,
+    control: Option<(PathBuf, Option<u32>)>,
+}
+impl DiagnosticPlan {
+    async fn run(mut self) -> Result<Reply> {
+        use tokio::io::AsyncWriteExt;
+        timeout(Duration::from_secs(70), async {
+            if let Some((socket, pid)) = &self.control {
+                let snapshot = control::config_snapshot(socket).await
+                    .context("Read active configuration; update/restart the proxy core if snapshots are unavailable")?;
+                anyhow::ensure!(Some(snapshot.pid) == *pid, "Core PID changed; retry diagnostics");
+                anyhow::ensure!(snapshot.text.len() <= CONFIG_LIMIT, "Configuration exceeds 480 KiB");
+                self.config_path = snapshot.path;
+                self.text = snapshot.text;
+            }
+            let mut child = core_process(self.executable)
+                .arg("--diagnose-stdin")
+                .arg(self.config_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut input = child.stdin.take().context("Missing diagnostic input")?;
+            input.write_all(self.text.as_bytes()).await?;
+            drop(input);
+            let output = child.wait_with_output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Diagnostic core failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(4096)
+                    .collect::<String>()
+            );
+            anyhow::ensure!(
+                output.stdout.len() < 900 * 1024,
+                "Diagnostic report exceeds limit"
+            );
+            let mut report: astra_ipc::diagnostics::Report = serde_json::from_slice(&output.stdout)
+                .context("Update the proxy core to use diagnostics")?;
+            report.running_config = self.running;
+            Ok(Reply::text(serde_json::to_string(&report)?))
+        })
+        .await
+        .context("Diagnostic core timed out")?
+    }
+}
 
 fn core_process(path: PathBuf) -> Process {
     astra_ipc::platform::background_core(path)
@@ -138,6 +258,58 @@ fn ensure_config(kind: Kind, path: &Path) -> Result<bool> {
 }
 
 impl Manager {
+    fn node_tags(&self, name: &str) -> Result<Vec<String>> {
+        let instance = self.instance(name)?;
+        let bindings = if instance.kind == Kind::Rule {
+            self.bound_proxies(name)
+        } else {
+            vec![name.to_owned()]
+        };
+        let mut tags = std::collections::BTreeSet::new();
+        for proxy in self.registry.instances.iter().filter(|i| {
+            i.kind == Kind::Proxy && (bindings.is_empty() || bindings.contains(&i.name))
+        }) {
+            let Ok(config) = read_config(&proxy.config)
+                .and_then(|text| Ok(toml::from_str::<toml::Value>(&text)?))
+            else {
+                continue;
+            };
+            if let Some(nodes) = config.get("outbounds").and_then(toml::Value::as_array) {
+                tags.extend(
+                    nodes
+                        .iter()
+                        .filter_map(|node| node.get("tag").and_then(toml::Value::as_str))
+                        .filter(|tag| !tag.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            if let Some(groups) = config.get("proxy_groups").and_then(toml::Value::as_table) {
+                tags.extend(groups.keys().cloned());
+            }
+            tags.insert("PROXY".into());
+        }
+        Ok(tags.into_iter().collect())
+    }
+    fn diagnostic_plan(&self, name: &str) -> Result<DiagnosticPlan> {
+        let instance = self.instance(name)?;
+        anyhow::ensure!(
+            instance.kind == Kind::Proxy,
+            "Select a proxy instance for diagnostics"
+        );
+        let running = self.running.get(name);
+        Ok(DiagnosticPlan {
+            executable: self.bin.join(Kind::Proxy.binary()),
+            config_path: running
+                .map(|r| r.config_path.clone())
+                .unwrap_or_else(|| instance.config.clone()),
+            text: match running {
+                Some(r) => r.config.clone(),
+                None => read_config(&instance.config)?,
+            },
+            running: running.is_some(),
+            control: running.map(|r| (self.socket(name), r.child.id())),
+        })
+    }
     fn load(home: PathBuf, bin: PathBuf) -> Result<Self> {
         let path = home.join("instances.toml");
         let registry = if path.exists() {
@@ -191,7 +363,7 @@ impl Manager {
     async fn validate(&self, kind: Kind, path: &Path) -> Result<()> {
         read_config(path)?;
         let output = timeout(
-            Duration::from_secs(20),
+            Duration::from_secs(if kind == Kind::Rule { 90 } else { 20 }),
             core_process(self.bin.join(kind.binary()))
                 .arg("--check")
                 .arg(path)
@@ -209,35 +381,207 @@ impl Manager {
         );
         Ok(())
     }
+    fn start_plan(&self, name: &str) -> Result<Vec<String>> {
+        fn visit(
+            manager: &Manager,
+            name: &str,
+            active: &mut HashSet<String>,
+            done: &mut HashSet<String>,
+            plan: &mut Vec<String>,
+        ) -> Result<()> {
+            manager.instance(name)?;
+            if done.contains(name) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                active.insert(name.to_owned()),
+                "Startup binding cycle: {name}"
+            );
+            if let Some(targets) = manager.registry.start_bindings.get(name) {
+                for target in targets {
+                    visit(manager, target, active, done, plan)?;
+                }
+            }
+            active.remove(name);
+            done.insert(name.to_owned());
+            plan.push(name.to_owned());
+            Ok(())
+        }
+        let mut plan = Vec::new();
+        let mut active = HashSet::new();
+        let mut done = HashSet::new();
+        visit(self, name, &mut active, &mut done, &mut plan)?;
+        // Reverse links are expanded only for an explicitly started rule.
+        // Starting one proxy never starts its sibling proxies.
+        if self.instance(name)?.kind == Kind::Rule {
+            for proxy in self.bound_proxies(name) {
+                visit(self, &proxy, &mut active, &mut done, &mut plan)?;
+            }
+        }
+        Ok(plan)
+    }
+    fn bound_proxies(&self, rule: &str) -> Vec<String> {
+        self.registry
+            .instances
+            .iter()
+            .filter(|instance| {
+                instance.kind == Kind::Proxy
+                    && self
+                        .registry
+                        .start_bindings
+                        .get(&instance.name)
+                        .is_some_and(|targets| targets.iter().any(|target| target == rule))
+            })
+            .map(|instance| instance.name.clone())
+            .collect()
+    }
+    fn bind_start(&mut self, name: &str, targets: Vec<String>) -> Result<()> {
+        let instance = self.instance(name)?;
+        let mut unique = HashSet::new();
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|target| unique.insert(target.clone()))
+            .collect();
+        let kind = instance.kind;
+        for target in &targets {
+            anyhow::ensure!(
+                self.instance(target)?.kind != kind,
+                "Bind proxies to a rule instance"
+            );
+        }
+        if kind == Kind::Proxy {
+            anyhow::ensure!(targets.len() <= 1, "Select one rule instance");
+        }
+        let previous = self.registry.start_bindings.clone();
+        if kind == Kind::Rule {
+            // Store one canonical proxy -> rule relation for both editing directions.
+            for proxy in self.bound_proxies(name) {
+                self.registry.start_bindings.remove(&proxy);
+            }
+            self.registry.start_bindings.remove(name);
+            for proxy in targets {
+                self.registry
+                    .start_bindings
+                    .insert(proxy, vec![name.to_owned()]);
+            }
+        } else if targets.is_empty() {
+            self.registry.start_bindings.remove(name);
+        } else {
+            self.registry
+                .start_bindings
+                .insert(name.to_owned(), targets);
+        }
+        if let Err(error) = self.start_plan(name).and_then(|_| self.persist()) {
+            self.registry.start_bindings = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
     async fn start(&mut self, name: &str) -> Result<()> {
+        self.reap()?;
+        let plan = self.start_plan(name)?;
+        // Validate the entire group before starting its first new process.
+        for item in &plan {
+            if let Some(running) = self.running.get(item) {
+                let status = control::request(&self.socket(item), Command::Status)
+                    .await
+                    .with_context(|| format!("Bound instance is unavailable: {item}"))?;
+                anyhow::ensure!(
+                    Some(status.pid) == running.child.id(),
+                    "Core PID mismatch: {item}"
+                );
+            } else {
+                let instance = self.instance(item)?;
+                self.validate(instance.kind, &instance.config).await?;
+            }
+        }
+        let mut started: Vec<String> = Vec::new();
+        for item in plan {
+            if self.running.contains_key(&item) {
+                continue;
+            }
+            if let Err(error) = self.start_one(&item).await {
+                // Only processes created by this attempt are rolled back.
+                let mut rollback_errors = Vec::new();
+                if self.running.contains_key(&item) {
+                    if let Err(error) = self.stop(&item).await {
+                        rollback_errors.push(format!("{item}: {error:#}"));
+                    }
+                }
+                for started in started.iter().rev() {
+                    if let Err(error) = self.stop(started).await {
+                        rollback_errors.push(format!("{started}: {error:#}"));
+                    }
+                }
+                if !rollback_errors.is_empty() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Start {item} failed; rollback incomplete: {}",
+                            rollback_errors.join("; ")
+                        )
+                    });
+                }
+                return Err(error).with_context(|| format!("Start bound instance {item}"));
+            }
+            started.push(item);
+        }
+        Ok(())
+    }
+    async fn start_one(&mut self, name: &str) -> Result<()> {
         self.reap()?;
         anyhow::ensure!(
             !self.running.contains_key(name),
             "Instance is already running"
         );
         let instance = self.instance(name)?;
-        self.validate(instance.kind, &instance.config).await?;
         let socket = self.socket(name);
-        anyhow::ensure!(
-            !socket.exists(),
-            "Control socket exists: {}; check for an orphaned core before removing it",
-            socket.display()
-        );
+        prepare_control_endpoint(&socket).await?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(self.log(name))?;
         let config = read_config(&instance.config)?;
-        let child = core_process(self.bin.join(instance.kind.binary()))
-            .arg(&instance.config)
-            .env("ASTRA_CONTROL_SOCKET", &socket)
-            .env("ASTRA_LOG_LEVEL", self.level(name).as_str())
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .kill_on_drop(true)
-            .spawn()?;
+        #[cfg(windows)]
+        let elevate = instance.kind == Kind::Proxy
+            && toml::from_str::<toml::Value>(&config)?.get("tun").is_some()
+            && !astra_ipc::elevation::is_elevated()?;
+        #[cfg(not(windows))]
+        let elevate = false;
+        #[cfg(windows)]
+        let elevated = if elevate {
+            let exe = self.bin.join(instance.kind.binary());
+            let config = fs::canonicalize(&instance.config)?;
+            let args = astra_ipc::elevation::core_arguments(
+                &config,
+                Some(&socket),
+                &self.log(name),
+                self.level(name).as_str(),
+            )?;
+            Some(ManagedChild::Elevated(
+                tokio::task::spawn_blocking(move || astra_ipc::elevation::spawn(&exe, &args))
+                    .await??,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let elevated: Option<ManagedChild> = None;
+        let child = if let Some(child) = elevated {
+            child
+        } else {
+            ManagedChild::Normal(
+                core_process(self.bin.join(instance.kind.binary()))
+                    .arg(&instance.config)
+                    .env("ASTRA_CONTROL_SOCKET", &socket)
+                    .env("ASTRA_LOG_LEVEL", self.level(name).as_str())
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone()?)
+                    .stderr(log)
+                    .kill_on_drop(true)
+                    .spawn()?,
+            )
+        };
         self.running.insert(
             name.to_owned(),
             Running {
@@ -247,7 +591,14 @@ impl Manager {
             },
         );
         self.exits.remove(name);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(if instance.kind == Kind::Rule {
+                60
+            } else if elevate {
+                30
+            } else {
+                10
+            });
         while tokio::time::Instant::now() < deadline {
             self.reap()?;
             let run = self
@@ -409,7 +760,9 @@ impl Manager {
         match action {
             Action::List => {
                 let mut reply = Reply::text("");
+                let mut details = HashMap::new();
                 for i in &self.registry.instances {
+                    details.insert(i.name.clone(), self.details(i));
                     let status = if self.running.contains_key(&i.name) {
                         control::request(&self.socket(&i.name), Command::Status)
                             .await
@@ -439,7 +792,9 @@ impl Manager {
                                         if let Some(applied) =
                                             status.as_ref().and_then(|s| s.applied.as_ref())
                                         {
-                                            applied.path != i.config
+                                            applied.path
+                                                != fs::canonicalize(&i.config)
+                                                    .unwrap_or_else(|_| i.config.clone())
                                                 || applied.digest != control::config_digest(&text)
                                         } else {
                                             text != r.config || i.config != r.config_path
@@ -450,11 +805,37 @@ impl Manager {
                             .unwrap_or(false),
                     });
                 }
+                reply.text = serde_json::to_string(&details)?;
                 Ok(reply)
             }
             Action::Add(i) => self.add(i).await,
             Action::Create { name, kind } => self.create(name, kind).await,
             Action::FollowLogs { .. } => bail!("Log subscriptions require a dedicated connection"),
+            Action::Diagnostics(_) => bail!("Diagnostics require a dedicated connection"),
+            Action::NodeTags(name) => {
+                let json = serde_json::to_string(&self.node_tags(&name)?)?;
+                anyhow::ensure!(
+                    json.len() < 900 * 1024,
+                    "Node suggestions exceed response limit"
+                );
+                Ok(Reply::text(json))
+            }
+            Action::ExplainRoute { name, request } => {
+                anyhow::ensure!(
+                    self.instance(&name)?.kind == Kind::Rule,
+                    "Select a rule instance"
+                );
+                let running = self
+                    .running
+                    .get(&name)
+                    .context("Start the rule instance before querying a route")?;
+                let explanation = control::explain_route(&self.socket(&name), request).await?;
+                anyhow::ensure!(
+                    Some(explanation.pid) == running.child.id(),
+                    "Core PID mismatch"
+                );
+                Ok(Reply::text(serde_json::to_string(&explanation)?))
+            }
             Action::GetLogLevel(name) => {
                 self.instance(&name)?;
                 Ok(Reply::text(self.level(&name).as_str()))
@@ -479,16 +860,25 @@ impl Manager {
                 }
                 Ok(Reply::text(level.as_str()))
             }
+            Action::BindStart { name, targets } => {
+                self.bind_start(&name, targets)?;
+                Ok(Reply::text("Startup bindings saved"))
+            }
             Action::Remove(name) => {
                 anyhow::ensure!(
                     !self.running.contains_key(&name),
                     "Stop the instance before removing it"
                 );
                 self.instance(&name)?;
-                let old = self.registry.instances.clone();
+                let old = self.registry.clone();
                 self.registry.instances.retain(|i| i.name != name);
+                self.registry.log_levels.remove(&name);
+                self.registry.start_bindings.remove(&name);
+                for targets in self.registry.start_bindings.values_mut() {
+                    targets.retain(|target| target != &name);
+                }
                 if let Err(e) = self.persist() {
-                    self.registry.instances = old;
+                    self.registry = old;
                     return Err(e);
                 }
                 Ok(Reply::text("Instance removed; configuration retained"))
@@ -511,6 +901,12 @@ impl Manager {
             Action::Restart(name) => {
                 let i = self.instance(&name)?;
                 self.validate(i.kind, &i.config).await?;
+                for target in self.start_plan(&name)? {
+                    if !self.running.contains_key(&target) {
+                        let instance = self.instance(&target)?;
+                        self.validate(instance.kind, &instance.config).await?;
+                    }
+                }
                 self.stop(&name).await?;
                 self.start(&name).await?;
                 Ok(Reply::text("Restarted with current configuration"))
@@ -647,6 +1043,116 @@ impl Manager {
     }
 }
 
+impl Manager {
+    fn details(&self, instance: &Instance) -> InstanceDetails {
+        fn preview(value: &str, limit: usize) -> String {
+            let mut text: String = value.chars().take(limit).collect();
+            if value.chars().count() > limit {
+                text.push('…');
+            }
+            text
+        }
+        let mut details = InstanceDetails {
+            node_tags_supported: true,
+            diagnostics_supported: true,
+            explanation_supported: true,
+            bindings: if instance.kind == Kind::Rule {
+                self.bound_proxies(&instance.name)
+            } else {
+                self.registry
+                    .start_bindings
+                    .get(&instance.name)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            log_level: self.level(&instance.name),
+            ..InstanceDetails::default()
+        };
+        let Ok(config) = read_config(&instance.config)
+            .and_then(|text| Ok(toml::from_str::<toml::Value>(&text)?))
+        else {
+            details.config_unavailable = true;
+            return details;
+        };
+        if instance.kind == Kind::Rule {
+            details.modes.push("Rules".into());
+            details.rules = config
+                .get("rules")
+                .and_then(toml::Value::as_array)
+                .map_or(0, Vec::len);
+            if let Some(socket) = config.get("socket").and_then(toml::Value::as_str) {
+                details
+                    .listeners
+                    .push(format!("IPC {}", preview(socket, 128)));
+            }
+        } else {
+            details.modes.push(
+                if config
+                    .get("standalone")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "Standalone"
+                } else {
+                    "Rules"
+                }
+                .into(),
+            );
+            for (key, label) in [("socks5_listen", "SOCKS5"), ("http_listen", "HTTP")] {
+                if let Some(address) = config.get(key).and_then(toml::Value::as_str) {
+                    details
+                        .listeners
+                        .push(format!("{label} {}", preview(address, 128)));
+                }
+            }
+            for (key, mode) in [
+                ("tun", "TUN"),
+                ("system_proxy", "System proxy"),
+                ("tproxy", "TPROXY"),
+                ("redirect", "REDIRECT"),
+            ] {
+                if config.get(key).is_some() {
+                    details.modes.push(mode.into());
+                }
+            }
+            if let Some(outbounds) = config.get("outbounds").and_then(toml::Value::as_array) {
+                details.outbound_count = outbounds.len();
+                details.outbounds = outbounds
+                    .iter()
+                    .filter_map(|outbound| {
+                        outbound
+                            .get("tag")
+                            .and_then(toml::Value::as_str)
+                            .map(|tag| preview(tag, 96))
+                    })
+                    .take(4)
+                    .collect();
+            }
+            if let Some(groups) = config.get("proxy_groups").and_then(toml::Value::as_table) {
+                details.outbound_count += groups.len();
+                details
+                    .outbounds
+                    .extend(groups.iter().take(4).map(|(name, group)| {
+                        let mode = group
+                            .get("mode")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or("select");
+                        format!("{} [{}]", preview(name, 64), mode)
+                    }));
+            }
+            if !config
+                .get("proxy_groups")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|g| g.contains_key("PROXY"))
+            {
+                details.outbound_count += 1;
+                details.outbounds.push("PROXY [select]".into());
+            }
+        }
+        details
+    }
+}
+
 #[cfg_attr(windows, allow(dead_code))]
 struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
@@ -663,6 +1169,7 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
     set_private(&socket, 0o600)?;
     let mut manager = Manager::load(home, bin)?;
     let mut followers = tokio::task::JoinSet::new();
+    let mut diagnostics = tokio::task::JoinSet::new();
     let signal = astra_ipc::shutdown_signal();
     tokio::pin!(signal);
     let result: Result<()> = async {
@@ -674,6 +1181,33 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
                     let request = timeout(Duration::from_secs(2), astra_ipc::receive_management::<Request>(&mut stream)).await;
                     let request = match request { Ok(Ok(r)) => r, _ => continue };
                     if request.version == astra_ipc::API_VERSION {
+                        if let Action::Diagnostics(name) = &request.action {
+                            let plan = (|| {
+                                anyhow::ensure!(diagnostics.len() < 2, "Diagnostics are busy; retry shortly");
+                                manager.diagnostic_plan(name)
+                            })();
+                            match plan {
+                                Ok(plan) => {
+                                    diagnostics.spawn(async move {
+                                        use tokio::io::AsyncReadExt;
+                                        let result = tokio::select! {
+                                            result = plan.run() => result,
+                                            _ = stream.read_u8() => return,
+                                        };
+                                        let reply = result.unwrap_or_else(|error| {
+                                            let mut reply = Reply::text("");
+                                            reply.error = Some(format!("{error:#}")); reply
+                                        });
+                                        let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut stream, &reply)).await;
+                                    });
+                                }
+                                Err(error) => {
+                                    let mut reply = Reply::text(""); reply.error = Some(format!("{error:#}"));
+                                    let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut stream, &reply)).await;
+                                }
+                            }
+                            continue;
+                        }
                         if let Action::FollowLogs{name,cursor} = &request.action {
                             let result = manager.instance(name).and_then(|_| {
                                 anyhow::ensure!(followers.len() < 16,"Too many log subscribers"); Ok(manager.log(name))
@@ -697,6 +1231,7 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
                 }
                 _ = sleep(Duration::from_millis(500)) => { manager.reap()?; }
                 Some(_) = followers.join_next(), if !followers.is_empty() => {},
+                Some(_) = diagnostics.join_next(), if !diagnostics.is_empty() => {},
             }
         }
         Ok(())
@@ -704,6 +1239,8 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
     manager.stop_all().await;
     followers.abort_all();
     while followers.join_next().await.is_some() {}
+    diagnostics.abort_all();
+    while diagnostics.join_next().await.is_some() {}
     result
 }
 
@@ -728,6 +1265,479 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn control_endpoint_recovery_preserves_live_and_unknown_owners() {
+        let temp = Temp::new();
+        let path = temp.0.join("t2.sock");
+        prepare_control_endpoint(&path).await.unwrap();
+        fs::write(&path, b"").unwrap();
+        prepare_control_endpoint(&path).await.unwrap();
+        assert!(!path.exists());
+        fs::write(&path, b"not a marker").unwrap();
+        assert!(prepare_control_endpoint(&path).await.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"not a marker");
+        fs::remove_file(&path).unwrap();
+        let control = control::Control::bind(Some(path.clone())).unwrap();
+        let server = tokio::spawn(async move { control.shutdown().await });
+        let error = prepare_control_endpoint(&path).await.unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("running core PID {}", std::process::id())));
+        assert!(path.exists());
+        assert_eq!(
+            control::request(&path, Command::Status).await.unwrap().pid,
+            std::process::id()
+        );
+        control::request(&path, Command::Stop).await.unwrap();
+        server.await.unwrap().unwrap();
+        let unresponsive = UnixListener::bind(&path).unwrap();
+        assert!(prepare_control_endpoint(&path).await.is_err());
+        assert!(
+            path.exists(),
+            "an unresponsive server still owns its endpoint"
+        );
+        drop(unresponsive);
+    }
+    #[tokio::test]
+    async fn node_suggestions_use_full_tags_from_bound_proxies_and_never_include_credentials() {
+        let temp = Temp::new();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::new()).unwrap();
+        for (name, kind) in [
+            ("r1", Kind::Rule),
+            ("r2", Kind::Rule),
+            ("p1", Kind::Proxy),
+            ("p2", Kind::Proxy),
+        ] {
+            manager.registry.instances.push(Instance {
+                name: name.into(),
+                kind,
+                config: temp.0.join(format!("{name}.toml")),
+            });
+        }
+        let mut config = String::from("standalone=true\n");
+        for i in 0..9 {
+            config.push_str(&format!("[[outbounds]]\nkind='socks5'\ntag='节点-{i}'\nserver='127.0.0.1:1080'\npassword='secret-should-not-leak'\n"));
+        }
+        fs::write(temp.0.join("p1.toml"), config).unwrap();
+        fs::write(
+            temp.0.join("p2.toml"),
+            "[[outbounds]]\nkind='socks5'\ntag='other'\nserver='127.0.0.1:1080'\n",
+        )
+        .unwrap();
+        assert_eq!(manager.node_tags("r1").unwrap().len(), 11);
+        manager.bind_start("p1", vec!["r1".into()]).unwrap();
+        manager.bind_start("p2", vec!["r2".into()]).unwrap();
+        let reply = manager.action(Action::NodeTags("r1".into())).await.unwrap();
+        assert!(!reply.text.contains("secret-should-not-leak"));
+        let tags: Vec<String> = serde_json::from_str(&reply.text).unwrap();
+        assert_eq!(tags.len(), 10);
+        assert!(tags.contains(&"节点-8".into()));
+        assert!(!tags.contains(&"other".into()));
+        assert_eq!(manager.node_tags("r2").unwrap(), ["PROXY", "other"]);
+        assert_eq!(manager.node_tags("p2").unwrap(), ["PROXY", "other"]);
+        assert!(manager.node_tags("missing").is_err());
+        let path = temp.0.join("p1.toml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("\n[proxy_groups.choose]\nmode='select'\nmembers=['节点-0','节点-8']\n");
+        fs::write(&path, text).unwrap();
+        assert!(manager.node_tags("r1").unwrap().contains(&"choose".into()));
+
+        fs::write(temp.0.join("p2.toml"), "invalid TOML").unwrap();
+        assert!(manager.node_tags("r2").unwrap().is_empty());
+    }
+    #[test]
+    fn diagnostic_plan_freezes_saved_configuration_and_rejects_rule_instances() {
+        let temp = Temp::new();
+        let path = temp.0.join("proxy.toml");
+        fs::write(&path, "standalone=true\n").unwrap();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("unused")).unwrap();
+        manager.registry.instances.push(Instance {
+            name: "proxy".into(),
+            kind: Kind::Proxy,
+            config: path.clone(),
+        });
+        let plan = manager.diagnostic_plan("proxy").unwrap();
+        fs::write(&path, "changed after request").unwrap();
+        assert_eq!(plan.text, "standalone=true\n");
+        assert!(!plan.running);
+        manager.registry.instances[0].kind = Kind::Rule;
+        assert!(manager.diagnostic_plan("proxy").is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_diagnostics_use_running_snapshot_keep_manager_responsive_and_cancel_child() {
+        use tokio::io::AsyncReadExt;
+        let temp = Temp::new();
+        let home = temp.0.join("state");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(2);
+        let fake = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                accepted_tx.send(()).await.unwrap();
+                assert!(stream.read_u8().await.is_err()); // timeout/cancel closes the outbound.
+            }
+        });
+        let source = temp.0.join("proxy.toml");
+        let inbound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = inbound.local_addr().unwrap();
+        drop(inbound);
+        fs::write(&source, format!("standalone=true\nsocks5_listen='{address}'\n[[outbounds]]\nkind='socks5'\ntag='edge'\nserver='{upstream}'\n")).unwrap();
+        let manager = tokio::spawn(serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        call(
+            &socket,
+            Action::Add(Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: source.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        call(&socket, Action::Start("proxy".into())).await.unwrap();
+        let reloaded = fs::read_to_string(&source)
+            .unwrap()
+            .replace("tag='edge'", "tag='live-edge'");
+        fs::write(&source, reloaded).unwrap();
+        // Reload the core directly, bypassing the manager's cached configuration.
+        control::request(
+            &socket.with_file_name("proxy.sock"),
+            Command::Reload { path: None },
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &source,
+            "invalid modified file; running core must still be used",
+        )
+        .unwrap();
+        let first_socket = socket.clone();
+        let first =
+            tokio::spawn(
+                async move { call(&first_socket, Action::Diagnostics("proxy".into())).await },
+            );
+        timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let list = timeout(Duration::from_secs(1), call(&socket, Action::List))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(list.rows[0].pid.is_some());
+        let reply = timeout(Duration::from_secs(12), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let report: astra_ipc::diagnostics::Report = serde_json::from_str(&reply.text).unwrap();
+        assert!(report.running_config);
+        assert_eq!(report.probes.len(), 3);
+        assert_eq!(report.probes[2].outbound, "PROXY");
+        assert!(report.probes[0].direct);
+        assert_eq!(report.probes[1].outbound, "live-edge");
+        assert!(report.probes[1].ip.is_none());
+        assert!(report.probes[1].error.is_some());
+        let second_socket = socket.clone();
+        let second =
+            tokio::spawn(
+                async move { call(&second_socket, Action::Diagnostics("proxy".into())).await },
+            );
+        timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        second.abort();
+        let _ = second.await;
+        timeout(Duration::from_secs(3), fake)
+            .await
+            .unwrap()
+            .unwrap();
+        call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[test]
+    fn startup_bindings_are_proxy_to_one_rule_and_persistent() {
+        let temp = Temp::new();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        for (name, kind) in [
+            ("proxy", Kind::Proxy),
+            ("other-proxy", Kind::Proxy),
+            ("rules-a", Kind::Rule),
+            ("rules-b", Kind::Rule),
+        ] {
+            manager.registry.instances.push(Instance {
+                name: name.into(),
+                kind,
+                config: temp.0.join(format!("{name}.toml")),
+            });
+        }
+        manager
+            .bind_start("proxy", vec!["rules-a".into(), "rules-a".into()])
+            .unwrap();
+        manager
+            .bind_start("other-proxy", vec!["rules-a".into()])
+            .unwrap();
+        assert_eq!(manager.start_plan("proxy").unwrap(), ["rules-a", "proxy"]);
+        assert!(manager
+            .bind_start("proxy", vec!["rules-a".into(), "rules-b".into()])
+            .is_err());
+        assert!(manager
+            .bind_start("proxy", vec!["other-proxy".into()])
+            .is_err());
+        assert!(manager
+            .bind_start("rules-b", vec!["rules-a".into()])
+            .is_err());
+        assert!(manager.bind_start("proxy", vec!["missing".into()]).is_err());
+        let restored = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        assert_eq!(restored.start_plan("proxy").unwrap(), ["rules-a", "proxy"]);
+        manager
+            .registry
+            .start_bindings
+            .insert("rules-a".into(), vec!["proxy".into()]);
+        assert!(manager.start_plan("proxy").is_err());
+        manager.bind_start("rules-a", Vec::new()).unwrap();
+        manager.bind_start("proxy", Vec::new()).unwrap();
+        assert_eq!(manager.start_plan("proxy").unwrap(), ["proxy"]);
+    }
+    #[test]
+    fn rule_bindings_edit_the_same_relation_and_start_rule_before_all_proxies() {
+        let temp = Temp::new();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        for (name, kind) in [
+            ("rule-a", Kind::Rule),
+            ("rule-b", Kind::Rule),
+            ("proxy-a", Kind::Proxy),
+            ("proxy-b", Kind::Proxy),
+        ] {
+            manager.registry.instances.push(Instance {
+                name: name.into(),
+                kind,
+                config: temp.0.join(format!("{name}.toml")),
+            });
+        }
+        manager
+            .bind_start(
+                "rule-a",
+                vec!["proxy-b".into(), "proxy-a".into(), "proxy-a".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.start_plan("rule-a").unwrap(),
+            ["rule-a", "proxy-a", "proxy-b"]
+        );
+        assert_eq!(
+            manager.start_plan("proxy-a").unwrap(),
+            ["rule-a", "proxy-a"]
+        );
+        assert_eq!(
+            manager
+                .details(&manager.instance("rule-a").unwrap())
+                .bindings,
+            ["proxy-a", "proxy-b"]
+        );
+        assert_eq!(
+            manager
+                .details(&manager.instance("proxy-a").unwrap())
+                .bindings,
+            ["rule-a"]
+        );
+        assert!(manager.bind_start("rule-a", vec!["rule-b".into()]).is_err());
+        assert!(manager
+            .bind_start("rule-a", vec!["missing".into()])
+            .is_err());
+        assert_eq!(manager.bound_proxies("rule-a"), ["proxy-a", "proxy-b"]);
+        manager
+            .bind_start("rule-b", vec!["proxy-b".into()])
+            .unwrap();
+        assert_eq!(manager.bound_proxies("rule-a"), ["proxy-a"]);
+        let restored = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        assert_eq!(
+            restored.start_plan("rule-b").unwrap(),
+            ["rule-b", "proxy-b"]
+        );
+        manager.bind_start("rule-a", Vec::new()).unwrap();
+        assert_eq!(manager.start_plan("proxy-a").unwrap(), ["proxy-a"]);
+        assert_eq!(
+            manager.start_plan("proxy-b").unwrap(),
+            ["rule-b", "proxy-b"]
+        );
+    }
+    #[test]
+    fn instance_summary_contains_endpoints_modes_tags_and_no_credentials() {
+        let temp = Temp::new();
+        let config = temp.0.join("proxy.toml");
+        fs::write(&config, "standalone=true\nhttp_listen='127.0.0.1:8080'\n[tun]\nname='Astra'\n[[outbounds]]\ntag='edge'\nkind='socks5'\nserver='127.0.0.1:1080'\npassword='do-not-expose'\n").unwrap();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        manager
+            .registry
+            .start_bindings
+            .insert("proxy".into(), vec!["rules".into()]);
+        let instance = Instance {
+            name: "proxy".into(),
+            kind: Kind::Proxy,
+            config,
+        };
+        let details = manager.details(&instance);
+        assert_eq!(details.modes, ["Standalone", "TUN"]);
+        assert_eq!(details.listeners, ["HTTP 127.0.0.1:8080"]);
+        assert_eq!(details.outbounds, ["edge", "PROXY [select]"]);
+        assert_eq!(details.outbound_count, 2);
+        assert_eq!(details.bindings, ["rules"]);
+        assert!(!serde_json::to_string(&details)
+            .unwrap()
+            .contains("do-not-expose"));
+        let large = format!(
+            "standalone=true\n{}",
+            format!("[[outbounds]]\ntag='{}'\n", "a".repeat(40000)).repeat(12)
+        );
+        fs::write(&instance.config, large).unwrap();
+        let summary = manager.details(&instance);
+        assert_eq!(summary.outbound_count, 13);
+        assert!(
+            serde_json::to_vec(&summary).unwrap().len() < 4096,
+            "List metadata must stay bounded even with very long node tags"
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_bound_start_reuses_running_dependencies_and_rolls_back_new_ones() {
+        let temp = Temp::new();
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let route = temp.0.join("rule.r");
+        let rules = temp.0.join("rule.toml");
+        fs::write(
+            &rules,
+            format!(
+                "socket={:?}\ndefault_action='direct'\n",
+                route.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = temp.0.join("proxy.toml");
+        fs::write(
+            &proxy,
+            format!(
+                "rule_socket={:?}\nsocks5_listen='{}'\n",
+                route.to_string_lossy(),
+                occupied.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut manager = Manager::load(temp.0.clone(), bin).unwrap();
+        manager.registry.instances = vec![
+            Instance {
+                name: "rules".into(),
+                kind: Kind::Rule,
+                config: rules,
+            },
+            Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: proxy,
+            },
+        ];
+        manager.bind_start("proxy", vec!["rules".into()]).unwrap();
+        assert!(manager.start("proxy").await.is_err());
+        assert!(
+            manager.running.is_empty(),
+            "Newly started dependency must be rolled back"
+        );
+        manager.start_one("rules").await.unwrap();
+        let pid = manager.running["rules"].child.id();
+        assert!(manager.start("proxy").await.is_err());
+        assert_eq!(
+            manager.running["rules"].child.id(),
+            pid,
+            "Existing dependency must be kept"
+        );
+        drop(occupied);
+        manager.start("proxy").await.unwrap();
+        let proxy_pid = manager.running["proxy"].child.id();
+        let rows = manager.action(Action::List).await.unwrap().rows;
+        assert!(
+            rows.iter().all(|row| !row.changed),
+            "Canonical path spelling must not create a pending reload"
+        );
+        manager.start("proxy").await.unwrap();
+        assert_eq!(manager.running["rules"].child.id(), pid);
+        assert_eq!(manager.running["proxy"].child.id(), proxy_pid);
+        manager.stop("proxy").await.unwrap();
+        assert!(manager.running.contains_key("rules"));
+        let proxy_two = temp.0.join("proxy-two.toml");
+        let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fs::write(
+            &proxy_two,
+            format!(
+                "rule_socket={:?}\nsocks5_listen='{}'\n",
+                route.to_string_lossy(),
+                blocked.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        manager.registry.instances.push(Instance {
+            name: "proxy-two".into(),
+            kind: Kind::Proxy,
+            config: proxy_two,
+        });
+        manager
+            .bind_start("rules", vec!["proxy".into(), "proxy-two".into()])
+            .unwrap();
+        assert!(manager.start("rules").await.is_err());
+        assert_eq!(
+            manager.running.len(),
+            1,
+            "A failed second proxy rolls back the first newly started proxy"
+        );
+        assert_eq!(manager.running["rules"].child.id(), pid);
+        drop(blocked);
+        manager.start("rules").await.unwrap();
+        assert_eq!(manager.running["rules"].child.id(), pid);
+        assert_eq!(manager.running.len(), 3);
+        let pids: Vec<_> = ["rules", "proxy", "proxy-two"]
+            .iter()
+            .map(|name| manager.running[*name].child.id())
+            .collect();
+        manager.start("rules").await.unwrap();
+        assert_eq!(
+            pids,
+            ["rules", "proxy", "proxy-two"]
+                .iter()
+                .map(|name| manager.running[*name].child.id())
+                .collect::<Vec<_>>()
+        );
+        manager.stop_all().await;
+        #[cfg(windows)]
+        for name in ["rules", "proxy", "proxy-two"] {
+            fs::write(manager.socket(name), b"").unwrap();
+        }
+        manager.start("rules").await.unwrap();
+        assert_eq!(manager.running.len(), 3);
+        manager.stop_all().await;
     }
     #[test]
     fn defaults_create_parents_are_private_and_preserve_existing_files() {
@@ -909,6 +1919,23 @@ mod tests {
             &socket,
             Action::SetLogLevel {
                 name: "rules".into(),
+                level: LogLevel::Route,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call(&socket, Action::GetLogLevel("rules".into()))
+                .await
+                .unwrap()
+                .text,
+            "route"
+        );
+        assert_eq!(pid, call(&socket, Action::List).await.unwrap().rows[0].pid);
+        call(
+            &socket,
+            Action::SetLogLevel {
+                name: "rules".into(),
                 level: LogLevel::Debug,
             },
         )
@@ -1006,7 +2033,23 @@ mod tests {
         }
         let rows = call(&socket, Action::List).await.unwrap().rows;
         assert!(rows.iter().all(|r| r.state == "Running" && r.pid.is_some()));
-        assert!(call(&socket, Action::Start("proxy".into())).await.is_err());
+        let proxy_pid = rows
+            .iter()
+            .find(|row| row.instance.name == "proxy")
+            .unwrap()
+            .pid;
+        call(&socket, Action::Start("proxy".into())).await.unwrap();
+        assert_eq!(
+            call(&socket, Action::List)
+                .await
+                .unwrap()
+                .rows
+                .iter()
+                .find(|row| row.instance.name == "proxy")
+                .unwrap()
+                .pid,
+            proxy_pid
+        );
         assert!(call(&socket, Action::Remove("rules".into())).await.is_err());
         assert!(call(
             &socket,

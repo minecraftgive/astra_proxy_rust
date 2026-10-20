@@ -1,4 +1,5 @@
 use crate::protocol::*;
+use crate::{i18n::t, tr};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -20,23 +21,33 @@ enum Mode {
     Search(String),
     DisplayLevel(usize),
     CaptureLevel(usize),
+    MemoryLimit(String),
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    level_order_version: u8,
     filter: String,
     search: String,
     min_level: Option<LogLevel>,
     follow: bool,
     mode: Mode,
+    #[serde(default = "default_memory_lines")]
+    memory_lines: usize,
+}
+fn default_memory_lines() -> usize {
+    5000
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            level_order_version: 1,
             filter: String::new(),
             search: String::new(),
             min_level: None,
             follow: true,
             mode: Mode::Browse,
+            memory_lines: default_memory_lines(),
         }
     }
 }
@@ -74,9 +85,20 @@ pub struct Viewer {
     horizontal: u16,
     status: String,
     viewport_height: Cell<usize>,
+    source: std::path::PathBuf,
+    vim_g: bool,
 }
 impl Viewer {
-    pub fn new(name: String, settings: Settings) -> Self {
+    pub fn new(name: String, mut settings: Settings) -> Self {
+        settings.memory_lines = settings.memory_lines.clamp(1, 100_000);
+        if settings.level_order_version == 0 {
+            match &mut settings.mode {
+                Mode::DisplayLevel(index) if *index >= 3 => *index += 1,
+                Mode::CaptureLevel(index) if *index >= 2 => *index += 1,
+                _ => {}
+            }
+            settings.level_order_version = 1;
+        }
         Self {
             name,
             settings,
@@ -90,11 +112,17 @@ impl Viewer {
             dropped: 0,
             top: 0,
             horizontal: 0,
-            status: "连接中".into(),
+            status: t("连接中").into(),
             viewport_height: Cell::new(10),
+            source: Default::default(),
+            vim_g: false,
         }
     }
     pub async fn connect(&mut self, socket: &Path) -> Result<()> {
+        self.source = socket
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("{}.log", self.name));
         let mut stream = crate::log_stream::connect(socket, self.name.clone(), self.cursor).await?;
         let (sender, receiver) = mpsc::channel(16);
         let task = tokio::spawn(async move {
@@ -103,7 +131,7 @@ impl Viewer {
                     Ok(event) => event,
                     Err(error) => {
                         let _ = sender
-                            .send(LogEvent::Error(format!("Log connection closed: {error}")))
+                            .send(LogEvent::Error(tr!("Log disconnected: {}", error)))
                             .await;
                         break;
                     }
@@ -115,12 +143,12 @@ impl Viewer {
             }
         });
         self.feed = Some(Feed { task, receiver });
-        self.status = "实时连接".into();
+        self.status = t("实时连接").into();
         Ok(())
     }
     pub fn stop(&mut self) {
         self.feed = None;
-        self.status = "已停止订阅；r 重连".into();
+        self.status = t("已停止订阅；r 重连").into();
     }
     pub fn cancel_input(&mut self) {
         self.settings.mode = Mode::Browse;
@@ -131,7 +159,7 @@ impl Viewer {
     }
     pub fn paste(&mut self, text: &str) {
         match &mut self.settings.mode {
-            Mode::Filter(input) | Mode::Search(input) => {
+            Mode::Filter(input) | Mode::Search(input) | Mode::MemoryLimit(input) => {
                 input.extend(text.chars().filter(|c| !c.is_control()))
             }
             _ => {}
@@ -162,13 +190,13 @@ impl Viewer {
         }
         if disconnected && self.feed.is_some() {
             self.stop();
-            return Some("Log subscription disconnected; continue to reconnect".into());
+            return Some(t("Log subscription disconnected; continue to reconnect").into());
         }
         None
     }
     fn apply(&mut self, event: LogEvent) {
         match event {
-            LogEvent::Waiting => self.status = "等待实例产生日志（订阅保持连接）".into(),
+            LogEvent::Waiting => self.status = t("等待实例产生日志（订阅保持连接）").into(),
             LogEvent::Data {
                 bytes,
                 cursor,
@@ -177,13 +205,13 @@ impl Viewer {
             } => {
                 if reset {
                     if self.cursor.is_some() {
-                        self.push("── 日志已轮换或截断，继续接收 ──".into());
+                        self.push(t("── 日志已轮换或截断，继续接收 ──").into());
                     }
                     self.partial.clear();
                     self.skip_line = skip_prefix;
                 }
                 self.cursor = Some(cursor);
-                self.status = "实时连接".into();
+                self.status = t("实时连接").into();
                 self.partial.extend(bytes);
                 while let Some(end) = self.partial.iter().position(|b| *b == b'\n') {
                     let mut line: Vec<_> = self.partial.drain(..=end).collect();
@@ -193,7 +221,7 @@ impl Viewer {
                     } else {
                         if line.len() > 64 * 1024 {
                             line.truncate(64 * 1024);
-                            line.extend_from_slice(" [超长行已截断]".as_bytes());
+                            line.extend_from_slice(t(" [超长行已截断]").as_bytes());
                         }
                         self.push(strip_ansi(&String::from_utf8_lossy(&line)));
                     }
@@ -202,7 +230,7 @@ impl Viewer {
                     self.partial.clear();
                 } else if self.partial.len() > 64 * 1024 {
                     let prefix = self.partial.drain(..64 * 1024).collect::<Vec<_>>();
-                    self.push(format!(
+                    self.push(tr!(
                         "{} [超长行已截断]",
                         strip_ansi(&String::from_utf8_lossy(&prefix))
                     ));
@@ -217,7 +245,11 @@ impl Viewer {
         self.bytes += text.len();
         let level = detect_level(&text);
         self.records.push_back(Record { text, level });
-        while self.records.len() > 5000 || self.bytes > 2 * 1024 * 1024 {
+        self.evict();
+    }
+    fn evict(&mut self) {
+        // The manager streams an existing on-disk log: eviction never loses its source.
+        while self.records.len() > self.settings.memory_lines || self.bytes > 2 * 1024 * 1024 {
             if let Some(line) = self.records.pop_front() {
                 self.bytes -= line.text.len();
                 self.dropped += 1;
@@ -243,9 +275,9 @@ impl Viewer {
             .filter(|line| self.matches(line))
             .collect()
     }
-    pub fn key(&mut self, key: KeyEvent) -> Command {
+    pub fn key(&mut self, mut key: KeyEvent) -> Command {
         match &mut self.settings.mode {
-            Mode::Filter(input) | Mode::Search(input) => {
+            Mode::Filter(input) | Mode::Search(input) | Mode::MemoryLimit(input) => {
                 match key.code {
                     KeyCode::Esc => self.cancel_input(),
                     KeyCode::Backspace => {
@@ -258,6 +290,15 @@ impl Viewer {
                         input.push(c)
                     }
                     KeyCode::Enter => {
+                        if let Mode::MemoryLimit(input) = &self.settings.mode {
+                            match input.parse::<usize>() {
+                                Ok(value) if (1..=100_000).contains(&value) => {}
+                                _ => {
+                                    self.status = t("Enter a line limit from 1 to 100000").into();
+                                    return Command::None;
+                                }
+                            }
+                        }
                         let mode = std::mem::take(&mut self.settings.mode);
                         match mode {
                             Mode::Filter(text) => {
@@ -267,6 +308,12 @@ impl Viewer {
                             Mode::Search(text) => {
                                 self.settings.search = text;
                                 self.jump(false);
+                            }
+                            Mode::MemoryLimit(text) => {
+                                self.settings.memory_lines = text.parse().unwrap();
+                                self.evict();
+                                self.records.shrink_to_fit();
+                                self.status = t("Log memory limit updated").into();
                             }
                             _ => {}
                         }
@@ -282,13 +329,13 @@ impl Viewer {
                 else {
                     unreachable!()
                 };
-                let max = if display { 5 } else { 4 };
+                let max = LogLevel::ALL.len() - usize::from(!display);
                 match key.code {
                     KeyCode::Esc => self.cancel_input(),
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => *selected = (*selected + 1).min(max),
+                    KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(max),
                     KeyCode::Enter => {
-                        let selected = *selected;
+                        let selected = (*selected).min(max);
                         if display {
                             self.settings.min_level = if selected == 0 {
                                 None
@@ -307,12 +354,33 @@ impl Viewer {
             }
             Mode::Browse => {}
         }
+        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+            if !self.vim_g {
+                self.vim_g = true;
+                return Command::None;
+            }
+            key.code = KeyCode::Home;
+        }
+        self.vim_g = false;
+        key.code = match key.code {
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('l') => KeyCode::Right,
+            KeyCode::Char('G') => KeyCode::End,
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::PageDown
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyCode::PageUp,
+            code => code,
+        };
         match key.code {
             KeyCode::Esc => return Command::Close,
             KeyCode::Char('r') => return Command::Reconnect,
             KeyCode::Char('/') => self.settings.mode = Mode::Search(self.settings.search.clone()),
             KeyCode::Char('f') => self.settings.mode = Mode::Filter(self.settings.filter.clone()),
-            KeyCode::Char('l') => {
+            KeyCode::Char('m') => self.settings.mode = Mode::MemoryLimit(String::new()),
+            KeyCode::Char('v') => {
                 self.settings.mode = Mode::DisplayLevel(
                     self.settings
                         .min_level
@@ -405,7 +473,7 @@ impl Viewer {
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let parts = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(2), Constraint::Length(4)])
+            .constraints([Constraint::Min(2), Constraint::Length(5)])
             .split(area);
         let visible = self.visible();
         let height = parts[0].height.saturating_sub(2) as usize;
@@ -424,6 +492,7 @@ impl Viewer {
                     Some(LogLevel::Error) => Color::Red,
                     Some(LogLevel::Warn) => Color::Yellow,
                     Some(LogLevel::Debug | LogLevel::Trace) => Color::Gray,
+                    Some(LogLevel::Route) => Color::Cyan,
                     _ => Color::White,
                 };
                 let highlight = !self.settings.search.is_empty()
@@ -441,18 +510,18 @@ impl Viewer {
                 )
             })
             .collect();
-        let title = format!(
+        let title = tr!(
             "实时日志 · {} · {} · 显示 {} · 记录 {}",
             self.name,
             if self.settings.follow {
-                "跟随"
+                t("跟随")
             } else {
-                "暂停跟随"
+                t("暂停跟随")
             },
             self.settings
                 .min_level
                 .map(|l| format!("{}+", l.as_str()))
-                .unwrap_or("全部".into()),
+                .unwrap_or(t("全部").into()),
             self.capture_level.as_str()
         );
         frame.render_widget(
@@ -461,25 +530,27 @@ impl Viewer {
                 .block(Block::default().title(title).borders(Borders::ALL)),
             parts[0],
         );
-        let status = format!(
-            "{} · 显示 {}/{} 行 · 缓冲淘汰 {} 行\n过滤: {}  搜索: {}",
+        let status = tr!(
+            "{} · {}/{} lines · limit {} · released {}\n过滤: {}  搜索: {}\nLocal log: {}",
             self.status,
             visible.len(),
             self.records.len(),
+            self.settings.memory_lines,
             self.dropped,
             self.settings.filter,
-            self.settings.search
+            self.settings.search,
+            self.source.display()
         );
         frame.render_widget(
             Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
             parts[1],
         );
         match &self.settings.mode {
-            Mode::Filter(input) | Mode::Search(input) => {
-                let label = if matches!(self.settings.mode, Mode::Filter(_)) {
-                    "过滤：仅显示含关键词的行"
-                } else {
-                    "搜索：高亮关键词，n/N 跳转"
+            Mode::Filter(input) | Mode::Search(input) | Mode::MemoryLimit(input) => {
+                let label = match self.settings.mode {
+                    Mode::Filter(_) => t("过滤：仅显示含关键词的行"),
+                    Mode::Search(_) => t("搜索：高亮关键词，n/N 跳转"),
+                    _ => t("In-memory log lines · 1–100000"),
                 };
                 let popup = Rect {
                     x: area.x + 1,
@@ -489,7 +560,7 @@ impl Viewer {
                 };
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
-                    Paragraph::new(format!("> {input}▏\nEnter 应用 · Esc 取消 · Ctrl-U 清空"))
+                    Paragraph::new(tr!("> {}▏\nEnter 应用 · Esc 取消 · Ctrl-U 清空", input))
                         .block(Block::default().title(label).borders(Borders::ALL)),
                     popup,
                 );
@@ -498,11 +569,11 @@ impl Viewer {
                 let display = matches!(self.settings.mode, Mode::DisplayLevel(_));
                 let mut choices = Vec::new();
                 if display {
-                    choices.push("全部（包含无级别日志）".to_owned());
+                    choices.push(t("全部（包含无级别日志）").to_owned());
                 }
                 choices.extend(LogLevel::ALL.iter().map(|level| {
                     if display {
-                        format!("{} 及以上", level.as_str().to_uppercase())
+                        tr!("{} 及以上", level.as_str().to_uppercase())
                     } else {
                         level.as_str().to_uppercase()
                     }
@@ -522,9 +593,9 @@ impl Viewer {
                         .block(
                             Block::default()
                                 .title(if display {
-                                    "显示级别 · ↑↓ 选择 · Enter 应用"
+                                    t("显示级别 · ↑↓ 选择 · Enter 应用")
                                 } else {
-                                    "core 记录级别 · 即时生效 · Enter 应用"
+                                    t("core 记录级别 · 即时生效 · Enter 应用")
                                 })
                                 .borders(Borders::ALL),
                         ),
@@ -580,6 +651,140 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vim_log_navigation_preserves_search_input_and_level_selection() {
+        let mut view = Viewer::new("proxy".into(), Settings::default());
+        for index in 0..30 {
+            view.push(format!("INFO {index}"));
+        }
+        view.key(key('g'));
+        view.key(key('g'));
+        assert_eq!(view.top, 0);
+        view.key(key('j'));
+        assert_eq!(view.top, 1);
+        view.key(key('k'));
+        assert_eq!(view.top, 0);
+        view.key(key('l'));
+        assert_eq!(view.horizontal, 8);
+        view.key(key('h'));
+        assert_eq!(view.horizontal, 0);
+        view.key(key('G'));
+        assert!(view.settings.follow);
+        view.key(key('/'));
+        for ch in "hjklgg".chars() {
+            view.key(key(ch));
+        }
+        assert!(matches!(&view.settings.mode,Mode::Search(text) if text=="hjklgg"));
+        view.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        view.key(key('v'));
+        assert!(matches!(view.settings.mode, Mode::DisplayLevel(_)));
+    }
+    #[test]
+    fn memory_limit_is_editable_persistent_and_releases_old_rows_immediately() {
+        let mut view = Viewer::new("proxy".into(), Settings::default());
+        for i in 0..100 {
+            view.push(format!("INFO {i}"));
+        }
+        view.key(key('m'));
+        view.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        view.paste("0");
+        view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(view.records.len(), 100);
+        assert!(matches!(view.settings.mode, Mode::MemoryLimit(_)));
+        view.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        view.paste("3");
+        view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(view.records.len(), 3);
+        assert_eq!(view.dropped, 97);
+        assert_eq!(view.records.front().unwrap().text, "INFO 97");
+        let settings =
+            serde_json::from_slice(&serde_json::to_vec(&view.settings).unwrap()).unwrap();
+        let restored = Viewer::new("proxy".into(), settings);
+        assert_eq!(restored.settings.memory_lines, 3);
+        view.settings.memory_lines = 100_000;
+        for _ in 0..100 {
+            view.push("x".repeat(64 * 1024));
+        }
+        assert!(view.bytes <= 2 * 1024 * 1024);
+        assert!(view.records.len() <= 32);
+    }
+    #[tokio::test]
+    async fn real_log_stream_releases_rows_while_retaining_the_complete_local_file() {
+        let fixture = crate::import::tests::Fixture::new();
+        let text = (0..50)
+            .map(|i| format!("INFO line {i}\n"))
+            .collect::<String>();
+        let path = fixture.write("proxy.log", &text);
+        let socket = fixture.0.join("manager.sock");
+        let listener = astra_ipc::platform::LocalListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
+            astra_ipc::send_management(&mut stream, &Reply::text("Streaming"))
+                .await
+                .unwrap();
+            crate::log_stream::serve(stream, path, None).await;
+        });
+        let mut view = Viewer::new(
+            "proxy".into(),
+            Settings {
+                memory_lines: 3,
+                ..Default::default()
+            },
+        );
+        view.connect(&socket).await.unwrap();
+        for _ in 0..100 {
+            view.poll();
+            if view.dropped == 47 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(view.records.len(), 3);
+        assert_eq!(view.dropped, 47);
+        assert_eq!(std::fs::read_to_string(&view.source).unwrap(), text);
+        view.stop();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        astra_ipc::platform::remove_socket(&socket);
+    }
+    #[test]
+    fn route_is_between_debug_and_info_in_filter_and_capture_picker() {
+        let mut view = Viewer::new("proxy".into(), Settings::default());
+        view.push("DEBUG debug-detail".into());
+        view.push("2026-10-19T00:00:00Z ROUTE astra_route: forwarding started".into());
+        view.push("INFO ready".into());
+        assert_eq!(view.records[1].level, Some(LogLevel::Route));
+        view.settings.min_level = Some(LogLevel::Route);
+        assert_eq!(view.visible().len(), 2);
+        view.settings.min_level = Some(LogLevel::Info);
+        assert_eq!(view.visible().len(), 1);
+        view.key(key('L'));
+        view.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(
+            view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Command::Capture(LogLevel::Route)
+        ));
+        view.cancel_input();
+        view.key(key('v'));
+        for _ in 0..20 {
+            view.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(view.settings.min_level, Some(LogLevel::Error));
+    }
+    #[test]
+    fn pending_level_picker_migrates_without_changing_its_selection() {
+        let old = r#"{"filter":"","search":"","min_level":"info","follow":true,"mode":{"CaptureLevel":2}}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        let mut view = Viewer::new("proxy".into(), settings);
+        assert!(matches!(
+            view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Command::Capture(LogLevel::Info)
+        ));
+    }
     fn event(bytes: &[u8], offset: u64, reset: bool) -> LogEvent {
         LogEvent::Data {
             bytes: bytes.to_vec(),
@@ -682,7 +887,7 @@ mod tests {
         assert!(text.contains("INFO ready"));
         assert!(!text.contains("ERROR failed"));
         // Wide CJK cells include a trailing blank cell in TestBackend buffers.
-        assert!(text.replace(' ', "").contains("过滤:ready搜索:INFO"));
+        assert!(text.replace(' ', "").contains("过滤：ready搜索：INFO"));
         view.key(key('L'));
         terminal
             .draw(|frame| view.render(frame, frame.area()))
@@ -694,7 +899,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.replace(' ', "").contains("core记录级别"));
+        assert!(text.replace(' ', "").contains("记录级别"));
         assert!(text.contains("TRACE"));
         assert!(text.contains("ERROR"));
     }

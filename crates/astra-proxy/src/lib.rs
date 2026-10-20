@@ -14,12 +14,14 @@ use proxy::limit;
 use proxy::packet;
 use proxy::rule_client;
 use proxy::runtime;
+mod diagnostics;
 mod http_forward;
+mod subscription;
 pub use astra_protocols::xhttp;
 use proxy::udp;
 
 use anyhow::{bail, Context, Result};
-use astra_ipc::{Inbound, Network, RouteAction, RouteRequest, Target, API_VERSION};
+use astra_ipc::{Inbound, Network, ProcessInfo, RouteAction, RouteRequest, Target, API_VERSION};
 use config::{OutboundConfig, ProxyConfig};
 use moka::sync::Cache;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -31,6 +33,7 @@ struct CacheKey {
     revision: u64,
     network: Network,
     inbound: Inbound,
+    process: Option<ProcessInfo>,
 }
 
 pub struct App {
@@ -38,6 +41,7 @@ pub struct App {
     source_text: String,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
     outbounds: HashMap<String, OutboundConfig>,
+    groups: proxy::groups::Groups,
     rule_client: Option<rule_client::RuleClient>,
     standalone_action: Option<RouteAction>,
     cache: Cache<CacheKey, RouteAction>,
@@ -57,6 +61,70 @@ impl App {
         inbound: Inbound,
         network: Network,
     ) -> Result<RouteAction> {
+        self.route_with_process(target, inbound, network, None)
+            .await
+    }
+
+    pub(crate) async fn route_connection(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<std::net::SocketAddr>,
+    ) -> Result<RouteAction> {
+        let process = if self.standalone_action.is_none() {
+            match (source, destination) {
+                (Some(source), Some(destination)) => {
+                    platform::process::lookup(network, source, destination).await
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.route_with_process(target, inbound, network, process)
+            .await
+    }
+
+    async fn route_with_process(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        process: Option<ProcessInfo>,
+    ) -> Result<RouteAction> {
+        let result = self
+            .decide_network(target, inbound, network, process.clone())
+            .await;
+        let result = match result {
+            Ok(action) => self.resolve_action(&action).await.map(|resolved| {
+                if resolved == RouteAction::Block {
+                    resolved
+                } else {
+                    action
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        match &result {
+            Ok(action) => {
+                tracing::debug!(target: "astra_route", phase = "route", host = ?target.host, port = target.port, ?inbound, ?network, ?process, ?action, "route selected")
+            }
+            Err(error) => {
+                tracing::debug!(target: "astra_route", phase = "route_failed", host = ?target.host, port = target.port, ?inbound, ?network, %error, "routing failed")
+            }
+        }
+        result
+    }
+
+    async fn decide_network(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        process: Option<ProcessInfo>,
+    ) -> Result<RouteAction> {
         if let Some(action) = &self.standalone_action {
             return Ok(action.clone());
         }
@@ -67,6 +135,7 @@ impl App {
             target: target.clone(),
             network,
             inbound,
+            process: process.clone(),
         };
         if revision != 0 && self.config.decision_cache_ttl_secs > 0 {
             if let Some(action) = self.cache.get(&key) {
@@ -79,6 +148,7 @@ impl App {
             target: target.clone(),
             network,
             inbound,
+            process,
         };
         let response = client.decide(req).await?;
         // Do not cache a decision across a concurrent rule generation switch.
@@ -90,7 +160,73 @@ impl App {
         Ok(decision)
     }
 
+    pub(crate) async fn connect_tracked(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        inbound: Inbound,
+        source: Option<std::net::SocketAddr>,
+    ) -> Result<outbound::Stream> {
+        let (resolved, lease) = self.resolve_session(action).await?;
+        let traffic =
+            proxy::traffic::Traffic::new(source, target, inbound, Network::Tcp, &resolved);
+        let connected = tokio::select! {
+            biased;
+            _ = lease.cancelled() => Err(anyhow::anyhow!("proxy group switched during connection")),
+            result = self.connect_resolved(target, &resolved) => result,
+        };
+        match connected {
+            Ok(inner) => {
+                let inner = lease.wrap(inner);
+                if let Some(traffic) = &traffic {
+                    traffic.connected();
+                } else {
+                    return Ok(inner);
+                }
+                Ok(Box::new(proxy::traffic::Stream { inner, traffic }))
+            }
+            Err(error) => {
+                if let Some(traffic) = &traffic {
+                    traffic.failed(&error);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub async fn connect(&self, target: &Target, action: &RouteAction) -> Result<outbound::Stream> {
+        let (resolved, lease) = self.resolve_session(action).await?;
+        let inner = tokio::select! {
+            biased;
+            _ = lease.cancelled() => bail!("proxy group switched during connection"),
+            result = self.connect_resolved(target, &resolved) => result?,
+        };
+        Ok(lease.wrap(inner))
+    }
+    pub(crate) async fn resolve_session(
+        &self,
+        action: &RouteAction,
+    ) -> Result<(RouteAction, proxy::group_sessions::Lease)> {
+        timeout(
+            Duration::from_secs(self.config.connect_timeout_secs),
+            self.groups.resolve_session(self, action),
+        )
+        .await
+        .context("proxy group selection timed out")?
+    }
+    pub(crate) async fn resolve_action(&self, action: &RouteAction) -> Result<RouteAction> {
+        timeout(
+            Duration::from_secs(self.config.connect_timeout_secs),
+            self.groups.resolve(self, action),
+        )
+        .await
+        .context("proxy group selection timed out; health checks are still running")?
+    }
+    async fn connect_resolved(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+    ) -> Result<outbound::Stream> {
         if *action == RouteAction::Direct {
             if let Some(interface) = self
                 .config
@@ -139,7 +275,19 @@ impl App {
     fn load(path: &std::path::Path) -> Result<Self> {
         let path = std::fs::canonicalize(path)?;
         let source_text = std::fs::read_to_string(&path)?;
-        let config: ProxyConfig = toml::from_str(&source_text)?;
+        Self::from_text(&path, source_text)
+    }
+    fn from_text(path: &std::path::Path, source_text: String) -> Result<Self> {
+        let mut config: ProxyConfig = toml::from_str(&source_text)?;
+        let tags = config
+            .outbounds
+            .iter()
+            .map(|o| o.tag().to_owned())
+            .collect();
+        astra_ipc::groups::ensure_default(&mut config.proxy_groups, &tags)
+            .map_err(anyhow::Error::msg)?;
+        config.proxy_groups =
+            astra_ipc::groups::expand(&config.proxy_groups, &tags).map_err(anyhow::Error::msg)?;
         let outbounds = config.validate()?;
         let native = native::compile(
             &config.outbounds,
@@ -150,6 +298,7 @@ impl App {
             builder = builder.time_to_live(Duration::from_secs(config.decision_cache_ttl_secs));
         }
         Ok(Self {
+            groups: proxy::groups::Groups::new(&config)?,
             standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),
             rule_client: if config.standalone {
                 None
@@ -173,9 +322,27 @@ impl App {
 }
 
 pub async fn run() -> Result<()> {
-    astra_ipc::logging::init()?;
+    let elevated_config = platform::privilege::bootstrap()?;
     let mut args = std::env::args().skip(1);
     let first = args.next();
+    let first = elevated_config.or(first);
+    if matches!(first.as_deref(), Some("--diagnose" | "--diagnose-stdin")) {
+        let path = std::path::absolute(args.next().context("expected config path")?)?;
+        let app = if first.as_deref() == Some("--diagnose-stdin") {
+            use std::io::Read;
+            let mut text = String::new();
+            std::io::stdin()
+                .take(480 * 1024 + 1)
+                .read_to_string(&mut text)?;
+            anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+            App::from_text(&path, text)?
+        } else {
+            App::load(&path)?
+        };
+        println!("{}", serde_json::to_string(&diagnostics::run(&app).await)?);
+        return Ok(());
+    }
+    astra_ipc::logging::init()?;
     if first.as_deref() == Some("--stop") {
         let socket = args.next().context("expected management socket")?;
         astra_ipc::control::request(
@@ -224,6 +391,9 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     if check {
+        return Ok(());
+    }
+    if platform::privilege::delegate(std::path::Path::new(&path), app.config.tun.is_some()).await? {
         return Ok(());
     }
     runtime::run(std::fs::canonicalize(path)?, app).await

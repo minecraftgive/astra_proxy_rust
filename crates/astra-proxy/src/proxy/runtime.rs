@@ -12,12 +12,19 @@ struct Listener {
     task: JoinHandle<()>,
     socket: Arc<TcpListener>,
 }
+struct GroupWorker(JoinHandle<()>);
+impl Drop for GroupWorker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 impl Drop for Listener {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 pub struct State {
+    generation: u64,
     path: PathBuf,
     text: String,
     current: Current,
@@ -26,6 +33,7 @@ pub struct State {
     tproxy_udp: Option<transparent::UdpGuard>,
     system: system_proxy::Guard,
     system_journal: PathBuf,
+    group_worker: Option<GroupWorker>,
 }
 impl State {
     async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
@@ -125,7 +133,28 @@ impl State {
         if let Some(client) = &mut candidate.rule_client {
             client.start_observer();
         }
+        // Prepare first; disconnect sessions only once the entire reload can commit.
+        self.group_worker.take();
+        candidate.groups.inherit(&old, &candidate.config);
+        candidate.groups.committed(&old, &candidate.config);
         self.current.store(Arc::new(candidate));
+        self.group_worker.take();
+        if self
+            .current
+            .load()
+            .config
+            .proxy_groups
+            .values()
+            .any(|g| g.mode == astra_ipc::groups::Mode::Auto)
+        {
+            let app = self.current.load_full();
+            self.group_worker = Some(GroupWorker(tokio::spawn(async move {
+                loop {
+                    app.groups.refresh_all(&app).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })));
+        }
         for (key, listener) in prepared {
             let task = tokio::spawn(accept(listener.clone(), key.0, self.current.clone()));
             self.listeners.insert(
@@ -146,6 +175,7 @@ impl State {
         }
         self.path = path;
         self.text = text;
+        self.generation = self.generation.wrapping_add(1);
         astra_ipc::control::applied(&self.path, &self.text);
         tracing::info!(config=%self.path.display(), "configuration committed; existing sessions retain their generation");
         Ok(())
@@ -153,13 +183,17 @@ impl State {
     async fn reload(&mut self, path: Option<PathBuf>) -> Result<()> {
         let path = std::fs::canonicalize(path.unwrap_or_else(|| self.path.clone()))?;
         let load_path = path.clone();
-        let app = tokio::task::spawn_blocking(move || App::load(&load_path)).await??;
+        let app = tokio::task::spawn_blocking(move || {
+            App::load(&load_path).map(|app| crate::subscription::cached_app(&load_path, app))
+        })
+        .await??;
         self.apply(path, app).await
     }
 }
 pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let current = Arc::new(ArcSwap::from_pointee(app));
     let mut state = State {
+        generation: 0,
         system_journal: std::env::var_os("ASTRA_CONTROL_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| path.clone())
@@ -168,13 +202,117 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         path: path.clone(),
         current: current.clone(),
         listeners: HashMap::new(),
+        group_worker: None,
         tunnel: None,
         tproxy_udp: None,
         system: Default::default(),
     };
-    let first = App::load(&path)?;
+    let first = crate::subscription::cached_app(&path, App::load(&path)?);
     state.apply(path, first).await?;
     let state = Arc::new(Mutex::new(state));
+    let subscription_worker = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut generation = 0;
+            let mut effective = String::new();
+            let mut ownership = None;
+            let mut due = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let (revision, path, base, settings) = {
+                    let state = state.lock().await;
+                    let settings = state.current.load().config.subscription.clone();
+                    (
+                        state.generation,
+                        state.path.clone(),
+                        state.text.clone(),
+                        settings,
+                    )
+                };
+                let Some(settings) = settings else {
+                    continue;
+                };
+                if revision != generation {
+                    generation = revision;
+                    effective = base.clone();
+                    ownership = Some(settings.clone());
+                    if let Some(cache) = crate::subscription::read(&path, &base) {
+                        if App::from_text(&path, cache.effective.clone()).is_ok() {
+                            effective = cache.effective;
+                            ownership = Some(cache.ownership);
+                        }
+                    }
+                    due = tokio::time::Instant::now();
+                }
+                if tokio::time::Instant::now() < due {
+                    continue;
+                }
+                due = tokio::time::Instant::now() + Duration::from_secs(settings.interval);
+                let previous = effective.clone();
+                let mut managed = ownership.clone().unwrap_or(settings.clone());
+                let source_path = path.clone();
+                let result = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let converted = astra_convert::subscription::fetch(
+                        &settings,
+                        source_path.parent().context("config has no parent")?,
+                    )?;
+                    let text = astra_convert::subscription::merge(
+                        &previous,
+                        &converted.proxy,
+                        &mut managed,
+                    )?;
+                    let mut app = App::from_text(&source_path, text.clone())?;
+                    // Management/editor snapshots describe the saved local configuration.
+                    app.source_text = base.clone();
+                    Ok((text, managed, app))
+                })
+                .await;
+                let mut state = state.lock().await;
+                if state.generation != revision {
+                    continue;
+                }
+                match result {
+                    Ok(Ok((text, managed, app))) => match state.apply(path, app).await {
+                        Ok(()) => {
+                            generation = state.generation;
+                            effective = text;
+                            tracing::info!(
+                                nodes = managed.managed_nodes.len(),
+                                "subscription updated"
+                            );
+                            ownership = Some(managed);
+                            let cache = crate::subscription::Cache {
+                                base: state.text.clone(),
+                                effective: effective.clone(),
+                                ownership: ownership.clone().unwrap(),
+                            };
+                            let cache_path = state.path.clone();
+                            // Serialize after commit; a cache failure cannot discard valid nodes.
+                            drop(state);
+                            if !matches!(
+                                tokio::task::spawn_blocking(move || crate::subscription::save(
+                                    &cache_path,
+                                    &cache
+                                ))
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                tracing::warn!(
+                                    "subscription updated but node cache could not be saved"
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("subscription apply failed; previous nodes retained")
+                        }
+                    },
+                    _ => tracing::warn!(
+                        "subscription download or validation failed; previous nodes retained"
+                    ),
+                }
+            }
+        })
+    };
     let control = astra_ipc::control::Control::from_env()?;
     let (failures, mut fatal) = tokio::sync::mpsc::channel(1);
     let watch = {
@@ -211,24 +349,40 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
             }
         })
     };
-    let service = control.run(|path| {
-        let state = state.clone();
-        async move {
-            state
-                .lock()
-                .await
-                .reload(path)
-                .await
-                .map_err(|e| format!("{e:#}"))
-        }
-    });
+    let service = control.run_with_snapshot(
+        |path| {
+            let state = state.clone();
+            async move {
+                state
+                    .lock()
+                    .await
+                    .reload(path)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+        },
+        || {
+            let state = state.clone();
+            async move {
+                let state = state.lock().await;
+                Ok(astra_ipc::control::ConfigSnapshot {
+                    api_version: astra_ipc::API_VERSION,
+                    pid: std::process::id(),
+                    path: state.path.clone(),
+                    text: state.text.clone(),
+                })
+            }
+        },
+    );
     let result = tokio::select! {
         result = service => result,
         _ = fatal.recv() => Err(std::io::Error::other("packet inbound stopped unexpectedly; see core log")),
     };
     watch.abort();
+    subscription_worker.abort();
     let mut state = state.lock().await;
     state.listeners.clear();
+    state.group_worker.take();
     state.tunnel.take();
     state.tproxy_udp.take();
     state.system.restore()?;

@@ -133,6 +133,7 @@ async fn observe(path: String, revision: Arc<AtomicU64>) {
                     },
                     network: astra_ipc::Network::Tcp,
                     inbound: astra_ipc::Inbound::Socks5,
+                    process: None,
                 },
             )
             .await?;
@@ -168,6 +169,7 @@ mod tests {
             },
             network: Network::Tcp,
             inbound: Inbound::Socks5,
+            process: None,
         }
     }
 

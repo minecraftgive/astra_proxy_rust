@@ -1,6 +1,6 @@
 # 系统接管模式与配置热重载
 
-运行本次构建的 `target/release/astra-proxy`、`astra-rule` 和 `astra-tui`。管理与路由 IPC 已更新为 v2，旧程序与新程序不能混用。后台 TUI 管理服务也需在更新后重新启动；停止已有实例会断开其连接，请在合适的时间操作。
+运行本次构建的 `target/release/astra-proxy`、`astra-rule` 和 `astra-tui`。管理与路由 IPC 已更新为 v3，旧程序与新程序不能混用。后台 TUI 管理服务也需在更新后重新启动；停止已有实例会断开其连接，请在合适的时间操作。
 
 ## 选择接管方式
 
@@ -82,13 +82,17 @@ gateway = "192.168.1.1"
 bypass = ["203.0.113.10/32", "8.8.8.8/32"] # 节点 IP + 原 DNS
 ```
 
-进程需以具备建卡/改路由权限的身份运行；TUI 不会自动提权，也不会读取管理员密码。建议由系统服务管理权限，TUI 使用对应管理服务进行操作。
+Linux/macOS 的进程需以具备建卡/改路由权限的身份运行。Windows 启动含 `[tun]` 的配置时会检查当前令牌，仅在尚未提权时通过系统 UAC 请求管理员权限；Astra 不读取或保存管理员密码。TUI 和 manager 保持原权限，仅该代理核心作为独立管理员进程运行，规则核心和其他普通代理不随之提权。已具备管理员权限时直接启动，不重复弹窗；`--check` 和查询、停止等控制命令不触发 UAC。取消授权会报告启动失败。
 
-Windows 使用 [Wintun 官方签名 DLL](https://www.wintun.net/)。运行前按 [安装说明](INSTALL.md) 准备匹配架构的 DLL 和许可文件；准备脚本只下载和复制文件，不加载驱动。DLL 默认从可执行文件目录按完整路径加载，也可由 `ASTRA_WINTUN_DLL` 指定可信路径。Astra 不在退出时卸载共享 Wintun 驱动，不复用其他应用已有的同名网卡。
+TUI manager 持有系统返回的进程句柄，继续校验核心 PID、读取原实例日志、通过 IPC 热重载和优雅停止；IPC 失败或停止超时才通过持有的句柄强制终止。每次重启均重新判断权限，不保存持久管理员授权。UAC 必须使用原 Windows 账户，避免切换账户后操作错误的用户代理设置或失去私有 IPC 访问权限。
+
+直接运行 `astra-proxy.exe 配置文件` 也支持按需提权，原进程等待管理员核心退出，日志写入配置旁的同名 `.elevated.log`；Ctrl+C 会通过管理端点请求停止。没有指定 `ASTRA_CONTROL_SOCKET` 时使用配置旁的同名 `.elevated.sock` 作为 Windows 命名管道标识。普通权限实例通过热重载首次开启 TUN 时会拒绝候选配置并保留当前运行状态，需要重启该实例以请求 UAC。关闭 TUN 会清理设备和路由；该核心的管理员令牌持续到进程退出，若要恢复普通权限，应关闭 TUN 后重启实例。
+
+Windows 使用 [Wintun 官方签名 DLL](https://www.wintun.net/)。运行前按 [安装说明](INSTALL.md) 准备匹配架构的 DLL 和许可文件；准备脚本只下载和复制文件，不加载驱动。DLL 默认从可执行文件目录按完整路径加载，也可由 `ASTRA_WINTUN_DLL` 指定可信路径。同名设备存在时尝试打开已有 Wintun 并建立会话，成功后按配置设置地址、MTU 和 metric；设备被占用、不是 Wintun 或无法访问时返回底层错误。退出时关闭本次会话和句柄，不卸载共享驱动；打开外部创建的设备不会取得其删除所有权。
 
 Windows 配置模板见 `configs/windows.toml`，两项模式默认关闭。启用 TUN 时 `name` 可用 `Astra`，`interface` 填实际物理网卡别名（如 `Ethernet`、`Wi-Fi`、中文别名）或接口索引。不能将 `interface` 指向 TUN 本身。托管路由使用 Windows IP Helper API 的临时路由，保留物理默认路由并使用两个 `/1` 接管路由；不接受 `/0`。已有冲突路由会拒绝，不覆盖外部条目；失败时清理本次新建项。直连 TCP/UDP 使用 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 绑定原出口，回环目的地址保持回环。
 
-可选 `ipv6_address = "fd00:198:18::1"`、`ipv6_prefix = 126` 配置 TUN 的 IPv6 地址；Windows 托管 IPv6 路由必须有该地址。双栈时 IPv4 网关写 `gateway`，IPv6 网关写 `gateway6`，例如 `fe80::1`；链路本地 IPv6 网关的 scope 根据物理 `interface` 填入。接管 IPv6 时使用 `::/1`、`8000::/1`，同时为 IPv6 节点和 DNS 添加更具体的 bypass。只有 IPv4 配置不会自动接管 IPv6。Windows 网卡和路由管理要求管理员权限；已运行的非管理员 TUI manager 不会因后来打开管理员 TUI 而自动提权。
+可选 `ipv6_address = "fd00:198:18::1"`、`ipv6_prefix = 126` 配置 TUN 的 IPv6 地址；Windows 托管 IPv6 路由必须有该地址。双栈时 IPv4 网关写 `gateway`，IPv6 网关写 `gateway6`，例如 `fe80::1`；链路本地 IPv6 网关的 scope 根据物理 `interface` 填入。接管 IPv6 时使用 `::/1`、`8000::/1`，同时为 IPv6 节点和 DNS 添加更具体的 bypass。只有 IPv4 配置不会自动接管 IPv6。Windows 网卡和路由管理要求管理员权限，由启动时按需提权的代理核心承担，非管理员 manager 无需重启为管理员。
 
 先安装 bypass，再安装接管路由；只添加自己拥有的路由，遇到已有冲突路由时拒绝并回滚新添加项，不覆盖外部路由。运行前检查被接管范围内的节点 IP 是否被 bypass 覆盖，防止节点连接回到 TUN。域名节点在准备时解析并检查所有结果；DNS 本身也应走原网关，节点 DNS 记录改变后需要更新 bypass。局域网 DNS 若已有比接管路由更具体的物理接口路由，则不会被接管，不需重复添加 bypass；不要重复添加原网关已有的主机路由。直连 TCP/UDP 绑定指定物理接口，避免直连规则形成循环。未接管的 IPv6 不会因上述 IPv4 配置而自动进入 TUN，IPv6 路由与 bypass 需要另行配置匹配的网关。
 

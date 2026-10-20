@@ -47,3 +47,5 @@ VMess、Shadowsocks、VLESS 加密等底层密码学继续使用已有的 `meow-
 5. 实际的 Linux/macOS 系统代理、TUN、路由及权限行为需要对应平台的运行验证；Windows 编译和测试不能替代这些验证。
 
 现有程序名称、配置字段及控制接口保持兼容。源文件路径已调整，维护脚本应按 Cargo package 定位构建目标，不应依赖旧的源文件布局。
+
+`astra-rule-data` 共享规则集格式、Mihomo classical 匹配项解析、GeoIP/GeoSite DAT 解码和有大小/超时限制的资源缓存加载，供规则核心和 converter 使用。规则核心负责索引、MMDB 查询及运行时规则代际；converter 仅序列化来源定义，不在转换阶段下载。

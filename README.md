@@ -27,7 +27,7 @@
 
 ## 系统接管与热重载
 
-提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。配置表可独立开启或关闭；TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置，节点切换保留既有连接。
+提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。配置表可独立开启或关闭；TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置；节点切换默认保留既有连接，代理组可按手动、自动优选、故障、恢复和成员/模式变更分别配置是否断开旧连接，见 [代理组设置](docs/TUI.md#配置可选项与切换后的连接)。
 
 精简配置见 [configs/modes.toml](configs/modes.toml)，平台权限、TUN 防自环、透明代理路由、设置恢复及实测边界见 [模式与热重载说明](docs/PROXY_MODES.md)。设备和防火墙权限相关路径尚需目标机器验收，不能仅凭配置校验视为已接管系统流量。
 
@@ -167,10 +167,12 @@ value = "10.0.0.0/8"
 action = "block"
 ```
 
-- 支持 `domain_exact`、`domain_suffix`、`ip_cidr`、`port`、`network`（`tcp` / `udp`）。不同规则类型仍严格按文件顺序，第一条匹配生效。
+- 支持 `domain_exact`、`domain_suffix`、`ip_cidr`、`port`、`network`（`tcp` / `udp`）、`process_name`、`process_path`、`domain_keyword`、`domain_regex`、`geoip`、`geosite` 和 `rule_set`。不同规则类型仍严格按文件顺序，第一条匹配生效。
+- 本地 IP 段默认 DIRECT（`direct_local = true`）：私有、回环、链路本地 IPv4/IPv6；显式规则优先，可在规则表单关闭。进程规则由 Windows/Linux 本机连接归属提供身份，无法识别时继续匹配其他规则。
+- GeoIP 使用本地或 HTTP(S) 缓存 MMDB / geoip.dat，支持国家与 telegram 等自定义分类；GEOSITE 使用标准 geosite.dat 并支持属性筛选；命名规则集支持 inline/file/http、classical/domain/ipcidr 和 YAML/text。Mihomo converter 保留 provider 引用和顺序，使用方式见 [转换说明](docs/MIHOMO_CONVERTER.md)。
 - `proxy:TAG` 对应代理配置中的出站标签；未知标签阻止连接，不会回退直连。
 - 后缀按域名标签边界匹配；CIDR 只匹配请求中已有的 IP，不会为了规则匹配主动解析域名。
-- 缓存键区分目标、TCP/UDP 和入站；最大 65536 项，默认 TTL 5 秒，`decision_cache_ttl_secs = 0` 可禁用。
+- 缓存键区分目标、TCP/UDP、入站和进程身份；最大 65536 项，默认 TTL 5 秒，`decision_cache_ttl_secs = 0` 可禁用。
 - Rule Core 不可用时，缓存未命中的新请求失败关闭；缓存命中仍可能沿用旧策略至 TTL 到期。重启规则进程不会使代理缓存立即失效。
 
 IPC 默认 8 个持久通道，每通道一条在途请求。一次决策的总超时包含排队、连接和重试；取消、超时或不完整响应会关闭该通道。帧上限 8192 字节，响应校验版本及 request ID。

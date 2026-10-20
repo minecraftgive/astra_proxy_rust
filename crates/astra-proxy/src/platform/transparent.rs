@@ -34,8 +34,18 @@ pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Resu
         host: destination.ip().to_string(),
         port: destination.port(),
     };
-    let action = app.route(&target, inbound).await?;
-    let mut remote = app.connect(&target, &action).await?;
+    let action = app
+        .route_connection(
+            &target,
+            inbound,
+            astra_ipc::Network::Tcp,
+            stream.peer_addr().ok(),
+            Some(destination),
+        )
+        .await?;
+    let mut remote = app
+        .connect_tracked(&target, &action, inbound, stream.peer_addr().ok())
+        .await?;
     tokio::io::copy_bidirectional(&mut stream, &mut remote).await?;
     Ok(())
 }

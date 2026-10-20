@@ -10,6 +10,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 astra-protocols = { path = "../astra-protocols" }
 astra-ipc = { path = "../astra-ipc" }
+astra-convert = { path = "../astra-convert" }
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true
@@ -32,6 +33,8 @@ tun-rs = { version = "2.8.13", features = ["async"] }
 etherparse = "0.16"
 
 ipnet = "2"
+webpki-roots = "1"
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_WinInet"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_WinInet"] }

@@ -8,6 +8,10 @@ connect_timeout_secs = 8
 max_connections = 4096
 decision_cache_ttl_secs = 5
 
+[proxy_groups.PROXY]
+mode = "select"
+include_all = true
+
 # Example upstream SOCKS5. Set rules to "proxy:edge" to route through it.
 # [[outbounds]]
 # kind = "socks5"

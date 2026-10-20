@@ -116,6 +116,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -165,11 +171,17 @@ name = "astra-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astra-ipc",
+ "astra-rule-data",
  "ipnet",
+ "regex",
  "serde",
  "serde_yaml",
  "toml",
+ "ureq",
+ "url",
  "uuid",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -177,8 +189,10 @@ name = "astra-ipc"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "regex",
  "serde",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
@@ -212,7 +226,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -221,6 +235,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "astra-convert",
  "astra-ipc",
  "astra-protocols",
  "bytes",
@@ -236,6 +251,7 @@ dependencies = [
  "moka",
  "netstack-smoltcp",
  "serde",
+ "serde_json",
  "socket2 0.6.5",
  "tokio",
  "tokio-rustls",
@@ -244,6 +260,7 @@ dependencies = [
  "tracing-subscriber",
  "tun-rs",
  "uuid",
+ "webpki-roots 1.0.9",
  "windows-sys 0.61.2",
 ]
 
@@ -254,12 +271,29 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "astra-ipc",
+ "astra-rule-data",
  "ipnet",
+ "maxminddb",
+ "regex",
  "serde",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "astra-rule-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "prost",
+ "regex",
+ "serde",
+ "serde_yaml",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]
@@ -333,6 +367,7 @@ name = "astra-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astra-convert",
  "astra-ipc",
  "crossterm",
  "ratatui",
@@ -1587,6 +1622,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2827,6 +2871,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "psl"
 version = "2.1.232"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3187,6 +3254,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4175,6 +4243,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4312,6 +4395,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -4707,6 +4799,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "yaml-rust2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57e5b818a27a4cd30884ea380857a5e56f7ec3ba24a3990a3cc0b95af3238e18"
+dependencies = [
+ "arraydeque",
+ "hashlink",
 ]
 
 [[package]]

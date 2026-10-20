@@ -60,6 +60,23 @@ pub struct Row {
     pub uptime: u64,
     pub changed: bool,
 }
+/// Optional JSON data in List replies keeps the existing bincode row layout
+/// compatible with older frontends and managers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstanceDetails {
+    pub modes: Vec<String>,
+    pub listeners: Vec<String>,
+    pub bindings: Vec<String>,
+    pub outbounds: Vec<String>,
+    pub outbound_count: usize,
+    pub rules: usize,
+    pub log_level: LogLevel,
+    pub config_unavailable: bool,
+    pub diagnostics_supported: bool,
+    pub node_tags_supported: bool,
+    pub explanation_supported: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     List,
@@ -94,6 +111,16 @@ pub enum Action {
     SetLogLevel {
         name: String,
         level: LogLevel,
+    },
+    BindStart {
+        name: String,
+        targets: Vec<String>,
+    },
+    Diagnostics(String),
+    NodeTags(String),
+    ExplainRoute {
+        name: String,
+        request: astra_ipc::RouteRequest,
     },
 }
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,5 +1,14 @@
 socket = "/tmp/astra-rule.sock"
 default_action = "direct"
+direct_local = true
+geoip_database = "geoip/Country.mmdb"
+geoip_url = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb"
+geoip_interval = 86400
+# telegram 等分类可将上面数据库与下载地址改为 geoip/geoip.dat 与
+# https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat
+geosite_database = "geosite/geosite.dat"
+geosite_url = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+geosite_interval = 86400
 
 # First matching rule wins, even across different rule categories.
 [[rules]]
@@ -32,3 +41,34 @@ action = "block"
 # kind = "network"
 # value = "udp"
 # action = "block"
+
+# Match the observed local executable; Windows/Linux socket owners are supported.
+# [[rules]]
+# kind = "process_name"
+# value = "browser.exe"
+# action = "proxy:edge"
+# [[rules]]
+# kind = "process_path"
+# value = 'C:\Program Files\Browser\browser.exe'
+# action = "direct"
+
+# GeoIP: 已预设 MMDB 来源；首次使用国家规则时下载到 geoip/Country.mmdb。
+# [[rules]]
+# kind = "geoip"
+# value = "CN"
+# action = "direct"
+# [[rules]]
+# kind = "rule_set"
+# value = "ads"
+# action = "block"
+# [rule_sets.ads]
+# behavior = "domain"
+# format = "yaml"
+# payload = ["+.ads.example"]
+# 文件模式: 删除 payload，设置 path = "rules/ads.yaml"。
+# HTTP 模式: 再设置 url = "https://example.com/ads.yaml" 和 interval = 86400。
+
+# [[rules]]
+# kind = "geosite"
+# value = "google@cn"
+# action = "direct"

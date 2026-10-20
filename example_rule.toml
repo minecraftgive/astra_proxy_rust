@@ -2,12 +2,20 @@
 # 配套 example_proxy.toml；两端 UDS 路径必须一致。
 # 校验：target/release/astra-rule --check example_rule.toml
 # 规则按本文件出现顺序，第一条匹配生效；不是按“精确 > 后缀 > CIDR”等固定优先级。
-# 不支持 include、规则集合引用、正则、GeoIP、进程规则或订阅；支持配置热切换/热重载。
+# 不支持 include、GeoIP .dat 或 MRS；支持 MMDB 与命名规则集；支持配置热切换/热重载。
 # ---------- 全部顶层设置 ----------
 watch_config = false # 默认 false；true：每秒监测当前文件内容，支持原子替换，编译成功后热应用
 # 失败保留旧规则；同一份无效内容不重复刷日志，修正内容后重试。也可 SIGHUP/TUI/管理 IPC 重载。
 # 这是本规则核心独立的开关，与 example_proxy.toml.watch_config 分别生效。
 socket = "/tmp/astra-rule.sock"
+# 显式规则未命中时，本地 IP 段默认直连，再使用 default_action。设为 false 可关闭。
+direct_local = true
+geoip_database = "geoip/Country.mmdb"
+geoip_url = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb"
+geoip_interval = 86400
+geosite_database = "geosite/geosite.dat"
+geosite_url = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+geosite_interval = 86400
 # 全部 action：direct / block / proxy:TAG；区分大小写。
 # TAG 为 example_proxy.toml 中唯一出站标签。默认使用 VLESS TLS 占位节点，运行前替换节点值。
 default_action = "proxy:vless-tls"
@@ -55,6 +63,19 @@ action = "direct"
 kind = "ip_cidr"
 value = "fc00::/7"
 action = "direct"
+
+# ---------- process_name / process_path：本地发起进程 ----------
+# Windows/Linux 查询本机连接归属；远程客户端或无权限时进程未知，不匹配进程规则。
+# 进程名不区分大小写；Windows 路径统一斜杠及大小写，Unix 路径区分大小写。
+# 与其他类别按文件顺序匹配；不从 HTTP 请求头或客户端声明推断进程。
+# [[rules]]
+# kind = "process_name"
+# value = "browser.exe"
+# action = "proxy:vless-tls"
+# [[rules]]
+# kind = "process_path"
+# value = 'C:\Program Files\Browser\browser.exe'
+# action = "direct"
 
 # ---------- port：单个端口，以字符串填写，范围 1..65535 ----------
 # 不接受 "80,443" 或 "1000-2000"；多个端口分别写规则。
@@ -107,3 +128,24 @@ action = "proxy:vless-tls"
 # 规则动作仅支持 direct/block/proxy:TAG；没有 mode/tun/system_proxy 等字段，它们放在代理配置中。
 # 启动记录级别可用 ASTRA_LOG_LEVEL=info；也可在 TUI 日志页 L 动态修改，不是本文件的 TOML 字段。
 # 更多模式、权限、设备重建限制和验收边界见 docs/PROXY_MODES.md；新旧 IPC 版本不可混用。
+
+# GeoIP: 已预设 MMDB 来源；首次使用国家规则时下载到 geoip/Country.mmdb。
+# [[rules]]
+# kind = "geoip"
+# value = "CN"
+# action = "direct"
+# [[rules]]
+# kind = "rule_set"
+# value = "ads"
+# action = "block"
+# [rule_sets.ads]
+# behavior = "domain"
+# format = "yaml"
+# payload = ["+.ads.example"]
+# 文件模式: 删除 payload，设置 path = "rules/ads.yaml"。
+# HTTP 模式: 再设置 url = "https://example.com/ads.yaml" 和 interval = 86400。
+
+# [[rules]]
+# kind = "geosite"
+# value = "google@cn"
+# action = "direct"

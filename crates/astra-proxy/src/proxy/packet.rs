@@ -60,7 +60,7 @@ async fn flow(
     };
     let connection = timeout(
         Duration::from_secs(app.config.connect_timeout_secs),
-        udp::open(&app, &target, inbound),
+        udp::open(&app, &target, inbound, source, destination),
     )
     .await
     .context("UDP open timeout")??;

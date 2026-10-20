@@ -1,0 +1,15 @@
+# 可直接离线转换；国家 GEOIP 可在提供 MMDB 后取消注释。
+socks-port: 7890
+rule-providers:
+  ads:
+    type: inline
+    behavior: domain
+    payload:
+      - '+.ads.example'
+      - tracker.example
+rules:
+  - RULE-SET,ads,REJECT
+  - GEOIP,LAN,DIRECT,no-resolve
+  # - GEOSITE,cn,DIRECT # 首次使用时加载 geosite.dat
+  # - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,DIRECT

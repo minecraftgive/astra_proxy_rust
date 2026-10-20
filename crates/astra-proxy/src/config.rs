@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use astra_protocols::config::OutboundConfig;
 
@@ -18,6 +18,7 @@ pub struct ProxyConfig {
     pub http_listen: Option<String>,
     #[serde(default)]
     pub watch_config: bool,
+    pub subscription: Option<astra_convert::subscription::Subscription>,
     pub system_proxy: Option<crate::mode_config::SystemProxy>,
     pub tun: Option<crate::mode_config::Tun>,
     pub tproxy: Option<crate::mode_config::Transparent>,
@@ -40,6 +41,8 @@ pub struct ProxyConfig {
     pub decision_cache_ttl_secs: u64,
     #[serde(default)]
     pub outbounds: Vec<OutboundConfig>,
+    #[serde(default)]
+    pub proxy_groups: BTreeMap<String, astra_ipc::groups::Group>,
 }
 fn default_udp_flows() -> usize {
     512
@@ -79,20 +82,30 @@ impl ProxyConfig {
             return Ok(None);
         }
         if let Some(tag) = &self.standalone_outbound {
-            if !self.outbounds.iter().any(|outbound| outbound.tag() == tag) {
+            if !self.outbounds.iter().any(|outbound| outbound.tag() == tag)
+                && !self.proxy_groups.contains_key(tag)
+            {
                 bail!("standalone_outbound references undefined outbound: {tag}");
             }
             return Ok(Some(tag.clone()));
         }
-        if self.outbounds.len() != 1 {
+        if self.outbounds.len() != 1 && !(self.outbounds.is_empty() && self.proxy_groups.len() == 1)
+        {
             bail!(
                 "standalone requires exactly one outbound or an explicit standalone_outbound tag"
             );
         }
-        Ok(Some(self.outbounds[0].tag().to_owned()))
+        Ok(Some(if let Some(node) = self.outbounds.first() {
+            node.tag().to_owned()
+        } else {
+            self.proxy_groups.keys().next().unwrap().clone()
+        }))
     }
 
     pub fn validate(&self) -> Result<HashMap<String, OutboundConfig>> {
+        if let Some(subscription) = &self.subscription {
+            subscription.validate()?;
+        }
         self.standalone_tag()?;
         crate::mode_config::validate(self)?;
         if !self.standalone && self.rule_socket.is_empty() {
@@ -162,6 +175,17 @@ impl ProxyConfig {
             if ob.tag().is_empty() || map.insert(ob.tag().to_owned(), ob.clone()).is_some() {
                 bail!("empty or duplicate outbound tag: {}", ob.tag());
             }
+        }
+        astra_ipc::groups::validate(&self.proxy_groups, &map.keys().cloned().collect())
+            .map_err(anyhow::Error::msg)?;
+        for (name, group) in &self.proxy_groups {
+            if group.mode == astra_ipc::groups::Mode::Auto {
+                crate::proxy::groups::test_uri(&group.url)
+                    .with_context(|| format!("proxy group {name}"))?;
+            }
+        }
+        if !self.proxy_groups.is_empty() && map.keys().any(|tag| astra_ipc::groups::builtin(tag)) {
+            bail!("outbound tags DIRECT and REJECT are reserved when using proxy groups");
         }
         Ok(map)
     }

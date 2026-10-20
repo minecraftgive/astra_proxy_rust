@@ -1,14 +1,23 @@
 //! Offline mihomo YAML -> Astra TOML conversion, independent of the proxy core.
+mod source;
+pub mod subscription;
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 use serde_yaml::Value as Y;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 use toml::{Table, Value as T};
 
 #[derive(Default)]
 pub struct Options {
     pub selections: BTreeMap<String, String>,
     pub rule_socket: Option<String>,
+    pub base_dir: PathBuf,
+    pub geoip_database: Option<String>,
+    pub geosite_database: Option<String>,
+    pub strict_rules: bool,
 }
 
 pub struct Converted {
@@ -29,6 +38,17 @@ struct Rule {
 struct Rules {
     socket: String,
     default_action: String,
+    direct_local: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geoip_database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geoip_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geosite_database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geosite_url: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rule_sets: BTreeMap<String, astra_rule_data::RuleSet>,
     rules: Vec<Rule>,
 }
 
@@ -273,6 +293,7 @@ struct Resolver<'a> {
     aliases: BTreeMap<String, String>,
     groups: BTreeMap<String, &'a Y>,
     options: &'a Options,
+    preserved: HashSet<String>,
 }
 impl Resolver<'_> {
     fn resolve(&self, name: &str, seen: &mut HashSet<String>) -> Option<String> {
@@ -286,6 +307,9 @@ impl Resolver<'_> {
         }
         if let Some(action) = self.aliases.get(name) {
             return Some(action.clone());
+        }
+        if self.preserved.contains(name) {
+            return Some(format!("proxy:{name}"));
         }
         if seen.len() >= 64 || !seen.insert(name.into()) {
             return None;
@@ -312,8 +336,119 @@ impl Resolver<'_> {
     }
 }
 
+fn native_groups(
+    resolver: &Resolver<'_>,
+) -> (
+    BTreeMap<String, astra_ipc::groups::Group>,
+    Vec<(String, String)>,
+) {
+    use astra_ipc::groups::{Group, Mode};
+    let names: HashSet<_> = resolver
+        .groups
+        .iter()
+        .filter(|(_, g)| matches!(s(g, "type").as_deref(), Some("select" | "url-test")))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut candidates = BTreeMap::new();
+    let mut errors = Vec::new();
+    for name in &names {
+        let source = resolver.groups[name];
+        let parsed = (|| -> Result<Group> {
+            let member = |name: &str| -> Result<String> {
+                if names.contains(name) || resolver.nodes.contains(name) {
+                    return Ok(name.into());
+                }
+                let action = resolver
+                    .action(name)
+                    .with_context(|| format!("不可用的代理组成员 {name}"))?;
+                Ok(match action.as_str() {
+                    "direct" => "DIRECT".into(),
+                    "block" => "REJECT".into(),
+                    _ => action
+                        .strip_prefix("proxy:")
+                        .context("无效代理组成员")?
+                        .into(),
+                })
+            };
+            let members = seq(source, "proxies")
+                .iter()
+                .map(|m| member(m.as_str().context("代理组成员必须是名称")?))
+                .collect::<Result<Vec<_>>>()?;
+            let selected = resolver
+                .options
+                .selections
+                .get(name)
+                .cloned()
+                .or_else(|| s(source, "default-selected"))
+                .as_ref()
+                .map(|v| member(v))
+                .transpose()?;
+            let integer = |key: &str, default| -> Result<u64> {
+                if get(source, key).is_null() {
+                    Ok(default)
+                } else {
+                    get(source, key)
+                        .as_u64()
+                        .with_context(|| format!("{key} 必须是非负整数"))
+                }
+            };
+            Ok(Group {
+                mode: if selected.is_some() || s(source, "type").as_deref() == Some("select") {
+                    Mode::Select
+                } else {
+                    Mode::Auto
+                },
+                members,
+                include_all: yes(source, "include-all-proxies") || yes(source, "include-all"),
+                filter: s(source, "filter"),
+                exclude_filter: s(source, "exclude-filter"),
+                selected,
+                url: s(source, "url").unwrap_or_else(|| Group::default().url),
+                interval: integer("interval", 300)?,
+                timeout_ms: integer("timeout", 5000)?,
+                tolerance_ms: integer("tolerance", 50)?,
+                ..Default::default()
+            })
+        })();
+        match parsed {
+            Ok(group) => {
+                candidates.insert(name.clone(), group);
+            }
+            Err(e) => errors.push((name.clone(), format!("{e:#}"))),
+        }
+    }
+    let mut valid = BTreeMap::new();
+    for name in candidates.keys() {
+        let mut subset = BTreeMap::new();
+        let mut pending = vec![name.clone()];
+        while let Some(name) = pending.pop() {
+            if subset.contains_key(&name) {
+                continue;
+            }
+            if let Some(group) = candidates.get(&name) {
+                pending.extend(
+                    group
+                        .members
+                        .iter()
+                        .filter(|m| candidates.contains_key(*m))
+                        .cloned(),
+                );
+                subset.insert(name, group.clone());
+            }
+        }
+        match astra_ipc::groups::validate(&subset, resolver.nodes) {
+            Ok(_) => {
+                valid.insert(name.clone(), candidates[name].clone());
+            }
+            Err(e) => errors.push((name.clone(), e)),
+        }
+    }
+    (valid, errors)
+}
+
 pub fn convert(input: &str, options: &Options) -> Result<Converted> {
     let mut root: Y = serde_yaml::from_str(input).context("无法解析 mihomo YAML")?;
+    let locations = source::Source::parse(input);
     root.apply_merge().context("无效 YAML 合并键")?;
     ensure!(root.is_mapping(), "配置根节点必须是映射");
     for key in ["proxies", "proxy-groups", "rules"] {
@@ -344,7 +479,10 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         }
     };
     if !seq(&root, "authentication").is_empty() {
-        warnings.push("入站认证不支持，监听地址限制为 127.0.0.1".into());
+        warnings.push(source::at(
+            locations.top("authentication"),
+            "入站认证不支持，监听地址限制为 127.0.0.1",
+        ));
     }
     let mixed = port(&root, "mixed-port")?;
     let socks = port(&root, "socks-port")?.or(mixed);
@@ -357,7 +495,10 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         put(&mut proxy, "http_listen", address(&host, port));
     }
     if mixed.is_some() {
-        warnings.push("mixed-port 仅映射为 SOCKS5（优先使用 socks-port）；HTTP 需独立 port".into());
+        warnings.push(source::at(
+            locations.top("mixed-port"),
+            "mixed-port 仅映射为 SOCKS5（优先使用 socks-port）；HTTP 需独立 port",
+        ));
     }
     if socks.is_none() && http.is_none() {
         put(&mut proxy, "socks5_listen", "127.0.0.1:1080");
@@ -368,7 +509,6 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         "tun",
         "sniffer",
         "proxy-providers",
-        "rule-providers",
         "listeners",
         "redir-port",
         "tproxy-port",
@@ -378,7 +518,10 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         "lan-disallowed-ips",
     ] {
         if !get(&root, key).is_null() {
-            warnings.push(format!("忽略顶层配置 {key}"));
+            warnings.push(source::at(
+                locations.top(key),
+                format!("忽略顶层配置 {key}"),
+            ));
         }
     }
     let mut nodes = HashSet::new();
@@ -403,33 +546,60 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             }
             _ => {}
         }
-        match node(v, &mut warnings) {
+        let mut node_warnings = Vec::new();
+        let parsed = node(v, &mut node_warnings);
+        warnings.extend(
+            node_warnings
+                .into_iter()
+                .map(|warning| source::at(locations.item("proxies", i), warning)),
+        );
+        match parsed {
             Ok(outbound) => {
                 nodes.insert(name);
                 outbounds.push(T::Table(outbound));
             }
-            Err(err) => warnings.push(format!("跳过节点 {name}: {err}")),
+            Err(err) => warnings.push(source::at(
+                locations.item("proxies", i),
+                format!("跳过节点 {name}: {err}"),
+            )),
         }
     }
     let mut groups = BTreeMap::new();
-    for group in seq(&root, "proxy-groups") {
+    let mut group_lines = BTreeMap::new();
+    for (index, group) in seq(&root, "proxy-groups").iter().enumerate() {
         if let Some(name) = s(group, "name") {
             ensure!(names.insert(name.clone()), "重复名称 {name}");
             ensure!(
                 !matches!(name.as_str(), "DIRECT" | "REJECT" | "REJECT-DROP"),
                 "代理组名称与内置策略冲突"
             );
+            group_lines.insert(name.clone(), locations.item("proxy-groups", index));
             groups.insert(name, group);
         } else {
-            warnings.push("跳过无名称代理组".into());
+            warnings.push(source::at(
+                locations.item("proxy-groups", index),
+                "跳过无名称代理组",
+            ));
         }
     }
-    let resolver = Resolver {
+    let mut resolver = Resolver {
         nodes: &nodes,
         aliases,
         groups,
         options,
+        preserved: HashSet::new(),
     };
+    let (mut proxy_groups, group_errors) = native_groups(&resolver);
+    astra_ipc::groups::validate(&proxy_groups, &nodes)
+        .map_err(anyhow::Error::msg)
+        .context("代理组配置超过原生限制或包含无效引用")?;
+    resolver.preserved.extend(proxy_groups.keys().cloned());
+    for (name, error) in group_errors {
+        warnings.push(source::at(
+            group_lines.get(&name).copied().flatten(),
+            format!("代理组 {name} 无法保留: {error}"),
+        ));
+    }
     for (group, selected) in &options.selections {
         let spec = resolver
             .groups
@@ -447,14 +617,114 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         );
     }
     for name in resolver.groups.keys() {
-        warnings.push(match resolver.action(name) {
-            Some(action) => format!("代理组 {name} 固定为 {action}，不保留测速/故障转移/负载均衡"),
-            None => format!("跳过代理组 {name}: 无可用成员、循环或类型不支持"),
-        });
+        if resolver.preserved.contains(name) {
+            continue;
+        }
+        warnings.push(source::at(
+            group_lines.get(name).copied().flatten(),
+            match resolver.action(name) {
+                Some(action) => {
+                    format!("代理组 {name} 固定为 {action}，不保留测速/故障转移/负载均衡")
+                }
+                None => format!("跳过代理组 {name}: 无可用成员、循环或类型不支持"),
+            },
+        ));
+    }
+    let mut providers = BTreeMap::new();
+    if let Some(mapping) = get(&root, "rule-providers").as_mapping() {
+        for (index, (name, provider)) in mapping.iter().enumerate() {
+            let name = name
+                .as_str()
+                .context("rule-provider name must be a string")?
+                .to_owned();
+            let parsed = (|| -> Result<astra_rule_data::RuleSet> {
+                let behavior = required(provider, "behavior")?;
+                let format = s(provider, "format").unwrap_or_else(|| "yaml".into());
+                let mut source = astra_rule_data::RuleSet {
+                    behavior,
+                    format,
+                    ..Default::default()
+                };
+                source.interval = if get(provider, "interval").is_null() {
+                    86400
+                } else {
+                    get(provider, "interval")
+                        .as_u64()
+                        .context("interval must be a nonnegative integer")?
+                };
+                match required(provider, "type")?.as_str() {
+                    "inline" => {
+                        source.payload = seq(provider, "payload")
+                            .iter()
+                            .map(|item| {
+                                item.as_str()
+                                    .map(str::to_owned)
+                                    .context("provider payload must contain strings")
+                            })
+                            .collect::<Result<_>>()?;
+                        source.validate()?;
+                        source.parse_entries(&source.payload)?;
+                    }
+                    "file" => {
+                        source.path = Some(
+                            astra_rule_data::resolve(
+                                &options.base_dir,
+                                &required(provider, "path")?,
+                            )
+                            .to_string_lossy()
+                            .into_owned(),
+                        );
+                    }
+                    "http" => {
+                        source.url = Some(required(provider, "url")?);
+                        source.path =
+                            Some(format!("rule-cache/provider-{index}.{}", source.format));
+                        for key in ["proxy", "header", "path-in-bundle", "size-limit"] {
+                            if !get(provider, key).is_null() {
+                                warnings.push(source::at(
+                                    locations.named("rule-providers", &name),
+                                    format!("规则集 {name}: 未映射 {key}，资源由规则核心直接下载"),
+                                ));
+                            }
+                        }
+                    }
+                    other => bail!("unsupported provider type: {other}"),
+                }
+                source.validate()?;
+                Ok(source)
+            })();
+            match parsed {
+                Ok(source) => {
+                    providers.insert(name, source);
+                }
+                Err(error) => {
+                    if options.strict_rules {
+                        return Err(error).context(source::at(
+                            locations.named("rule-providers", &name),
+                            format!("rule-provider {name}"),
+                        ));
+                    }
+                    warnings.push(source::at(
+                        locations.named("rule-providers", &name),
+                        format!("规则集 {name} 不可转换: {error}"),
+                    ));
+                }
+            }
+        }
     }
     let mut rules = Rules {
         socket,
         default_action: "block".into(),
+        direct_local: false,
+        geoip_database: options.geoip_database.clone(),
+        geoip_url: None,
+        geosite_database: options.geosite_database.clone(),
+        geosite_url: if options.geosite_database.is_some() {
+            None
+        } else {
+            s(get(&root, "geox-url"), "geosite")
+        },
+        rule_sets: BTreeMap::new(),
         rules: Vec::new(),
     };
     let mode = s(&root, "mode")
@@ -472,8 +742,17 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         "rule" => {
             let mut matched = false;
             for (i, spec) in seq(&root, "rules").iter().enumerate() {
+                let line = locations.item("rules", i);
                 let Some(spec) = spec.as_str() else {
-                    warnings.push(format!("跳过规则 {}: 必须为字符串", i + 1));
+                    ensure!(
+                        !options.strict_rules,
+                        "{}",
+                        source::at(line, format!("规则 {} 必须为字符串", i + 1))
+                    );
+                    warnings.push(source::at(
+                        line,
+                        format!("跳过规则 {}: 必须为字符串", i + 1),
+                    ));
                     continue;
                 };
                 let parts: Vec<_> = spec.split(',').map(str::trim).collect();
@@ -485,7 +764,15 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
                 };
                 let action = target.and_then(|name| resolver.action(name));
                 let Some(action) = action else {
-                    warnings.push(format!("跳过规则 {}: 策略不存在或不可转换", i + 1));
+                    ensure!(
+                        !options.strict_rules,
+                        "{}",
+                        source::at(line, format!("规则 {} 的策略不存在或不可转换", i + 1))
+                    );
+                    warnings.push(source::at(
+                        line,
+                        format!("跳过规则 {}: 策略不存在或不可转换", i + 1),
+                    ));
                     continue;
                 };
                 if final_rule && parts.len() == 2 {
@@ -499,8 +786,27 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
                     action,
                 });
                 match result {
-                    Ok(rule) => rules.rules.push(rule),
-                    Err(err) => warnings.push(format!("跳过规则 {}: {err}", i + 1)),
+                    Ok(rule) => {
+                        if rule.kind == "rule_set" {
+                            let source = providers.get(&rule.value).with_context(|| {
+                                source::at(
+                                    line,
+                                    format!(
+                                        "RULE-SET references missing or unsupported provider: {}",
+                                        rule.value
+                                    ),
+                                )
+                            })?;
+                            rules.rule_sets.insert(rule.value.clone(), source.clone());
+                        }
+                        rules.rules.push(rule);
+                    }
+                    Err(err) => {
+                        if options.strict_rules {
+                            return Err(err).context(source::at(line, format!("rule {}", i + 1)));
+                        }
+                        warnings.push(source::at(line, format!("跳过规则 {}: {err}", i + 1)));
+                    }
                 }
             }
             if !matched {
@@ -509,8 +815,90 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         }
         _ => bail!("不支持的 mode: {mode}"),
     }
+    let has_geoip = rules
+        .rules
+        .iter()
+        .any(|rule| rule.kind == "geoip" && rule.value != "LAN");
+    let custom_geoip = rules
+        .rules
+        .iter()
+        .any(|rule| rule.kind == "geoip" && rule.value != "LAN" && rule.value.len() != 2)
+        || rules
+            .rule_sets
+            .values()
+            .filter(|set| set.behavior == "classical")
+            .any(|set| {
+                set.payload.iter().any(|item| {
+                    astra_rule_data::parse_classical(item).is_ok_and(|rule| {
+                        rule.kind == "geoip" && rule.value != "LAN" && rule.value.len() != 2
+                    })
+                })
+            });
+    let geox = get(&root, "geox-url");
+    let use_dat = yes(&root, "geodata-mode")
+        || (s(geox, "mmdb").is_none() && (custom_geoip || s(geox, "geoip").is_some()));
+    // An explicit local database must not be replaced by a remote source.
+    if options.geoip_database.is_none() {
+        rules.geoip_url = s(geox, if use_dat { "geoip" } else { "mmdb" });
+    }
+    if rules.geoip_database.is_none()
+        && (has_geoip
+            || rules.geoip_url.is_some()
+            || rules
+                .rule_sets
+                .values()
+                .any(|set| set.behavior == "classical"))
+    {
+        let filename = if use_dat { "geoip.dat" } else { "Country.mmdb" };
+        let local = astra_rule_data::resolve(&options.base_dir, filename);
+        rules.geoip_database = Some(if rules.geoip_url.is_some() {
+            format!("geoip/{filename}")
+        } else if use_dat && !local.is_file() {
+            rules.geoip_url = Some(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
+                    .into(),
+            );
+            "geoip/geoip.dat".into()
+        } else {
+            local.to_string_lossy().into_owned()
+        });
+        if has_geoip && rules.geoip_url.is_none() {
+            warnings.push(format!(
+                "GEOIP 默认读取源配置旁的 {filename}，可用 --geoip-db 指定 MMDB 或 geoip.dat"
+            ));
+        }
+    }
+    let needs_geosite = rules.rules.iter().any(|r| r.kind == "geosite")
+        || rules
+            .rule_sets
+            .values()
+            .any(|source| source.behavior == "classical");
+    if rules.geosite_database.is_none() && (needs_geosite || rules.geosite_url.is_some()) {
+        let local = astra_rule_data::resolve(&options.base_dir, "geosite.dat");
+        if rules.geosite_url.is_none() && local.is_file() {
+            rules.geosite_database = Some(local.to_string_lossy().into_owned());
+        } else {
+            rules.geosite_database = Some("geosite/geosite.dat".into());
+            if rules.geosite_url.is_none() {
+                rules.geosite_url=Some("https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat".into());
+            }
+        }
+    }
     let node_count = outbounds.len();
+    astra_ipc::groups::ensure_default(&mut proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
+    astra_ipc::groups::validate(&proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
+    for rule in &mut rules.rules {
+        if rule.action.starts_with("proxy:") {
+            rule.action = "proxy:PROXY".into();
+        }
+    }
+    if rules.default_action.starts_with("proxy:") {
+        rules.default_action = "proxy:PROXY".into();
+    }
     proxy.insert("outbounds".into(), T::Array(outbounds));
+    if !proxy_groups.is_empty() {
+        proxy.insert("proxy_groups".into(), T::try_from(&proxy_groups)?);
+    }
     Ok(Converted {
         proxy: toml::to_string_pretty(&proxy)?,
         rules: toml::to_string_pretty(&rules)?,
@@ -522,55 +910,14 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
 
 fn parse_rule(parts: &[&str]) -> Result<(String, String)> {
     ensure!(
-        parts.len() == 3
-            || (parts.len() == 4
-                && parts[3] == "no-resolve"
-                && matches!(parts[0], "IP-CIDR" | "IP-CIDR6")),
+        parts.len() == 3 || (parts.len() == 4 && parts[3] == "no-resolve"),
         "不支持的规则参数"
     );
-    let value = parts[1];
-    let kind = match parts[0] {
-        "DOMAIN" | "DOMAIN-SUFFIX" => {
-            ensure!(
-                !value.trim_end_matches('.').is_empty()
-                    && value.len() <= 253
-                    && !value.contains(' ')
-                    && !value.starts_with('.')
-                    && !value.trim_end_matches('.').ends_with('.'),
-                "无效域名规则"
-            );
-            if parts[0] == "DOMAIN" {
-                "domain_exact"
-            } else {
-                "domain_suffix"
-            }
-        }
-        "IP-CIDR" | "IP-CIDR6" => {
-            value.parse::<ipnet::IpNet>().context("无效 CIDR")?;
-            "ip_cidr"
-        }
-        "DST-PORT" => {
-            ensure!(
-                value.parse::<u16>().is_ok_and(|p| p > 0),
-                "仅支持单个非零目标端口"
-            );
-            "port"
-        }
-        "NETWORK" => {
-            ensure!(
-                matches!(value.to_ascii_lowercase().as_str(), "tcp" | "udp"),
-                "无效 NETWORK"
-            );
-            "network"
-        }
-        _ => bail!("不支持的规则类型 {}", parts[0]),
+    let classical = if parts.len() == 4 {
+        format!("{},{},{}", parts[0], parts[1], parts[3])
+    } else {
+        format!("{},{}", parts[0], parts[1])
     };
-    Ok((
-        kind.into(),
-        if kind == "network" {
-            value.to_ascii_lowercase()
-        } else {
-            value.into()
-        },
-    ))
+    let matcher = astra_rule_data::parse_classical(&classical)?;
+    Ok((matcher.kind, matcher.value))
 }

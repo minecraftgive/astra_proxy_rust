@@ -1,6 +1,7 @@
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
+use crate::{i18n::t, tr};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
@@ -14,8 +15,9 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Terminal,
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -46,19 +48,71 @@ enum Prompt {
     Remove(String),
     Shutdown,
     Discard,
+    Import,
+    ImportConfirm { text: String, notices: String },
+    Explain(String),
 }
 impl Prompt {
+    fn confirmation(&self) -> bool {
+        matches!(
+            self,
+            Self::Remove(_) | Self::Shutdown | Self::Discard | Self::ImportConfirm { .. }
+        )
+    }
     fn title(&self) -> &str {
         match self {
-            Self::AddName => "New instance name (ASCII; current core tab)",
-            Self::AddPath(_) => "Configuration path (missing file: create default and edit)",
-            Self::Config(_) => "Select configuration path (missing file: create default and edit)",
-            Self::Clone(_) => "New configuration path (same directory; will not overwrite)",
-            Self::Remove(_) => "Remove instance? Type yes; config file is retained",
-            Self::Shutdown => "Stop ALL instances and manager? Type yes",
-            Self::Discard => "Discard unsaved edits? Type yes",
+            Self::AddName => t("Name (1–24: a-z, 0-9, -_)"),
+            Self::AddPath(_) => t("Configuration path"),
+            Self::Config(_) => t("Configuration path"),
+            Self::Clone(_) => t("Copy to path"),
+            Self::Remove(_) => t("Remove instance? Configuration is kept."),
+            Self::Shutdown => t("Stop all instances?"),
+            Self::Discard => t("Discard changes?"),
+            Self::Import => t("Import TOML / YAML · paste or drop a file path"),
+            Self::ImportConfirm { .. } => t("Replace editor draft?"),
+            Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Start,
+    Stop,
+    Restart,
+    Reload,
+    Edit,
+    Logs,
+    Bind,
+    Config,
+    Copy,
+    Remove,
+    Diagnostics,
+    Explain,
+}
+impl Operation {
+    fn label(self) -> &'static str {
+        t(match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+            Self::Reload => "Reload",
+            Self::Edit => "Edit",
+            Self::Logs => "Logs",
+            Self::Bind => "Startup bindings",
+            Self::Config => "Configuration path",
+            Self::Copy => "Copy configuration",
+            Self::Remove => "Remove",
+            Self::Diagnostics => "Connectivity / Exit IP",
+            Self::Explain => "Route explanation",
+        })
+    }
+}
+struct BindingPicker {
+    name: String,
+    choices: Vec<(String, Kind)>,
+    selected: usize,
+    targets: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +141,8 @@ struct Session {
     log_settings: HashMap<String, logs::Settings>,
     #[serde(default)]
     active_log: Option<String>,
+    #[serde(default)]
+    external_draft: Option<crate::external_editor::Draft>,
 }
 fn launch_directory() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
@@ -103,6 +159,7 @@ impl Default for Session {
             working_dir: launch_directory(),
             log_settings: HashMap::new(),
             active_log: None,
+            external_draft: None,
         }
     }
 }
@@ -142,6 +199,14 @@ struct Ui {
     scroll: u16,
     refresh_paused: bool,
     persistence_paused: bool,
+    details: HashMap<String, InstanceDetails>,
+    details_supported: bool,
+    menu: Option<usize>,
+    binding_picker: Option<BindingPicker>,
+    prefilled_input: bool,
+    diagnostics: Option<crate::diagnostics::View>,
+    explanation: Option<crate::explanation::View>,
+    vim_g: bool,
 }
 impl std::ops::Deref for Ui {
     type Target = Session;
@@ -159,18 +224,96 @@ enum Input {
     Idle,
     Quit,
     Run(Action, Option<(Prompt, String)>),
+    ExternalEditor,
 }
 
 impl Ui {
+    fn prepare_external(
+        &mut self,
+        home: &std::path::Path,
+    ) -> Result<(crate::external_editor::Draft, PathBuf)> {
+        let editor = self
+            .editor
+            .as_mut()
+            .context(t("Open a configuration first"))?;
+        let text = editor.prepare_save()?;
+        let name = editor.name.clone();
+        if let Some(previous) = &self.external_draft {
+            if previous.name == name && previous.base != text && previous.path.is_file() {
+                anyhow::ensure!(
+                    previous.read()? == previous.base,
+                    "{}: {}",
+                    t("TUI draft changed; external file is kept for manual import"),
+                    previous.path.display()
+                );
+            }
+        }
+        let draft = match &self.external_draft {
+            Some(draft) if draft.name == name && draft.base == text && draft.path.is_file() => {
+                draft.clone()
+            }
+            _ => crate::external_editor::Draft::create(home, name.clone(), text)?,
+        };
+        self.external_draft = Some(draft.clone());
+        self.message = tr!(
+            "External draft: {} · F5 read again · Ctrl-S save",
+            draft.path.display()
+        );
+        let directory = self
+            .rows
+            .iter()
+            .find(|row| row.instance.name == name)
+            .and_then(|row| row.instance.config.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.working_dir.clone());
+        Ok((draft, directory))
+    }
+    fn read_external(&mut self) -> Result<()> {
+        let draft = self
+            .external_draft
+            .clone()
+            .context(t("No external draft; press F4 to open an editor"))?;
+        let text = draft.read()?;
+        let editor = self
+            .editor
+            .as_mut()
+            .context(t("Open a configuration first"))?;
+        anyhow::ensure!(
+            editor.name == draft.name,
+            t("External draft belongs to another instance")
+        );
+        anyhow::ensure!(
+            editor.text() == draft.base || editor.text() == text,
+            t("TUI draft changed; external file is kept for manual import")
+        );
+        let path = draft.path.clone();
+        if editor.text() != text {
+            editor.import(text.clone())?;
+        }
+        self.external_draft.as_mut().unwrap().base = text;
+        self.message = tr!(
+            "External draft: {} · F5 read again · Ctrl-S save",
+            path.display()
+        );
+        Ok(())
+    }
     fn new(session: Session) -> Self {
         Self {
             session,
             rows: vec![],
-            message: "Connected via local IPC; operation state and drafts are remembered".into(),
+            message: String::new(),
             viewer: None,
             scroll: 0,
             refresh_paused: false,
             persistence_paused: false,
+            details: HashMap::new(),
+            details_supported: false,
+            menu: None,
+            binding_picker: None,
+            prefilled_input: false,
+            diagnostics: None,
+            explanation: None,
+            vim_g: false,
         }
     }
     fn index(&self) -> usize {
@@ -189,6 +332,186 @@ impl Ui {
     fn selected(&self) -> Option<&Row> {
         self.rows().get(self.selections[self.index()]).copied()
     }
+    fn operations(&self) -> Vec<Operation> {
+        let Some(row) = self.selected() else {
+            return Vec::new();
+        };
+        let mut operations = if row.pid.is_some() {
+            vec![Operation::Stop, Operation::Restart, Operation::Reload]
+        } else {
+            vec![Operation::Start]
+        };
+        operations.extend([
+            Operation::Edit,
+            Operation::Logs,
+            Operation::Config,
+            Operation::Copy,
+        ]);
+        operations.insert(operations.len() - 2, Operation::Bind);
+        if row.instance.kind == Kind::Proxy {
+            operations.push(Operation::Diagnostics);
+        }
+        if row.instance.kind == Kind::Rule && row.pid.is_some() {
+            operations.push(Operation::Explain);
+        }
+        if row.pid.is_none() {
+            operations.push(Operation::Remove);
+        }
+        operations
+    }
+    fn open_bindings(&mut self, name: String, targets: Option<Vec<String>>) {
+        let Some(kind) = self
+            .rows
+            .iter()
+            .find(|row| row.instance.name == name)
+            .map(|row| row.instance.kind)
+        else {
+            return;
+        };
+        if !self.details_supported {
+            self.message = "Restart manager to enable startup bindings".into();
+            return;
+        }
+        let choices: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| row.instance.kind != kind)
+            .map(|row| (row.instance.name.clone(), row.instance.kind))
+            .collect();
+        if choices.is_empty() {
+            self.message = if kind == Kind::Rule {
+                "Create a proxy instance first"
+            } else {
+                "Create a rule instance first"
+            }
+            .into();
+            return;
+        }
+        let targets = targets.unwrap_or_else(|| {
+            self.details
+                .get(&name)
+                .map(|details| details.bindings.clone())
+                .unwrap_or_default()
+        });
+        self.binding_picker = Some(BindingPicker {
+            name,
+            choices,
+            selected: 0,
+            targets,
+        });
+    }
+    fn operation(&mut self, operation: Operation) -> Input {
+        let Some(row) = self.selected() else {
+            return Input::Idle;
+        };
+        let name = row.instance.name.clone();
+        let running = row.pid.is_some();
+        let action = match operation {
+            Operation::Start => {
+                if running
+                    && self
+                        .details
+                        .get(&name)
+                        .is_none_or(|details| details.bindings.is_empty())
+                {
+                    self.message = "Already running".into();
+                    None
+                } else {
+                    Some(Action::Start(name))
+                }
+            }
+            Operation::Stop => {
+                if running {
+                    Some(Action::Stop(name))
+                } else {
+                    self.message = "Already stopped".into();
+                    None
+                }
+            }
+            Operation::Restart => Some(if running {
+                Action::Restart(name)
+            } else {
+                Action::Start(name)
+            }),
+            Operation::Reload => {
+                if running {
+                    Some(Action::Reload(name))
+                } else {
+                    self.message = "Not running".into();
+                    None
+                }
+            }
+            Operation::Edit => Some(Action::Read(name)),
+            Operation::Logs => Some(Action::Logs(name)),
+            Operation::Diagnostics => {
+                if row.instance.kind != Kind::Proxy {
+                    return Input::Idle;
+                }
+                if !self
+                    .details
+                    .get(&name)
+                    .is_some_and(|d| d.diagnostics_supported)
+                {
+                    self.message = "Restart manager to enable diagnostics".into();
+                    None
+                } else {
+                    Some(Action::Diagnostics(name))
+                }
+            }
+            Operation::Bind => {
+                self.open_bindings(name, None);
+                None
+            }
+            Operation::Explain => {
+                if row.instance.kind != Kind::Rule || !running {
+                    return Input::Idle;
+                }
+                if !self
+                    .details
+                    .get(&name)
+                    .is_some_and(|d| d.explanation_supported)
+                {
+                    self.message = "Restart manager to enable route explanation".into();
+                } else {
+                    self.prompt(Prompt::Explain(name));
+                }
+                None
+            }
+            Operation::Config => {
+                self.prompt(Prompt::Config(name));
+                None
+            }
+            Operation::Copy => {
+                self.prompt(Prompt::Clone(name));
+                None
+            }
+            Operation::Remove => {
+                if running {
+                    self.message = "Stop instance before removing".into();
+                } else {
+                    self.prompt(Prompt::Remove(name));
+                }
+                None
+            }
+        };
+        action
+            .map(|action| Input::Run(action, None))
+            .unwrap_or(Input::Idle)
+    }
+    fn update_rows(&mut self, reply: Reply) {
+        let details = serde_json::from_str(&reply.text);
+        self.details_supported = details.is_ok();
+        self.details = details.unwrap_or_default();
+        self.rows = reply.rows;
+        for (index, kind) in [Kind::Proxy, Kind::Rule].into_iter().enumerate() {
+            let count = self
+                .rows
+                .iter()
+                .filter(|row| row.instance.kind == kind)
+                .count();
+            self.selections[index] = self.selections[index].min(count.saturating_sub(1));
+        }
+    }
     fn prompt(&mut self, prompt: Prompt) {
         if matches!(
             prompt,
@@ -196,8 +519,67 @@ impl Ui {
         ) {
             self.working_dir = launch_directory();
         }
+        self.input = match &prompt {
+            Prompt::Config(name) => self
+                .rows
+                .iter()
+                .find(|row| &row.instance.name == name)
+                .map(|row| row.instance.config.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Prompt::Clone(name) => self
+                .rows
+                .iter()
+                .find(|row| &row.instance.name == name)
+                .map(|row| {
+                    let source = &row.instance.config;
+                    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+                    let mut target = source.with_file_name(format!("{stem}-copy.toml"));
+                    for index in 2..=100 {
+                        if !target.exists() {
+                            break;
+                        }
+                        target = source.with_file_name(format!("{stem}-copy-{index}.toml"));
+                    }
+                    target.to_string_lossy().into_owned()
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.prefilled_input = !self.input.is_empty();
         self.prompt = Some(prompt);
-        self.input.clear();
+    }
+    fn paste_prompt(&mut self, text: &str) {
+        if self.prefilled_input {
+            self.input.clear();
+            self.prefilled_input = false;
+        }
+        self.input
+            .extend(text.chars().filter(|character| !character.is_control()));
+    }
+    fn paste(&mut self, text: &str) {
+        if self.recovery.is_some()
+            || self.menu.is_some()
+            || self.binding_picker.is_some()
+            || self.diagnostics.is_some()
+            || self.explanation.is_some()
+            || self.prompt.as_ref().is_some_and(Prompt::confirmation)
+        {
+            return;
+        }
+        if self.prompt.is_some() {
+            self.paste_prompt(text);
+        } else if self.editor.as_ref().is_some_and(Editor::browsing) {
+            if let Err(error) = self.submit(Prompt::Import, text.to_owned()) {
+                self.fail(
+                    format!("{error:#}"),
+                    Resume::Prompt(Prompt::Import, text.to_owned()),
+                );
+            }
+        } else if let Some(editor) = &mut self.editor {
+            editor.paste(text);
+        } else if let Some(viewer) = &mut self.viewer {
+            viewer.paste(text);
+        }
     }
     fn fail(&mut self, error: impl std::fmt::Display, resume: Resume) {
         self.recovery = Some(Recovery {
@@ -219,7 +601,7 @@ impl Ui {
         if let Err(error) = self.session.save(path) {
             if self.recovery.is_none() {
                 self.fail(
-                    format!("Cannot remember operation state: {error:#}"),
+                    tr!("Cannot save session: {}", format!("{error:#}")),
                     Resume::Session,
                 );
             }
@@ -270,13 +652,15 @@ impl Ui {
                             "Draft retained; correct the file or permissions, then Ctrl-S to retry"
                                 .into();
                     }
+                    Resume::Request(Action::BindStart { name, targets }) => {
+                        self.open_bindings(name, Some(targets));
+                    }
                     Resume::Request(action) => return Input::Run(action, None),
                     Resume::Editor => {
-                        self.message =
-                            "Entry draft retained; correct the value and press Enter".into();
+                        self.message = "Edit the value · Enter confirm".into();
                     }
                     Resume::Session => {
-                        self.message = "Continuing; retrying session save".into();
+                        self.message = "Retrying…".into();
                     }
                 }
             }
@@ -295,7 +679,7 @@ impl Ui {
                         && input
                             .bytes()
                             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
-                    "Name: 1–24 ASCII letters, digits, '-' or '_'"
+                    t("Name: 1–24 letters, digits, - or _")
                 );
                 Some(Action::Create {
                     name: input,
@@ -321,6 +705,39 @@ impl Ui {
                 self.editor = None;
                 None
             }
+            Prompt::Explain(name) => Some(Action::ExplainRoute {
+                name,
+                request: crate::explanation::request(&input)?,
+            }),
+            Prompt::Import => {
+                let path = crate::import::path(&input, &self.working_dir)?;
+                let editor = self.editor.as_ref().context("Missing editor")?;
+                let imported = crate::import::load(&path, self.kind, &editor.text())?;
+                if editor.text() != editor.original || !imported.warnings.is_empty() {
+                    let mut notices = vec![path.display().to_string()];
+                    if editor.text() != editor.original {
+                        notices.push(t("Unsaved draft will be replaced").into());
+                    }
+                    notices.extend(imported.warnings.iter().map(|s| t(s).to_owned()));
+                    self.prompt = Some(Prompt::ImportConfirm {
+                        text: imported.text,
+                        notices: notices.join("\n\n"),
+                    });
+                    self.scroll = 0;
+                } else {
+                    self.editor.as_mut().unwrap().import(imported.text)?;
+                    self.message = "Imported to draft · Ctrl-S save".into();
+                }
+                None
+            }
+            Prompt::ImportConfirm { text, .. } if input == "yes" => {
+                self.editor
+                    .as_mut()
+                    .context("Missing editor")?
+                    .import(text)?;
+                self.message = "Imported to draft · Ctrl-S save".into();
+                None
+            }
             _ => None,
         })
     }
@@ -335,8 +752,113 @@ impl Ui {
         if self.recovery.is_some() {
             return Input::Idle;
         }
+        if let Some(view) = &mut self.explanation {
+            match key.code {
+                KeyCode::Esc => self.explanation = None,
+                KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+                KeyCode::PageDown => view.scroll = view.scroll.saturating_add(10),
+                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(10),
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        if let Some(view) = &mut self.diagnostics {
+            match key.code {
+                KeyCode::Esc => self.diagnostics = None,
+                KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
+                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(10),
+                KeyCode::PageDown => view.scroll = view.scroll.saturating_add(10),
+                KeyCode::Char('t') => {
+                    return Input::Run(Action::Diagnostics(view.name.clone()), None)
+                }
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        let binding_is_proxy = self.kind == Kind::Proxy;
+        if let Some(picker) = &mut self.binding_picker {
+            match key.code {
+                KeyCode::Esc => self.binding_picker = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker.selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.choices.len().saturating_sub(1))
+                }
+                KeyCode::Char(' ') => {
+                    if let Some((name, _)) = picker.choices.get(picker.selected) {
+                        if picker.targets.contains(name) {
+                            picker.targets.retain(|target| target != name);
+                        } else {
+                            if binding_is_proxy {
+                                picker.targets.clear();
+                            }
+                            picker.targets.push(name.clone());
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    let picker = self.binding_picker.take().unwrap();
+                    return Input::Run(
+                        Action::BindStart {
+                            name: picker.name,
+                            targets: picker.targets,
+                        },
+                        None,
+                    );
+                }
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        if let Some(selected) = self.menu {
+            let operations = self.operations();
+            match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.menu = None,
+                KeyCode::Up | KeyCode::Char('k') => self.menu = Some(selected.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.menu = Some((selected + 1).min(operations.len().saturating_sub(1)))
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    self.menu = None;
+                    if let Some(operation) = operations.get(selected) {
+                        return self.operation(*operation);
+                    }
+                }
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => self.prompt = None,
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let prompt = self.prompt.take().unwrap();
+                    match self.submit(prompt.clone(), "yes".into()) {
+                        Ok(Some(action)) => {
+                            return Input::Run(action, Some((prompt, "yes".into())))
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.fail(format!("{error:#}"), Resume::Prompt(prompt, "yes".into()))
+                        }
+                    }
+                }
+                KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+                KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
+                _ => {}
+            }
+            return Input::Idle;
+        }
         if self.prompt.is_some() {
             match key.code {
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.clear();
+                    self.prefilled_input = false;
+                }
                 KeyCode::Esc => {
                     if let Some(Prompt::AddPath(name)) = self.prompt.take() {
                         self.prompt = Some(Prompt::AddName);
@@ -344,14 +866,27 @@ impl Ui {
                     }
                 }
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    if self.prefilled_input {
+                        self.input.clear();
+                        self.prefilled_input = false;
+                    } else {
+                        self.input.pop();
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.prefilled_input {
+                        self.input.clear();
+                        self.prefilled_input = false;
+                    }
                     self.input.push(c)
                 }
                 KeyCode::Enter => {
                     let prompt = self.prompt.take().unwrap();
-                    let input = self.input.trim().to_owned();
+                    let input = if prompt.confirmation() && self.input.trim().is_empty() {
+                        "yes".to_owned()
+                    } else {
+                        self.input.trim().to_owned()
+                    };
                     match self.submit(prompt.clone(), input.clone()) {
                         Ok(Some(action)) => return Input::Run(action, Some((prompt, input))),
                         Ok(None) => {}
@@ -362,8 +897,33 @@ impl Ui {
                 }
                 _ => {}
             }
+        } else if key.code == KeyCode::Char('t')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.kind == Kind::Rule
+            && self.editor.as_ref().is_some_and(Editor::browsing)
+        {
+            self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
         } else if let Some(editor) = &mut self.editor {
-            if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::F(4) {
+                return Input::ExternalEditor;
+            } else if key.code == KeyCode::F(5) {
+                if !editor.browsing() {
+                    self.message =
+                        "Confirm or cancel the field before reading external changes".into();
+                } else if let Err(error) = self.read_external() {
+                    self.fail(format!("{error:#}"), Resume::Editor);
+                }
+            } else if key.code == KeyCode::Char('o')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                if editor.browsing() {
+                    self.prompt(Prompt::Import);
+                } else {
+                    self.message = "Confirm or cancel the field before importing".into();
+                }
+            } else if key.code == KeyCode::Char('s')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
                 match editor.prepare_save() {
                     Ok(text) => {
                         return Input::Run(
@@ -404,6 +964,16 @@ impl Ui {
         } else {
             let index = self.index();
             let name = self.selected().map(|r| r.instance.name.clone());
+            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+                if self.vim_g {
+                    self.selections[index] = 0;
+                    self.vim_g = false;
+                } else {
+                    self.vim_g = true;
+                }
+                return Input::Idle;
+            }
+            self.vim_g = false;
             match key.code {
                 KeyCode::Char('q') => return Input::Quit,
                 KeyCode::Char('Q') => self.prompt(Prompt::Shutdown),
@@ -414,39 +984,58 @@ impl Ui {
                         Kind::Proxy
                     }
                 }
-                KeyCode::Up => self.selections[index] = self.selections[index].saturating_sub(1),
-                KeyCode::Down => {
+                KeyCode::Left | KeyCode::Char('h') => self.kind = Kind::Proxy,
+                KeyCode::Right | KeyCode::Char('l') => self.kind = Kind::Rule,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selections[index] = self.selections[index].saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
                     self.selections[index] =
                         (self.selections[index] + 1).min(self.rows().len().saturating_sub(1))
                 }
+                KeyCode::Home => self.selections[index] = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.selections[index] = self.rows().len().saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.selections[index] =
+                        (self.selections[index] + 10).min(self.rows().len().saturating_sub(1))
+                }
+                KeyCode::PageUp => {
+                    self.selections[index] = self.selections[index].saturating_sub(10)
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.selections[index] =
+                        (self.selections[index] + 10).min(self.rows().len().saturating_sub(1))
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.selections[index] = self.selections[index].saturating_sub(10)
+                }
                 KeyCode::Char('n') => self.prompt(Prompt::AddName),
+                KeyCode::Enter if name.is_some() => self.menu = Some(0),
                 KeyCode::Char(c) if name.is_some() => {
-                    let name = name.unwrap();
-                    let action = match c {
-                        's' => Some(Action::Start(name)),
-                        'x' => Some(Action::Stop(name)),
-                        'r' => Some(Action::Restart(name)),
-                        'R' => Some(Action::Reload(name)),
-                        'v' => Some(Action::Validate(name)),
-                        'e' => Some(Action::Read(name)),
-                        'l' => Some(Action::Logs(name)),
-                        'd' => {
-                            self.prompt(Prompt::Remove(name));
-                            None
+                    let operation = match c {
+                        's' => Operation::Start,
+                        'x' => Operation::Stop,
+                        'r' => Operation::Restart,
+                        'R' => Operation::Reload,
+                        'e' => Operation::Edit,
+                        'L' => Operation::Logs,
+                        't' => {
+                            if self.kind == Kind::Rule {
+                                Operation::Explain
+                            } else {
+                                Operation::Diagnostics
+                            }
                         }
-                        'c' => {
-                            self.prompt(Prompt::Config(name));
-                            None
-                        }
-                        'y' => {
-                            self.prompt(Prompt::Clone(name));
-                            None
-                        }
-                        _ => None,
+                        'b' => Operation::Bind,
+                        'd' => Operation::Remove,
+                        'c' => Operation::Config,
+                        'y' => Operation::Copy,
+                        'v' => return Input::Run(Action::Validate(name.unwrap()), None),
+                        _ => return Input::Idle,
                     };
-                    if let Some(action) = action {
-                        return Input::Run(action, None);
-                    }
+                    return self.operation(operation);
                 }
                 _ => {}
             }
@@ -459,6 +1048,11 @@ impl Ui {
         mut action: Action,
         mut origin: Option<(Prompt, String)>,
     ) -> bool {
+        if let Action::Diagnostics(name) = &action {
+            self.diagnostics = Some(crate::diagnostics::View::start(socket, name.clone()));
+            self.message.clear();
+            return false;
+        }
         if let Action::Logs(name) = &action {
             self.active_log = Some(name.clone());
             if self
@@ -491,7 +1085,8 @@ impl Ui {
                     Ok(reply) if !reply.text.is_empty() => {
                         self.editor =
                             Some(Editor::new(name.clone(), reply.text).with_kind(self.kind));
-                        self.message = "Default configuration created; review and Ctrl-S to save, then start explicitly".into();
+                        self.message = "Review configuration · Ctrl-S save".into();
+                        self.refresh_node_tags(socket).await;
                         return false;
                     }
                     Ok(_) => {}
@@ -533,14 +1128,25 @@ impl Ui {
                 }
                 Action::Read(name) => {
                     self.editor = Some(Editor::new(name, reply.text).with_kind(self.kind));
-                    self.message = "Configuration ready; Ctrl-S validates and saves; missing files use defaults".into();
+                    self.message.clear();
+                    self.refresh_node_tags(socket).await;
+                    return false;
+                }
+                Action::ExplainRoute { .. } => {
+                    match serde_json::from_str(&reply.text) {
+                        Ok(report) => {
+                            self.explanation = Some(crate::explanation::View { report, scroll: 0 });
+                            self.message.clear();
+                        }
+                        Err(error) => self.fail(error.to_string(), Resume::Request(action)),
+                    }
                     return false;
                 }
                 Action::SetLogLevel { level, .. } => {
                     if let Some(viewer) = &mut self.viewer {
                         viewer.capture_changed(level);
                     }
-                    self.message = format!("记录级别已改为 {}，无需重启", level.as_str());
+                    self.message = tr!("记录级别已改为 {}，无需重启", level.as_str());
                     return false;
                 }
                 Action::Save { .. } => {
@@ -551,11 +1157,13 @@ impl Ui {
                     return false;
                 }
                 Action::List => {
-                    self.rows = reply.rows;
-                    for (index, kind) in [Kind::Proxy, Kind::Rule].into_iter().enumerate() {
-                        let count = self.rows.iter().filter(|r| r.instance.kind == kind).count();
-                        self.selections[index] =
-                            self.selections[index].min(count.saturating_sub(1));
+                    self.update_rows(reply);
+                    return false;
+                }
+                Action::BindStart { .. } => {
+                    self.message = reply.text;
+                    if let Ok(reply) = call(socket, Action::List).await {
+                        self.update_rows(reply);
                     }
                     return false;
                 }
@@ -572,48 +1180,366 @@ impl Ui {
     }
     async fn refresh_binding(&mut self, socket: &std::path::Path, name: &str) {
         if let Ok(reply) = call(socket, Action::List).await {
-            self.rows = reply.rows;
+            self.update_rows(reply);
             if let Some(index) = self.rows().iter().position(|r| r.instance.name == name) {
                 let kind = self.index();
                 self.selections[kind] = index;
             }
         }
     }
-    fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        terminal.draw(|f| {
-            let chunks = Layout::default().direction(Direction::Vertical).constraints([
-                Constraint::Length(3), Constraint::Min(4), Constraint::Length(4), Constraint::Length(3),
-            ]).split(f.area());
-            let tabs = match self.kind { Kind::Proxy => "[ Proxy Core ]    Rule Core", Kind::Rule => "  Proxy Core    [ Rule Core ]" };
-            f.render_widget(Paragraph::new(format!("Astra Dual Core  |  {tabs}  |  Tab: switch")).block(Block::default().borders(Borders::ALL)).style(Style::default().fg(Color::Cyan)), chunks[0]);
-            if let Some(recovery) = &self.recovery {
-                f.render_widget(Paragraph::new(format!("{}\n\nThe current step, input and editor draft are retained.\nPress c to continue / correct and retry. Press b to end this operation.", recovery.message)).scroll((self.scroll, 0)).wrap(Wrap { trim: false }).style(Style::default().fg(Color::Yellow)).block(Block::default().title("Operation paused / c continue / b end / ↑↓ scroll").borders(Borders::ALL)), chunks[1]);
-            } else if let Some(editor) = &self.editor {
-                editor.render(f,chunks[1]);
-            } else if let Some(viewer) = &self.viewer {
-                viewer.render(f,chunks[1]);
-            } else {
-                let items: Vec<ListItem> = self.rows().iter().map(|row| ListItem::new(format!("{:<24} {:<16} PID {:<8} {:>6}s {}", row.instance.name, row.state, row.pid.map(|p| p.to_string()).unwrap_or("—".into()), row.uptime, if row.changed { "[reload pending]" } else { "" }))).collect();
-                let mut state = ListState::default(); if !items.is_empty() { state.select(Some(self.selections[self.index()])); }
-                f.render_stateful_widget(List::new(items).block(Block::default().title("Instances / n add / ↑↓ select").borders(Borders::ALL)).highlight_style(Style::default().bg(Color::Blue)).highlight_symbol("› "), chunks[1], &mut state);
+    async fn refresh_node_tags(&mut self, socket: &std::path::Path) {
+        if self.kind != Kind::Rule {
+            return;
+        }
+        let Some(name) = self.editor.as_ref().map(|editor| editor.name.clone()) else {
+            return;
+        };
+        if !self
+            .details
+            .get(&name)
+            .is_some_and(|details| details.node_tags_supported)
+        {
+            return;
+        }
+        match call(socket, Action::NodeTags(name))
+            .await
+            .and_then(|reply| Ok(serde_json::from_str::<Vec<String>>(&reply.text)?))
+        {
+            Ok(tags) => self.editor.as_mut().unwrap().set_node_tags(tags),
+            Err(_) => {
+                self.message = "Node suggestions unavailable; manual entry is supported".into()
             }
-            let detail = if let Some(prompt) = &self.prompt {
-                format!("{}\n> {}▏ (Enter confirm / Esc cancel)", prompt.title(), self.input)
-            } else if let Some(row) = self.selected() { format!("Config: {}\n{}", row.instance.config.display(), self.message) }
-            else { self.message.clone() };
-            f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL)), chunks[2]);
-            let help = if self.recovery.is_some() { "c continue / correct and retry    b end operation    ↑↓ scroll error\nCtrl-C detach with state retained" }
-            else if self.viewer.is_some() { "/ 搜索 · n/N 跳转 · f 关键词过滤 · l 显示级别 · L 记录级别\n空格 暂停/跟随 · End 跟随最新 · r 重连 · Backspace 清筛选 · Esc 返回" }
-            else if self.editor.is_some() { "↑↓ 选择 · Enter 编辑/展开节点 · Esc 收起节点/返回 · Ctrl-S 保存\nn 新增 · d 删除 · K/J 排序 · F2 显示/隐藏凭据 · Ctrl-C 记住草稿退出" }
-            else { "s start  x stop  r restart  R reload  d remove  c config  e edit  v check  y copy  l logs\nq detach  Q stop all & quit  |  Ctrl-C detach and remember current step" };
-            f.render_widget(Paragraph::new(help).style(Style::default().fg(Color::Gray)), chunks[3]);
-        })?;
+        }
+    }
+    fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        terminal.draw(|frame| self.render(frame))?;
         Ok(())
+    }
+    fn render(&self, f: &mut Frame<'_>) {
+        let overview = self.editor.is_none() && self.viewer.is_none() && self.recovery.is_none();
+        let detail_height = if self.prompt.is_some() {
+            3
+        } else if overview {
+            4
+        } else if self.message.is_empty() {
+            0
+        } else {
+            1
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(detail_height),
+                Constraint::Length(2),
+            ])
+            .split(f.area());
+        let tabs = match self.kind {
+            Kind::Proxy => tr!("[ {} ]  {}", t("Proxy"), t("Rules")),
+            Kind::Rule => tr!("{}  [ {} ]", t("Proxy"), t("Rules")),
+        };
+        f.render_widget(
+            Paragraph::new(format!("Astra  ·  {tabs}  ·  Tab"))
+                .block(Block::default().borders(Borders::ALL))
+                .style(Style::default().fg(Color::Cyan)),
+            chunks[0],
+        );
+        if let Some(recovery) = &self.recovery {
+            f.render_widget(
+                Paragraph::new(&*recovery.message)
+                    .scroll((self.scroll, 0))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(Color::Yellow))
+                    .block(Block::default().title(t("Paused")).borders(Borders::ALL)),
+                chunks[1],
+            );
+        } else if let Some(editor) = &self.editor {
+            editor.render(f, chunks[1]);
+        } else if let Some(viewer) = &self.viewer {
+            viewer.render(f, chunks[1]);
+        } else {
+            let items: Vec<ListItem> = self
+                .rows()
+                .iter()
+                .map(|row| {
+                    let color = if row.state == "Running" {
+                        Color::Green
+                    } else if row.state == "Unresponsive" || row.state.starts_with("Exited") {
+                        Color::Red
+                    } else {
+                        Color::Gray
+                    };
+                    let details = self.details.get(&row.instance.name);
+                    let modes = details
+                        .map(|details| {
+                            details
+                                .modes
+                                .iter()
+                                .map(|mode| t(mode))
+                                .collect::<Vec<_>>()
+                                .join(" + ")
+                        })
+                        .unwrap_or_default();
+                    let first = Line::from(vec![
+                        Span::styled(
+                            if row.pid.is_some() { "● " } else { "○ " },
+                            Style::default().fg(color),
+                        ),
+                        Span::raw(format!("{}  ", row.instance.name)),
+                        Span::styled(t(&row.state).to_owned(), Style::default().fg(color)),
+                        Span::raw(if chunks[1].width >= 48 {
+                            format!("  {modes}")
+                        } else {
+                            String::new()
+                        }),
+                        Span::styled(
+                            if row.changed {
+                                t(" · reload pending")
+                            } else {
+                                ""
+                            },
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]);
+                    let summary = if let Some(details) = details {
+                        let mut summary = if details.config_unavailable {
+                            t("Configuration unavailable").to_owned()
+                        } else {
+                            details.listeners.join(" · ")
+                        };
+                        if !details.bindings.is_empty() {
+                            summary.push_str(&format!("  → {}", details.bindings.join(", ")));
+                        }
+                        if summary.is_empty() {
+                            summary = t("No listeners").into();
+                        }
+                        summary
+                    } else {
+                        row.instance
+                            .config
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    ListItem::new(Text::from(vec![
+                        first,
+                        Line::styled(format!("  {summary}"), Style::default().fg(Color::Gray)),
+                    ]))
+                })
+                .collect();
+            let empty = items.is_empty();
+            let mut state = ListState::default();
+            if !empty {
+                state.select(Some(self.selections[self.index()]));
+            }
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title(tr!("Instances ({})", self.rows().len()))
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(Style::default().bg(Color::Blue))
+                .highlight_symbol("› ");
+            f.render_stateful_widget(list, chunks[1], &mut state);
+            if empty {
+                f.render_widget(
+                    Paragraph::new(t("n to add an instance")),
+                    chunks[1].inner(ratatui::layout::Margin::new(2, 1)),
+                );
+            }
+        }
+        let detail = if let Some(prompt) = &self.prompt {
+            if prompt.confirmation() {
+                prompt.title().to_owned()
+            } else {
+                format!("{}\n> {}▏", prompt.title(), self.input)
+            }
+        } else if overview {
+            if let Some(row) = self.selected() {
+                let metadata = self.details.get(&row.instance.name);
+                let summary = metadata
+                    .map(|details| {
+                        if row.instance.kind == Kind::Rule {
+                            tr!("{} rules", details.rules)
+                        } else if details.outbounds.is_empty() {
+                            t("No outbounds").to_owned()
+                        } else {
+                            tr!(
+                                "{} outbounds: {}",
+                                details.outbound_count.max(details.outbounds.len()),
+                                format!(
+                                    "{}{}",
+                                    details.outbounds.join(", "),
+                                    if details.outbound_count > details.outbounds.len() {
+                                        " …"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            )
+                        }
+                    })
+                    .unwrap_or_default();
+                let level = metadata
+                    .map(|details| details.log_level.as_str().to_uppercase())
+                    .unwrap_or_default();
+                format!(
+                    "{}\nPID {}  ·  {} {}  ·  {} {}\n{}  {}",
+                    row.instance.config.display(),
+                    row.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    t("Uptime"),
+                    uptime(row.uptime),
+                    t("Log level"),
+                    level,
+                    summary,
+                    t(&self.message)
+                )
+            } else {
+                t(&self.message).to_owned()
+            }
+        } else {
+            t(&self.message).to_owned()
+        };
+        f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[2]);
+        let help = if self.recovery.is_some() {
+            t("c retry · b cancel · ↑↓ scroll")
+        } else if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
+            t("Enter confirm · Esc cancel")
+        } else if self.prompt.is_some() {
+            t("Enter confirm · Esc cancel · Ctrl-U clear")
+        } else if self.viewer.is_some() {
+            t("hjkl scroll · gg/G first/follow · / search · v level\nf filter · m memory · L capture · Space pause · Esc back")
+        } else if self.editor.is_some() {
+            if self.kind == Kind::Rule {
+                t("hjkl navigate · gg/G ends · zM/zR fold/open · Ctrl-S save\nn add · r rename set · e toggle set · Ctrl-T query")
+            } else {
+                t("hjkl navigate · gg/G ends · Ctrl-S save · Esc back\nn add · d delete · K/J move · Ctrl-O import · F2 reveal")
+            }
+        } else {
+            if self.kind == Kind::Proxy {
+                t("j/k move · h/l tabs · gg/G ends · Enter actions\nn add · e edit · L logs · t test · q quit · Q stop all")
+            } else {
+                t("j/k move · h/l tabs · gg/G ends · Enter actions\nn add · e edit · L logs · t query · q quit · Q stop all")
+            }
+        };
+        f.render_widget(
+            Paragraph::new(help).style(Style::default().fg(Color::Gray)),
+            chunks[3],
+        );
+        if let Some(Prompt::ImportConfirm { notices, .. }) = &self.prompt {
+            let popup = f.area().inner(ratatui::layout::Margin::new(3, 3));
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(notices.as_str())
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(t("Replace editor draft?"))
+                            .title_bottom(t("Enter confirm · Esc cancel · ↑↓ scroll")),
+                    ),
+                popup,
+            );
+        }
+        if let Some(view) = &self.diagnostics {
+            view.render(f, f.area());
+        }
+        if let Some(view) = &self.explanation {
+            view.render(f, f.area());
+        }
+        if self.menu.is_some() || self.binding_picker.is_some() {
+            let height = if let Some(picker) = &self.binding_picker {
+                picker.choices.len() + 2
+            } else {
+                self.operations().len() + 2
+            };
+            let area = f.area();
+            let width = area.width.saturating_sub(4).min(64);
+            let height = (height as u16).min(area.height.saturating_sub(2));
+            let popup = ratatui::layout::Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
+            f.render_widget(Clear, popup);
+            let (items, selected, title, help): (Vec<ListItem>, usize, String, &str) =
+                if let Some(picker) = &self.binding_picker {
+                    (
+                        picker
+                            .choices
+                            .iter()
+                            .map(|(name, kind)| {
+                                ListItem::new(format!(
+                                    "[{}] {}  ·  {}",
+                                    if picker.targets.contains(name) {
+                                        "✓"
+                                    } else {
+                                        " "
+                                    },
+                                    name,
+                                    t(if *kind == Kind::Proxy {
+                                        "Proxy"
+                                    } else {
+                                        "Rules"
+                                    })
+                                ))
+                            })
+                            .collect(),
+                        picker.selected,
+                        tr!("Startup bindings · {}", picker.name),
+                        t("Space select · Enter save · Esc cancel"),
+                    )
+                } else {
+                    (
+                        self.operations()
+                            .iter()
+                            .map(|operation| ListItem::new(operation.label()))
+                            .collect(),
+                        self.menu.unwrap_or(0),
+                        tr!(
+                            "Actions · {}",
+                            self.selected()
+                                .map(|row| row.instance.name.as_str())
+                                .unwrap_or_default()
+                        ),
+                        t("↑↓ select · Enter apply · Esc back"),
+                    )
+                };
+            let mut state = ListState::default().with_selected(Some(selected));
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .title(title)
+                            .title_bottom(help)
+                            .borders(Borders::ALL),
+                    )
+                    .highlight_style(Style::default().bg(Color::Blue))
+                    .highlight_symbol("› "),
+                popup,
+                &mut state,
+            );
+        }
     }
 }
 
+fn uptime(seconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 fn absolute(text: &str, directory: &std::path::Path) -> Result<PathBuf> {
-    anyhow::ensure!(!text.is_empty(), "Enter a configuration file path");
+    anyhow::ensure!(!text.is_empty(), t("Enter a configuration file path"));
     let path = PathBuf::from(text);
     Ok(if path.is_absolute() {
         path
@@ -632,12 +1558,18 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         Err(error) => {
             let mut ui = Ui::new(Session::default());
             ui.fail(
-                format!("Cannot restore operation state: {error:#}"),
+                tr!("Cannot restore session: {}", format!("{error:#}")),
                 Resume::Session,
             );
             ui
         }
     };
+    let initial_list = call(&socket, Action::List).await;
+    let loaded = initial_list.is_ok();
+    if let Ok(reply) = initial_list {
+        ui.update_rows(reply);
+    }
+    ui.refresh_node_tags(&socket).await;
     enable_raw_mode()?;
     let _screen = Screen;
     execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
@@ -645,8 +1577,15 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     if let Some(name) = ui.active_log.clone() {
         ui.execute(&socket, Action::Logs(name), None).await;
     }
-    let mut refreshed = Instant::now() - Duration::from_secs(3);
+    let mut refreshed = if loaded {
+        Instant::now()
+    } else {
+        Instant::now() - Duration::from_secs(3)
+    };
     loop {
+        if let Some(view) = &mut ui.diagnostics {
+            view.poll();
+        }
         let stream_error = ui
             .viewer
             .as_mut()
@@ -662,6 +1601,9 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             && ui.prompt.is_none()
             && ui.viewer.is_none()
             && ui.recovery.is_none()
+            && ui.menu.is_none()
+            && ui.binding_picker.is_none()
+            && ui.diagnostics.is_none()
             && !ui.refresh_paused
         {
             ui.execute(&socket, Action::List, None).await;
@@ -676,13 +1618,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         }
         let input = match event::read()? {
             Event::Paste(text) if ui.recovery.is_none() => {
-                if ui.prompt.is_some() {
-                    ui.input.extend(text.chars().filter(|c| !c.is_control()));
-                } else if let Some(editor) = &mut ui.editor {
-                    editor.paste(&text);
-                } else if let Some(viewer) = &mut ui.viewer {
-                    viewer.paste(&text);
-                }
+                ui.paste(&text);
                 Input::Idle
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => ui.key(key),
@@ -691,13 +1627,45 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         let quit = match input {
             Input::Quit => true,
             Input::Run(action, origin) => {
-                ui.message = "Working via IPC…".into();
+                ui.message = "Working…".into();
                 ui.draw(&mut terminal)?;
                 let quit = ui.execute(&socket, action, origin).await;
                 refreshed = Instant::now() - Duration::from_secs(3);
                 quit
             }
             Input::Idle => false,
+            Input::ExternalEditor => {
+                let result = (|| -> Result<()> {
+                    let command = crate::external_editor::command()?;
+                    let (draft, directory) = ui.prepare_external(
+                        socket.parent().context("Manager socket has no directory")?,
+                    )?;
+                    anyhow::ensure!(
+                        ui.checkpoint(&session_path),
+                        t("Cannot open editor until the draft is checkpointed")
+                    );
+                    let launched = (|| -> Result<()> {
+                        disable_raw_mode()?;
+                        execute!(
+                            io::stdout(),
+                            DisableBracketedPaste,
+                            crossterm::cursor::Show,
+                            LeaveAlternateScreen
+                        )?;
+                        crate::external_editor::launch(&command, &draft, &directory)
+                    })();
+                    // Always restore the TUI, including when the executable cannot start.
+                    enable_raw_mode()?;
+                    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+                    terminal.clear()?;
+                    launched?;
+                    ui.read_external()
+                })();
+                if let Err(error) = result {
+                    ui.fail(format!("{error:#}"), Resume::Editor);
+                }
+                false
+            }
         };
         let remembered = ui.checkpoint(&session_path);
         // A failed checkpoint is recoverable too: show c/b instead of dropping the draft.
@@ -713,6 +1681,656 @@ mod tests {
     use super::*;
     fn key(c: char) -> event::KeyEvent {
         event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn sample_ui(running: bool) -> Ui {
+        let mut ui = Ui::new(Session::default());
+        ui.rows = vec![
+            Row {
+                instance: Instance {
+                    name: "proxy".into(),
+                    kind: Kind::Proxy,
+                    config: "/configs/proxy.toml".into(),
+                },
+                pid: running.then_some(42),
+                state: if running { "Running" } else { "Stopped" }.into(),
+                uptime: 610,
+                changed: false,
+            },
+            Row {
+                instance: Instance {
+                    name: "rules".into(),
+                    kind: Kind::Rule,
+                    config: "/configs/rules.toml".into(),
+                },
+                pid: None,
+                state: "Stopped".into(),
+                uptime: 0,
+                changed: false,
+            },
+        ];
+        ui.details_supported = true;
+        ui.details.insert(
+            "proxy".into(),
+            InstanceDetails {
+                modes: vec!["Rules".into(), "TUN".into()],
+                listeners: vec!["SOCKS5 127.0.0.1:1080".into()],
+                bindings: vec!["rules".into()],
+                outbounds: vec!["edge".into()],
+                log_level: LogLevel::Route,
+                ..InstanceDetails::default()
+            },
+        );
+        ui
+    }
+    fn press(ui: &mut Ui, code: KeyCode) -> Input {
+        ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    fn import_ui() -> Ui {
+        let mut ui = sample_ui(false);
+        ui.editor =
+            Some(Editor::new("proxy".into(), "standalone=true\n".into()).with_kind(Kind::Proxy));
+        ui
+    }
+    #[test]
+    fn vim_list_navigation_and_log_shortcut_leave_prompt_text_intact() {
+        let mut ui = sample_ui(false);
+        let mut second = ui.rows[0].clone();
+        second.instance.name = "second".into();
+        ui.rows.insert(1, second);
+        ui.key(key('j'));
+        assert_eq!(ui.selections[0], 1);
+        ui.key(key('k'));
+        assert_eq!(ui.selections[0], 0);
+        ui.key(key('G'));
+        assert_eq!(ui.selections[0], 1);
+        ui.key(key('g'));
+        ui.key(key('g'));
+        assert_eq!(ui.selections[0], 0);
+        press(&mut ui, KeyCode::Enter);
+        ui.key(key('j'));
+        assert_eq!(ui.menu, Some(1));
+        ui.key(key('h'));
+        assert!(ui.menu.is_none());
+        ui.key(key('l'));
+        assert_eq!(ui.kind, Kind::Rule);
+        assert!(matches!(ui.key(key('L')),Input::Run(Action::Logs(name),_) if name=="rules"));
+        ui.prompt(Prompt::AddName);
+        for ch in "hjklgg".chars() {
+            ui.key(key(ch));
+        }
+        assert_eq!(ui.input, "hjklgg");
+    }
+    #[test]
+    fn diagnostics_are_only_offered_for_proxy_instances_and_supported_managers() {
+        let mut ui = sample_ui(false);
+        ui.details.get_mut("proxy").unwrap().diagnostics_supported = true;
+        assert!(ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::Diagnostics)));
+        assert!(
+            matches!(ui.key(key('t')), Input::Run(Action::Diagnostics(name), None) if name == "proxy")
+        );
+        ui.details.get_mut("proxy").unwrap().diagnostics_supported = false;
+        assert!(matches!(ui.key(key('t')), Input::Idle));
+        assert_eq!(ui.message, "Restart manager to enable diagnostics");
+        ui.kind = Kind::Rule;
+        assert!(!ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::Diagnostics)));
+        assert!(matches!(ui.key(key('t')), Input::Idle));
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_rule_query_keeps_draft_and_explains_rule_set_toggle() {
+        let fixture = crate::import::tests::Fixture::new();
+        let home = fixture.0.join("query-manager");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manager = tokio::spawn(crate::manager::serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let text = format!("socket={:?}\ndefault_action='direct'\n[[rules]]\nkind='rule_set'\nvalue='sites'\naction='block'\n[rule_sets.sites]\nbehavior='domain'\npayload=['+.example.test']\n", fixture.0.join("query-route.sock").to_string_lossy());
+        let path = fixture.write("query-rules.toml", &text);
+        call(
+            &socket,
+            Action::Add(Instance {
+                name: "rules".into(),
+                kind: Kind::Rule,
+                config: path,
+            }),
+        )
+        .await
+        .unwrap();
+        call(&socket, Action::Start("rules".into())).await.unwrap();
+        let mut ui = Ui::new(Session::default());
+        ui.kind = Kind::Rule;
+        ui.execute(&socket, Action::List, None).await;
+        ui.key(key('t'));
+        assert!(matches!(ui.prompt, Some(Prompt::Explain(_))));
+        ui.paste("a.example.test:443 tcp");
+        let Input::Run(action, origin) = press(&mut ui, KeyCode::Enter) else {
+            panic!("query action");
+        };
+        ui.execute(&socket, action, origin).await;
+        let report = &ui.explanation.as_ref().unwrap().report;
+        assert_eq!(report.action, astra_ipc::RouteAction::Block);
+        assert!(report.path.starts_with("rules[1] -> rule_set(\"sites\")"));
+        assert_eq!(
+            report.condition,
+            Some(("domain_suffix".into(), "example.test".into()))
+        );
+        let previous_revision = report.revision;
+        press(&mut ui, KeyCode::Esc);
+        let draft = text.replace("default_action='direct'", "default_action='proxy:unsaved'");
+        ui.editor = Some(Editor::new("rules".into(), draft.clone()).with_kind(Kind::Rule));
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        ));
+        ui.paste("unmatched.test");
+        let Input::Run(action, origin) = press(&mut ui, KeyCode::Enter) else {
+            panic!("draft query");
+        };
+        ui.execute(&socket, action, origin).await;
+        assert_eq!(
+            ui.explanation.as_ref().unwrap().report.default_action,
+            "direct"
+        );
+        assert_eq!(ui.editor.as_ref().unwrap().text(), draft);
+        press(&mut ui, KeyCode::Esc);
+        call(
+            &socket,
+            Action::Save {
+                name: "rules".into(),
+                original: text.clone(),
+                text: text.replace("behavior='domain'", "enabled=false\nbehavior='domain'"),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = call(
+            &socket,
+            Action::ExplainRoute {
+                name: "rules".into(),
+                request: crate::explanation::request("a.example.test").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let report: astra_ipc::control::RouteExplanation =
+            serde_json::from_str(&reply.text).unwrap();
+        assert_eq!(report.action, astra_ipc::RouteAction::Direct);
+        assert_eq!(report.path, "default_action");
+        assert!(report.revision > previous_revision);
+        call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_rule_editor_completes_a_bound_proxy_node_and_saves_valid_action() {
+        let fixture = crate::import::tests::Fixture::new();
+        let home = fixture.0.join("manager");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manager = tokio::spawn(crate::manager::serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        call(
+            &socket,
+            Action::Create {
+                name: "rules".into(),
+                kind: Kind::Rule,
+            },
+        )
+        .await
+        .unwrap();
+        let path = fixture.write("proxy.toml", "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='east-node'\nserver='127.0.0.1:1081'\nusername='test-user'\npassword='do-not-show'\n");
+        call(
+            &socket,
+            Action::Add(Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: path,
+            }),
+        )
+        .await
+        .unwrap();
+        call(
+            &socket,
+            Action::BindStart {
+                name: "proxy".into(),
+                targets: vec!["rules".into()],
+            },
+        )
+        .await
+        .unwrap();
+        let mut ui = Ui::new(Session::default());
+        ui.kind = Kind::Rule;
+        ui.execute(&socket, Action::List, None).await;
+        ui.execute(&socket, Action::Read("rules".into()), None)
+            .await;
+        assert!(ui.recovery.is_none());
+        let editor = ui.editor.as_mut().unwrap();
+        editor
+            .key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        editor.paste("eas");
+        editor
+            .key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let text = editor.text();
+        assert!(!text.contains("do-not-show"));
+        assert_eq!(
+            toml::from_str::<toml::Value>(&text).unwrap()["default_action"].as_str(),
+            Some("proxy:east-node")
+        );
+        let Input::Run(save, _) = ui.key(event::KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        )) else {
+            panic!("save");
+        };
+        ui.execute(&socket, save, None).await;
+        assert!(ui.recovery.is_none());
+        let saved = call(&socket, Action::Read("rules".into()))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(
+            toml::from_str::<toml::Value>(&saved).unwrap()["default_action"].as_str(),
+            Some("proxy:east-node")
+        );
+        call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[test]
+    fn dropped_config_and_import_shortcut_replace_only_draft_then_use_normal_save() {
+        let fixture = crate::import::tests::Fixture::new();
+        let path = fixture.write(
+            "中文 file.toml",
+            "standalone=true\nsocks5_listen='127.0.0.1:1234'\n",
+        );
+        for shortcut in [false, true] {
+            let mut ui = import_ui();
+            if shortcut {
+                ui.key(event::KeyEvent::new(
+                    KeyCode::Char('o'),
+                    KeyModifiers::CONTROL,
+                ));
+                assert!(matches!(ui.prompt, Some(Prompt::Import)));
+                ui.paste(&format!("\"{}\"", path.display()));
+                press(&mut ui, KeyCode::Enter);
+            } else {
+                ui.paste(&format!("\"{}\"", path.display()));
+            }
+            assert!(ui.prompt.is_none());
+            assert!(ui.editor.as_ref().unwrap().text().contains("1234"));
+            assert_eq!(ui.editor.as_ref().unwrap().original, "standalone=true\n");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "standalone=true\nsocks5_listen='127.0.0.1:1234'\n"
+            );
+            assert!(
+                matches!(ui.key(event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), Input::Run(Action::Save {name, original, text}, None) if name == "proxy" && original == "standalone=true\n" && text.contains("1234"))
+            );
+        }
+    }
+    #[test]
+    fn import_failure_cancel_and_confirmation_preserve_draft_and_survive_restore() {
+        let fixture = crate::import::tests::Fixture::new();
+        let path = fixture.write(
+            "new.toml",
+            "standalone=true\nhttp_listen='127.0.0.1:9876'\n",
+        );
+        let mut ui = import_ui();
+        ui.editor
+            .as_mut()
+            .unwrap()
+            .import("standalone=true\n# my draft\n".into())
+            .unwrap();
+        let old = ui.editor.as_ref().unwrap().text();
+        ui.paste("missing-file.toml");
+        assert!(ui.recovery.is_some());
+        assert_eq!(ui.editor.as_ref().unwrap().text(), old);
+        press(&mut ui, KeyCode::Char('c'));
+        assert!(matches!(ui.prompt, Some(Prompt::Import)));
+        press(&mut ui, KeyCode::Esc);
+        ui.paste(path.to_str().unwrap());
+        assert!(matches!(ui.prompt, Some(Prompt::ImportConfirm { .. })));
+        ui.paste("ignored.toml");
+        assert_eq!(ui.editor.as_ref().unwrap().text(), old);
+        press(&mut ui, KeyCode::Esc);
+        assert_eq!(ui.editor.as_ref().unwrap().text(), old);
+        ui.paste(path.to_str().unwrap());
+        let session_path = fixture.0.join("ui-session.json");
+        ui.session.save(&session_path).unwrap();
+        let mut restored = Ui::new(Session::load(&session_path).unwrap());
+        assert!(matches!(
+            restored.prompt,
+            Some(Prompt::ImportConfirm { .. })
+        ));
+        press(&mut restored, KeyCode::Enter);
+        assert!(restored.prompt.is_none());
+        assert!(restored.editor.as_ref().unwrap().text().contains("9876"));
+        assert_eq!(
+            restored.editor.as_ref().unwrap().original,
+            "standalone=true\n"
+        );
+    }
+    #[test]
+    fn pasting_inside_a_field_keeps_field_editing_and_ctrl_o_does_not_discard_input() {
+        let mut ui = import_ui();
+        press(&mut ui, KeyCode::Enter);
+        assert!(!ui.editor.as_ref().unwrap().browsing());
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(ui.prompt.is_none());
+        ui.paste("true");
+        assert!(ui.recovery.is_none());
+        assert!(!ui.editor.as_ref().unwrap().browsing());
+    }
+    #[test]
+    fn yaml_import_review_renders_in_three_languages_and_small_windows() {
+        use ratatui::backend::TestBackend;
+        let fixture = crate::import::tests::Fixture::new();
+        let path = fixture.write("source.yaml", "socks-port: 1088\nrules: ['MATCH,DIRECT']\n");
+        let mut ui = import_ui();
+        ui.paste(path.to_str().unwrap());
+        assert!(matches!(ui.prompt, Some(Prompt::ImportConfirm { .. })));
+        for lang in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Simplified,
+            crate::i18n::Language::Traditional,
+        ] {
+            crate::i18n::with_language(lang, || {
+                for (width, height) in [(110, 32), (60, 16), (20, 8)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|frame| ui.render(frame)).unwrap();
+                }
+            });
+        }
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.editor.as_ref().unwrap().original, "standalone=true\n");
+        assert!(ui.editor.as_ref().unwrap().text().contains("1088"));
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_import_saves_each_core_without_changing_source_or_binding() {
+        let fixture = crate::import::tests::Fixture::new();
+        let home = fixture.0.join("manager");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manager = tokio::spawn(crate::manager::serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let source = "socks-port: 11088\nrules: ['MATCH,DIRECT']\n";
+        let path = fixture.write("导入 file.yaml", source);
+        let mut ui = Ui::new(Session::default());
+        for (name, kind) in [("rules", Kind::Rule), ("proxy", Kind::Proxy)] {
+            ui.kind = kind;
+            ui.execute(
+                &socket,
+                Action::Create {
+                    name: name.into(),
+                    kind,
+                },
+                None,
+            )
+            .await;
+            assert!(ui.recovery.is_none());
+            let original = ui.editor.as_ref().unwrap().original.clone();
+            ui.execute(&socket, Action::List, None).await;
+            let bound = ui
+                .rows
+                .iter()
+                .find(|r| r.instance.name == name)
+                .unwrap()
+                .instance
+                .config
+                .clone();
+            ui.paste(path.to_str().unwrap());
+            assert!(matches!(ui.prompt, Some(Prompt::ImportConfirm { .. })));
+            press(&mut ui, KeyCode::Enter);
+            assert_eq!(std::fs::read_to_string(&bound).unwrap(), original);
+            let Input::Run(action, _) = ui.key(event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL,
+            )) else {
+                panic!("save");
+            };
+            ui.execute(&socket, action, None).await;
+            assert!(ui.recovery.is_none());
+            let saved = std::fs::read_to_string(&bound).unwrap();
+            assert_ne!(saved, original);
+            ui.execute(&socket, Action::List, None).await;
+            assert_eq!(
+                ui.rows
+                    .iter()
+                    .find(|r| r.instance.name == name)
+                    .unwrap()
+                    .instance
+                    .config,
+                bound
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+        call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[test]
+    fn context_menu_only_offers_applicable_actions_and_keeps_shortcuts() {
+        let mut ui = sample_ui(true);
+        assert!(!ui
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, Operation::Start | Operation::Remove)));
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.menu, Some(0));
+        for _ in 0..3 {
+            press(&mut ui, KeyCode::Down);
+        }
+        assert!(
+            matches!(press(&mut ui, KeyCode::Enter), Input::Run(Action::Read(name), None) if name == "proxy")
+        );
+        assert!(matches!(ui.key(key('d')), Input::Idle));
+        assert!(ui.prompt.is_none());
+        let mut ui = sample_ui(false);
+        assert!(!ui.operations().iter().any(|operation| matches!(
+            operation,
+            Operation::Stop | Operation::Restart | Operation::Reload
+        )));
+        assert!(
+            matches!(ui.key(key('r')), Input::Run(Action::Start(name), None) if name == "proxy")
+        );
+        assert!(matches!(ui.key(key('R')), Input::Idle));
+    }
+    #[test]
+    fn bindings_are_selected_without_typing_and_cancel_does_not_save() {
+        let mut ui = sample_ui(false);
+        ui.key(key('b'));
+        assert_eq!(ui.binding_picker.as_ref().unwrap().targets, ["rules"]);
+        press(&mut ui, KeyCode::Char(' '));
+        assert!(ui.binding_picker.as_ref().unwrap().targets.is_empty());
+        assert!(
+            matches!(press(&mut ui, KeyCode::Enter), Input::Run(Action::BindStart { name, targets }, None) if name == "proxy" && targets.is_empty())
+        );
+        ui.key(key('b'));
+        press(&mut ui, KeyCode::Char(' '));
+        press(&mut ui, KeyCode::Esc);
+        assert!(ui.binding_picker.is_none());
+        assert_eq!(ui.details["proxy"].bindings, ["rules"]);
+    }
+    #[test]
+    fn binding_picker_selects_one_rule_or_multiple_proxies() {
+        let mut ui = sample_ui(false);
+        let mut other_proxy = ui.rows[0].clone();
+        other_proxy.instance.name = "other-proxy".into();
+        ui.rows.push(other_proxy);
+        let mut other_rule = ui
+            .rows
+            .iter()
+            .find(|row| row.instance.kind == Kind::Rule)
+            .unwrap()
+            .clone();
+        other_rule.instance.name = "other-rule".into();
+        ui.rows.push(other_rule);
+        ui.key(key('b'));
+        assert_eq!(ui.binding_picker.as_ref().unwrap().choices.len(), 2);
+        assert!(ui
+            .binding_picker
+            .as_ref()
+            .unwrap()
+            .choices
+            .iter()
+            .all(|(_, kind)| *kind == Kind::Rule));
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Char(' '));
+        assert_eq!(ui.binding_picker.as_ref().unwrap().targets, ["other-rule"]);
+        press(&mut ui, KeyCode::Esc);
+        ui.kind = Kind::Rule;
+        assert!(ui
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, Operation::Bind)));
+        ui.key(key('b'));
+        assert!(ui
+            .binding_picker
+            .as_ref()
+            .unwrap()
+            .choices
+            .iter()
+            .all(|(_, kind)| *kind == Kind::Proxy));
+        press(&mut ui, KeyCode::Char(' '));
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Char(' '));
+        assert_eq!(
+            ui.binding_picker.as_ref().unwrap().targets,
+            ["proxy", "other-proxy"]
+        );
+    }
+    #[test]
+    fn confirmations_use_enter_and_escape_without_a_typed_phrase() {
+        let mut ui = sample_ui(false);
+        ui.key(key('d'));
+        assert!(
+            matches!(press(&mut ui, KeyCode::Enter), Input::Run(Action::Remove(name), _) if name == "proxy")
+        );
+        ui.key(key('Q'));
+        press(&mut ui, KeyCode::Esc);
+        assert!(ui.prompt.is_none());
+        ui.key(key('Q'));
+        assert!(matches!(ui.key(key('y')), Input::Run(Action::Shutdown, _)));
+    }
+    #[test]
+    fn configuration_paths_are_prefilled_and_paste_replaces_the_default() {
+        let mut ui = sample_ui(false);
+        ui.key(key('c'));
+        assert!(ui.input.ends_with("proxy.toml"));
+        ui.paste_prompt("new path.toml");
+        assert_eq!(ui.input, "new path.toml");
+        press(&mut ui, KeyCode::Esc);
+        ui.key(key('y'));
+        assert!(ui.input.ends_with("proxy-copy.toml"));
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(ui.input.is_empty());
+    }
+    #[test]
+    fn instance_overview_and_overlays_render_in_all_languages_and_small_windows() {
+        use crate::i18n::{with_language, Language};
+        use ratatui::backend::TestBackend;
+        for language in [
+            Language::English,
+            Language::Simplified,
+            Language::Traditional,
+        ] {
+            with_language(language, || {
+                let mut ui = sample_ui(true);
+                let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+                terminal.draw(|frame| ui.render(frame)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                for value in [
+                    "proxy",
+                    "TUN",
+                    "127.0.0.1:1080",
+                    "rules",
+                    "PID 42",
+                    "00:10:10",
+                    "ROUTE",
+                    "edge",
+                ] {
+                    assert!(text.contains(value), "Missing {value}: {text}");
+                }
+                ui.key(key('b'));
+                for (width, height) in [(100, 24), (20, 8), (8, 4)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|frame| ui.render(frame)).unwrap();
+                }
+                press(&mut ui, KeyCode::Esc);
+                press(&mut ui, KeyCode::Enter);
+                terminal.draw(|frame| ui.render(frame)).unwrap();
+            });
+        }
+    }
+    #[test]
+    fn older_manager_rows_work_without_sending_an_unsupported_binding_action() {
+        let mut ui = sample_ui(false);
+        let rows = ui.rows.clone();
+        let mut reply = Reply::text("");
+        reply.rows = rows;
+        ui.update_rows(reply);
+        assert!(!ui.details_supported);
+        assert!(matches!(ui.key(key('b')), Input::Idle));
+        assert!(ui.binding_picker.is_none());
+        assert!(!ui.message.is_empty());
     }
     #[test]
     fn new_instance_name_creates_bound_config_without_a_second_path_prompt() {
@@ -833,6 +2451,47 @@ default_action = "direct"
             .contains("ipc_connections = 16"));
     }
     #[test]
+    fn external_editor_roundtrip_keeps_original_and_recovers_invalid_or_conflicting_edits() {
+        let home = std::env::temp_dir().join(format!("astra-external-ui-{}", std::process::id()));
+        crate::manager::private_dir(&home).unwrap();
+        let mut ui = sample_ui(false);
+        let original = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n";
+        ui.editor = Some(Editor::new("proxy".into(), original.into()));
+        assert!(matches!(
+            press(&mut ui, KeyCode::F(4)),
+            Input::ExternalEditor
+        ));
+        let (draft, _) = ui.prepare_external(&home).unwrap();
+        let changed = original.replace("1080", "1088");
+        std::fs::write(&draft.path, &changed).unwrap();
+        let session = serde_json::to_string(&ui.session).unwrap();
+        let mut ui = Ui::new(serde_json::from_str(&session).unwrap());
+        press(&mut ui, KeyCode::F(5));
+        assert_eq!(ui.editor.as_ref().unwrap().text(), changed);
+        assert_eq!(ui.editor.as_ref().unwrap().original, original);
+        assert!(
+            matches!(ui.key(event::KeyEvent::new(KeyCode::Char('s'),KeyModifiers::CONTROL)),Input::Run(Action::Save{original:base,text,..},_) if base==original && text==changed)
+        );
+        std::fs::write(&draft.path, "bad = [").unwrap();
+        assert!(ui.read_external().is_err());
+        assert_eq!(ui.editor.as_ref().unwrap().text(), changed);
+        // Local edits made after the last external import cannot be silently replaced.
+        ui.editor
+            .as_mut()
+            .unwrap()
+            .import(changed.replace("1088", "1099"))
+            .unwrap();
+        std::fs::write(&draft.path, original).unwrap();
+        assert!(ui.read_external().is_err());
+        assert!(ui.editor.as_ref().unwrap().text().contains("1099"));
+        assert!(ui.prepare_external(&home).is_err());
+        assert_eq!(ui.external_draft.as_ref().unwrap().path, draft.path);
+
+        std::fs::remove_file(draft.path).unwrap();
+        std::fs::remove_dir(home.join("external-drafts")).unwrap();
+        std::fs::remove_dir(home).unwrap();
+    }
+    #[test]
     fn occupied_start_retries_same_action_and_cancel_does_not_execute() {
         let mut ui = Ui::new(Session::default());
         ui.fail(
@@ -878,6 +2537,7 @@ default_action = "direct"
             working_dir: launch_directory(),
             log_settings: HashMap::new(),
             active_log: None,
+            external_draft: None,
         };
         session
             .editor

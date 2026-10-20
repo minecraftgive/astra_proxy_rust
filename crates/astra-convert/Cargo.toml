@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-ipc = { path = "../astra-ipc" }
+astra-rule-data = { path = "../astra-rule-data" }
 anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
 serde_yaml = "0.9"
+yaml-rust2 = { version = "0.13", default-features = false }
 ipnet = "2"
 uuid = "1"
+
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
+regex = "1"

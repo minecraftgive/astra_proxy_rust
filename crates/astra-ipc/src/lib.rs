@@ -5,10 +5,14 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod control;
+pub mod diagnostics;
+#[cfg(windows)]
+pub mod elevation;
+pub mod groups;
 pub mod logging;
 pub mod platform;
 
-pub const API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 3;
 const MAX_MESSAGE_BYTES: u32 = 8192;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -39,6 +43,15 @@ pub struct RouteRequest {
     pub target: Target,
     pub network: Network,
     pub inbound: Inbound,
+    pub process: Option<ProcessInfo>,
+}
+
+/// Observed socket owner, supplied by the local proxy, never by client headers.
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

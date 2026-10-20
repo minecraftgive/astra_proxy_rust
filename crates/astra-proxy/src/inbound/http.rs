@@ -42,7 +42,16 @@ pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
             }
         }
     };
-    let action = match app.route(&target, Inbound::HttpConnect).await {
+    let action = match app
+        .route_connection(
+            &target,
+            Inbound::HttpConnect,
+            astra_ipc::Network::Tcp,
+            client.peer_addr().ok(),
+            client.local_addr().ok(),
+        )
+        .await
+    {
         Ok(route) => route,
         Err(err) => {
             client
@@ -57,7 +66,15 @@ pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
             .await?;
         return Ok(());
     }
-    let mut upstream = match app.connect(&target, &action).await {
+    let mut upstream = match app
+        .connect_tracked(
+            &target,
+            &action,
+            Inbound::HttpConnect,
+            client.peer_addr().ok(),
+        )
+        .await
+    {
         Ok(s) => s,
         Err(err) => {
             client

@@ -13,7 +13,16 @@ pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
     if command == 3 {
         return crate::udp::associate(client, target, app).await;
     }
-    let action = match app.route(&target, Inbound::Socks5).await {
+    let action = match app
+        .route_connection(
+            &target,
+            Inbound::Socks5,
+            astra_ipc::Network::Tcp,
+            client.peer_addr().ok(),
+            client.local_addr().ok(),
+        )
+        .await
+    {
         Ok(route) => route,
         Err(err) => {
             reply_socks5(&mut client, 1).await?;
@@ -24,7 +33,10 @@ pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
         reply_socks5(&mut client, 2).await?;
         return Ok(());
     }
-    let mut upstream = match app.connect(&target, &action).await {
+    let mut upstream = match app
+        .connect_tracked(&target, &action, Inbound::Socks5, client.peer_addr().ok())
+        .await
+    {
         Ok(s) => s,
         Err(err) => {
             reply_socks5(&mut client, 5).await?;

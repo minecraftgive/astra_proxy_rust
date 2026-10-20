@@ -1,5 +1,7 @@
 pub mod egress;
 pub mod mode_config;
+pub(crate) mod privilege;
+pub(crate) mod process;
 #[cfg(not(windows))]
 pub mod system_proxy;
 #[cfg(windows)]
