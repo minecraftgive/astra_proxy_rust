@@ -125,6 +125,7 @@ async fn observe(path: String, revision: Arc<AtomicU64>) {
             astra_ipc::send(
                 &mut stream,
                 &RouteRequest {
+                    destination_ip: None,
                     api_version: API_VERSION,
                     id: 0,
                     target: astra_ipc::Target {
@@ -161,6 +162,7 @@ mod tests {
     use astra_ipc::{Inbound, Network, RouteAction, Target};
     fn request() -> RouteRequest {
         RouteRequest {
+            destination_ip: None,
             api_version: API_VERSION,
             id: 0,
             target: Target {
@@ -171,6 +173,124 @@ mod tests {
             inbound: Inbound::Socks5,
             process: None,
         }
+    }
+
+    #[tokio::test]
+    async fn routing_context_uses_original_destination_only_for_transparent_inbounds() {
+        let app = crate::App::from_text(
+            &std::env::temp_dir().join("astra-route-context.toml"),
+            "rule_socket='unused'\nipc_connections=1\nsocks5_listen='127.0.0.1:1080'\n".into(),
+        )
+        .unwrap();
+        let cases = [
+            (Inbound::Socks5, "qq.com", "127.0.0.1:1080", None),
+            (Inbound::HttpConnect, "qq.com", "127.0.0.1:8080", None),
+            (
+                Inbound::Tun,
+                "qq.com",
+                "203.0.113.8:443",
+                Some("203.0.113.8"),
+            ),
+            (
+                Inbound::Socks5,
+                "203.0.113.8",
+                "127.0.0.1:1080",
+                Some("203.0.113.8"),
+            ),
+        ];
+        let (local, mut remote) = astra_ipc::platform::stream_pair().await.unwrap();
+        app.rule_client.as_ref().unwrap().idle.lock().unwrap()[0] = Some(local);
+        let server = tokio::spawn(async move {
+            for (inbound, host, _, ip) in cases {
+                let req: RouteRequest = astra_ipc::receive(&mut remote).await.unwrap();
+                assert_eq!(req.inbound, inbound);
+                assert_eq!(req.target.host, host);
+                assert_eq!(req.destination_ip, ip.map(|ip| ip.parse().unwrap()));
+                astra_ipc::send(
+                    &mut remote,
+                    &RouteResponse {
+                        api_version: API_VERSION,
+                        id: req.id,
+                        revision: 1,
+                        action: RouteAction::Block,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        for (inbound, host, destination, _) in cases {
+            assert_eq!(
+                app.route_connection(
+                    &Target {
+                        host: host.into(),
+                        port: 443
+                    },
+                    inbound,
+                    Network::Tcp,
+                    None,
+                    Some(destination.parse().unwrap()),
+                )
+                .await
+                .unwrap(),
+                RouteAction::Block
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_ip_restores_domain_before_rule_ipc_for_tcp_and_udp() {
+        let text="rule_socket='unused'\nipc_connections=1\nsocks5_listen='127.0.0.1:1080'\n[dns]\nlisten=[]\nfake_ip=true\n";
+        let app = crate::App::from_text(
+            &std::env::temp_dir().join("astra-dns-rule.toml"),
+            text.into(),
+        )
+        .unwrap();
+        let (local, mut remote) = astra_ipc::platform::stream_pair().await.unwrap();
+        app.rule_client.as_ref().unwrap().idle.lock().unwrap()[0] = Some(local);
+        let server = tokio::spawn(async move {
+            for network in [Network::Tcp, Network::Udp] {
+                let request: RouteRequest = astra_ipc::receive(&mut remote).await.unwrap();
+                assert_eq!(request.target.host, "blocked.example");
+                assert_eq!(request.network, network);
+                astra_ipc::send(
+                    &mut remote,
+                    &RouteResponse {
+                        api_version: API_VERSION,
+                        id: request.id,
+                        revision: 1,
+                        action: RouteAction::Block,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let query = astra_dns::wire::query("blocked.example", hickory_proto::rr::RecordType::A)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let reply =
+            hickory_proto::op::Message::from_vec(&app.dns_answer(&query).await.unwrap()).unwrap();
+        let hickory_proto::rr::RData::A(ip) = reply.answers[0].data else {
+            panic!()
+        };
+        let target = app
+            .restore_target(&Target {
+                host: ip.0.to_string(),
+                port: 443,
+            })
+            .unwrap();
+        for network in [Network::Tcp, Network::Udp] {
+            assert_eq!(
+                app.route_network(&target, Inbound::Tun, network)
+                    .await
+                    .unwrap(),
+                RouteAction::Block
+            );
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

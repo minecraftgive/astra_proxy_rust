@@ -23,6 +23,7 @@ pub struct ProxyConfig {
     pub subscriptions: BTreeMap<String, astra_convert::subscription::Subscription>,
     pub system_proxy: Option<crate::mode_config::SystemProxy>,
     pub tun: Option<crate::mode_config::Tun>,
+    pub dns: Option<astra_dns::Config>,
     pub tproxy: Option<crate::mode_config::Transparent>,
     pub redirect: Option<crate::mode_config::Transparent>,
     #[serde(default = "default_workers")]
@@ -75,6 +76,17 @@ fn default_cache_ttl() -> u64 {
 }
 
 impl ProxyConfig {
+    pub fn dns_only(&self) -> bool {
+        self.socks5_listen.is_none()
+            && self.http_listen.is_none()
+            && self.tun.is_none()
+            && self.tproxy.is_none()
+            && self.redirect.is_none()
+            && self
+                .dns
+                .as_ref()
+                .is_some_and(|dns| dns.enable && !dns.respect_rules && !dns.listen.is_empty())
+    }
     /// Standalone never falls back to direct or chooses arbitrarily among nodes.
     pub fn standalone_tag(&self) -> Result<Option<String>> {
         if !self.standalone {
@@ -90,6 +102,11 @@ impl ProxyConfig {
                 bail!("standalone_outbound references undefined outbound: {tag}");
             }
             return Ok(Some(tag.clone()));
+        }
+        // Generated subscription groups all feed the default group. Their arrival
+        // must not turn a previously valid standalone subscription into ambiguity.
+        if !self.subscription_sources().is_empty() && self.proxy_groups.contains_key("PROXY") {
+            return Ok(Some("PROXY".into()));
         }
         if self.outbounds.len() != 1 && !(self.outbounds.is_empty() && self.proxy_groups.len() == 1)
         {
@@ -114,6 +131,9 @@ impl ProxyConfig {
         sources
     }
     pub fn validate(&self) -> Result<HashMap<String, OutboundConfig>> {
+        if let Some(dns) = &self.dns {
+            dns.validate()?;
+        }
         anyhow::ensure!(
             self.subscriptions.len() <= 32,
             "at most 32 subscriptions allowed"
@@ -134,7 +154,7 @@ impl ProxyConfig {
         );
         self.standalone_tag()?;
         crate::mode_config::validate(self)?;
-        if !self.standalone && self.rule_socket.is_empty() {
+        if !self.standalone && !self.dns_only() && self.rule_socket.is_empty() {
             bail!("rule_socket is required unless standalone = true");
         }
         if self.http_listen.is_none()
@@ -142,6 +162,10 @@ impl ProxyConfig {
             && self.tun.is_none()
             && self.tproxy.is_none()
             && self.redirect.is_none()
+            && !self
+                .dns
+                .as_ref()
+                .is_some_and(|dns| dns.enable && !dns.listen.is_empty())
         {
             bail!("at least one inbound listener must be configured");
         }

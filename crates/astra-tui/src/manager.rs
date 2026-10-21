@@ -115,7 +115,96 @@ struct DiagnosticPlan {
     control: Option<(PathBuf, Option<u32>)>,
 }
 impl DiagnosticPlan {
-    async fn run(mut self) -> Result<Reply> {
+    async fn stream(
+        mut self,
+        targets: Vec<String>,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<()> {
+        use astra_ipc::diagnostics::Event;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        if let Some((socket, pid)) = &self.control {
+            let snapshot = control::config_snapshot(socket)
+                .await
+                .context("Read active configuration")?;
+            anyhow::ensure!(
+                Some(snapshot.pid) == *pid,
+                "Core PID changed; retry diagnostics"
+            );
+            anyhow::ensure!(
+                snapshot.text.len() <= CONFIG_LIMIT,
+                "Configuration exceeds 480 KiB"
+            );
+            self.config_path = snapshot.path;
+            self.text = snapshot.text;
+        }
+        let payload = serde_json::to_vec(&astra_ipc::diagnostics::Request {
+            config: self.text,
+            targets: Some(targets),
+            list_targets: false,
+        })?;
+        let mut child = core_process(self.executable)
+            .arg("--diagnose-stream")
+            .arg(self.config_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut input = child.stdin.take().context("Missing diagnostic input")?;
+        input.write_all(&payload).await?;
+        drop(input);
+        let stderr = child.stderr.take().context("Missing diagnostic errors")?;
+        let errors = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr.take(4096).read_to_end(&mut bytes).await;
+            bytes
+        });
+        let mut reader = BufReader::new(child.stdout.take().context("Missing diagnostic output")?);
+        let mut done = false;
+        for _ in 0..20000 {
+            let mut line = String::new();
+            if (&mut reader).take(1024 * 1024).read_line(&mut line).await? == 0 {
+                break;
+            }
+            anyhow::ensure!(line.ends_with('\n'), "Diagnostic event exceeds limit");
+            let mut event: Event =
+                serde_json::from_str(&line).context("Update proxy core to use live node tests")?;
+            if let Event::Started { running_config, .. } = &mut event {
+                *running_config = self.running;
+            }
+            if matches!(event, Event::Done) {
+                done = true;
+                break;
+            }
+            timeout(
+                Duration::from_secs(2),
+                astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&event)?)),
+            )
+            .await??;
+        }
+        let status = child.wait().await?;
+        let errors = String::from_utf8_lossy(&errors.await?).into_owned();
+        anyhow::ensure!(status.success(), "Diagnostic core failed: {errors}");
+        anyhow::ensure!(done, "Diagnostic stream ended before completion");
+        astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&Event::Done)?))
+            .await?;
+        Ok(())
+    }
+    async fn run(self) -> Result<Reply> {
+        self.run_selection(None, false).await
+    }
+    async fn run_selection(self, targets: Option<Vec<String>>, list: bool) -> Result<Reply> {
+        self.run_job(targets, list, false).await
+    }
+    async fn run_refresh(self) -> Result<Reply> {
+        self.run_job(None, false, true).await
+    }
+    async fn run_job(
+        mut self,
+        targets: Option<Vec<String>>,
+        list: bool,
+        refresh: bool,
+    ) -> Result<Reply> {
         use tokio::io::AsyncWriteExt;
         timeout(Duration::from_secs(70), async {
             if let Some((socket, pid)) = &self.control {
@@ -126,16 +215,15 @@ impl DiagnosticPlan {
                 self.config_path = snapshot.path;
                 self.text = snapshot.text;
             }
+            let selected = targets.is_some() || list;
+            let payload = if selected {
+                serde_json::to_vec(&astra_ipc::diagnostics::Request { config: self.text, targets, list_targets: list })?
+            } else { self.text.into_bytes() };
             let mut child = core_process(self.executable)
-                .arg("--diagnose-stdin")
-                .arg(self.config_path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
+                .arg(if refresh { "--refresh-subscriptions-stdin" } else if selected { "--diagnose-request" } else { "--diagnose-stdin" }).arg(self.config_path)
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
             let mut input = child.stdin.take().context("Missing diagnostic input")?;
-            input.write_all(self.text.as_bytes()).await?;
+            input.write_all(&payload).await?;
             drop(input);
             let output = child.wait_with_output().await?;
             anyhow::ensure!(
@@ -150,6 +238,11 @@ impl DiagnosticPlan {
                 output.stdout.len() < 900 * 1024,
                 "Diagnostic report exceeds limit"
             );
+            if refresh { return Ok(Reply::text(String::from_utf8(output.stdout)?)); }
+            if list {
+                let targets: Vec<String> = serde_json::from_slice(&output.stdout)?;
+                return Ok(Reply::text(serde_json::to_string(&targets)?));
+            }
             let mut report: astra_ipc::diagnostics::Report = serde_json::from_slice(&output.stdout)
                 .context("Update the proxy core to use diagnostics")?;
             report.running_config = self.running;
@@ -811,7 +904,12 @@ impl Manager {
             Action::Add(i) => self.add(i).await,
             Action::Create { name, kind } => self.create(name, kind).await,
             Action::FollowLogs { .. } => bail!("Log subscriptions require a dedicated connection"),
-            Action::Diagnostics(_) => bail!("Diagnostics require a dedicated connection"),
+            Action::Diagnostics(_)
+            | Action::DiagnosticTargets(_)
+            | Action::DiagnosticsSelected { .. } => {
+                bail!("Diagnostics require a dedicated connection")
+            }
+            Action::DiagnosticsStream { .. } => bail!("Diagnostics require a dedicated connection"),
             Action::NodeTags(name) => {
                 let json = serde_json::to_string(&self.node_tags(&name)?)?;
                 anyhow::ensure!(
@@ -903,7 +1001,9 @@ impl Manager {
                     self.instance(&name)?.kind == Kind::Proxy,
                     "Select a proxy instance"
                 );
-                anyhow::ensure!(self.running.contains_key(&name), "Not running");
+                if !self.running.contains_key(&name) {
+                    return self.diagnostic_plan(&name)?.run_refresh().await;
+                }
                 astra_ipc::control::request(&self.socket(&name), Command::UpdateSubscriptions)
                     .await?;
                 Ok(Reply::text("Subscription update scheduled"))
@@ -1199,7 +1299,28 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
                     let request = timeout(Duration::from_secs(2), astra_ipc::receive_management::<Request>(&mut stream)).await;
                     let request = match request { Ok(Ok(r)) => r, _ => continue };
                     if request.version == astra_ipc::API_VERSION {
-                        if let Action::Diagnostics(name) = &request.action {
+                        if let Action::DiagnosticsStream {name, targets} = &request.action {
+                            let plan = (|| { anyhow::ensure!(diagnostics.len() < 2, "Diagnostics are busy; retry shortly"); manager.diagnostic_plan(name) })();
+                            let targets = targets.clone();
+                            let (mut input, mut output) = tokio::io::split(stream);
+                            diagnostics.spawn(async move {
+                                use tokio::io::AsyncReadExt;
+                                let result = tokio::select! {
+                                    result = async { timeout(Duration::from_secs(45), plan?.stream(targets, &mut output)).await.context("Diagnostic stream timed out")? } => result,
+                                    _ = input.read_u8() => return,
+                                };
+                                if let Err(error) = result {
+                                    let mut reply = Reply::text(""); reply.error = Some(format!("{error:#}"));
+                                    let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut output, &reply)).await;
+                                }
+                            });
+                            continue;
+                        }
+                        let offline_refresh = matches!(&request.action, Action::UpdateSubscriptions(name) if !manager.running.contains_key(name));
+                        if matches!(&request.action, Action::Diagnostics(_) | Action::DiagnosticTargets(_) | Action::DiagnosticsSelected {..}) || offline_refresh {
+                            let name = match &request.action { Action::Diagnostics(name) | Action::DiagnosticTargets(name) | Action::DiagnosticsSelected {name, ..} | Action::UpdateSubscriptions(name) => name, _ => unreachable!() };
+                            let list = matches!(&request.action, Action::DiagnosticTargets(_));
+                            let targets = if let Action::DiagnosticsSelected {targets, ..} = &request.action { Some(targets.clone()) } else { None };
                             let plan = (|| {
                                 anyhow::ensure!(diagnostics.len() < 2, "Diagnostics are busy; retry shortly");
                                 manager.diagnostic_plan(name)
@@ -1209,7 +1330,7 @@ pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
                                     diagnostics.spawn(async move {
                                         use tokio::io::AsyncReadExt;
                                         let result = tokio::select! {
-                                            result = plan.run() => result,
+                                            result = async { if offline_refresh { plan.run_refresh().await } else if !list && targets.is_none() { plan.run().await } else { plan.run_selection(targets, list).await } } => result,
                                             _ = stream.read_u8() => return,
                                         };
                                         let reply = result.unwrap_or_else(|error| {
@@ -1383,6 +1504,205 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "requires freshly built core binaries"]
+    async fn live_diagnostics_stream_updates_early_and_cancel_closes_core() {
+        use astra_ipc::diagnostics::Event;
+        use tokio::io::AsyncReadExt;
+        let temp = Temp::new();
+        let home = temp.0.join("state");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = slow.local_addr().unwrap();
+        let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_address = fast.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = slow.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert!(stream.read_u8().await.is_err());
+        });
+        let quick = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = fast.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+            }
+        });
+        let source = temp.0.join("proxy.toml");
+        fs::write(&source,format!("standalone=true\nstandalone_outbound='slow'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='slow'\nserver='{address}'\n[[outbounds]]\nkind='socks5'\ntag='fast'\nserver='{fast_address}'\n")).unwrap();
+        let manager = tokio::spawn(serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        call(
+            &socket,
+            Action::Add(Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: source,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = astra_ipc::platform::LocalStream::connect(&socket)
+            .await
+            .unwrap();
+        astra_ipc::send_management(
+            &mut stream,
+            &Request {
+                version: astra_ipc::API_VERSION,
+                action: Action::DiagnosticsStream {
+                    name: "proxy".into(),
+                    targets: vec!["slow".into(), "fast".into()],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let reply: Reply = astra_ipc::receive_management(&mut stream).await.unwrap();
+                assert!(reply.error.is_none(), "{:?}", reply.error);
+                if let Event::Finished { probe } =
+                    serde_json::from_str::<Event>(&reply.text).unwrap()
+                {
+                    assert_eq!(probe.outbound, "fast");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("fast result must arrive while slow node is still pending");
+        timeout(Duration::from_secs(1), call(&socket, Action::List))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stream);
+        timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("cancel must close the diagnostic child tunnel")
+            .unwrap();
+        let mut stream = astra_ipc::platform::LocalStream::connect(&socket)
+            .await
+            .unwrap();
+        astra_ipc::send_management(
+            &mut stream,
+            &Request {
+                version: astra_ipc::API_VERSION,
+                action: Action::DiagnosticsStream {
+                    name: "proxy".into(),
+                    targets: vec!["fast".into()],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let reply: Reply = astra_ipc::receive_management(&mut stream).await.unwrap();
+                assert!(reply.error.is_none(), "{:?}", reply.error);
+                if matches!(
+                    serde_json::from_str::<Event>(&reply.text).unwrap(),
+                    Event::Done
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        quick.await.unwrap();
+        call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_stopped_subscription_update_keeps_manager_responsive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = Temp::new();
+        let home = temp.0.join("state");
+        let socket = home.join("manager.sock");
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let fake = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            tx.send(()).unwrap();
+            sleep(Duration::from_millis(300)).await;
+            let body = "proxies: [{name: fetched, type: http, server: 127.0.0.1, port: 1234}]";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let source = temp.0.join("proxy.toml");
+        let text = format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[subscriptions.remote]\nurl='http://{address}/sub'\n");
+        fs::write(&source, &text).unwrap();
+        let manager = tokio::spawn(serve(home, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        call(
+            &socket,
+            Action::Add(Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: source.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let first_socket = socket.clone();
+        let update = tokio::spawn(async move {
+            call(&first_socket, Action::UpdateSubscriptions("proxy".into())).await
+        });
+        timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+        let status = timeout(Duration::from_millis(200), call(&socket, Action::List))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.rows[0].pid.is_none());
+        assert!(update.await.unwrap().unwrap().text.contains("Updated 1"));
+        let nodes = call(&socket, Action::SubscriptionNodes("proxy".into()))
+            .await
+            .unwrap();
+        assert!(nodes.text.contains("fetched"));
+        assert_eq!(fs::read_to_string(source).unwrap(), text);
+        call(&socket, Action::Shutdown).await.unwrap();
+        fake.await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
     async fn live_diagnostics_use_running_snapshot_keep_manager_responsive_and_cancel_child() {
         use tokio::io::AsyncReadExt;
         let temp = Temp::new();
@@ -1446,11 +1766,26 @@ mod tests {
             "invalid modified file; running core must still be used",
         )
         .unwrap();
+        let catalog = call(&socket, Action::DiagnosticTargets("proxy".into()))
+            .await
+            .unwrap();
+        let targets: Vec<String> = serde_json::from_str(&catalog.text).unwrap();
+        assert_eq!(targets, ["DIRECT", "live-edge", "PROXY"]);
+        assert!(
+            accepted_rx.try_recv().is_err(),
+            "Listing nodes must not start probes"
+        );
         let first_socket = socket.clone();
-        let first =
-            tokio::spawn(
-                async move { call(&first_socket, Action::Diagnostics("proxy".into())).await },
-            );
+        let first = tokio::spawn(async move {
+            call(
+                &first_socket,
+                Action::DiagnosticsSelected {
+                    name: "proxy".into(),
+                    targets: vec!["live-edge".into()],
+                },
+            )
+            .await
+        });
         timeout(Duration::from_secs(5), accepted_rx.recv())
             .await
             .unwrap()
@@ -1467,17 +1802,22 @@ mod tests {
             .unwrap();
         let report: astra_ipc::diagnostics::Report = serde_json::from_str(&reply.text).unwrap();
         assert!(report.running_config);
-        assert_eq!(report.probes.len(), 3);
-        assert_eq!(report.probes[2].outbound, "PROXY");
-        assert!(report.probes[0].direct);
-        assert_eq!(report.probes[1].outbound, "live-edge");
-        assert!(report.probes[1].ip.is_none());
-        assert!(report.probes[1].error.is_some());
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].outbound, "live-edge");
+        assert!(!report.probes[0].direct);
+        assert!(report.probes[0].ip.is_none());
+        assert!(report.probes[0].error.is_some());
         let second_socket = socket.clone();
-        let second =
-            tokio::spawn(
-                async move { call(&second_socket, Action::Diagnostics("proxy".into())).await },
-            );
+        let second = tokio::spawn(async move {
+            call(
+                &second_socket,
+                Action::DiagnosticsSelected {
+                    name: "proxy".into(),
+                    targets: vec!["live-edge".into()],
+                },
+            )
+            .await
+        });
         timeout(Duration::from_secs(5), accepted_rx.recv())
             .await
             .unwrap()

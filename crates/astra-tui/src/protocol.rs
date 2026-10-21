@@ -130,6 +130,15 @@ pub enum Action {
     },
     UpdateSubscriptions(String),
     SubscriptionNodes(String),
+    DiagnosticTargets(String),
+    DiagnosticsSelected {
+        name: String,
+        targets: Vec<String>,
+    },
+    DiagnosticsStream {
+        name: String,
+        targets: Vec<String>,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {

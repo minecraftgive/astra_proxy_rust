@@ -358,9 +358,7 @@ impl Ui {
         operations.insert(operations.len() - 2, Operation::Bind);
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
-            if row.pid.is_some() {
-                operations.push(Operation::UpdateSubscriptions);
-            }
+            operations.push(Operation::UpdateSubscriptions);
         }
         if row.instance.kind == Kind::Rule && row.pid.is_some() {
             operations.push(Operation::Explain);
@@ -821,16 +819,10 @@ impl Ui {
             return Input::Idle;
         }
         if let Some(view) = &mut self.diagnostics {
-            match key.code {
-                KeyCode::Esc => self.diagnostics = None,
-                KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
-                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(10),
-                KeyCode::PageDown => view.scroll = view.scroll.saturating_add(10),
-                KeyCode::Char('t') => {
-                    return Input::Run(Action::Diagnostics(view.name.clone()), None)
-                }
-                _ => {}
+            if key.code == KeyCode::Esc {
+                self.diagnostics = None;
+            } else {
+                view.key(key);
             }
             return Input::Idle;
         }
@@ -961,7 +953,13 @@ impl Ui {
         {
             self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
         } else if let Some(editor) = &mut self.editor {
-            if key.code == KeyCode::F(4) {
+            if editor.requests_subscription_update(key) {
+                if editor.text() != editor.original {
+                    self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
+                } else {
+                    return Input::Run(Action::UpdateSubscriptions(editor.name.clone()), None);
+                }
+            } else if key.code == KeyCode::F(4) {
                 return Input::ExternalEditor;
             } else if key.code == KeyCode::F(5) {
                 if !editor.browsing() {
@@ -1280,6 +1278,11 @@ impl Ui {
                     self.message = tr!("记录级别已改为 {}，无需重启", level.as_str());
                     return false;
                 }
+                Action::UpdateSubscriptions(_) => {
+                    self.refresh_node_tags(socket).await;
+                    self.message = reply.text;
+                    return false;
+                }
                 Action::Save { .. } => {
                     if let Some(editor) = &mut self.editor {
                         editor.original = editor.text();
@@ -1463,6 +1466,19 @@ impl Ui {
         }
     }
     fn render(&self, f: &mut Frame<'_>) {
+        if let Some(view) = &self.diagnostics {
+            view.render(f, f.area());
+            if let Some(scroll) = self.help_scroll {
+                let text = crate::help::text(self.help_page());
+                f.render_widget(
+                    Paragraph::new(text)
+                        .scroll((scroll, 0))
+                        .block(Block::default().borders(Borders::ALL).title(t("Help"))),
+                    f.area(),
+                );
+            }
+            return;
+        }
         let overview = self.editor.is_none() && self.viewer.is_none() && self.recovery.is_none();
         let operation_text = self.operation_text();
         let operation_height = if operation_text.is_empty() {
@@ -2533,6 +2549,10 @@ mod tests {
         assert!(matches!(ui.key(key('d')), Input::Idle));
         assert!(ui.prompt.is_none());
         let mut ui = sample_ui(false);
+        assert!(ui
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, Operation::UpdateSubscriptions)));
         assert!(!ui.operations().iter().any(|operation| matches!(
             operation,
             Operation::Stop | Operation::Restart | Operation::Reload

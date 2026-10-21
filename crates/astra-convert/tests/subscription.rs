@@ -1,6 +1,91 @@
 use astra_convert::{subscription::*, Options};
+
+#[test]
+fn subscriptions_become_groups_and_proxy_membership_is_controlled_on_each_group() {
+    use astra_ipc::groups::{ensure_default, expand, validate, Group};
+    use std::collections::{BTreeMap, HashSet};
+    let mut doc: toml::Table = toml::from_str("[[outbounds]]\ntag='a'\nkind='socks5'\nserver='localhost:1'\n[[outbounds]]\ntag='b'\nkind='socks5'\nserver='localhost:2'\n[subscriptions.first]\nurl='https://example.com/a'\nmanaged_nodes=['a']\n[subscriptions.second]\nurl='https://example.com/b'\nmanaged_nodes=['b']\n").unwrap();
+    prepare_groups(&mut doc).unwrap();
+    assert_eq!(
+        doc["proxy_groups"]["first"]["members"].as_array().unwrap(),
+        &[toml::Value::String("a".into())]
+    );
+    assert_eq!(
+        doc["proxy_groups"]["second"]["include_in_proxy"].as_bool(),
+        Some(true)
+    );
+    doc["proxy_groups"]["first"]
+        .as_table_mut()
+        .unwrap()
+        .insert("include_in_proxy".into(), false.into());
+    doc["proxy_groups"]["first"]
+        .as_table_mut()
+        .unwrap()
+        .insert("selected".into(), "a".into());
+    prepare_groups(&mut doc).unwrap();
+    let mut groups: BTreeMap<String, Group> = doc["proxy_groups"].clone().try_into().unwrap();
+    let nodes: HashSet<_> = ["a", "b"].into_iter().map(str::to_owned).collect();
+    ensure_default(&mut groups, &nodes).unwrap();
+    let expanded = expand(&groups, &nodes).unwrap();
+    assert_eq!(expanded["PROXY"].members, ["second"]);
+    assert_eq!(expanded["first"].selected.as_deref(), Some("a"));
+    validate(&groups, &nodes).unwrap();
+    groups.get_mut("PROXY").unwrap().members = vec!["first".into(), "a".into()];
+    assert_eq!(
+        expand(&groups, &nodes).unwrap()["PROXY"].members,
+        ["second"]
+    );
+}
+
+#[test]
+fn named_refresh_preserves_group_controls_and_other_subscription_members() {
+    let current = "[subscriptions.first]\nurl='https://example.com/a'\n[subscriptions.second]\nurl='https://example.com/b'\n[proxy_groups.first]\nsubscription='first'\ninclude_in_proxy=false\nmode='auto'\n";
+    let mut first = Subscription::default();
+    let one = convert_nodes(&source("a"), &Options::default(), "test", false).unwrap();
+    let two = convert_nodes(&source("b"), &Options::default(), "test", false).unwrap();
+    let updated = merge_named(current, &one.proxy, &mut first, "first").unwrap();
+    let mut second = Subscription::default();
+    let updated = merge_named(&updated, &two.proxy, &mut second, "second").unwrap();
+    let next = convert_nodes(&source("new-a"), &Options::default(), "test", false).unwrap();
+    let updated = merge_named(&updated, &next.proxy, &mut first, "first").unwrap();
+    let doc: toml::Value = toml::from_str(&updated).unwrap();
+    assert_eq!(
+        doc["proxy_groups"]["first"]["members"][0].as_str(),
+        Some("new-a")
+    );
+    assert_eq!(
+        doc["proxy_groups"]["first"]["include_in_proxy"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(doc["proxy_groups"]["first"]["mode"].as_str(), Some("auto"));
+    assert_eq!(
+        doc["proxy_groups"]["second"]["members"][0].as_str(),
+        Some("b")
+    );
+    assert!(!doc["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["tag"].as_str() == Some("a")));
+}
 fn source(name: &str) -> String {
     format!("proxies: [{{name: {name}, type: socks5, server: 127.0.0.1, port: 1234}}]\nproxy-groups: [{{name: PROXY, type: select, include-all: true}}]\nrules: ['MATCH,PROXY']")
+}
+#[test]
+fn nested_selection_survives_refresh_and_clears_when_node_disappears() {
+    let current = "[subscriptions.remote]\nurl='https://example.com/sub'\n[proxy_groups.parent]\nmembers=['remote']\nselected='chosen'\n";
+    let mut owned = Subscription::default();
+    let nodes = convert_nodes(&source("chosen"), &Options::default(), "test", false).unwrap();
+    let merged = merge_named(current, &nodes.proxy, &mut owned, "remote").unwrap();
+    let doc: toml::Value = toml::from_str(&merged).unwrap();
+    assert_eq!(
+        doc["proxy_groups"]["parent"]["selected"].as_str(),
+        Some("chosen")
+    );
+    let nodes = convert_nodes(&source("replacement"), &Options::default(), "test", false).unwrap();
+    let merged = merge_named(&merged, &nodes.proxy, &mut owned, "remote").unwrap();
+    let doc: toml::Value = toml::from_str(&merged).unwrap();
+    assert!(doc["proxy_groups"]["parent"].get("selected").is_none());
 }
 #[test]
 fn providers_membership_filters_and_yaml_anchors() {
@@ -229,4 +314,39 @@ fn injected_download_covers_subscription_and_nested_http_provider() {
             "https://provider.test/nodes"
         ]
     );
+}
+
+#[test]
+fn fetch_diagnostics_distinguish_html_yaml_and_unsupported_nodes() {
+    let config = Subscription {
+        url: "https://example.com/private?token=secret".into(),
+        ..Default::default()
+    };
+    for (body, expected) in [
+        (
+            "<!doctype html><html>login token=body-secret</html>",
+            "HTML/XML",
+        ),
+        ("proxies: [", "YAML at line"),
+        (
+            "proxies: [{name: bad, type: imaginary, server: 127.0.0.1, port: 1234, password: body-secret}]",
+            "不支持的协议 imaginary",
+        ),
+    ] {
+        let error = fetch_with(&config, std::path::Path::new("."), &|_, _| Ok(body.into()))
+            .err()
+            .unwrap();
+        let diagnostic = diagnostics::error(&error);
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("body-secret") && !diagnostic.contains("token=secret"),
+            "{diagnostic}"
+        );
+    }
+    let error = fetch_with(&config, std::path::Path::new("."), &|_, _| {
+        Err(anyhow::anyhow!("connection refused"))
+    })
+    .err()
+    .unwrap();
+    assert!(diagnostics::error(&error).contains("download subscription: connection refused"));
 }

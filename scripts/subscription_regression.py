@@ -62,7 +62,15 @@ def main():
         assert parsed['subscription']['import_groups'] is False
         assert parsed['subscription']['managed_groups'] == []
         assert not (directory/'rule.toml').exists(), 'node subscription imported rules'
-        assert set(parsed['proxy_groups']) == {'PROXY'}, 'node subscription imported remote groups'
+        groups = parsed['proxy_groups']
+        owned_groups = [(name, group) for name, group in groups.items()
+                        if group.get('subscription') == '__legacy__']
+        assert len(owned_groups) == 1, 'node subscription must generate one local subscription group'
+        subscription_group_name, subscription_group = owned_groups[0]
+        assert set(groups) == {'PROXY', subscription_group_name}, 'node subscription imported remote groups'
+        assert subscription_group['members'] == parsed['subscription']['managed_nodes'], 'subscription group membership differs from owned nodes'
+        assert subscription_group['include_in_proxy'] is True, 'subscription group must join PROXY by default'
+        assert 'remote-only' not in groups, 'nodes-only import must exclude remote groups'
         full = directory/'full'
         subprocess.run([str(binaries/executable('astra-convert')), url, '--include-config', '-o', str(full)], check=True, capture_output=True)
         assert (full/'rule.toml').is_file()

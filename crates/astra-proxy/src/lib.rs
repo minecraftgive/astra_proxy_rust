@@ -15,6 +15,7 @@ use proxy::packet;
 use proxy::rule_client;
 use proxy::runtime;
 mod diagnostics;
+mod dns;
 mod http_forward;
 mod subscription;
 pub use astra_protocols::xhttp;
@@ -29,6 +30,7 @@ use tokio::time::timeout;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
+    destination_ip: Option<std::net::IpAddr>,
     target: Target,
     revision: u64,
     network: Network,
@@ -37,6 +39,8 @@ struct CacheKey {
 }
 
 pub struct App {
+    egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
+    dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
     source_text: String,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
@@ -51,6 +55,10 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) async fn egress_cancelled(&self) {
+        let mut changed = self.egress_signal.subscribe();
+        let _ = changed.wait_for(|changed| *changed).await;
+    }
     pub async fn route(&self, target: &Target, inbound: Inbound) -> Result<RouteAction> {
         self.route_network(target, inbound, Network::Tcp).await
     }
@@ -84,7 +92,16 @@ impl App {
         } else {
             None
         };
-        self.route_with_process(target, inbound, network, process)
+        // Explicit proxy listeners report their own local socket here, not
+        // the requested endpoint. Only transparent inbounds observe the latter.
+        let destination_ip = match inbound {
+            Inbound::Tun | Inbound::Tproxy | Inbound::Redirect => {
+                destination.map(|address| address.ip())
+            }
+            Inbound::Socks5 | Inbound::HttpConnect => target.host.parse().ok(),
+        }
+        .filter(|ip| !self.synthetic_ip(*ip));
+        self.route_with_context(target, inbound, network, process, destination_ip)
             .await
     }
 
@@ -95,6 +112,19 @@ impl App {
         network: Network,
         process: Option<ProcessInfo>,
     ) -> Result<RouteAction> {
+        self.route_with_context(target, inbound, network, process, None)
+            .await
+    }
+    async fn route_with_context(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        process: Option<ProcessInfo>,
+        destination_ip: Option<std::net::IpAddr>,
+    ) -> Result<RouteAction> {
+        let restored = self.restore_fake_target(target)?;
+        let target = &restored;
         if inbound == Inbound::Tun
             && process
                 .as_ref()
@@ -103,7 +133,7 @@ impl App {
             bail!("TUN recaptured a proxy-core connection; check tun.interface and outbound bypass routes");
         }
         let result = self
-            .decide_network(target, inbound, network, process.clone())
+            .decide_network(target, inbound, network, process.clone(), destination_ip)
             .await;
         let result = match result {
             Ok(action) => self.resolve_action(&action).await.map(|resolved| {
@@ -117,7 +147,7 @@ impl App {
         };
         match &result {
             Ok(action) => {
-                tracing::debug!(target: "astra_route", phase = "route", host = ?target.host, port = target.port, ?inbound, ?network, ?process, ?action, "route selected")
+                tracing::debug!(target: "astra_route", phase = "route", host = ?target.host, port = target.port, ?destination_ip, ?inbound, ?network, ?process, ?action, "route selected")
             }
             Err(error) => {
                 tracing::debug!(target: "astra_route", phase = "route_failed", host = ?target.host, port = target.port, ?inbound, ?network, %error, "routing failed")
@@ -132,6 +162,7 @@ impl App {
         inbound: Inbound,
         network: Network,
         process: Option<ProcessInfo>,
+        destination_ip: Option<std::net::IpAddr>,
     ) -> Result<RouteAction> {
         if let Some(action) = &self.standalone_action {
             return Ok(action.clone());
@@ -139,6 +170,7 @@ impl App {
         let client = self.rule_client.as_ref().context("rule client missing")?;
         let revision = client.revision();
         let key = CacheKey {
+            destination_ip,
             revision,
             target: target.clone(),
             network,
@@ -151,6 +183,7 @@ impl App {
             }
         }
         let req = RouteRequest {
+            destination_ip,
             api_version: API_VERSION,
             id: 0,
             target: target.clone(),
@@ -175,6 +208,8 @@ impl App {
         inbound: Inbound,
         source: Option<std::net::SocketAddr>,
     ) -> Result<outbound::Stream> {
+        let restored = self.restore_fake_target(target)?;
+        let target = &restored;
         let (resolved, lease) = self.resolve_session(action).await?;
         let traffic =
             proxy::traffic::Traffic::new(source, target, inbound, Network::Tcp, &resolved);
@@ -203,6 +238,8 @@ impl App {
     }
 
     pub async fn connect(&self, target: &Target, action: &RouteAction) -> Result<outbound::Stream> {
+        let restored = self.restore_fake_target(target)?;
+        let target = &restored;
         let (resolved, lease) = self.resolve_session(action).await?;
         let inner = tokio::select! {
             biased;
@@ -236,10 +273,30 @@ impl App {
         action: &RouteAction,
     ) -> Result<outbound::Stream> {
         if *action == RouteAction::Direct {
-            if let Some(tun) = &self.config.tun {
+            if self.config.tun.is_some() || self.dns.is_some() {
                 return timeout(
                     Duration::from_secs(self.config.connect_timeout_secs),
-                    egress::connect(target, tun.interface.as_deref()),
+                    async {
+                        let interface = self
+                            .config
+                            .tun
+                            .as_ref()
+                            .and_then(|tun| tun.interface.as_deref());
+                        let mut last = None;
+                        for address in self.lookup_real(&target.host, target.port).await? {
+                            let literal = Target {
+                                host: address.ip().to_string(),
+                                port: address.port(),
+                            };
+                            match egress::connect(&literal, interface).await {
+                                Ok(stream) => return Ok(stream),
+                                Err(error) => last = Some(error),
+                            }
+                        }
+                        Err(last.unwrap_or_else(|| {
+                            anyhow::anyhow!("direct DNS lookup returned no addresses")
+                        }))
+                    },
                 )
                 .await
                 .context("direct egress timeout")?
@@ -282,6 +339,31 @@ impl App {
     }
     fn from_text(path: &std::path::Path, source_text: String) -> Result<Self> {
         let mut config: ProxyConfig = toml::from_str(&source_text)?;
+        if let (Some(dns), Some(tun)) = (&config.dns, &mut config.tun) {
+            if dns.enable && dns.fake_ip {
+                let range: ipnet::Ipv4Net = dns.fake_ip_range.parse()?;
+                let cidr = range.trunc().to_string();
+                if !tun.routes.contains(&cidr) {
+                    tun.routes.push(cidr);
+                }
+                if let Some(range) = &dns.fake_ip_range6 {
+                    let range: ipnet::Ipv6Net = range.parse()?;
+                    anyhow::ensure!(
+                        tun.ipv6_address.is_some(),
+                        "IPv6 Fake IP with TUN requires tun.ipv6_address"
+                    );
+                    let cidr = range.trunc().to_string();
+                    if !tun.routes.contains(&cidr) {
+                        tun.routes.push(cidr);
+                    }
+                }
+            }
+        }
+        if !config.subscription_sources().is_empty() {
+            let mut document: toml::Table = toml::from_str(&source_text)?;
+            astra_convert::subscription::prepare_groups(&mut document)?;
+            config.proxy_groups = document["proxy_groups"].clone().try_into()?;
+        }
         let tags = config
             .outbounds
             .iter()
@@ -300,10 +382,55 @@ impl App {
         if config.decision_cache_ttl_secs > 0 {
             builder = builder.time_to_live(Duration::from_secs(config.decision_cache_ttl_secs));
         }
+        let mut dns = config
+            .dns
+            .clone()
+            .filter(|dns| dns.enable)
+            .map(astra_dns::Resolver::new)
+            .transpose()?;
+        if let Some(dns) = &mut dns {
+            if let Some(tun) = &config.tun {
+                let subnet = ipnet::Ipv4Net::new(tun.address, tun.prefix)?;
+                for address in [tun.address, subnet.network(), subnet.broadcast()] {
+                    dns.reserve_address(address.into());
+                }
+                if let Some(address) = tun.ipv6_address {
+                    let subnet = ipnet::Ipv6Net::new(address, tun.ipv6_prefix)?;
+                    dns.reserve_address(address.into());
+                    dns.reserve_address(subnet.network().into());
+                }
+            }
+            for node in &config.outbounds {
+                let server = match node {
+                    OutboundConfig::Native { config, .. } => {
+                        dns.exclude_domain(&config.server);
+                        continue;
+                    }
+                    OutboundConfig::Socks5 { server, .. }
+                    | OutboundConfig::Http { server, .. }
+                    | OutboundConfig::TrojanTls { server, .. }
+                    | OutboundConfig::VlessTls { server, .. } => server,
+                };
+                if let Ok(uri) = url::Url::parse(&format!("tcp://{server}")) {
+                    if let Some(host) = uri.host_str() {
+                        dns.exclude_domain(host);
+                    }
+                }
+            }
+            for subscription in config.subscription_sources().values() {
+                if let Ok(uri) = url::Url::parse(&subscription.url) {
+                    if let Some(host) = uri.host_str() {
+                        dns.exclude_domain(host);
+                    }
+                }
+            }
+        }
         Ok(Self {
+            egress_signal: Arc::new(tokio::sync::watch::channel(false).0),
+            dns,
             groups: proxy::groups::Groups::new(&config)?,
             standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),
-            rule_client: if config.standalone {
+            rule_client: if config.standalone || config.dns_only() {
                 None
             } else {
                 Some(rule_client::RuleClient::new(
@@ -329,20 +456,84 @@ pub async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let first = args.next();
     let first = elevated_config.or(first);
-    if matches!(first.as_deref(), Some("--diagnose" | "--diagnose-stdin")) {
+    if matches!(
+        first.as_deref(),
+        Some(
+            "--diagnose"
+                | "--diagnose-stdin"
+                | "--diagnose-request"
+                | "--diagnose-stream"
+                | "--refresh-subscriptions-stdin"
+        )
+    ) {
         let path = std::path::absolute(args.next().context("expected config path")?)?;
-        let app = if first.as_deref() == Some("--diagnose-stdin") {
+        let mut request = None;
+        let app = if matches!(
+            first.as_deref(),
+            Some(
+                "--diagnose-stdin"
+                    | "--diagnose-request"
+                    | "--diagnose-stream"
+                    | "--refresh-subscriptions-stdin"
+            )
+        ) {
             use std::io::Read;
-            let mut text = String::new();
+            let mut input = String::new();
             std::io::stdin()
-                .take(480 * 1024 + 1)
-                .read_to_string(&mut text)?;
+                .take(2 * 1024 * 1024 + 1)
+                .read_to_string(&mut input)?;
+            anyhow::ensure!(
+                input.len() <= 2 * 1024 * 1024,
+                "Diagnostic request exceeds limit"
+            );
+            let text = if matches!(
+                first.as_deref(),
+                Some("--diagnose-request" | "--diagnose-stream")
+            ) {
+                let payload: astra_ipc::diagnostics::Request = serde_json::from_str(&input)?;
+                let text = payload.config.clone();
+                request = Some(payload);
+                text
+            } else {
+                input
+            };
             anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
             App::from_text(&path, text)?
         } else {
             App::load(&path)?
         };
-        println!("{}", serde_json::to_string(&diagnostics::run(&app).await)?);
+        if first.as_deref() == Some("--refresh-subscriptions-stdin") {
+            println!("{}", subscription::refresh_once(&path, app).await?);
+            return Ok(());
+        }
+        let app = subscription::cached_app(&path, app);
+        if first.as_deref() == Some("--diagnose-stream") {
+            use std::io::Write;
+            let tags = request
+                .and_then(|r| r.targets)
+                .unwrap_or_else(|| diagnostics::targets(&app));
+            diagnostics::selected_stream(&app, &tags, |event| {
+                let mut stdout = std::io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &event)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+                Ok(())
+            })
+            .await?;
+            return Ok(());
+        }
+        let output = if let Some(request) = request {
+            if request.list_targets {
+                serde_json::to_string(&diagnostics::targets(&app))?
+            } else if let Some(targets) = request.targets {
+                serde_json::to_string(&diagnostics::selected(&app, &targets).await?)?
+            } else {
+                serde_json::to_string(&diagnostics::run(&app).await)?
+            }
+        } else {
+            serde_json::to_string(&diagnostics::run(&app).await)?
+        };
+        println!("{output}");
         return Ok(());
     }
     astra_ipc::logging::init()?;
@@ -356,6 +547,7 @@ pub async fn run() -> Result<()> {
             .context("configuration has no TUN")?;
         egress::prepare_interface(tun)?;
         egress::persist_interface(&path, &app.source_text, tun)?;
+        egress::cache_interface(&path, tun)?;
         println!("TUN physical egress: {}", tun.interface.as_deref().unwrap());
         return Ok(());
     }

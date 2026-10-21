@@ -13,6 +13,7 @@ impl Drop for Temp {
 }
 fn request(id: u64, host: &str) -> RouteRequest {
     RouteRequest {
+        destination_ip: None,
         api_version: API_VERSION,
         id,
         target: Target {

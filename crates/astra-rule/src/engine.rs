@@ -539,7 +539,10 @@ impl RuleEngine {
         };
         consider(&mut best, self.network.get(&netkey));
 
-        if let Ok(ip) = req.target.host.parse::<IpAddr>() {
+        let destination_ip = req
+            .destination_ip
+            .or_else(|| req.target.host.parse::<IpAddr>().ok());
+        if let Some(ip) = destination_ip {
             if local_ip(ip) {
                 consider(&mut best, self.countries.get("LAN"));
             }
@@ -583,7 +586,8 @@ impl RuleEngine {
                     }
                 }
             }
-        } else {
+        }
+        if req.target.host.parse::<IpAddr>().is_err() {
             let domain = req.target.host.trim_end_matches('.').to_ascii_lowercase();
             consider(&mut best, self.exact.get(&domain));
             for (pattern, entry) in &self.regexes {
@@ -630,7 +634,7 @@ impl RuleEngine {
                     expanded_index: entry.index + 1,
                 },
             }
-        } else if self.direct_local && req.target.host.parse::<IpAddr>().is_ok_and(local_ip) {
+        } else if self.direct_local && destination_ip.is_some_and(local_ip) {
             Decision {
                 action: RouteAction::Direct,
                 path: DecisionPath::Local,
@@ -726,6 +730,7 @@ mod tests {
         .unwrap();
         let engine = RuleEngine::compile(&config).unwrap();
         engine.decide(&RouteRequest {
+            destination_ip: None,
             api_version: API_VERSION,
             id: 1,
             target: Target {
@@ -739,6 +744,7 @@ mod tests {
     }
     fn request(host: &str, process: Option<astra_ipc::ProcessInfo>) -> RouteRequest {
         RouteRequest {
+            destination_ip: None,
             api_version: API_VERSION,
             id: 1,
             target: Target {
@@ -882,6 +888,9 @@ mod tests {
                 .path
                 .to_string()
                 .starts_with("rules[2] -> rule_set"));
+            let mut restored = request("restored.example", None);
+            restored.destination_ip = Some(host.parse().unwrap());
+            assert_eq!(engine.decide(&restored), RouteAction::Block);
         }
         for host in ["localhost", "example.com", "192.0.2.1", "2001:db9::1"] {
             assert_eq!(engine.decide(&request(host, None)), RouteAction::Direct);
@@ -1273,12 +1282,32 @@ mod tests {
         );
     }
     #[test]
+    fn restored_domain_and_observed_ip_share_original_rule_order() {
+        let domain = "[[rules]]\nkind='domain_suffix'\nvalue='qq.com'\naction='direct'\n";
+        let ip = "[[rules]]\nkind='ip_cidr'\nvalue='203.0.113.0/24'\naction='block'\n";
+        let mut req = request("www.qq.com", None);
+        req.destination_ip = Some("203.0.113.8".parse().unwrap());
+        assert_eq!(
+            compile(&format!("{domain}{ip}")).decide(&req),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            compile(&format!("{ip}{domain}")).decide(&req),
+            RouteAction::Block
+        );
+        req.target.host = "unmatched.test".into();
+        assert_eq!(compile(ip).decide(&req), RouteAction::Block);
+        req.destination_ip = Some("192.168.1.1".parse().unwrap());
+        assert_eq!(compile("").decide(&req), RouteAction::Direct);
+    }
+    #[test]
     #[ignore = "manual benchmark; run cargo test -p astra-rule --release -- --ignored --nocapture"]
     fn benchmark_mixed_rules() {
         use std::time::Instant;
         let config: RuleConfig = toml::from_str("socket = '/tmp/test.sock'\ndefault_action = 'direct'\n[[rules]]\nkind='domain_suffix'\nvalue='example.com'\naction='block'\n").unwrap();
         let engine = RuleEngine::compile(&config).unwrap();
         let req = RouteRequest {
+            destination_ip: None,
             api_version: API_VERSION,
             id: 1,
             target: Target {

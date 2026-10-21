@@ -2,26 +2,68 @@
 #[cfg(unix)]
 use anyhow::ensure;
 use anyhow::{Context, Result};
-/// Resolve once per committed generation, before the TUN installs routes.
-/// An explicitly configured interface always takes precedence over discovery.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct PhysicalEgress {
+    pub interface: String,
+    pub gateway: Option<std::net::Ipv4Addr>,
+    pub gateway6: Option<std::net::Ipv6Addr>,
+}
+pub(crate) fn settled_update(
+    previous: &crate::mode_config::Tun,
+    observed: crate::mode_config::Tun,
+    pending: &mut Option<crate::mode_config::Tun>,
+) -> bool {
+    if &observed == previous {
+        *pending = None;
+        return false;
+    }
+    if pending.as_ref() != Some(&observed) {
+        *pending = Some(observed);
+        return false;
+    }
+    true
+}
+/// Resolve a generation before installing routes. Automatic selection remains
+/// automatic across reloads; discovery results never turn into a user override.
 pub fn prepare_interface(tun: &mut crate::mode_config::Tun) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let interface = match tun.interface.as_deref() {
-            Some(interface) => super::windows_network::interface_alias(interface)?,
-            None => super::windows_network::physical_default_interface(tun.name.as_deref())?,
+    let automatic = tun.detects_interface();
+    tun.auto_interface = Some(automatic);
+    if automatic || tun.auto_gateway {
+        let selected = if automatic {
+            None
+        } else {
+            tun.interface.as_deref()
         };
+        #[cfg(windows)]
+        let detected = super::windows_network::physical_egress(selected, tun.name.as_deref())?;
+        #[cfg(not(windows))]
+        let detected = super::unix_network::physical_egress(selected, tun.name.as_deref())?;
         anyhow::ensure!(
-            tun.name.as_deref() != Some(&interface),
+            tun.name.as_deref() != Some(&detected.interface),
             "TUN cannot be its own egress"
         );
-        tun.interface = Some(interface);
+        tun.interface = Some(detected.interface);
+        if tun.auto_gateway {
+            tun.gateway = detected.gateway.map(std::net::IpAddr::V4);
+            tun.gateway6 = detected.gateway6;
+        }
+    } else {
+        let interface = tun
+            .interface
+            .as_deref()
+            .context("manual egress requires tun.interface")?;
+        #[cfg(windows)]
+        {
+            tun.interface = Some(super::windows_network::interface_alias(interface)?);
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::ensure!(
+                tun.name.as_deref() != Some(interface),
+                "TUN cannot be its own egress"
+            );
+        }
     }
-    #[cfg(not(windows))]
-    anyhow::ensure!(
-        tun.interface.is_some(),
-        "TUN requires tun.interface for outbound socket binding"
-    );
     Ok(())
 }
 
@@ -31,6 +73,9 @@ pub fn persist_interface(
     source: &str,
     tun: &crate::mode_config::Tun,
 ) -> Result<String> {
+    if tun.detects_interface() {
+        return Ok(source.to_owned());
+    }
     use std::io::Write;
     let mut document: toml_edit::DocumentMut = source.parse()?;
     let table = document
@@ -100,6 +145,34 @@ pub fn persist_interface(
     }
     tracing::info!(%interface, config=%path.display(), "physical egress saved to configuration");
     Ok(text)
+}
+
+pub(crate) fn cache_interface(path: &std::path::Path, tun: &crate::mode_config::Tun) -> Result<()> {
+    use std::io::Write;
+    let cache = path.with_extension("egress-cache.json");
+    let temporary = cache.with_file_name(format!(".astra-egress-{}.tmp", uuid::Uuid::new_v4()));
+    let text = serde_json::to_vec_pretty(
+        &serde_json::json!({"version":1,"interface":tun.interface,"gateway":tun.gateway,"gateway6":tun.gateway6,"auto_interface":tun.detects_interface(),"auto_gateway":tun.auto_gateway}),
+    )?;
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&text)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &cache)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 #[cfg(unix)]
 use std::{ffi::CString, os::fd::AsRawFd};
@@ -226,6 +299,55 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_mode_stays_automatic_and_cache_is_only_diagnostic() {
+        let directory =
+            std::env::temp_dir().join(format!("astra-egress-auto-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("client.toml");
+        let source = "# preserve\n[tun]\nauto_interface=true\n";
+        std::fs::write(&path, source).unwrap();
+        let mut tun: crate::mode_config::Tun = toml::from_str("auto_interface=true").unwrap();
+        tun.interface = Some("Ethernet".into());
+        tun.gateway = Some("192.0.2.1".parse().unwrap());
+        assert_eq!(persist_interface(&path, source, &tun).unwrap(), source);
+        cache_interface(&path, &tun).unwrap();
+        tun.interface = Some("Wi-Fi".into());
+        tun.gateway = Some("192.0.2.254".parse().unwrap());
+        cache_interface(&path, &tun).unwrap();
+        let cache: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.with_extension("egress-cache.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache["interface"], "Wi-Fi");
+        assert_eq!(cache["gateway"], "192.0.2.254");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path.with_extension("egress-cache.json")).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn automatic_discovery_is_debounced_and_manual_selection_is_explicit() {
+        let mut previous: crate::mode_config::Tun =
+            toml::from_str("auto_interface=true\ninterface='Ethernet'").unwrap();
+        assert!(previous.detects_interface());
+        let mut detected = previous.clone();
+        detected.interface = Some("Wi-Fi".into());
+        detected.gateway = Some("192.0.2.254".parse().unwrap());
+        let mut pending = None;
+        assert!(!settled_update(&previous, detected.clone(), &mut pending));
+        assert!(settled_update(&previous, detected.clone(), &mut pending));
+        assert!(!settled_update(&previous, previous.clone(), &mut pending));
+        assert!(pending.is_none());
+        assert!(!settled_update(&previous, detected, &mut pending));
+        previous.auto_interface = Some(false);
+        assert!(!previous.detects_interface());
+        let explicit: crate::mode_config::Tun = toml::from_str("interface='Wi-Fi'").unwrap();
+        assert!(!explicit.detects_interface());
+        let automatic: crate::mode_config::Tun = toml::from_str("").unwrap();
+        assert!(automatic.detects_interface());
+    }
 
     #[test]
     fn saves_missing_interface_preserving_comments_cache_and_concurrent_edits() {

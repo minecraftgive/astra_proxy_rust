@@ -8,6 +8,7 @@ pub mod hysteria2;
 pub mod native;
 pub mod outbound;
 pub mod shadowsocks;
+pub mod sniff;
 pub mod socks5;
 pub mod trojan;
 pub mod tuic;

@@ -73,13 +73,15 @@ def main():
         rule.write_text(f'socket={json.dumps(route.as_posix())}\ndefault_action="proxy:main"\ndirect_local=false\n', encoding='utf-8')
         port = free_port()
 
-        def config(selected='speed', cycle=False, manual=False, automatic=False, failure=False, dynamic_filter=None):
+        def config(selected='speed', cycle=False, manual=False, automatic=False, failure=False, dynamic_filter=None, nested=False):
             text = f'rule_socket={json.dumps(route.as_posix())}\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\ndecision_cache_ttl_secs=60\n'
             for server in servers:
                 text += f'[[outbounds]]\nkind="http"\ntag="{server.marker}"\nserver="127.0.0.1:{server.server_address[1]}"\n'
             text += '[proxy_groups.speed]\nmode="auto"\nmembers=["a","b"]\nurl="http://example.test/204"\ninterval=1\ntimeout_ms=1000\ntolerance_ms=0\n'
             text += f'disconnect_on_auto={str(automatic).lower()}\ndisconnect_on_failure={str(failure).lower()}\n'
             members = ['speed', 'a', 'b', 'DIRECT', 'REJECT'] + (['main'] if cycle else [])
+            if nested:
+                members = ['speed']
             text += f'[proxy_groups.main]\nmode="select"\nmembers={json.dumps(members)}\nselected="{selected}"\n'
             text += f'disconnect_on_manual={str(manual).lower()}\n'
             if dynamic_filter is not None:
@@ -188,6 +190,12 @@ def main():
                         break
                     data += chunk
                 assert data.endswith(b'a'), 'failed reload disconnected an existing stream'
+            config('b', nested=True)
+            subprocess.run([binary, '--reload', str(control)], check=True, timeout=10)
+            assert request() == 'b', 'parent must pin a nested node despite the child auto-selection'
+            config('a', nested=True)
+            subprocess.run([binary, '--reload', str(control)], check=True, timeout=10)
+            assert request() == 'a', 'switching a nested node must change actual traffic'
             config('REJECT')
             subprocess.run([binary, '--reload', str(control)], check=True, timeout=10)
             denied, status = socks_connect(port, 'example.test', 80)

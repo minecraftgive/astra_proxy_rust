@@ -130,6 +130,23 @@ macro_rules! tr {
     ($source:literal $(, $arg:expr)* $(,)?) => { $crate::i18n::message($source, &[$(format!("{}", $arg)),*]) };
 }
 const CATALOG: &[(&str, &str, &str, &str)] = &[
+    ("Node tests", "Node tests", "节点测试", "節點測試"),
+    ("Node", "Node", "节点", "節點"),
+    ("TCP latency", "TCP latency", "TCP 延迟", "TCP 延遲"),
+    ("Connectivity", "Connectivity", "连通性", "連線狀態"),
+    ("Exit IP", "Exit IP", "出口 IP", "出口 IP"),
+    ("Connected", "Connected", "连通", "已連線"),
+    ("Testing…", "Testing…", "测试中…", "測試中…"),
+    ("Queued", "Queued", "排队中", "排隊中"),
+    ("Querying exit IP…", "Querying exit IP…", "查询出口 IP…", "查詢出口 IP…"),
+    ("Progress {}/{} · Running {} · Queued {} · {}s", "Progress {}/{} · Running {} · Queued {} · {}s", "进度 {}/{} · 测试中 {} · 排队 {} · {}秒", "進度 {}/{} · 測試中 {} · 排隊 {} · {}秒"),
+    ("↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · x stop · Esc back", "↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · x stop · Esc back", "↑↓ 选择 · 空格勾选 · a 全选/取消全选 · c 清空\nEnter/t 测试所选节点 · x 停止测试 · Esc 返回", "↑↓ 選擇 · 空白鍵勾選 · a 全選/取消全選 · c 清除\nEnter/t 測試所選節點 · x 停止測試 · Esc 返回"),
+    ("Loading nodes…", "Loading nodes…", "正在加载节点…", "正在載入節點…"),
+    ("Select at least one node", "Select at least one node", "请至少选择一个节点", "請至少選擇一個節點"),
+    ("Select nodes, then press Enter to test", "Select nodes, then press Enter to test", "选择节点后按 Enter 开始测试", "選擇節點後按 Enter 開始測試"),
+    ("Include in Proxy group", "Include in Proxy group", "加入 Proxy 组", "加入 Proxy 群組"),
+    ("↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · Esc back", "↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · Esc back", "↑↓ 选择 · 空格勾选 · a 全选/取消全选 · c 清空\nEnter/t 测试所选节点 · Esc 返回", "↑↓ 選擇 · 空白鍵勾選 · a 全選/取消全選 · c 清除\nEnter/t 測試所選節點 · Esc 返回"),
+
     ("hjkl scroll · gg/G first/follow · / search · v level\nf filter · m memory · L capture · Space pause · Esc back", "hjkl scroll · gg/G first/follow · / search · v level\nf filter · m memory · L capture · Space pause · Esc back", "hjkl 滚动 · gg/G 开头/跟随 · / 搜索 · v 级别\nf 过滤 · m 内存 · L 记录级别 · 空格 暂停 · Esc 返回", "hjkl 捲動 · gg/G 開頭/跟隨 · / 搜尋 · v 級別\nf 篩選 · m 記憶體 · L 記錄級別 · 空白 暫停 · Esc 返回"),
     ("hjkl navigate · gg/G ends · zM/zR fold/open · Ctrl-S save\nn add · r rename set · e toggle set · Ctrl-T query", "hjkl navigate · gg/G ends · zM/zR fold/open · Ctrl-S save\nn add · r rename set · e toggle set · Ctrl-T query", "hjkl 导航 · gg/G 首尾 · zM/zR 折叠/展开 · Ctrl-S 保存\nn 新增 · r 重命名规则集 · e 启停规则集 · Ctrl-T 查询", "hjkl 導航 · gg/G 首尾 · zM/zR 收合/展開 · Ctrl-S 儲存\nn 新增 · r 重新命名規則集 · e 啟停規則集 · Ctrl-T 查詢"),
     ("hjkl navigate · gg/G ends · Ctrl-S save · Esc back\nn add · d delete · K/J move · Ctrl-O import · F2 reveal", "hjkl navigate · gg/G ends · Ctrl-S save · Esc back\nn add · d delete · K/J move · Ctrl-O import · F2 reveal", "hjkl 导航 · gg/G 首尾 · Ctrl-S 保存 · Esc 返回\nn 新增 · d 删除 · K/J 移动 · Ctrl-O 导入 · F2 显示凭据", "hjkl 導航 · gg/G 首尾 · Ctrl-S 儲存 · Esc 返回\nn 新增 · d 刪除 · K/J 移動 · Ctrl-O 匯入 · F2 顯示認證資訊"),

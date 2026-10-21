@@ -60,7 +60,7 @@ python3 scripts/astra.py --bin-dir target/release --proxy /path/to/proxy-standal
 | UDP 未完项 | 部分协议的大包/空包边界；Hysteria2/sing-box 返回方向超过 4096 字节仍有截断 |
 | XHTTP | stream-one、stream-up、packet-up；当前范围为 HTTP/2 |
 | TCP 半关闭 | relay 使用 `copy_bidirectional`，但最终行为取决于协议和服务端；不能据此保证所有路径支持半关闭 |
-| 尚未实现 | Fake-IP、DNS 嗅探 |
+| DNS / Fake IP | UDP/TCP、DoH/DoT、TTL 缓存、TUN DNS 接管、IPv4/IPv6 Fake IP 与域名还原；详见 [DNS](docs/DNS.md) |
 
 XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确认已排队 POST 后结束整个隧道；需要上传结束后继续接收响应的应用不能依赖该模式。普通互通测试是在收到回显后才关闭上传；严格半关闭测试使用 `--trailer`，当前 VLESS/Xray 路径仍有失败。
 

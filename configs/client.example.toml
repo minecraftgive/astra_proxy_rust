@@ -52,6 +52,9 @@ decision_cache_ttl_secs = 5
 
 # 原生 TUN：Linux/macOS/Windows；Unix 需 root/CAP_NET_ADMIN，Windows 需管理员及官方 Wintun DLL。
 # [tun]
+# auto_interface = true # 运行时跟随物理默认出口；false 时使用 interface
+# auto_gateway = true   # 跟随所选接口的网关；静态 gateway 配置请设 false
+# sniff = true # 从 TLS SNI/HTTP Host 补充域名规则；真实目标 IP 保持不变
 # name = "utun20" # macOS；Linux 示例 astra0；省略自动分配；多实例不可重名
 # address = "198.18.0.1" # 默认 IPv4 接口地址
 # prefix = 30 # 默认 30；0..32
@@ -71,7 +74,7 @@ decision_cache_ttl_secs = 5
 # DNS 也应走原出口；局域网 DNS 若已有更具体的物理接口路由，不必再重复添加 bypass。
 # 直连规则的 TCP/UDP 绑定 interface；使用域名节点时需维护 DNS 变化后的 bypass。
 # 此处 IPv4 routes 不接管 IPv6；IPv6 需对应路由、绕过和网关，不能用 IPv4 网关套用。
-# 只提供真实 IP 路由，没有 Fake-IP、域名嗅探或 DNS 劫持；UDP 分片/超 MTU 边界尚未完整验收。
+# 可在 [dns] 启用 DNS 接管、DoH/DoT 和 Fake IP，见 docs/DNS.md；UDP 分片/超 MTU 边界尚未完整验收。
 # 节点/规则切换及同设备路由更新保留协议栈；MTU/地址/设备名变更涉及设备重建。
 # 修改 MTU 需新设备名；接管路由冲突时先关闭旧 TUN 或由外部管理路由。设备重建可能中断连接。
 
@@ -1415,7 +1418,7 @@ server = "node.example.com:443"
 sni = "node.example.com"
 uuid = "00000000-0000-0000-0000-000000000001"
 
-# 尚未暴露的 TOML 配置：入站账号、DNS/Fake-IP、自动故障切换、全局 UDP 开关、
+# 尚未暴露的 TOML 配置：入站账号、自动故障切换、全局 UDP 开关、
 # ALPN、TLS insecure/skip_verify、HY2 带宽/端口跳跃、mux 池大小/填充等未向本版 TOML 暴露。
 # 不要将其他项目同名字段直接复制到这里，未知字段会被拒绝。
 # XHTTP packet-up 无独立上传 EOF；Xray 空包/大包与半关闭边界见兼容性说明。
@@ -1647,3 +1650,20 @@ include_all = true
 # [subscriptions.backup]
 # url = "https://example.net/clash"
 # interval = 7200
+
+# DNS / Fake IP (optional; UDP and TCP listeners share the listed addresses)
+# [dns]
+# enable = true
+# listen = ["127.0.0.1:1053"]
+# nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+# fallback = ["udp://8.8.8.8:53"]
+# bootstrap = ["1.1.1.1", "8.8.8.8"]
+# respect_rules = false
+# hijack = true
+# fake_ip = true
+# fake_ip_range = "198.18.0.0/16"
+# fake_ip_filter = ["+.lan", "+.local", "localhost"]
+# cache_capacity = 4096
+# max_concurrent = 128
+# mapping_capacity = 8192
+# See docs/DNS.md for IPv6, TTL, nameserver_policy and subscription imports.

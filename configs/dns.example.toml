@@ -1,0 +1,13 @@
+# Standalone DNS service; no Rule Core or proxy inbound required.
+# Point a test DNS client at 127.0.0.1:1053 (UDP or TCP).
+[dns]
+enable = true
+listen = ["127.0.0.1:1053"]
+nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+fallback = ["udp://8.8.8.8:53"]
+bootstrap = ["1.1.1.1", "8.8.8.8"]
+respect_rules = false
+fake_ip = false
+cache_capacity = 4096
+query_timeout_ms = 3000
+max_concurrent = 128

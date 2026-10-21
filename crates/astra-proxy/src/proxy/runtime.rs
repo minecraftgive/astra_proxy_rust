@@ -31,14 +31,70 @@ pub struct State {
     listeners: HashMap<Key, Listener>,
     tunnel: Option<tun::Guard>,
     tproxy_udp: Option<transparent::UdpGuard>,
+    dns: Option<crate::dns::Guard>,
     system: system_proxy::Guard,
     system_journal: PathBuf,
     group_worker: Option<GroupWorker>,
     outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
 }
 impl State {
+    async fn refresh_egress(
+        &mut self,
+        pending: &mut Option<crate::mode_config::Tun>,
+    ) -> Result<bool> {
+        let Some(mut observed) = self.current.load().config.tun.clone() else {
+            *pending = None;
+            return Ok(false);
+        };
+        if !observed.detects_interface() && !observed.auto_gateway {
+            *pending = None;
+            return Ok(false);
+        }
+        let previous = observed.clone();
+        observed = tokio::task::spawn_blocking(move || -> Result<_> {
+            crate::egress::prepare_interface(&mut observed)?;
+            Ok(observed)
+        })
+        .await??;
+        if !crate::egress::settled_update(&previous, observed, pending) {
+            return Ok(false);
+        }
+        let path = self.path.clone();
+        let text = self.text.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            App::from_text(&path, text).map(|app| crate::subscription::cached_app(&path, app))
+        })
+        .await??;
+        self.apply(self.path.clone(), candidate).await?;
+        *pending = None;
+        if let Some(tun) = &self.current.load().config.tun {
+            tracing::info!(interface=?tun.interface,gateway=?tun.gateway,gateway6=?tun.gateway6,"physical egress changed; new connections use the updated interface");
+        }
+        Ok(true)
+    }
     async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
         let old = self.current.load_full();
+        if let (Some(candidate_dns), Some(old_dns)) = (&mut candidate.dns, &old.dns) {
+            candidate_dns.inherit(old_dns)?;
+        } else if old.dns.as_ref().is_some_and(|dns| dns.config.fake_ip) && candidate.dns.is_none()
+        {
+            anyhow::bail!("disabling active Fake IP requires a proxy restart");
+        }
+        let dns_addresses = candidate
+            .dns
+            .as_ref()
+            .map(|dns| dns.config.listen.clone())
+            .unwrap_or_default();
+        let replace_dns = self.dns.as_ref().map(|guard| &guard.addresses) != Some(&dns_addresses);
+        let dns_prepared = if replace_dns && !dns_addresses.is_empty() {
+            Some(
+                crate::dns::Prepared::bind(&dns_addresses, self.dns.as_ref())
+                    .await
+                    .context("bind DNS UDP/TCP listeners")?,
+            )
+        } else {
+            None
+        };
         if let Some(tun) = &mut candidate.config.tun {
             crate::egress::prepare_interface(tun)?;
         }
@@ -160,7 +216,18 @@ impl State {
         self.group_worker.take();
         candidate.groups.inherit(&old, &candidate.config);
         candidate.groups.committed(&old, &candidate.config);
+        let egress_key = |tun: Option<&crate::mode_config::Tun>| {
+            tun.map(|tun| (tun.interface.clone(), tun.gateway, tun.gateway6))
+        };
+        if egress_key(candidate.config.tun.as_ref()) == egress_key(old.config.tun.as_ref()) {
+            candidate.egress_signal = old.egress_signal.clone();
+        } else {
+            old.egress_signal.send_replace(true);
+        }
         self.current.store(Arc::new(candidate));
+        if replace_dns {
+            self.dns = dns_prepared.map(|prepared| prepared.start(self.current.clone()));
+        }
         self.outbound_interface = outbound_interface;
         self.group_worker.take();
         if self
@@ -197,6 +264,11 @@ impl State {
         if replace_udp {
             self.tproxy_udp = udp.map(|prepared| prepared.start(self.current.clone()));
         }
+        if let Some(tun) = &self.current.load().config.tun {
+            if let Err(error) = crate::egress::cache_interface(&path, tun) {
+                tracing::warn!(%error,"could not save diagnostic egress cache");
+            }
+        }
         self.path = path;
         self.text = text;
         self.generation = self.generation.wrapping_add(1);
@@ -230,6 +302,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         outbound_interface: None,
         tunnel: None,
         tproxy_udp: None,
+        dns: None,
         system: Default::default(),
     };
     let first = crate::subscription::cached_app(&path, App::load(&path)?);
@@ -266,8 +339,10 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                     effective = base.clone();
                     ownership = settings.clone();
                     if let Some(cache) = crate::subscription::read(&path, &base) {
-                        if App::from_text(&path, cache.effective.clone()).is_ok() {
-                            effective = cache.effective;
+                        let cached = crate::subscription::effective_text(&cache)
+                            .unwrap_or_else(|_| cache.effective.clone());
+                        if App::from_text(&path, cached.clone()).is_ok() {
+                            effective = cached;
                             ownership = cache.subscriptions;
                             if ownership.is_empty() {
                                 ownership.insert("__legacy__".into(), cache.ownership);
@@ -296,7 +371,11 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                     tokio::time::Instant::now() + Duration::from_secs(settings.interval),
                 );
                 let previous = effective.clone();
+                let started = std::time::Instant::now();
+                let endpoint = astra_convert::subscription::diagnostics::endpoint(&settings.url);
+                let retry_secs = settings.interval;
                 let mut managed = ownership.get(&source).cloned().unwrap_or(settings.clone());
+                let merge_source = source.clone();
                 let source_path = path.clone();
                 let download_app = current.load_full();
                 let download_runtime = tokio::runtime::Handle::current();
@@ -311,13 +390,17 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                                 agent,
                             ))
                         },
-                    )?;
-                    let text = astra_convert::subscription::merge(
+                    )
+                    .context("fetch subscription nodes")?;
+                    let text = astra_convert::subscription::merge_named(
                         &previous,
                         &converted.proxy,
                         &mut managed,
-                    )?;
-                    let mut app = App::from_text(&source_path, text.clone())?;
+                        &merge_source,
+                    )
+                    .context("merge subscription with local configuration")?;
+                    let mut app = App::from_text(&source_path, text.clone())
+                        .context("validate merged subscription configuration")?;
                     // Management/editor snapshots describe the saved local configuration.
                     app.source_text = base.clone();
                     Ok((text, managed, app))
@@ -347,25 +430,38 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                             let cache_path = state.path.clone();
                             // Serialize after commit; a cache failure cannot discard valid nodes.
                             drop(state);
-                            if !matches!(
-                                tokio::task::spawn_blocking(move || crate::subscription::save(
-                                    &cache_path,
-                                    &cache
-                                ))
-                                .await,
-                                Ok(Ok(()))
-                            ) {
+                            let saved = tokio::task::spawn_blocking(move || {
+                                crate::subscription::save(&cache_path, &cache)
+                            })
+                            .await
+                            .context("subscription cache worker failed")
+                            .and_then(|result| result);
+                            if let Err(error) = saved {
                                 tracing::warn!(
+                                    subscription = %source,
+                                    error = %astra_convert::subscription::diagnostics::error(&error),
                                     "subscription updated but node cache could not be saved"
                                 );
                             }
                         }
-                        Err(_) => {
-                            tracing::warn!(subscription = %source, "subscription apply failed; previous nodes retained")
+                        Err(error) => {
+                            tracing::warn!(subscription = %source, %endpoint,
+                                elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
+                                error = %astra_convert::subscription::diagnostics::error(&error),
+                                "subscription apply failed; previous nodes retained")
                         }
                     },
-                    _ => tracing::warn!(
-                        subscription = %source, "subscription download or validation failed; previous nodes retained"
+                    Ok(Err(error)) => tracing::warn!(
+                        subscription = %source, %endpoint,
+                        elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
+                        error = %astra_convert::subscription::diagnostics::error(&error),
+                        "subscription download or validation failed; previous nodes retained"
+                    ),
+                    Err(error) => tracing::warn!(
+                        subscription = %source, %endpoint,
+                        elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
+                        error = %astra_convert::subscription::diagnostics::error(&error.into()),
+                        "subscription worker failed; previous nodes retained"
                     ),
                 }
             }
@@ -377,6 +473,9 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let mut previous_failure = String::new();
+            let mut previous_egress_failure = String::new();
+            let mut pending_egress = None;
+            let mut egress_tick = 0u8;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut state = state.lock().await;
@@ -388,6 +487,20 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                 {
                     let _ = failures.send(()).await;
                     break;
+                }
+                egress_tick = (egress_tick + 1) % 2;
+                if egress_tick == 0 {
+                    match state.refresh_egress(&mut pending_egress).await {
+                        Ok(_) => previous_egress_failure.clear(),
+                        Err(error) => {
+                            pending_egress = None;
+                            let detail = format!("{error:#}");
+                            if detail != previous_egress_failure {
+                                tracing::warn!(error=%detail,"egress refresh deferred; previous configuration retained, retrying when network recovers");
+                                previous_egress_failure = detail;
+                            }
+                        }
+                    }
                 }
                 if !state.current.load().config.watch_config {
                     continue;
@@ -463,6 +576,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     state.group_worker.take();
     state.tunnel.take();
     state.tproxy_udp.take();
+    state.dns.take();
     state.system.restore()?;
     let app = current.load_full();
     // Existing sessions retain their own Arc; drain the current generation.
@@ -490,15 +604,88 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
         let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let _permit = permit;
-            let result = match inbound {
-                Inbound::Socks5 => inbound::handle_socks5(stream, app).await,
-                Inbound::HttpConnect => inbound::handle_http(stream, app).await,
-                Inbound::Tproxy | Inbound::Redirect => transparent::tcp(stream, app, inbound).await,
-                Inbound::Tun => unreachable!(),
+            let cancellation = app.clone();
+            let session = async {
+                match inbound {
+                    Inbound::Socks5 => inbound::handle_socks5(stream, app).await,
+                    Inbound::HttpConnect => inbound::handle_http(stream, app).await,
+                    Inbound::Tproxy | Inbound::Redirect => {
+                        transparent::tcp(stream, app, inbound).await
+                    }
+                    Inbound::Tun => unreachable!(),
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                _=cancellation.egress_cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect session")),
+                result=session=>result,
             };
             if let Err(error) = result {
                 tracing::debug!(%peer, %error, "session ended");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn app() -> App {
+        App::from_text(&std::env::temp_dir().join("astra-egress-session.toml"),"standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct]\nmembers=['DIRECT']\n".into()).unwrap()
+    }
+    async fn client(proxy: std::net::SocketAddr, target: u16) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&target.to_be_bytes());
+        stream.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        stream
+    }
+    #[tokio::test]
+    async fn egress_change_closes_old_tcp_sessions_and_accepts_fresh_ones() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut jobs = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {Some(_)=jobs.join_next(),if !jobs.is_empty()=>{},accepted=echo.accept()=>{let (mut stream,_)=accepted.unwrap();jobs.spawn(async move{let (mut r,mut w)=stream.split();let _=tokio::io::copy(&mut r,&mut w).await;});}}
+            }
+        });
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap();
+        let current = Arc::new(ArcSwap::from_pointee(app()));
+        let previous = current.load_full();
+        let listener_task = tokio::spawn(accept(listener, Inbound::Socks5, current.clone()));
+        let mut old = client(address, echo_port).await;
+        old.write_all(b"a").await.unwrap();
+        assert_eq!(old.read_u8().await.unwrap(), b'a');
+        current.store(Arc::new(app()));
+        previous.egress_signal.send_replace(true);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), old.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let mut fresh = client(address, echo_port).await;
+        fresh.write_all(b"b").await.unwrap();
+        assert_eq!(fresh.read_u8().await.unwrap(), b'b');
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            current.load_full().egress_cancelled()
+        )
+        .await
+        .is_err());
+        listener_task.abort();
+        echo_task.abort();
     }
 }

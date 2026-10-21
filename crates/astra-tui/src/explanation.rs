@@ -79,6 +79,7 @@ pub fn request(input: &str) -> Result<RouteRequest> {
         })
     };
     Ok(RouteRequest {
+        destination_ip: None,
         api_version: API_VERSION,
         id: 0,
         target: Target { host, port },

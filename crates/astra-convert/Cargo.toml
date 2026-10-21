@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-dns = { path = "../astra-dns" }
 astra-ipc = { path = "../astra-ipc" }
 astra-rule-data = { path = "../astra-rule-data" }
 anyhow.workspace = true

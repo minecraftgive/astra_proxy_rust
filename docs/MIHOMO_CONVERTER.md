@@ -75,7 +75,7 @@ target/release/astra-proxy converted/proxy.toml
 
 `mode: rule` 按源顺序转换规则；未知策略、不支持的规则、引用被跳过节点的规则会跳过。没有可用 `MATCH` 时默认 `block`。`mode: direct` 使用默认直连并忽略规则；`mode: global` 使用源配置中显式声明的 `GLOBAL` 组，无可用组时默认 `block`。
 
-没有对应实现的字段忽略，包括 DNS/Fake-IP、sniffer、proxy-provider、面板及控制 API。TUN、重定向、透明代理及自定义 listeners 也不自动映射：双方的路由和系统设置语义不同。没有可转换监听器时补充 `127.0.0.1:1080` SOCKS5 并提示。远程代理 provider 不展开，节点必须已经位于 `proxies` 中。规则 provider 由规则 core 在运行时加载。
+DNS/Fake-IP 常用字段可转换，支持范围及订阅本地优先策略见 [DNS](DNS.md)。没有对应实现的字段忽略，包括 sniffer、proxy-provider、面板及控制 API。TUN、重定向、透明代理及自定义 listeners 也不自动映射：双方的路由和系统设置语义不同。没有可转换监听器时补充 `127.0.0.1:1080` SOCKS5 并提示。远程代理 provider 不展开，节点必须已经位于 `proxies` 中。规则 provider 由规则 core 在运行时加载。
 
 跳过信息输出到标准错误；摘要不保证枚举每个未映射字段，首条提示说明其他字段被忽略。语法错误、顶层数组格式错误、重复名称、端口冲突、错误的 `--select` 会失败；单个节点缺少必要字段会跳过该节点。转换结果是功能子集，忽略规则及字段会改变源配置的路由行为，应检查摘要及输出后再使用。
 
@@ -139,7 +139,7 @@ converter 也能生成包含订阅链接的代理配置：
 astra-convert "https://example.com/clash?token=YOUR_TOKEN" -o configs/subscribed --interval 3600
 ```
 
-订阅默认只生成 `proxy.toml`，导入节点和订阅信息；不生成 `rule.toml`，不采用订阅的组、规则、监听、TUN 或 DNS 设置。默认 PROXY 仍是本地动态节点组。普通本地 YAML 转换仍默认输出两份完整配置；使用 `--subscribe URL` 绑定订阅后也默认仅节点。
+订阅默认只生成 `proxy.toml`，导入节点和订阅信息；不生成 `rule.toml`，不采用订阅的组、规则、代理监听或 TUN 设置；DNS/Fake IP 在本地没有 dns 表时导入，后续更新保留本地设置。默认 PROXY 仍是本地动态节点组。普通本地 YAML 转换仍默认输出两份完整配置；使用 `--subscribe URL` 绑定订阅后也默认仅节点。
 
 需要首次转换时额外采用远程配置的组与规则，可显式使用 `--include-config`。这会生成两份配置并设置 `import_groups = true`，后续核心更新节点及订阅管理的组；定时更新始终不会改变 Rule Core 的规则和本地入站设置。只有设置 `import_groups = true` 时，订阅里的组定义才参与周期转换与校验；默认节点模式会忽略无效或不支持的远程规则、组和监听设置。
 
@@ -212,3 +212,6 @@ astra-convert "vless://UUID@server.example:443?security=tls&sni=server.example&t
 导入支持不代表核心新增了协议能力：旧版 VMess alterId、SS 插件、Hysteria1、Hysteria2 Gecko/端口跳跃/ECH、AnyTLS/WireGuard、TLS 不安全跳过和自定义 ALPN 等当前无法正确执行的选项会拒绝，不会默默丢弃。有效导入不会自动联网测试节点；未知查询参数、混合列表中的错误和重名节点使本次导入失败，不留下半份草稿。
 
 格式核对来源：[Shadowsocks SIP002](https://shadowsocks.org/doc/sip002.html)、[Hysteria2 URI Scheme](https://hysteria.network/docs/developers/URI-Scheme/)、[v2rayN VMess 分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)、[TUIC 导入实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/TuicFmt.cs)、[Trojan 导入实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/TrojanFmt.cs)。
+
+
+订阅节点默认按订阅来源形成代理组，并作为 `PROXY` 的子组。订阅代理组中的 `subscription` 记录来源键，`include_in_proxy` 默认 `true`；在该代理组内设为 `false` 可从默认组排除整个订阅。组成员由订阅更新维护，其他组设置保留。单一旧式 `[subscription]` 使用来源键 `__legacy__`，默认显示组名 `subscription`。

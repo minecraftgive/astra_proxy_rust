@@ -192,6 +192,7 @@ fn run() -> Result<()> {
             },
         };
         proxy.insert("subscription".into(), toml::Value::try_from(settings)?);
+        subscription::prepare_groups(&mut proxy)?;
         result.proxy = toml::to_string_pretty(&proxy)?;
     }
     eprintln!("── {source_label} ──");
@@ -209,7 +210,7 @@ fn run() -> Result<()> {
         }
         if nodes_only {
             eprintln!(
-                "已写入 {}（仅订阅节点）",
+                "已写入 {}（订阅节点及 DNS；保留本地 DNS 设置）",
                 output.join("proxy.toml").display()
             );
         } else {

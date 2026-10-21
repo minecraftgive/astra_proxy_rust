@@ -10,6 +10,33 @@ pub struct SystemProxy {
     pub services: Vec<String>,
 }
 
+/// An unspecified bind address serves loopback too, but must never be written
+/// into OS proxy settings as the destination address.
+fn local_proxy_address(listener: &str) -> Result<SocketAddr> {
+    let mut address: SocketAddr = listener.parse()?;
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => address.set_ip(Ipv4Addr::LOCALHOST.into()),
+        IpAddr::V6(ip) if ip.is_unspecified() => address.set_ip(Ipv6Addr::LOCALHOST.into()),
+        _ => {}
+    }
+    ensure!(address.ip().is_loopback() && address.port() != 0,
+        "system proxy listener {listener} must bind a loopback IP or all interfaces and use a nonzero port");
+    Ok(address)
+}
+
+pub(crate) fn system_proxy_address(config: &crate::config::ProxyConfig) -> Result<SocketAddr> {
+    #[cfg(windows)]
+    let listener = &config.http_listen;
+    #[cfg(not(windows))]
+    let listener = &config.socks5_listen;
+    let listener = listener.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+        "system_proxy requires an HTTP listener on Windows, or a SOCKS5 listener on macOS/Linux"
+    )
+    })?;
+    local_proxy_address(listener)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tun {
@@ -32,6 +59,16 @@ pub struct Tun {
     pub gateway: Option<IpAddr>,
     pub gateway6: Option<Ipv6Addr>,
     pub interface: Option<String>,
+    /// None infers auto when no interface is supplied; an explicit interface
+    /// remains a manual choice unless auto_interface=true is requested.
+    pub auto_interface: Option<bool>,
+    #[serde(default = "auto_gateway")]
+    pub auto_gateway: bool,
+    #[serde(default = "auto_gateway")]
+    pub sniff: bool,
+}
+fn auto_gateway() -> bool {
+    true
 }
 fn address() -> Ipv4Addr {
     Ipv4Addr::new(198, 18, 0, 1)
@@ -74,6 +111,10 @@ pub fn validate(config: &crate::config::ProxyConfig) -> Result<()> {
         );
     }
     if let Some(tun) = &config.tun {
+        ensure!(
+            tun.auto_interface != Some(false) || tun.interface.is_some(),
+            "manual TUN egress requires tun.interface"
+        );
         ensure!(
             cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "TUN is supported on Linux/macOS/Windows"
@@ -137,19 +178,7 @@ pub fn validate(config: &crate::config::ProxyConfig) -> Result<()> {
         );
     }
     if config.system_proxy.is_some() {
-        #[cfg(windows)]
-        let listener = config.http_listen.as_ref();
-        #[cfg(not(windows))]
-        let listener = config.socks5_listen.as_ref();
-        ensure!(
-            listener.is_some(),
-            "system_proxy requires a loopback HTTP listener on Windows, or a SOCKS5 listener on macOS/Linux"
-        );
-        let addr: SocketAddr = listener.unwrap().parse()?;
-        ensure!(
-            addr.ip().is_loopback() && addr.port() != 0,
-            "system proxy listener must be a loopback IP with a nonzero port"
-        );
+        system_proxy_address(config)?;
         if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             bail!("system_proxy unsupported on this OS");
         }
@@ -163,7 +192,59 @@ pub fn validate(config: &crate::config::ProxyConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_listeners_use_matching_loopback_family_for_os_proxy() {
+        for (bind, expected) in [
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("[::]:8080", "[::1]:8080"),
+            ("127.0.0.1:8080", "127.0.0.1:8080"),
+            ("[::1]:8080", "[::1]:8080"),
+        ] {
+            assert_eq!(local_proxy_address(bind).unwrap().to_string(), expected);
+        }
+        for invalid in ["0.0.0.0:0", "[::]:0", "127.0.0.1:0", "192.0.2.1:8080"] {
+            assert!(local_proxy_address(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn validation_and_os_proxy_share_the_same_listener_resolution() {
+        let config: crate::config::ProxyConfig = toml::from_str(
+            "socks5_listen='0.0.0.0:1080'\nhttp_listen='0.0.0.0:8080'\n[system_proxy]\n",
+        )
+        .unwrap();
+        validate(&config).unwrap();
+        let expected_port = if cfg!(windows) { 8080 } else { 1080 };
+        let target = system_proxy_address(&config).unwrap();
+        assert_eq!(target.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(target.port(), expected_port);
+        assert_eq!(config.http_listen.as_deref(), Some("0.0.0.0:8080"));
+    }
+
+    #[tokio::test]
+    async fn mapped_target_reaches_the_wildcard_listener() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let target = local_proxy_address(&listener.local_addr().unwrap().to_string()).unwrap();
+        let _client = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert!(peer.ip().is_loopback());
+    }
+}
+
 impl Tun {
+    pub fn detects_interface(&self) -> bool {
+        self.auto_interface.unwrap_or(self.interface.is_none())
+    }
     pub fn gateway_for(&self, cidr: &str) -> Option<IpAddr> {
         if cidr.contains(':') {
             self.gateway6

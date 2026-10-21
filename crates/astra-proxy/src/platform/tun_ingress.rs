@@ -176,6 +176,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_syn_retries_and_connection_churn_have_bounded_allocations() {
+        let (stack, runner, _, tcp) = netstack_smoltcp::StackBuilder::default()
+            .enable_tcp(true)
+            .tcp_socket_limit(4)
+            .tcp_recv_buffer_size(4096)
+            .tcp_send_buffer_size(4096)
+            .build()
+            .unwrap();
+        let runner = tokio::spawn(runner.unwrap());
+        let (mut sink, mut packets) = stack.split();
+        let drain = tokio::spawn(async move { while packets.next().await.is_some() {} });
+        let mut tcp = tcp.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            // Repeat full capacity/drop cycles: slots must be reclaimed promptly,
+            // even for connections that never complete the TCP handshake.
+            for round in 0..32u16 {
+                let mut streams = Vec::new();
+                for offset in 0..4 {
+                    let packet = syn("2001:db8::2", 40000 + round * 8 + offset);
+                    sink.send(packet.clone()).await.unwrap();
+                    streams.push(tcp.next().await.unwrap());
+                    for _ in 0..32 {
+                        sink.send(packet.clone()).await.unwrap();
+                    }
+                }
+                // Distinct excess SYNs must also be rejected before allocation.
+                for offset in 4..8 {
+                    sink.send(syn("2001:db8::2", 40000 + round * 8 + offset))
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), tcp.next())
+                        .await
+                        .is_err(),
+                    "retransmission or capacity overflow allocated another socket"
+                );
+                drop(streams);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropped TCP sockets must release capacity promptly");
+        runner.abort();
+        drain.abort();
+    }
+
+    #[tokio::test]
     async fn link_local_syn_burst_is_filtered_before_tcp_stream_allocation() {
         // Real smoltcp listener, no privileged adapter or external network.
         // Hold accepted streams to reproduce the allocation behind a recapture burst.

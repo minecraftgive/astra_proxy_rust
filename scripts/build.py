@@ -65,7 +65,7 @@ def main():
     profile = ['--profile', 'dev'] if args.debug else ['--release']
     target = ['--target', host]
     binaries = pathlib.Path(metadata['target_directory']) / host / ('debug' if args.debug else 'release')
-    client_packages = [item for name in ('astra-ipc','astra-rule-data','astra-rule','astra-proxy','astra-tui','astra-convert') for item in ('-p',name)]
+    client_packages = [item for name in ('astra-dns','astra-ipc','astra-rule-data','astra-rule','astra-proxy','astra-tui','astra-convert') for item in ('-p',name)]
     run(['cargo', 'build', '--locked', *client_packages, '--bins', *target, *profile])
     if os.name == 'nt':
         arch = {'amd64':'amd64', 'x86_64':'amd64', 'arm64':'arm64', 'aarch64':'arm64', 'x86':'x86', 'i686':'x86'}.get(platform.machine().lower())
@@ -79,6 +79,8 @@ def main():
     if not args.skip_tests:
         run(['cargo', 'test', '--locked', *client_packages, *target, *profile])
         run(['cargo', 'test', '--locked', '-p', 'astra-tui', *target, *profile, 'live_', '--', '--ignored'])
+        run([sys.executable, ROOT/'scripts/subscription_diagnostics_regression.py', '--bin-dir', binaries])
+        run([sys.executable, ROOT/'scripts/dns_regression.py', '--bin-dir', binaries])
         if os.name == 'nt':
             run([sys.executable, ROOT/'scripts/windows_regression.py', '--bin-dir', binaries])
             run([sys.executable, ROOT/'scripts/ruleset_regression.py', '--bin-dir', binaries])

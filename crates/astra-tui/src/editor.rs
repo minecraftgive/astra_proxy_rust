@@ -234,6 +234,7 @@ enum Row {
 }
 #[derive(Clone)]
 enum FlatRow {
+    UpdateSubscriptions,
     Info {
         path: Path,
         label: String,
@@ -271,6 +272,7 @@ enum FlatRow {
 impl FlatRow {
     fn path(&self) -> Path {
         match self {
+            Self::UpdateSubscriptions => vec![Part::Key("subscriptions".into())],
             Self::Info { path, .. }
             | Self::Field { path, .. }
             | Self::Collection { path, .. }
@@ -450,15 +452,16 @@ fn proxy_targets(doc: &DocumentMut) -> Vec<String> {
 }
 fn expanded_proxy_groups(
     doc: &DocumentMut,
+    snapshots: &std::collections::BTreeMap<String, crate::protocol::SubscriptionNodes>,
 ) -> Result<std::collections::BTreeMap<String, astra_ipc::groups::Group>> {
     let value: toml::Value = toml::from_str(&doc.to_string())?;
-    let mut groups = value
+    let mut groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> = value
         .get("proxy_groups")
         .cloned()
         .map(|g| g.try_into())
         .transpose()?
         .unwrap_or_default();
-    let nodes = doc
+    let mut nodes: std::collections::HashSet<String> = doc
         .get("outbounds")
         .and_then(Item::as_array_of_tables)
         .into_iter()
@@ -466,6 +469,25 @@ fn expanded_proxy_groups(
         .filter_map(|n| n.get("tag").and_then(Item::as_str))
         .map(str::to_owned)
         .collect();
+    for group in groups.values_mut() {
+        let Some(source) = &group.subscription else {
+            continue;
+        };
+        let settings = if source == "__legacy__" {
+            value.get("subscription")
+        } else {
+            value.get("subscriptions").and_then(|v| v.get(source))
+        };
+        if let Some(snapshot) = snapshots.get(source).filter(|snapshot| {
+            settings
+                .and_then(|v| v.get("url"))
+                .and_then(toml::Value::as_str)
+                == Some(snapshot.url.as_str())
+        }) {
+            group.members = snapshot.tags.clone();
+            nodes.extend(snapshot.tags.iter().cloned());
+        }
+    }
     astra_ipc::groups::ensure_default(&mut groups, &nodes).map_err(anyhow::Error::msg)?;
     astra_ipc::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)
 }
@@ -650,6 +672,33 @@ impl Editor {
     ) {
         self.subscription_nodes = nodes;
     }
+    pub fn requests_subscription_update(&self, key: KeyEvent) -> bool {
+        self.document().is_ok_and(|doc| self.is_proxy(&doc))
+            && self.browsing()
+            && ((key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Enter
+                    && self
+                        .document()
+                        .ok()
+                        .and_then(|doc| {
+                            self.visible_rows(&doc)
+                                .get(self.form.selected)
+                                .map(|row| matches!(row, FlatRow::UpdateSubscriptions))
+                        })
+                        .unwrap_or(false)))
+    }
+    fn reference_label(&self, doc: &DocumentMut, key: &str, tag: &str) -> String {
+        if key == "selected" {
+            if let Some(root) = proxy_group_name(&self.form.path) {
+                if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
+                    if let Some(path) = astra_ipc::groups::member_path(&groups, root, tag) {
+                        return path.join(" › ");
+                    }
+                }
+            }
+        }
+        tag.to_owned()
+    }
     pub fn subscription_page(&self) -> bool {
         self.document().ok().and_then(|doc|self.visible_rows(&doc).get(self.form.selected).map(FlatRow::path)).is_some_and(|path|matches!(path.first(),Some(Part::Key(key)) if matches!(key.as_str(),"subscription"|"subscriptions")))
     }
@@ -658,9 +707,12 @@ impl Editor {
     }
     fn reference_values(&self, doc: &DocumentMut, key: &str) -> Option<Vec<String>> {
         if key == "selected" && proxy_group_name(&self.form.path).is_some() {
-            if let Ok(groups) = expanded_proxy_groups(doc) {
-                if let Some(group) = groups.get(proxy_group_name(&self.form.path).unwrap()) {
-                    return Some(group.members.clone());
+            if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
+                if groups.contains_key(proxy_group_name(&self.form.path).unwrap()) {
+                    return Some(astra_ipc::groups::member_choices(
+                        &groups,
+                        proxy_group_name(&self.form.path).unwrap(),
+                    ));
                 }
             }
             return Some(
@@ -802,6 +854,23 @@ impl Editor {
                 group["mode"] = value("select");
                 group["include_all"] = value(true);
                 groups.insert("PROXY", Item::Table(group));
+            }
+        }
+        if self.is_proxy(&doc) {
+            let mut data: toml::Table = toml::from_str(&doc.to_string())?;
+            astra_convert::subscription::prepare_groups(&mut data)?;
+            if let Some(groups) = data.get("proxy_groups").and_then(|v| v.as_table()) {
+                for (name, group) in groups
+                    .iter()
+                    .filter(|(_, g)| g.get("subscription").is_some())
+                {
+                    let snippet: DocumentMut = toml::to_string(group)?.parse()?;
+                    let table =
+                        table_at_mut(doc.as_table_mut(), &[Part::Key("proxy_groups".into())])?;
+                    if table.get(name).is_none() {
+                        table.insert(name, Item::Table(snippet.as_table().clone()));
+                    }
+                }
             }
         }
         Ok(doc)
@@ -1115,6 +1184,20 @@ impl Editor {
                 text("filter", t("Dynamic member filter"), "", false),
                 text("exclude_filter", t("Dynamic member exclusion"), "", false),
             ];
+            if !get("subscription").is_empty() {
+                fields.insert(
+                    0,
+                    Spec {
+                        kind: Type::Boolean,
+                        ..text(
+                            "include_in_proxy",
+                            t("Include in Proxy group"),
+                            "true",
+                            false,
+                        )
+                    },
+                );
+            }
             if get("mode") == "auto" {
                 fields.extend([
                     text(
@@ -1183,8 +1266,132 @@ impl Editor {
                     false,
                 )
             }]
+        } else if last_key(path) == Some("dns") {
+            vec![
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("enable", "启用 DNS 服务", "true", false)
+                },
+                Spec {
+                    kind: Type::StringList,
+                    ..text(
+                        "listen",
+                        "DNS 监听地址（UDP/TCP）",
+                        "[\"127.0.0.1:1053\"]",
+                        false,
+                    )
+                },
+                Spec {
+                    kind: Type::StringList,
+                    ..text(
+                        "nameserver",
+                        "DNS 上游（UDP/TCP/DoH/DoT）",
+                        "[\"udp://1.1.1.1:53\"]",
+                        false,
+                    )
+                },
+                Spec {
+                    kind: Type::StringList,
+                    ..text("fallback", "DNS 失败备用上游", "[]", false)
+                },
+                Spec {
+                    kind: Type::StringList,
+                    ..text(
+                        "bootstrap",
+                        "上游域名引导解析 IP",
+                        "[\"1.1.1.1\",\"8.8.8.8\"]",
+                        false,
+                    )
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("respect_rules", "DNS 上游连接遵循路由规则", "false", false)
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("ipv6", "解析 IPv6 地址", "true", false)
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("hijack", "接管 TUN 的 53 端口 DNS", "true", false)
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("fake_ip", "启用 Fake IP", "false", false)
+                },
+                text("fake_ip_range", "Fake IPv4 地址池", "198.18.0.0/16", false),
+                text("fake_ip_range6", "Fake IPv6 地址池（可选 ULA）", "", false),
+                choice(
+                    "fake_ip_filter_mode",
+                    "Fake IP 过滤方式",
+                    "blacklist",
+                    &["blacklist", "whitelist"],
+                    false,
+                ),
+                Spec {
+                    kind: Type::StringList,
+                    ..text(
+                        "fake_ip_filter",
+                        "Fake IP 域名过滤列表",
+                        "[\"+.lan\",\"+.local\",\"localhost\"]",
+                        false,
+                    )
+                },
+                number("cache_capacity", "DNS 缓存条目上限", 4096, 0, 65536),
+                number(
+                    "cache_max_ttl_secs",
+                    "DNS 缓存最大 TTL（秒）",
+                    3600,
+                    1,
+                    86400,
+                ),
+                number("negative_ttl_secs", "DNS 负缓存最大 TTL（秒）", 60, 0, 3600),
+                number(
+                    "query_timeout_ms",
+                    "DNS 单个上游超时（毫秒）",
+                    3000,
+                    100,
+                    30000,
+                ),
+                number("max_concurrent", "DNS 并发查询上限", 128, 1, 1024),
+                number("mapping_capacity", "DNS 域名映射条目上限", 8192, 1, 65536),
+                number(
+                    "mapping_ttl_secs",
+                    "Fake IP 映射保留时间（秒）",
+                    86400,
+                    1,
+                    604800,
+                ),
+                number("fake_ip_ttl", "Fake IP 响应 TTL（秒）", 60, 1, 3600),
+            ]
         } else if last_key(path) == Some("tun") {
             vec![
+                Spec {
+                    kind: Type::Boolean,
+                    ..text(
+                        "auto_interface",
+                        "自动跟随出口网卡（运行时检测）",
+                        if get("interface").is_empty() {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                        false,
+                    )
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text("auto_gateway", "自动跟随所选网卡的网关", "true", false)
+                },
+                Spec {
+                    kind: Type::Boolean,
+                    ..text(
+                        "sniff",
+                        "从 TLS/HTTP 识别域名以匹配规则（保留原始目标 IP）",
+                        "true",
+                        false,
+                    )
+                },
                 text("name", t("TUN 接口名（留空自动分配）"), "", false),
                 text("address", t("TUN IPv4 地址"), "198.18.0.1", false),
                 number("prefix", t("TUN 地址前缀"), 30, 0, 32),
@@ -1445,6 +1652,7 @@ impl Editor {
                 vec![
                     ("system_proxy", t("系统代理（SOCKS）")),
                     ("tun", t("TUN 接管")),
+                    ("dns", "DNS / Fake IP"),
                     ("tproxy", "TPROXY (TCP/UDP)"),
                     ("redirect", "REDIRECT (TCP)"),
                     ("outbounds", t("出站节点")),
@@ -1543,6 +1751,10 @@ impl Editor {
     ) {
         if path.len() > 32 {
             return;
+        }
+        if matches!(path, [Part::Key(key)] if matches!(key.as_str(), "subscriptions" | "subscription"))
+        {
+            output.push(FlatRow::UpdateSubscriptions);
         }
         for row in self.schema_rows(doc, path) {
             match row {
@@ -2209,7 +2421,7 @@ impl Editor {
             FlatRow::Section { path, .. }
                 if matches!(
                     last_key(&path),
-                    Some("tls" | "system_proxy" | "tun" | "tproxy" | "redirect")
+                    Some("tls" | "system_proxy" | "tun" | "dns" | "tproxy" | "redirect")
                 ) =>
             {
                 let (Part::Key(key), parent) = path.split_last().context(t("TLS 参数路径无效"))?
@@ -2240,7 +2452,7 @@ impl Editor {
                 self.form.selected =
                     (self.form.selected + 1).min(self.visible_rows(&doc).len().saturating_sub(1));
             }
-            FlatRow::Info { .. } | FlatRow::Section { .. } => {}
+            FlatRow::UpdateSubscriptions | FlatRow::Info { .. } | FlatRow::Section { .. } => {}
         }
         Ok(())
     }
@@ -2392,11 +2604,12 @@ impl Editor {
                     ),
                 );
                 let name = proxy_group_name(&self.form.path).unwrap();
-                if let Some(effective) = expanded_proxy_groups(&doc)?.get(name) {
+                let groups = expanded_proxy_groups(&doc, &self.subscription_nodes)?;
+                if let Some(effective) = groups.get(name) {
                     if effective
                         .selected
                         .as_ref()
-                        .is_some_and(|s| !effective.members.contains(s))
+                        .is_some_and(|s| astra_ipc::groups::member_path(&groups, name, s).is_none())
                     {
                         let group = table_at_mut(doc.as_table_mut(), &self.form.path)?;
                         if let Some(first) = effective.members.first() {
@@ -2491,6 +2704,16 @@ impl Editor {
                         source["url"] = value("");
                         source["interval"] = value(3600);
                         table.insert(&key, Item::Table(source));
+                        let mut data: toml::Table = toml::from_str(&doc.to_string())?;
+                        astra_convert::subscription::prepare_groups(&mut data)?;
+                        let groups = data.get("proxy_groups").and_then(|v| v.as_table()).unwrap();
+                        for (name, group) in groups.iter().filter(|(_, g)| {
+                            g.get("subscription").and_then(|v| v.as_str()) == Some(key.as_str())
+                        }) {
+                            let snippet: DocumentMut = toml::to_string(group)?.parse()?;
+                            table_at_mut(doc.as_table_mut(), &[Part::Key("proxy_groups".into())])?
+                                .insert(name, Item::Table(snippet.as_table().clone()));
+                        }
                         self.update(doc);
                         self.cancel_input();
                         self.form.path.push(Part::Key(key));
@@ -2899,7 +3122,7 @@ impl Editor {
             .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
         let expanded_groups = if self.is_proxy(&doc) {
-            expanded_proxy_groups(&doc).ok()
+            expanded_proxy_groups(&doc, &self.subscription_nodes).ok()
         } else {
             None
         };
@@ -3051,7 +3274,7 @@ impl Editor {
                             rule_set_summary(&doc, path)
                         } else if matches!(
                             last_key(path),
-                            Some("tls" | "system_proxy" | "tun" | "tproxy" | "redirect")
+                            Some("tls" | "system_proxy" | "tun" | "dns" | "tproxy" | "redirect")
                         ) {
                             if table_at(doc.as_table(), path).is_some() {
                                 t(" · 已启用 / Enter 关闭").to_owned()
@@ -3096,6 +3319,10 @@ impl Editor {
                             Style::default().fg(Color::Gray),
                         )
                     }
+                    FlatRow::UpdateSubscriptions => (
+                        tr!("↻ {} · Ctrl-R", t("Update subscriptions")),
+                        Style::default().fg(Color::Cyan),
+                    ),
                     FlatRow::Info { label, .. } => {
                         (label.clone(), Style::default().fg(Color::Cyan))
                     }
@@ -3208,7 +3435,7 @@ impl Editor {
                         let selected = input.candidate.as_ref().unwrap_or(&input.text);
                         let at = values.iter().position(|value| value == selected).unwrap_or(0);
                         let start = at.saturating_sub(2).min(values.len().saturating_sub(6));
-                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},if value.is_empty() {t("(未设置)")} else {value})).collect::<Vec<_>>().join("\n")
+                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},if value.is_empty() {t("(未设置)").to_owned()} else {self.reference_label(&doc,key,value)})).collect::<Vec<_>>().join("\n")
                     }).unwrap_or_default();
                     let hint = if suggestions.is_some() { t("Type to filter · ↑↓ select · Tab complete · Enter confirm · Esc cancel") } else { t("Enter confirm · Esc cancel · Ctrl-U clear · F2 reveal") };
                     let text = format!("> {}\n{}\n{}\n{}",display.iter().collect::<String>(),choices,hint,spec.as_ref().map(|s|s.help.as_str()).unwrap_or(""));
@@ -3278,6 +3505,49 @@ fn outbound_template(kind: &str, tag: &str) -> Table {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    #[test]
+    fn nested_subscription_picker_exposes_nodes_and_update_entry() {
+        let mut editor = Editor::new("proxy".into(), "standalone=true\n[subscriptions.remote]\nurl='https://example.com/sub'\n[proxy_groups.parent]\nmembers=['remote']\n".into());
+        editor.set_subscription_nodes(
+            [(
+                "remote".into(),
+                crate::protocol::SubscriptionNodes {
+                    url: "https://example.com/sub".into(),
+                    tags: vec!["node-a".into(), "node-b".into()],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        editor.form.path = vec![Part::Key("proxy_groups".into()), Part::Key("parent".into())];
+        let doc = editor.document().unwrap();
+        assert_eq!(
+            editor.reference_values(&doc, "selected").unwrap(),
+            ["remote", "node-a", "node-b"]
+        );
+        assert_eq!(
+            editor.reference_label(&doc, "selected", "node-b"),
+            "remote › node-b"
+        );
+        assert!(editor.requests_subscription_update(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL
+        )));
+        let rows = editor.visible_rows(&doc);
+        editor.form.selected = rows
+            .iter()
+            .position(|row| matches!(row, FlatRow::UpdateSubscriptions))
+            .unwrap();
+        assert!(
+            editor.requests_subscription_update(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+        let mut doc = doc;
+        doc["subscriptions"]["remote"]["url"] = value("https://example.com/changed");
+        assert_eq!(
+            editor.reference_values(&doc, "selected").unwrap(),
+            ["remote"]
+        );
+    }
     #[test]
     fn subscription_nodes_are_read_only_source_scoped_and_hide_after_draft_url_change() {
         let mut editor=Editor::new("proxy".into(),"standalone=true\n[subscriptions.a]\nurl='https://example.com/a'\n[subscriptions.b]\nurl='https://example.com/b'\n".into());
@@ -3398,6 +3668,22 @@ mod tests {
             .visible_rows(&doc)
             .iter()
             .any(|row| matches!(row, FlatRow::Field { spec, .. } if spec.key == "import_groups")));
+        assert_eq!(
+            doc["proxy_groups"]["primary"]["subscription"].as_str(),
+            Some("primary")
+        );
+        assert_eq!(
+            doc["proxy_groups"]["primary"]["include_in_proxy"].as_bool(),
+            Some(true)
+        );
+        let path = vec![
+            Part::Key("proxy_groups".into()),
+            Part::Key("primary".into()),
+        ];
+        assert!(editor
+            .schema_rows(&doc, &path)
+            .iter()
+            .any(|row| matches!(row, Row::Field(spec) if spec.key == "include_in_proxy")));
         let mut saved: Editor =
             serde_json::from_str(&serde_json::to_string(&editor).unwrap()).unwrap();
         saved.normalize();

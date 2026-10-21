@@ -5,7 +5,6 @@ use astra_ipc::platform::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
-    net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -53,11 +52,7 @@ fn plan(
     let Some(settings) = &config.system_proxy else {
         return Ok(vec![]);
     };
-    let address: SocketAddr = config
-        .socks5_listen
-        .as_ref()
-        .context("SOCKS listener required")?
-        .parse()?;
+    let address = super::mode_config::system_proxy_address(config)?;
     let mut changes = vec![];
     if cfg!(target_os = "macos") {
         let services = if settings.services.is_empty() {

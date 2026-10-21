@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    net::SocketAddr,
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -182,15 +181,7 @@ impl Guard {
             settings.services.is_empty(),
             "system_proxy.services is macOS-only"
         );
-        let address: SocketAddr = config
-            .http_listen
-            .as_ref()
-            .context("Windows system proxy requires http_listen")?
-            .parse()?;
-        ensure!(
-            address.ip().is_loopback() && address.port() != 0,
-            "Windows system proxy requires a loopback HTTP listener"
-        );
+        let address = super::mode_config::system_proxy_address(config)?;
         let mut lock = lock(None)?;
         let original =
             query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;

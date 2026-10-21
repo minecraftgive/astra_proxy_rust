@@ -44,7 +44,8 @@ def main():
         log_path = directory/'core.log'
         port = free_port()
         url = f'http://127.0.0.1:{server.server_address[1]}'
-        base = f'standalone=true\nstandalone_outbound="PROXY"\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\nwatch_config=true\n'
+        base = f'standalone=true\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\nwatch_config=true\n'
+        base += '[proxy_groups.one]\nsubscription="one"\ninclude_in_proxy=false\n'
         def source(name, path):
             return f'[subscriptions.{name}]\nurl={json.dumps(url+path)}\ninterval=3600\n'
         config.write_text(base+source('one', '/a')+source('two', '/b'), encoding='utf-8')
@@ -58,8 +59,16 @@ def main():
                     try:
                         import tomllib
                         data = json.loads(cache.read_text(encoding='utf-8'))
-                        tags = {n['tag'] for n in tomllib.loads(data['effective'])['outbounds']}
-                        if tags == set(names): return
+                        effective = tomllib.loads(data['effective'])
+                        tags = {n['tag'] for n in effective['outbounds']}
+                        if tags == set(names):
+                            groups = effective['proxy_groups']
+                            for source_name, ownership in data['subscriptions'].items():
+                                owned = [group for group in groups.values() if group.get('subscription') == source_name]
+                                assert len(owned) == 1, groups
+                                assert set(owned[0]['members']) == set(ownership['managed_nodes']), owned
+                            assert groups['one']['include_in_proxy'] is False
+                            return
                     except (OSError, KeyError, ValueError): pass
                     time.sleep(.1)
                 raise AssertionError('expected nodes '+repr(names)+'\n'+log_path.read_text(encoding='utf-8'))

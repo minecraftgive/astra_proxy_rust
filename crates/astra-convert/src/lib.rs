@@ -1,4 +1,5 @@
 //! Offline mihomo YAML -> Astra TOML conversion, independent of the proxy core.
+mod dns;
 pub mod share;
 mod source;
 pub mod subscription;
@@ -505,8 +506,13 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         put(&mut proxy, "socks5_listen", "127.0.0.1:1080");
         warnings.push("无可转换入站，使用 SOCKS5 127.0.0.1:1080".into());
     }
+    if !get(&root, "dns").is_null() {
+        proxy.insert(
+            "dns".into(),
+            dns::convert(get(&root, "dns"), &mut warnings)?,
+        );
+    }
     for key in [
-        "dns",
         "tun",
         "sniffer",
         "proxy-providers",

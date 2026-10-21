@@ -171,6 +171,7 @@ name = "astra-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astra-dns",
  "astra-ipc",
  "astra-rule-data",
  "base64 0.22.1",
@@ -185,6 +186,19 @@ dependencies = [
  "url",
  "uuid",
  "yaml-rust2",
+]
+
+[[package]]
+name = "astra-dns"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hickory-proto",
+ "ipnet",
+ "serde",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -239,11 +253,13 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "astra-convert",
+ "astra-dns",
  "astra-ipc",
  "astra-protocols",
  "bytes",
  "etherparse",
  "futures-util",
+ "hickory-proto",
  "http",
  "http-body-util",
  "hyper",
@@ -253,6 +269,7 @@ dependencies = [
  "meow-common",
  "moka",
  "netstack-smoltcp",
+ "rcgen",
  "serde",
  "serde_json",
  "socket2 0.6.5",
@@ -1777,6 +1794,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2548,8 +2566,6 @@ dependencies = [
 [[package]]
 name = "netstack-smoltcp"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c38f66cdd673ff0e760752f27c6d34a7e3a140f0b1eea9efae3c46d8867c83d"
 dependencies = [
  "etherparse",
  "futures",

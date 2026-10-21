@@ -315,6 +315,9 @@ async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Re
         .stack_buffer_size(256)
         .tcp_buffer_size(256)
         .udp_buffer_size(256)
+        // Four 256 KiB windows per socket: cap stack windows at 256 MiB,
+        // including SYNs awaiting dispatch (before application permits).
+        .tcp_socket_limit(256)
         .tcp_recv_buffer_size(256 * 1024)
         .tcp_send_buffer_size(256 * 1024)
         .mtu(mtu as usize)
@@ -401,12 +404,24 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                 streams.spawn(async move {
                     let _permit = permit;
                     let target = Target {host: destination.ip().to_string(), port: destination.port()};
-                    let result: Result<()> = async {
-                        let action = app.route_connection(&target, Inbound::Tun, astra_ipc::Network::Tcp, Some(source), Some(destination)).await?;
-                        let mut remote = app.connect_tracked(&target, &action, Inbound::Tun, Some(source)).await?;
+                    let session = async {
+                        if app.intercept_dns(destination) {
+                            return crate::dns::tcp(stream, app.clone()).await;
+                        }
+                        let sniff=app.config.tun.as_ref().is_none_or(|tun|tun.sniff) && matches!(destination.port(),80|443|8080|8443);
+                        let (prefix,hostname)=if sniff {crate::proxy::target::preface(&mut stream).await?}else{(vec![],None)};
+                        let (route,dial)=crate::proxy::target::select(&app,&target,hostname)?;
+                        let action = app.route_connection(&route, Inbound::Tun, astra_ipc::Network::Tcp, Some(source), Some(destination)).await?;
+                        tracing::debug!(target:"astra_route",phase="destination",original=%target.host,host=%route.host,dial=%dial.host,%destination,"TUN routing name and dial address");
+                        let mut remote = app.connect_tracked(&dial, &action, Inbound::Tun, Some(source)).await?;
+                        tokio::io::AsyncWriteExt::write_all(&mut remote,&prefix).await?;
                         tokio::io::copy_bidirectional(&mut stream, &mut remote).await?;
                         Ok(())
-                    }.await;
+                    };
+                    let result:Result<()>=tokio::select! {
+                        _=app.egress_cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect TUN session")),
+                        result=session=>result,
+                    };
                     if let Err(error) = result { tracing::debug!(%error, %source, %destination, "TUN TCP ended"); }
                 });
             }
@@ -524,10 +539,11 @@ mod tests {
                             let mut greeting = [0; 3]; client.read_exact(&mut greeting).await.unwrap();
                             client.write_all(&[5,0]).await.unwrap();
                             let mut header = [0;4];client.read_exact(&mut header).await.unwrap();
-                            assert_eq!(header[3],1);
-                            let mut address=[0;6];client.read_exact(&mut address).await.unwrap();
+                            let mut address=[0;6];
+                            if header[3]==1 {client.read_exact(&mut address).await.unwrap();}
+                            else {assert_eq!(header[3],3);let size=client.read_u8().await.unwrap() as usize;let mut domain=vec![0;size];client.read_exact(&mut domain).await.unwrap();assert_eq!(domain,b"fake.example");client.read_exact(&mut address[4..]).await.unwrap();}
                             if header[1] == 1 {
-                                assert_eq!(&address[..4], &[203,0,113,8]);
+                                if header[3]==1 {assert_eq!(&address[..4], &[203,0,113,8]);}
                                 client.write_all(&[5,0,0,1,0,0,0,0,0,0]).await.unwrap();
                                 let (mut read, mut write)=client.into_split();
                                 let _=tokio::io::copy(&mut read,&mut write).await;
@@ -589,8 +605,8 @@ mod tests {
         dispatch.abort();
         proxy.abort();
     }
-    fn tcp_packet(sequence: u32, ack: Option<u32>, body: &[u8]) -> Vec<u8> {
-        let builder = etherparse::PacketBuilder::ipv4([198, 18, 0, 2], [203, 0, 113, 8], 64)
+    fn tcp_packet(destination: [u8; 4], sequence: u32, ack: Option<u32>, body: &[u8]) -> Vec<u8> {
+        let builder = etherparse::PacketBuilder::ipv4([192, 0, 2, 2], destination, 64)
             .tcp(3456, 443, sequence, 65535);
         let builder = if let Some(ack) = ack {
             builder.ack(ack)
@@ -603,7 +619,41 @@ mod tests {
     }
     #[tokio::test]
     async fn raw_tcp_stack_handshake_and_payload_use_selected_proxy() {
+        tcp_round_trip(false, b"tun-echo").await;
+    }
+    #[tokio::test]
+    async fn fake_ip_tcp_stack_restores_domain_and_proxies_payload() {
+        tcp_round_trip(true, b"tun-echo").await;
+    }
+    #[tokio::test]
+    async fn sniffed_http_keeps_original_ip_and_replays_payload_through_tcp_stack() {
+        tcp_round_trip(false, b"GET / HTTP/1.1\r\nHost: qq.com\r\n\r\nbody").await;
+    }
+    async fn tcp_round_trip(fake: bool, payload: &[u8]) {
         let (current, proxy) = proxy().await;
+        let destination = if fake {
+            let text = format!(
+                "{}\n[dns]\nlisten=[]\nfake_ip=true\n",
+                current.load().source_text
+            );
+            let app =
+                crate::App::from_text(&std::env::temp_dir().join("astra-fake-tcp.toml"), text)
+                    .unwrap();
+            let query = astra_dns::wire::query("fake.example", hickory_proto::rr::RecordType::A)
+                .unwrap()
+                .to_vec()
+                .unwrap();
+            let reply =
+                hickory_proto::op::Message::from_vec(&app.dns_answer(&query).await.unwrap())
+                    .unwrap();
+            let hickory_proto::rr::RData::A(ip) = reply.answers[0].data else {
+                panic!()
+            };
+            current.store(Arc::new(app));
+            ip.0.octets()
+        } else {
+            [203, 0, 113, 8]
+        };
         let (stack, runner, _, tcp) = netstack_smoltcp::StackBuilder::default()
             .enable_tcp(true)
             .enable_udp(false)
@@ -617,7 +667,9 @@ mod tests {
             tcp_dispatch(tcp.unwrap(), current).await.unwrap();
         });
         let (mut sink, mut packets) = stack.split();
-        sink.send(tcp_packet(1000, None, &[])).await.unwrap();
+        sink.send(tcp_packet(destination, 1000, None, &[]))
+            .await
+            .unwrap();
         let syn_ack = tokio::time::timeout(std::time::Duration::from_secs(3), packets.next())
             .await
             .unwrap()
@@ -630,10 +682,10 @@ mod tests {
         assert!(tcp.syn() && tcp.ack());
         assert_eq!(tcp.acknowledgment_number(), 1001);
         let acknowledgment = tcp.sequence_number().wrapping_add(1);
-        sink.send(tcp_packet(1001, Some(acknowledgment), &[]))
+        sink.send(tcp_packet(destination, 1001, Some(acknowledgment), &[]))
             .await
             .unwrap();
-        sink.send(tcp_packet(1001, Some(acknowledgment), b"tun-echo"))
+        sink.send(tcp_packet(destination, 1001, Some(acknowledgment), payload))
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -642,7 +694,7 @@ mod tests {
                 let parsed = etherparse::SlicedPacket::from_ip(&packet).unwrap();
                 if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
                     if !tcp.payload().is_empty() {
-                        assert_eq!(tcp.payload(), b"tun-echo");
+                        assert_eq!(tcp.payload(), payload);
                         break;
                     }
                 }

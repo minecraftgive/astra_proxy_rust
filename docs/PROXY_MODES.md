@@ -56,7 +56,7 @@ Windows 使用相同入口，例如 `./target/debug/astra-proxy.exe --restore-sy
 
 ## 原生 TUN
 
-TUN 设备由 `tun-rs` 创建，数据包由 Rust `netstack-smoltcp` 拆成 TCP 流和 UDP 会话，继续使用 Astra 的原生协议出站；不启动外部代理核心。TCP/UDP IPv4/IPv6 协议栈可用，DNS 作为普通 UDP/TCP 转发，没有 Fake-IP、域名嗅探或 DNS 劫持；IP 流量按 IP/端口规则匹配。ICMP 由本地用户态栈响应，不代表远端目标的真实 ping 结果。
+TUN 设备由 `tun-rs` 创建，数据包由 Rust `netstack-smoltcp` 拆成 TCP 流和 UDP 会话，继续使用 Astra 的原生协议出站；不启动外部代理核心。TCP/UDP IPv4/IPv6 协议栈可用，未配置 DNS 时，DNS 作为普通 UDP/TCP 转发；可通过独立 DNS 模块启用 53 端口接管、DoH/DoT、Fake IP 和域名还原，详见 [DNS](DNS.md)。无域名映射的 IP 流量按 IP/端口规则匹配。ICMP 由本地用户态栈响应，不代表远端目标的真实 ping 结果。
 
 最低配置（路由由外部管理）：
 
@@ -179,3 +179,7 @@ cargo test -p astra-proxy tun::tests
 ```
 
 实现参考：[tun-rs](https://github.com/tun-rs/tun-rs)、[netstack-smoltcp](https://github.com/cavivie/netstack-smoltcp)、[Linux 内核 TPROXY 文档](https://www.kernel.org/doc/html/latest/networking/tproxy.html)。
+
+系统代理支持回环监听及通配监听：`0.0.0.0:PORT` 自动使用 `127.0.0.1:PORT` 作为系统代理目标，`[::]:PORT` 自动使用 `[::1]:PORT`。监听绑定不变；零端口及仅绑定非回环具体 IP 的配置仍会被拒绝。Windows 使用 HTTP 监听，macOS/Linux 使用 SOCKS5 监听。
+
+出口网卡可设 `auto_interface=true` 在运行时跟随物理默认出口；`auto_gateway=true`（默认）跟随所选接口的网关。手动固定 Wi-Fi 时设 `auto_interface=false`、`interface="Wi-Fi"`；完全静态网关还需 `auto_gateway=false`。旧版写入的 interface 不再代表自动模式，需显式开启。详见 [出口切换](EGRESS_SWITCHING.md)。

@@ -13,6 +13,10 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Group {
+    /// Subscription source whose nodes form this group's managed membership.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<String>,
+    pub include_in_proxy: bool,
     pub mode: Mode,
     pub members: Vec<String>,
     pub include_all: bool,
@@ -36,6 +40,8 @@ pub struct Group {
 impl Default for Group {
     fn default() -> Self {
         Self {
+            subscription: None,
+            include_in_proxy: true,
             mode: Mode::Select,
             members: vec![],
             include_all: false,
@@ -94,6 +100,11 @@ pub fn expand(
             .transpose()
     }
     let mut result = groups.clone();
+    let subscription_nodes: HashSet<_> = groups
+        .values()
+        .filter(|g| g.subscription.is_some())
+        .flat_map(|g| g.members.iter().cloned())
+        .collect();
     for (name, source) in groups {
         let filter = pattern(&source.filter).map_err(|e| format!("proxy group {name}: {e}"))?;
         let exclude =
@@ -106,12 +117,17 @@ pub fn expand(
         }
         let mut dynamic: Vec<_> = nodes
             .iter()
-            .filter(|_| source.include_all)
-            .chain(
-                groups
-                    .keys()
-                    .filter(|g| source.include_all_groups && *g != name),
-            )
+            .filter(|node| {
+                source.include_all && !(name == "PROXY" && subscription_nodes.contains(*node))
+            })
+            .chain(groups.keys().filter(|g| {
+                *g != name
+                    && (source.include_all_groups
+                        || (name == "PROXY" && groups[*g].subscription.is_some()))
+                    && !(name == "PROXY"
+                        && groups[*g].subscription.is_some()
+                        && !groups[*g].include_in_proxy)
+            }))
             .filter(|m| {
                 filter.as_ref().is_none_or(|r| r.is_match(m))
                     && !exclude.as_ref().is_some_and(|r| r.is_match(m))
@@ -120,11 +136,110 @@ pub fn expand(
             .collect();
         dynamic.sort();
         let target = result.get_mut(name).unwrap();
+        if name == "PROXY" {
+            let excluded = |member: &String| {
+                subscription_nodes.contains(member)
+                    || groups
+                        .get(member)
+                        .is_some_and(|g| g.subscription.is_some() && !g.include_in_proxy)
+            };
+            target.members.retain(|m| !excluded(m));
+            seen.retain(|m| !excluded(m));
+        }
         target
             .members
             .extend(dynamic.into_iter().filter(|m| seen.insert(m.clone())));
     }
+    if let Some(selected) = result
+        .get("PROXY")
+        .and_then(|g| g.selected.as_ref())
+        .cloned()
+    {
+        if (subscription_nodes.contains(&selected)
+            || groups
+                .get(&selected)
+                .is_some_and(|g| g.subscription.is_some() && !g.include_in_proxy))
+            && member_path(&result, "PROXY", &selected).is_none()
+        {
+            result.get_mut("PROXY").unwrap().selected = None;
+        }
+    }
     Ok(result)
+}
+
+/// Find an actual membership path; a parent may pin any reachable descendant
+/// without changing the selected member of the shared child group.
+pub fn member_path(
+    groups: &BTreeMap<String, Group>,
+    root: &str,
+    target: &str,
+) -> Option<Vec<String>> {
+    let mut pending = std::collections::VecDeque::from([(root.to_owned(), Vec::new())]);
+    let mut seen = HashSet::new();
+    while let Some((name, path)) = pending.pop_front() {
+        if path.len() >= 32 || !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(group) = groups.get(&name) else {
+            continue;
+        };
+        if group.members.iter().any(|m| m == target) {
+            let mut found = path;
+            found.push(target.to_owned());
+            return Some(found);
+        }
+        for member in &group.members {
+            if groups.contains_key(member) && member != root {
+                let mut next = path.clone();
+                next.push(member.clone());
+                pending.push_back((member.clone(), next));
+            }
+        }
+    }
+    None
+}
+
+pub fn member_choices(groups: &BTreeMap<String, Group>, root: &str) -> Vec<String> {
+    fn visit(
+        groups: &BTreeMap<String, Group>,
+        name: &str,
+        depth: usize,
+        seen: &mut HashSet<String>,
+        output: &mut Vec<String>,
+    ) {
+        if depth >= 32 {
+            return;
+        }
+        if let Some(group) = groups.get(name) {
+            for member in &group.members {
+                if seen.insert(member.clone()) {
+                    output.push(member.clone());
+                    visit(groups, member, depth + 1, seen, output);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::from([root.to_owned()]);
+    let mut output = Vec::new();
+    visit(groups, root, 0, &mut seen, &mut output);
+    output
+}
+
+/// Saved configs need not contain cached subscription nodes yet. Such a pin is
+/// kept pending and cannot route until a source supplies an actual member path.
+pub fn pending_subscription_selection(groups: &BTreeMap<String, Group>, root: &str) -> bool {
+    std::iter::once(root.to_owned())
+        .chain(member_choices(groups, root))
+        .any(|name| {
+            groups
+                .get(&name)
+                .is_some_and(|g| g.subscription.is_some() && g.members.is_empty())
+        })
+}
+fn subscription_descendant(groups: &BTreeMap<String, Group>, root: &str) -> bool {
+    std::iter::once(root.to_owned())
+        .chain(member_choices(groups, root))
+        .any(|name| groups.get(&name).is_some_and(|g| g.subscription.is_some()))
 }
 /// Child groups precede their parents; cycles and ambiguous references are rejected.
 pub fn validate(
@@ -154,7 +269,10 @@ fn validate_expanded(
             ));
         }
         total += group.members.len();
-        if (group.members.is_empty() && !group.include_all && !group.include_all_groups)
+        if (group.members.is_empty()
+            && !group.include_all
+            && !group.include_all_groups
+            && group.subscription.is_none())
             || group.members.len() > 1024
             || total > 4096
         {
@@ -172,13 +290,15 @@ fn validate_expanded(
                 ));
             }
         }
-        if group
-            .selected
-            .as_ref()
-            .is_some_and(|s| !group.members.contains(s))
-        {
+        if group.selected.as_ref().is_some_and(|s| {
+            member_path(&groups, name, s).is_none()
+                && !(!nodes.contains(s)
+                    && !groups.contains_key(s)
+                    && !builtin(s)
+                    && subscription_descendant(groups, name))
+        }) {
             return Err(format!(
-                "proxy group {name}: selected must be one of its members"
+                "proxy group {name}: selected must be a reachable member"
             ));
         }
         if !(1..=86400).contains(&group.interval)

@@ -72,6 +72,26 @@ impl Groups {
             order,
         })
     }
+    fn manual_target(
+        app: &App,
+        name: &str,
+        group: &astra_ipc::groups::Group,
+        path: &mut Vec<String>,
+    ) -> Result<String> {
+        let target = group
+            .selected
+            .as_ref()
+            .or_else(|| group.members.first())
+            .context("proxy group has no members")?;
+        let members = astra_ipc::groups::member_path(&app.config.proxy_groups, name, target)
+            .with_context(|| format!("proxy group {name}: selected node is not available"))?;
+        ensure!(
+            path.len() + members.len() <= 32,
+            "proxy group nesting exceeds limit"
+        );
+        path.extend(members[..members.len() - 1].iter().cloned());
+        Ok(target.clone())
+    }
     fn cached(&self, app: &App, name: &str) -> Result<RouteAction> {
         self.cached_path(app, name).map(|v| v.0)
     }
@@ -94,12 +114,7 @@ impl Groups {
             };
             path.push(name.clone());
             name = if group.mode == Mode::Select {
-                group
-                    .selected
-                    .as_ref()
-                    .or_else(|| group.members.first())
-                    .with_context(|| format!("proxy group {name}: no members"))?
-                    .clone()
+                Self::manual_target(app, &name, group, &mut path)?
             } else {
                 selections
                     .get(&name)
@@ -136,12 +151,7 @@ impl Groups {
             ensure!(path.len() < 32, "proxy group nesting exceeds limit");
             path.push(current.clone());
             current = if group.mode == Mode::Select {
-                group
-                    .selected
-                    .as_ref()
-                    .or_else(|| group.members.first())
-                    .context("proxy group has no members")?
-                    .clone()
+                Self::manual_target(app, &current, group, &mut path)?
             } else {
                 guard
                     .get(&current)
@@ -492,6 +502,37 @@ mod tests {
     }
     fn app(a: &Stub, b: &Stub, mode: &str, selected: &str, tolerance: u64) -> App {
         App::from_text(std::path::Path::new("groups.toml"), format!("standalone=true\nstandalone_outbound='main'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='http'\ntag='a'\nserver='{}'\n[[outbounds]]\nkind='http'\ntag='b'\nserver='{}'\n[proxy_groups.speed]\nmode='{mode}'\nmembers=['a','b']\nselected='{selected}'\nurl='http://example.test/204'\ninterval=1\ntimeout_ms=1000\ntolerance_ms={tolerance}\n[proxy_groups.main]\nmode='select'\nmembers=['speed','DIRECT']\nselected='speed'\n",a.address,b.address)).unwrap()
+    }
+    #[tokio::test]
+    async fn parent_pins_descendant_without_changing_shared_child_selection() {
+        let a = stub(1, "a").await;
+        let b = stub(1, "b").await;
+        let original = app(&a, &b, "select", "b", 0);
+        let text = original
+            .source_text
+            .replace("selected='speed'", "selected='a'");
+        let app = App::from_text(std::path::Path::new("groups.toml"), text).unwrap();
+        let parent = RouteAction::Proxy("main".into());
+        let child = RouteAction::Proxy("speed".into());
+        assert_eq!(
+            app.groups.resolve(&app, &parent).await.unwrap(),
+            RouteAction::Proxy("a".into())
+        );
+        assert_eq!(
+            app.groups.resolve(&app, &child).await.unwrap(),
+            RouteAction::Proxy("b".into())
+        );
+        let (resolved, path) = app.groups.cached_path(&app, "main").unwrap();
+        assert_eq!(resolved, RouteAction::Proxy("a".into()));
+        assert_eq!(path, ["main", "speed"]);
+        assert_eq!(
+            app.groups.resolve_session(&app, &parent).await.unwrap().0,
+            resolved
+        );
+        let invalid = app
+            .source_text
+            .replace("selected='a'", "selected='missing'");
+        assert!(App::from_text(std::path::Path::new("groups.toml"), invalid).is_err());
     }
     #[tokio::test]
     async fn automatic_groups_measure_switch_retain_tolerance_and_fail_closed() {

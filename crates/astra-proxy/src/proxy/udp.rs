@@ -187,6 +187,18 @@ pub(crate) async fn open(
             Some(destination),
         )
         .await?;
+    open_action(app, target, inbound, source, action).await
+}
+
+pub(crate) async fn open_action(
+    app: &App,
+    target: &Target,
+    inbound: Inbound,
+    source: SocketAddr,
+    action: RouteAction,
+) -> Result<PacketConnection> {
+    let restored = app.restore_fake_target(target)?;
+    let target = &restored;
     let (action, lease) = app.resolve_session(&action).await?;
     let traffic =
         super::traffic::Traffic::new(Some(source), target, inbound, Network::Udp, &action);
@@ -194,8 +206,10 @@ pub(crate) async fn open(
         match action {
             RouteAction::Block => bail!("UDP blocked"),
             RouteAction::Direct => {
-                let mut destination = tokio::net::lookup_host((target.host.as_str(), target.port))
+                let mut destination = app
+                    .lookup_real(&target.host, target.port)
                     .await?
+                    .into_iter()
                     .next()
                     .context("UDP destination has no addresses")?;
                 let interface = app

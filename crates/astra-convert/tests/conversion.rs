@@ -88,7 +88,6 @@ fn skipped_entries_report_original_lines_instead_of_list_positions() {
         ("跳过代理组 cycle", 10),
         ("跳过无名称代理组", 11),
         ("规则集 broken 不可转换", 14),
-        ("忽略顶层配置 dns", 19),
         ("跳过规则 1", 22),
         ("跳过规则 2", 23),
         ("跳过规则 3", 24),

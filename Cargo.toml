@@ -1,7 +1,7 @@
 [workspace]
-members = ["crates/astra-rule-data", "crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-api", "crates/astra-server-core", "crates/astra-server-tui"]
+members = ["crates/astra-dns", "crates/astra-rule-data", "crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-api", "crates/astra-server-core", "crates/astra-server-tui"]
 resolver = "2"
-exclude = ["vendor/meow-proxy"]
+exclude = ["vendor/meow-proxy", "vendor/netstack-smoltcp"]
 
 [workspace.package]
 edition = "2021"
@@ -18,3 +18,4 @@ anyhow = "1"
 
 [patch.crates-io]
 meow-proxy = { path = "vendor/meow-proxy" }
+netstack-smoltcp = { path = "vendor/netstack-smoltcp" }

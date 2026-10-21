@@ -6,6 +6,7 @@ use serde_yaml::Value as Y;
 use std::{collections::HashSet, io::Read, path::Path, time::Duration};
 
 const LIMIT: u64 = 8 * 1024 * 1024;
+pub mod diagnostics;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Subscription {
@@ -64,8 +65,13 @@ pub fn download(url: &str, user_agent: &str) -> Result<String> {
         .get(url)
         .set("User-Agent", user_agent)
         .call()
-        .map_err(|_| {
-            anyhow::anyhow!("subscription download failed (HTTP, TLS or network error)")
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) => anyhow::anyhow!("subscription HTTP {code}"),
+            ureq::Error::Transport(error) => anyhow::anyhow!(
+                "subscription transport {:?}: {}",
+                error.kind(),
+                diagnostics::error(&anyhow::anyhow!(error.to_string()))
+            ),
         })?;
     bounded(response.into_reader())
 }
@@ -135,7 +141,8 @@ fn convert_clash_with(
             }
             "http" | "file" => {
                 let text = if required(&spec, "type")? == "http" {
-                    download(&required(&spec, "url")?, user_agent)?
+                    download(&required(&spec, "url")?, user_agent)
+                        .with_context(|| format!("download HTTP proxy-provider {name}"))?
                 } else {
                     bounded(std::fs::File::open(
                         options.base_dir.join(required(&spec, "path")?),
@@ -268,7 +275,7 @@ fn convert_nodes_with(
         .as_mapping()
         .context("Clash configuration must be a mapping")?;
     let mut nodes = serde_yaml::Mapping::new();
-    for key in ["proxies", "proxy-providers", "proxy-groups"] {
+    for key in ["proxies", "proxy-providers", "proxy-groups", "dns"] {
         if key == "proxy-groups" && !import_groups {
             continue;
         }
@@ -293,8 +300,10 @@ pub fn fetch_with(
     download: &dyn Fn(&str, &str) -> Result<String>,
 ) -> Result<Converted> {
     config.validate()?;
-    let text = download(&config.url, &config.user_agent)?;
-    convert_nodes_with(
+    let text = download(&config.url, &config.user_agent).context("download subscription")?;
+    ensure!(!text.trim_start_matches('\u{feff}').trim_start().starts_with('<'),
+        "subscription returned HTML/XML instead of Clash YAML or share links; check URL and authorization");
+    let converted = convert_nodes_with(
         &text,
         &Options {
             base_dir: base_dir.into(),
@@ -304,11 +313,31 @@ pub fn fetch_with(
         config.import_groups,
         download,
     )
+    .context("parse/convert subscription nodes")?;
+    ensure!(
+        converted.nodes > 0,
+        "subscription contains no supported nodes: {}",
+        diagnostics::error(&anyhow::anyhow!(converted
+            .warnings
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")))
+    );
+    Ok(converted)
 }
 /// Replace only subscription-owned nodes/groups, preserving local runtime settings.
 pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Result<String> {
     let mut current: toml::Table = toml::from_str(current)?;
     let remote: toml::Table = toml::from_str(converted)?;
+    // Import DNS on first use; explicit local settings and previous imports
+    // remain editable and win over subsequent subscription refreshes.
+    if !current.contains_key("dns") {
+        if let Some(dns) = remote.get("dns") {
+            current.insert("dns".into(), dns.clone());
+        }
+    }
     let incoming = remote
         .get("outbounds")
         .and_then(|v| v.as_array())
@@ -404,4 +433,149 @@ pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Re
     ownership.managed_nodes = managed_nodes;
     ownership.managed_groups = managed_groups;
     Ok(toml::to_string_pretty(&current)?)
+}
+
+/// Materialize a stable group per subscription. Local group settings are retained.
+pub fn prepare_groups(document: &mut toml::Table) -> Result<()> {
+    let mut sources = document
+        .get("subscriptions")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(legacy) = document.get("subscription") {
+        sources.insert("__legacy__".into(), legacy.clone());
+    }
+    let nodes: HashSet<String> = document
+        .get("outbounds")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("tag")?.as_str().map(str::to_owned))
+        .collect();
+    let groups = document
+        .entry("proxy_groups")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("invalid groups")?;
+    for (source, settings) in sources {
+        let existing = groups
+            .iter()
+            .find(|(_, g)| g.get("subscription").and_then(|v| v.as_str()) == Some(source.as_str()))
+            .map(|(n, _)| n.clone());
+        let name = if let Some(name) = existing {
+            name
+        } else {
+            let stem: String = source
+                .chars()
+                .scan(0usize, |len, c| {
+                    *len += c.len_utf8();
+                    (*len <= 42).then_some(c)
+                })
+                .collect();
+            let stem = if source == "__legacy__" {
+                "subscription".to_owned()
+            } else {
+                stem
+            };
+            let mut name = stem.clone();
+            let mut index = 1;
+            while name == "PROXY"
+                || astra_ipc::groups::builtin(&name)
+                || nodes.contains(&name)
+                || groups.contains_key(&name)
+            {
+                name = format!("{stem}-subscription-{index}");
+                index += 1;
+            }
+            name
+        };
+        let group = groups
+            .entry(name)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("invalid subscription group")?;
+        group.insert("subscription".into(), source.into());
+        group.entry("mode").or_insert_with(|| "select".into());
+        group
+            .entry("include_in_proxy")
+            .or_insert_with(|| true.into());
+        let members: Vec<_> = settings
+            .get("managed_nodes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|v| v.as_str().is_some_and(|s| nodes.contains(s)))
+            .cloned()
+            .collect();
+        if group.get("selected").is_some_and(|s| !members.contains(s)) {
+            group.remove("selected");
+        }
+        group.insert("members".into(), members.into());
+    }
+    Ok(())
+}
+
+/// Named subscription refresh updates only that source and its generated group.
+pub fn merge_named(
+    current: &str,
+    converted: &str,
+    ownership: &mut Subscription,
+    source: &str,
+) -> Result<String> {
+    let text = merge(current, converted, ownership)?;
+    let mut document: toml::Table = toml::from_str(&text)?;
+    let settings = if source == "__legacy__" {
+        document.get_mut("subscription")
+    } else {
+        document
+            .get_mut("subscriptions")
+            .and_then(|v| v.as_table_mut())
+            .and_then(|s| s.get_mut(source))
+    }
+    .context("subscription source missing")?
+    .as_table_mut()
+    .context("invalid subscription")?;
+    settings.insert(
+        "managed_nodes".into(),
+        ownership
+            .managed_nodes
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    settings.insert(
+        "managed_groups".into(),
+        ownership
+            .managed_groups
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    prepare_groups(&mut document)?;
+    let groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> =
+        document["proxy_groups"].clone().try_into()?;
+    let nodes = document
+        .get("outbounds")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("tag")?.as_str().map(str::to_owned))
+        .collect();
+    let expanded = astra_ipc::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)?;
+    for (name, group) in &expanded {
+        if group.selected.as_ref().is_some_and(|tag| {
+            astra_ipc::groups::member_path(&expanded, name, tag).is_none()
+                && !astra_ipc::groups::pending_subscription_selection(&expanded, name)
+        }) {
+            document["proxy_groups"][name]
+                .as_table_mut()
+                .unwrap()
+                .remove("selected");
+        }
+    }
+    Ok(toml::to_string_pretty(&document)?)
 }

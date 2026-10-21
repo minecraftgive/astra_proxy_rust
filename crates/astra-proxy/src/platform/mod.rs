@@ -10,6 +10,8 @@ pub mod system_proxy;
 pub mod transparent;
 pub mod tun;
 mod tun_ingress;
+#[cfg(not(windows))]
+mod unix_network;
 #[cfg(windows)]
 pub mod windows_network;
 

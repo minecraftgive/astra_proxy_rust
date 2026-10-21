@@ -35,7 +35,7 @@
 | 规则更新 | 规则进程启动时编译配置；代理默认缓存最多保留 5 秒，既有 TCP/UDP 流保持已选路由。需要每次新连接查规则时设 TTL 为 0。 |
 | 平台与入站 | 本次可运行二进制为 macOS arm64，未签名/公证；默认入站只监听本机且没有用户认证。 |
 
-最初首版未包含 TUN、规则热加载和 Windows IPC；当前代码已增加跨平台 TUN、规则热加载、Windows 命名管道 IPC 和当前用户系统代理。Windows TUN、普通 HTTP 转发及系统代理已通过专用地址转发、WinINet HTTP/HTTPS 与恢复检查，详见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)；系统模式边界见 [模式说明](PROXY_MODES.md)，此前 Windows 构建及本地回归范围见 [安装说明](INSTALL.md)。Fake-IP、DNS 嗅探仍未实现。HTTP CONNECT 不承载 UDP；Hysteria2 暂不支持自定义 CA 文件，使用系统信任或证书指纹。XHTTP HTTP/1.1/HTTP/3、所有 CDN 和所有服务端配置组合没有经过本版验收。
+最初首版未包含 TUN、规则热加载和 Windows IPC；当前代码已增加跨平台 TUN、规则热加载、Windows 命名管道 IPC 和当前用户系统代理。Windows TUN、普通 HTTP 转发及系统代理已通过专用地址转发、WinINet HTTP/HTTPS 与恢复检查，详见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)；系统模式边界见 [模式说明](PROXY_MODES.md)，此前 Windows 构建及本地回归范围见 [安装说明](INSTALL.md)。已增加独立 DNS 服务、DoH/DoT、TUN DNS 接管与 Fake IP 域名映射，见 [DNS](DNS.md)；TLS/HTTP 域名嗅探仍未实现。HTTP CONNECT 不承载 UDP；Hysteria2 暂不支持自定义 CA 文件，使用系统信任或证书指纹。XHTTP HTTP/1.1/HTTP/3、所有 CDN 和所有服务端配置组合没有经过本版验收。
 
 ## 复现与证据
 

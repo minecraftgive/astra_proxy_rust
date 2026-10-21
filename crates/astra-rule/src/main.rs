@@ -355,7 +355,7 @@ async fn serve(
         let subscription = req.id == 0 && req.target.host.is_empty() && req.target.port == 0;
         if !subscription || req.api_version != API_VERSION {
             tracing::debug!(target: "astra_route", core="rule", phase="received", peer_id, request_id=req.id, api_version=req.api_version,
-                host=?req.target.host, port=req.target.port, network=?req.network, inbound=?req.inbound, process=?req.process, "rule request received");
+                host=?req.target.host, port=req.target.port, destination_ip=?req.destination_ip, network=?req.network, inbound=?req.inbound, process=?req.process, "rule request received");
         }
         if req.api_version != API_VERSION {
             tracing::debug!(target: "astra_route", core="rule", phase="rejected", peer_id, request_id=req.id, reason="unsupported IPC version", "rule request rejected");

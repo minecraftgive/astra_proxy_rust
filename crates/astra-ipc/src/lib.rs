@@ -12,7 +12,7 @@ pub mod groups;
 pub mod logging;
 pub mod platform;
 
-pub const API_VERSION: u16 = 3;
+pub const API_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: u32 = 8192;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -38,6 +38,10 @@ pub struct Target {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteRequest {
+    /// Observed real destination retained alongside a DNS/SNI hostname.
+    /// Synthetic Fake IP addresses must never populate this field.
+    #[serde(default)]
+    pub destination_ip: Option<std::net::IpAddr>,
     pub api_version: u16,
     pub id: u64,
     pub target: Target,
@@ -74,12 +78,15 @@ pub async fn send<T: Serialize>(stream: &mut UnixStream, message: &T) -> io::Res
 }
 
 /// Management messages may include configuration text, unlike route frames.
-pub async fn send_management<T: Serialize>(stream: &mut UnixStream, message: &T) -> io::Result<()> {
+pub async fn send_management<T: Serialize>(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &T,
+) -> io::Result<()> {
     send_bounded(stream, message, 1024 * 1024).await
 }
 
 async fn send_bounded<T: Serialize>(
-    stream: &mut UnixStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     message: &T,
     limit: u32,
 ) -> io::Result<()> {
