@@ -77,12 +77,19 @@ pub struct InstanceDetails {
     pub node_tags_supported: bool,
     pub explanation_supported: bool,
     pub subscription_nodes_supported: bool,
+    pub runtime_supported: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionNodes {
     pub url: String,
     pub tags: Vec<String>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoragePaths {
+    pub config: PathBuf,
+    pub state: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     List,
@@ -139,13 +146,26 @@ pub enum Action {
         name: String,
         targets: Vec<String>,
     },
+    StoragePaths,
+    Runtime {
+        name: String,
+        command: astra_ipc::runtime::Command,
+        expected_pid: Option<u32>,
+    },
+    Session,
+    WatchList,
+    WatchRuntime {
+        name: String,
+        expected_pid: u32,
+        interval_ms: u64,
+    },
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub version: u16,
     pub action: Action,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reply {
     pub version: u16,
     pub error: Option<String>,
@@ -162,31 +182,82 @@ impl Reply {
         }
     }
 }
+
 pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Reply> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    type Peer = astra_ipc::session::Peer<Request, Reply>;
+    static POOL: OnceLock<Mutex<HashMap<(PathBuf, u8), Peer>>> = OnceLock::new();
     let seconds = if matches!(action, Action::Shutdown) {
         2400
     } else {
         180
     };
-    tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
-        let mut stream = astra_ipc::platform::LocalStream::connect(socket).await?;
-        astra_ipc::send_management(
-            &mut stream,
-            &Request {
+    let lane = if matches!(
+        action,
+        Action::List
+            | Action::StoragePaths
+            | Action::GetLogLevel(_)
+            | Action::NodeTags(_)
+            | Action::SubscriptionNodes(_)
+    ) {
+        0
+    } else {
+        1
+    };
+    let peer = {
+        let mut pool = POOL.get_or_init(Default::default).lock().unwrap();
+        pool.retain(|_, peer| !peer.is_closed());
+        if pool.len() >= 64 {
+            if let Some(key) = pool.keys().next().cloned() {
+                pool.remove(&key);
+            }
+        }
+        pool.entry((socket.to_owned(), lane))
+            .or_insert_with(|| {
+                Peer::new(socket.to_owned(), || Request {
+                    version: astra_ipc::API_VERSION,
+                    action: Action::Session,
+                })
+            })
+            .clone()
+    };
+    let reply = peer
+        .request(
+            Request {
                 version: astra_ipc::API_VERSION,
                 action,
             },
+            std::time::Duration::from_secs(seconds),
         )
         .await?;
-        let reply: Reply = astra_ipc::receive_management(&mut stream).await?;
-        anyhow::ensure!(
-            reply.version == astra_ipc::API_VERSION,
-            "Unsupported manager version"
-        );
-        if let Some(error) = &reply.error {
-            anyhow::bail!("{error}");
-        }
-        Ok(reply)
-    })
-    .await?
+    anyhow::ensure!(
+        reply.version == astra_ipc::API_VERSION,
+        "Unsupported manager version"
+    );
+    if let Some(error) = &reply.error {
+        anyhow::bail!("{error}");
+    }
+    Ok(reply)
+}
+pub async fn subscribe(
+    socket: &std::path::Path,
+    action: Action,
+) -> anyhow::Result<astra_ipc::platform::LocalStream> {
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        astra_ipc::platform::LocalStream::connect(socket),
+    )
+    .await??;
+    astra_ipc::send_management(
+        &mut stream,
+        &Request {
+            version: astra_ipc::API_VERSION,
+            action,
+        },
+    )
+    .await?;
+    Ok(stream)
 }

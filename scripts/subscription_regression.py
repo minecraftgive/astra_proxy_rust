@@ -36,6 +36,9 @@ def main():
     binaries = args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra subscription ') as td, contextlib.ExitStack() as stack:
         directory = pathlib.Path(td)
+        runtime = directory / 'runtime'
+        env = dict(os.environ, ASTRA_RUNTIME_DIR=str(runtime),
+                   ASTRA_CONTROL_SOCKET=str(directory / 'control.sock'))
         upstreams = []
         for marker in ('a', 'b'):
             server = stack.enter_context(Upstream(('127.0.0.1', 0), Handler))
@@ -86,7 +89,7 @@ def main():
         log_path = directory/'core.log'
         with log_path.open('w', encoding='utf-8') as log:
             child = subprocess.Popen([str(binaries/executable('astra-proxy')), str(config)], stdout=log, stderr=subprocess.STDOUT,
-                env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(directory/'control.sock')), **process_flags())
+                env=env, **process_flags())
             try:
                 wait_port(port, child, log_path)
 
@@ -123,11 +126,12 @@ def main():
                 assert probe() == b'b', 'failed update discarded the working node'
                 assert config.read_bytes() == saved, 'subscription overwrote local config'
                 assert 'secret' not in log_path.read_text(encoding='utf-8'), 'subscription token leaked to log'
-                assert config.with_suffix('.subscription-cache.json').is_file(), 'core did not persist node cache'
+                assert len(list((runtime / 'subscriptions').glob('*.cache'))) == 1, 'core did not persist node cache'
+                assert not config.with_suffix('.subscription-cache.json').exists(), 'core wrote cache beside source configuration'
                 child.terminate()
                 child.wait(timeout=15)
                 child = subprocess.Popen([str(binaries/executable('astra-proxy')), str(config)], stdout=log, stderr=subprocess.STDOUT,
-                    env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(directory/'control.sock')), **process_flags())
+                    env=env, **process_flags())
                 wait_port(port, child, log_path)
                 assert probe() == b'b', 'offline restart lost the most recent working nodes'
                 child.terminate()
@@ -136,7 +140,7 @@ def main():
                 subscription.content = content(1)
                 config.write_text(f'standalone=true\nstandalone_outbound="PROXY"\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\n[subscription]\nurl={json.dumps(url)}\ninterval=60\n', encoding='utf-8')
                 child = subprocess.Popen([str(binaries/executable('astra-proxy')), str(config)], stdout=log, stderr=subprocess.STDOUT,
-                    env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(directory/'control.sock')), **process_flags())
+                    env=env, **process_flags())
                 wait_port(port, child, log_path)
                 deadline = time.monotonic()+15
                 while True:

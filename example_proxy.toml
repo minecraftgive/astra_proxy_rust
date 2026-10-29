@@ -6,7 +6,7 @@
 # 配置检查不会连接服务器；通过检查不代表每个组合已有互通验证。
 # 已实测组合与服务端边界见 docs/COMPATIBILITY.md。
 # 本文件同时注册多个出站；规则模式按 tag 选用，独立模式用 standalone_outbound 固定选择。
-# 不会自动测速、负载均衡或故障切换。启用系统接管前删除未用占位节点并填写真实参数。
+# 可使用 proxy_groups 的 select / auto / fallback / load_balance 模式。启用系统接管前删除未用占位节点并填写真实参数。
 # 运行时按当前平台选择配置，不要一次取消所有可选模式的注释。
 # Direct/Block 是规则 action，不是 [[outbounds]] 的 kind。
 
@@ -19,8 +19,13 @@ standalone = false                # true：全部入站流量使用固定出站�
 # 无节点、标签不存在或多节点未选择会拒绝启动；上游故障不会回退直连。
 # rule_socket 可省略；ipc_connections/decision_timeout_ms/决策缓存不参与独立模式路由。
 rule_socket = "/tmp/astra-rule.sock" # 与 example_rule.toml 的 socket 一致；独立模式可省略
-socks5_listen = "127.0.0.1:1080"    # TCP CONNECT + UDP ASSOCIATE；无入站认证
-http_listen = "127.0.0.1:8080"      # 仅 HTTP CONNECT；无普通 HTTP 转发
+socks5_listen = "127.0.0.1:1080"    # TCP CONNECT + UDP ASSOCIATE
+http_listen = "127.0.0.1:8080"      # HTTP CONNECT + 普通 HTTP 流式转发
+# mixed_listen = "127.0.0.1:7890"   # 同一端口自动识别 SOCKS5 与 HTTP，含 SOCKS5 UDP
+authentication = []                # 可填 ["user:password"]，HTTP Basic 与 SOCKS5 用户名/密码认证
+lan_allowed_ips = []               # 非空时只允许这些 CIDR，例如 ["127.0.0.0/8", "192.168.1.0/24"]
+lan_disallowed_ips = []            # 拒绝优先于允许，例如 ["192.168.1.100/32"]
+skip_auth_prefixes = []            # 明确列入的来源 CIDR 可免认证；默认没有例外
 # 可只保留一个监听；也可移除两个监听，仅启用 TUN/TPROXY/REDIRECT 中至少一种。
 # 所有 TCP 监听地址必须不同，端口非零；IPv6 例：[::1]:1080。系统代理额外要求 SOCKS5 loopback 监听。
 ipc_connections = 8               # 1..128；持久 UDS 通道数量
@@ -36,7 +41,7 @@ udp_idle_timeout_secs = 120        # >0；UDP 流/关联空闲回收
 # 版本推送存在短暂异步传播延迟；既有数据流不重新选择出口。
 decision_cache_ttl_secs = 5
 
-# ---------- 系统接管模式：表存在即启用，删除整表关闭，可与普通监听并用 ----------
+# ---------- 系统接管参数：启停保存在独立运行目录，通过 TUI S/T 切换；这些表只提供固定参数 ----------
 # 可选表默认全部未启用。取消表头注释时，也只取消所需字段的注释。
 # 顶层设置必须放在所有 [表] / [[outbounds]] 之前，避免误写入前一张表。
 

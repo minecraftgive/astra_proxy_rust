@@ -36,11 +36,28 @@ fn response(raw: &[u8], truncated: bool) -> Vec<u8> {
     }
     reply.to_vec().unwrap()
 }
+
+// Windows can reserve a UDP port even when TCP can bind the same number.
+async fn dual_protocol_listeners() -> (TcpListener, UdpSocket) {
+    for _ in 0..128 {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        match UdpSocket::bind(tcp.local_addr().unwrap()).await {
+            Ok(udp) => return (tcp, udp),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("bind test DNS UDP socket: {error}"),
+        }
+    }
+    panic!("could not allocate a test port available for both TCP and UDP");
+}
+
 #[tokio::test]
 async fn udp_upstream_retries_truncated_responses_over_tcp() {
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = dual_protocol_listeners().await;
     let address = tcp.local_addr().unwrap();
-    let udp = UdpSocket::bind(address).await.unwrap();
     let worker = tokio::spawn(async move {
         let mut query = vec![0; 4096];
         let (size, peer) = udp.recv_from(&mut query).await.unwrap();
@@ -69,9 +86,10 @@ async fn udp_upstream_retries_truncated_responses_over_tcp() {
 }
 #[tokio::test]
 async fn local_udp_and_tcp_dns_listener_reload_keeps_fake_address_ownership() {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (probe, udp_probe) = dual_protocol_listeners().await;
     let address = probe.local_addr().unwrap();
     drop(probe);
+    drop(udp_probe);
     let app = app("fake_ip=true");
     let current = Arc::new(arc_swap::ArcSwap::from_pointee(app));
     let guard = Prepared::bind(&[address], None)

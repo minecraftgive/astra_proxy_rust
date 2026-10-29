@@ -160,7 +160,7 @@ impl Routes {
 pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> {
     #[cfg(windows)]
     ensure!(astra_ipc::elevation::is_elevated()?,
-        "Enabling Windows TUN requires administrator permission; restart this proxy instance to request UAC elevation (the current configuration is retained)");
+        "Enabling Windows TUN requires administrator permission; enable it from the updated TUI to request an elevated restart, or run the core as administrator (the profile is unchanged)");
     // Reuse the same native device when its identity/address is unchanged. Routes
     // are reference-counted so a candidate can share existing owned routes safely.
     let existing_device = previous

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-ipc = { path = "../astra-ipc" }
 anyhow.workspace = true
 serde.workspace = true
 serde_yaml = "0.9"

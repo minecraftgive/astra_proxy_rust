@@ -88,6 +88,23 @@ async fn forward(
     source: Option<std::net::SocketAddr>,
     destination: Option<std::net::SocketAddr>,
 ) -> Response<Body> {
+    let auth: Vec<_> = request
+        .headers()
+        .get_all(header::PROXY_AUTHORIZATION)
+        .iter()
+        .map(|v| v.to_str().unwrap_or(""))
+        .collect();
+    if !crate::inbound::http_authorized(&auth, app.authentication(source.map(|s| s.ip()))) {
+        let mut denied = response(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "Proxy authentication required",
+        );
+        denied.headers_mut().insert(
+            header::PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"Astra\""),
+        );
+        return denied;
+    }
     if request.method() == http::Method::CONNECT || request.headers().contains_key(header::UPGRADE)
     {
         return response(

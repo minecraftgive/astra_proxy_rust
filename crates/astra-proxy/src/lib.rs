@@ -39,6 +39,8 @@ struct CacheKey {
 }
 
 pub struct App {
+    metrics: Arc<proxy::traffic::Metrics>,
+    overrides: Arc<std::sync::RwLock<astra_ipc::runtime::Overrides>>,
     egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
     dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
@@ -50,11 +52,55 @@ pub struct App {
     standalone_action: Option<RouteAction>,
     cache: Cache<CacheKey, RouteAction>,
     native: native::Registry,
+    native_interfaces: HashMap<String, native::Registry>,
     udp_permits: Arc<limit::Limit>,
     permits: Arc<limit::Limit>,
 }
 
 impl App {
+    fn inbound_allowed(&self, ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        let allow_lan = self.overrides.read().unwrap().allow_lan.unwrap_or(false);
+        (allow_lan || ip.is_loopback())
+            && (self.config.lan_allowed_ips.is_empty()
+                || self
+                    .config
+                    .lan_allowed_ips
+                    .iter()
+                    .any(|cidr| cidr.contains(&ip)))
+            && !self
+                .config
+                .lan_disallowed_ips
+                .iter()
+                .any(|cidr| cidr.contains(&ip))
+    }
+    fn authentication(&self, ip: Option<std::net::IpAddr>) -> &[String] {
+        if ip.is_some_and(|ip| {
+            self.config
+                .skip_auth_prefixes
+                .iter()
+                .any(|cidr| cidr.contains(&ip.to_canonical()))
+        }) {
+            &[]
+        } else {
+            &self.config.authentication
+        }
+    }
+    fn lan_enabled(&self) -> bool {
+        let allowed = self.overrides.read().unwrap().allow_lan.unwrap_or(false);
+        allowed
+            && self
+                .config
+                .socks5_listen
+                .iter()
+                .chain(&self.config.http_listen)
+                .chain(&self.config.mixed_listen)
+                .any(|address| {
+                    address
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| !a.ip().is_loopback())
+                })
+    }
     pub(crate) async fn egress_cancelled(&self) {
         let mut changed = self.egress_signal.subscribe();
         let _ = changed.wait_for(|changed| *changed).await;
@@ -98,7 +144,7 @@ impl App {
             Inbound::Tun | Inbound::Tproxy | Inbound::Redirect => {
                 destination.map(|address| address.ip())
             }
-            Inbound::Socks5 | Inbound::HttpConnect => target.host.parse().ok(),
+            Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed => target.host.parse().ok(),
         }
         .filter(|ip| !self.synthetic_ip(*ip));
         self.route_with_context(target, inbound, network, process, destination_ip)
@@ -164,6 +210,11 @@ impl App {
         process: Option<ProcessInfo>,
         destination_ip: Option<std::net::IpAddr>,
     ) -> Result<RouteAction> {
+        match self.overrides.read().unwrap().mode {
+            astra_ipc::runtime::Mode::Direct => return Ok(RouteAction::Direct),
+            astra_ipc::runtime::Mode::Global => return Ok(RouteAction::Proxy("PROXY".into())),
+            astra_ipc::runtime::Mode::Rule => {}
+        }
         if let Some(action) = &self.standalone_action {
             return Ok(action.clone());
         }
@@ -211,12 +262,19 @@ impl App {
         let restored = self.restore_fake_target(target)?;
         let target = &restored;
         let (resolved, lease) = self.resolve_session(action).await?;
-        let traffic =
-            proxy::traffic::Traffic::new(source, target, inbound, Network::Tcp, &resolved);
+        let traffic = proxy::traffic::Traffic::new(
+            &self.metrics,
+            source,
+            target,
+            inbound,
+            Network::Tcp,
+            &resolved,
+        );
         let connected = tokio::select! {
             biased;
             _ = lease.cancelled() => Err(anyhow::anyhow!("proxy group switched during connection")),
-            result = self.connect_resolved(target, &resolved) => result,
+            _ = proxy::traffic::Traffic::cancelled(&traffic) => Err(anyhow::anyhow!("connection closed by user")),
+            result = self.connect_resolved_on(target, &resolved, lease.1.as_deref()) => result,
         };
         match connected {
             Ok(inner) => {
@@ -226,7 +284,7 @@ impl App {
                 } else {
                     return Ok(inner);
                 }
-                Ok(Box::new(proxy::traffic::Stream { inner, traffic }))
+                Ok(Box::new(proxy::traffic::Stream::new(inner, traffic)))
             }
             Err(error) => {
                 if let Some(traffic) = &traffic {
@@ -244,7 +302,7 @@ impl App {
         let inner = tokio::select! {
             biased;
             _ = lease.cancelled() => bail!("proxy group switched during connection"),
-            result = self.connect_resolved(target, &resolved) => result?,
+            result = self.connect_resolved_on(target, &resolved, lease.1.as_deref()) => result?,
         };
         Ok(lease.wrap(inner))
     }
@@ -272,16 +330,33 @@ impl App {
         target: &Target,
         action: &RouteAction,
     ) -> Result<outbound::Stream> {
+        self.connect_resolved_on(target, action, None).await
+    }
+    fn native_for(&self, interface: Option<&str>) -> &native::Registry {
+        interface.and_then(|name| self.native_interfaces.get(name)).unwrap_or(&self.native)
+    }
+    async fn connect_resolved_on(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        interface: Option<&str>,
+    ) -> Result<outbound::Stream> {
+        let interface = interface.or_else(|| self.config.tun.as_ref().and_then(|tun| tun.interface.as_deref()));
+        meow_common::outbound_iface::with_outbound_interface(
+            interface, self.connect_resolved_inner(target, action, interface),
+        ).await?
+    }
+    async fn connect_resolved_inner(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        interface: Option<&str>,
+    ) -> Result<outbound::Stream> {
         if *action == RouteAction::Direct {
-            if self.config.tun.is_some() || self.dns.is_some() {
+            if interface.is_some() || self.config.tun.is_some() || self.dns.is_some() {
                 return timeout(
                     Duration::from_secs(self.config.connect_timeout_secs),
                     async {
-                        let interface = self
-                            .config
-                            .tun
-                            .as_ref()
-                            .and_then(|tun| tun.interface.as_deref());
                         let mut last = None;
                         for address in self.lookup_real(&target.host, target.port).await? {
                             let literal = Target {
@@ -304,7 +379,7 @@ impl App {
             }
         }
         if let RouteAction::Proxy(tag) = action {
-            if let Some(adapter) = self.native.get(tag) {
+            if let Some(adapter) = self.native_for(interface).get(tag) {
                 return timeout(
                     Duration::from_secs(self.config.connect_timeout_secs),
                     native::connect(adapter, target),
@@ -378,6 +453,15 @@ impl App {
             &config.outbounds,
             path.parent().context("configuration has no parent")?,
         )?;
+        // Multiplexed QUIC/TLS clients must never share a socket across bindings.
+        let mut native_interfaces = HashMap::new();
+        for interface in config.proxy_groups.values().filter_map(|group| group.interface.as_ref()) {
+            if !native_interfaces.contains_key(interface) {
+                native_interfaces.insert(interface.clone(), native::compile(
+                    &config.outbounds, path.parent().context("configuration has no parent")?,
+                )?);
+            }
+        }
         let mut builder = Cache::builder().max_capacity(65_536);
         if config.decision_cache_ttl_secs > 0 {
             builder = builder.time_to_live(Duration::from_secs(config.decision_cache_ttl_secs));
@@ -426,6 +510,8 @@ impl App {
             }
         }
         Ok(Self {
+            metrics: Arc::default(),
+            overrides: Arc::default(),
             egress_signal: Arc::new(tokio::sync::watch::channel(false).0),
             dns,
             groups: proxy::groups::Groups::new(&config)?,
@@ -447,6 +533,7 @@ impl App {
             config,
             outbounds,
             native,
+            native_interfaces,
         })
     }
 }
@@ -537,6 +624,57 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     astra_ipc::logging::init()?;
+    if first.as_deref() == Some("--runtime") {
+        use astra_ipc::runtime::{Command, Mode};
+        let socket = args
+            .next()
+            .context("--runtime requires a core management socket")?;
+        let command = match args.next().as_deref().unwrap_or("snapshot") {
+            "snapshot" => Command::Snapshot,
+            "mode" => Command::SetMode(match args.next().as_deref() {
+                Some("rule") => Mode::Rule,
+                Some("global") => Mode::Global,
+                Some("direct") => Mode::Direct,
+                _ => bail!("mode requires rule, global or direct"),
+            }),
+            "select" => Command::Select {
+                group: args.next().context("select requires group")?,
+                member: args.next().context("select requires member")?,
+            },
+            "test" => Command::TestGroup(args.next().context("test requires group")?),
+            "close-all" => Command::Disconnect(None),
+            "close" => Command::Disconnect(Some(
+                args.next()
+                    .context("close requires connection ID")?
+                    .parse()?,
+            )),
+            "system-proxy" => Command::SystemProxy(match args.next().as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("system-proxy requires on or off"),
+            }),
+            "tun" => Command::Tun(match args.next().as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("tun requires on or off"),
+            }),
+            "allow-lan" => Command::AllowLan(match args.next().as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("allow-lan requires on or off"),
+            }),
+            "reset" => Command::Reset,
+            _ => bail!("unknown runtime command"),
+        };
+        anyhow::ensure!(args.next().is_none(), "unexpected runtime argument");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &astra_ipc::control::runtime(std::path::Path::new(&socket), command).await?
+            )?
+        );
+        return Ok(());
+    }
     if first.as_deref() == Some("--configure-egress") {
         let path = std::fs::canonicalize(args.next().context("expected config path")?)?;
         let mut app = App::load(&path)?;
@@ -546,7 +684,6 @@ pub async fn run() -> Result<()> {
             .as_mut()
             .context("configuration has no TUN")?;
         egress::prepare_interface(tun)?;
-        egress::persist_interface(&path, &app.source_text, tun)?;
         egress::cache_interface(&path, tun)?;
         println!("TUN physical egress: {}", tun.interface.as_deref().unwrap());
         return Ok(());
@@ -592,6 +729,19 @@ pub async fn run() -> Result<()> {
         .await?;
         return Ok(());
     }
+    if first.as_deref() == Some("--check-stdin") {
+        use std::io::Read;
+        let path = args
+            .next()
+            .context("--check-stdin requires the configuration path")?;
+        let mut text = String::new();
+        std::io::stdin()
+            .take(480 * 1024 + 1)
+            .read_to_string(&mut text)?;
+        anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+        App::from_text(std::path::Path::new(&path), text)?;
+        return Ok(());
+    }
     let check = first.as_deref() == Some("--check");
     let mode = first.as_deref() == Some("--print-routing-mode");
     let path = if check || mode { args.next() } else { first }
@@ -611,7 +761,12 @@ pub async fn run() -> Result<()> {
     if check {
         return Ok(());
     }
-    if platform::privilege::delegate(std::path::Path::new(&path), app.config.tun.is_some()).await? {
+    if platform::privilege::delegate(
+        std::path::Path::new(&path),
+        astra_ipc::runtime::load_overrides(std::path::Path::new(&path))?.tun == Some(true),
+    )
+    .await?
+    {
         return Ok(());
     }
     runtime::run(std::fs::canonicalize(path)?, app).await

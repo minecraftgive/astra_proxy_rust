@@ -348,7 +348,12 @@ fn native_groups(
     let names: HashSet<_> = resolver
         .groups
         .iter()
-        .filter(|(_, g)| matches!(s(g, "type").as_deref(), Some("select" | "url-test")))
+        .filter(|(_, g)| {
+            matches!(
+                s(g, "type").as_deref(),
+                Some("select" | "url-test" | "fallback" | "load-balance")
+            )
+        })
         .map(|(name, _)| name.clone())
         .collect();
     let mut candidates = BTreeMap::new();
@@ -398,7 +403,11 @@ fn native_groups(
                 mode: if selected.is_some() || s(source, "type").as_deref() == Some("select") {
                     Mode::Select
                 } else {
-                    Mode::Auto
+                    match s(source, "type").as_deref() {
+                        Some("fallback") => Mode::Fallback,
+                        Some("load-balance") => Mode::LoadBalance,
+                        _ => Mode::Auto,
+                    }
                 },
                 members,
                 include_all: yes(source, "include-all-proxies") || yes(source, "include-all"),
@@ -467,8 +476,8 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
     let mut warnings = vec!["仅转换有对应能力的字段；其他字段忽略，未执行节点连通性检查".into()];
     let mut proxy = Table::new();
     put(&mut proxy, "rule_socket", &socket);
-    // Authentication and LAN ACLs cannot be represented by Astra's listeners.
-    let host = if !seq(&root, "authentication").is_empty() || !yes(&root, "allow-lan") {
+    // Preserve explicit LAN access and inbound authentication.
+    let host = if !yes(&root, "allow-lan") {
         "127.0.0.1".to_owned()
     } else {
         match s(&root, "bind-address").as_deref() {
@@ -480,14 +489,41 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             }
         }
     };
-    if !seq(&root, "authentication").is_empty() {
-        warnings.push(source::at(
-            locations.top("authentication"),
-            "入站认证不支持，监听地址限制为 127.0.0.1",
-        ));
+    for (source, target) in [
+        ("lan-allowed-ips", "lan_allowed_ips"),
+        ("lan-disallowed-ips", "lan_disallowed_ips"),
+        ("skip-auth-prefixes", "skip_auth_prefixes"),
+    ] {
+        if !get(&root, source).is_null() {
+            let prefixes = seq(&root, source)
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(|v| toml::Value::String(v.into()))
+                        .context("inbound prefixes must be strings")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            proxy.insert(target.into(), toml::Value::Array(prefixes));
+        }
+    }
+    for key in [
+        "lan_allowed_ips",
+        "lan_disallowed_ips",
+        "skip_auth_prefixes",
+    ] {
+        if let Some(prefixes) = proxy.get(key).and_then(toml::Value::as_array) {
+            ensure!(prefixes.len() <= 256, "too many inbound ACL prefixes");
+            for prefix in prefixes {
+                prefix
+                    .as_str()
+                    .unwrap()
+                    .parse::<ipnet::IpNet>()
+                    .context("invalid inbound CIDR prefix")?;
+            }
+        }
     }
     let mixed = port(&root, "mixed-port")?;
-    let socks = port(&root, "socks-port")?.or(mixed);
+    let socks = port(&root, "socks-port")?;
     let http = port(&root, "port")?;
     if let Some(port) = socks {
         put(&mut proxy, "socks5_listen", address(&host, port));
@@ -496,13 +532,28 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         ensure!(Some(port) != socks, "SOCKS5 和 HTTP 不能共用端口");
         put(&mut proxy, "http_listen", address(&host, port));
     }
-    if mixed.is_some() {
-        warnings.push(source::at(
-            locations.top("mixed-port"),
-            "mixed-port 仅映射为 SOCKS5（优先使用 socks-port）；HTTP 需独立 port",
-        ));
+    if let Some(port) = mixed {
+        ensure!(
+            Some(port) != socks && Some(port) != http,
+            "mixed-port 必须与 socks-port / port 不同"
+        );
+        put(&mut proxy, "mixed_listen", address(&host, port));
     }
-    if socks.is_none() && http.is_none() {
+    let authentication = seq(&root, "authentication")
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .context("authentication entries must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !authentication.is_empty() {
+        proxy.insert(
+            "authentication".into(),
+            toml::Value::try_from(authentication)?,
+        );
+    }
+    if socks.is_none() && http.is_none() && mixed.is_none() {
         put(&mut proxy, "socks5_listen", "127.0.0.1:1080");
         warnings.push("无可转换入站，使用 SOCKS5 127.0.0.1:1080".into());
     }
@@ -521,8 +572,6 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         "tproxy-port",
         "hosts",
         "external-controller",
-        "lan-allowed-ips",
-        "lan-disallowed-ips",
     ] {
         if !get(&root, key).is_null() {
             warnings.push(source::at(
@@ -597,6 +646,13 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         preserved: HashSet::new(),
     };
     let (mut proxy_groups, group_errors) = native_groups(&resolver);
+    for (name, source) in &resolver.groups {
+        if s(source, "type").as_deref() == Some("load-balance")
+            && s(source, "strategy").as_deref() != Some("round-robin")
+        {
+            warnings.push(source::at(group_lines.get(name).copied().flatten(), format!("代理组 {name}: load-balance 使用健康节点轮询，未保留 consistent-hashing / sticky-sessions 策略")));
+        }
+    }
     astra_ipc::groups::validate(&proxy_groups, &nodes)
         .map_err(anyhow::Error::msg)
         .context("代理组配置超过原生限制或包含无效引用")?;

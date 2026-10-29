@@ -1,3 +1,4 @@
+mod server;
 use crate::protocol::*;
 use anyhow::{bail, Context, Result};
 use astra_ipc::control::{self, Command};
@@ -23,10 +24,15 @@ use tokio::{
 struct Registry {
     #[serde(default)]
     instances: Vec<Instance>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     log_levels: HashMap<String, LogLevel>,
     #[serde(default)]
     start_bindings: HashMap<String, Vec<String>>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct RuntimeState {
+    #[serde(default)]
+    log_levels: HashMap<String, LogLevel>,
 }
 struct Running {
     child: ManagedChild,
@@ -76,7 +82,10 @@ impl ManagedChild {
     }
 }
 pub struct Manager {
+    publisher: Option<std::sync::Arc<server::Hub>>,
     home: PathBuf,
+    config_home: PathBuf,
+    runtime: RuntimeState,
     bin: PathBuf,
     registry: Registry,
     running: HashMap<String, Running>,
@@ -351,6 +360,11 @@ fn ensure_config(kind: Kind, path: &Path) -> Result<bool> {
 }
 
 impl Manager {
+    fn notify(&self) {
+        if let Some(publisher) = &self.publisher {
+            publisher.publish(self);
+        }
+    }
     fn node_tags(&self, name: &str) -> Result<Vec<String>> {
         let instance = self.instance(name)?;
         let bindings = if instance.kind == Kind::Rule {
@@ -403,24 +417,55 @@ impl Manager {
             control: running.map(|r| (self.socket(name), r.child.id())),
         })
     }
+    #[cfg(test)]
     fn load(home: PathBuf, bin: PathBuf) -> Result<Self> {
-        let path = home.join("instances.toml");
-        let registry = if path.exists() {
-            toml::from_str(&fs::read_to_string(path)?)?
+        Self::load_with_config(home.clone(), home.join("config"), bin)
+    }
+    fn load_with_config(home: PathBuf, config_home: PathBuf, bin: PathBuf) -> Result<Self> {
+        private_dir(&config_home)?;
+        private_dir(&config_home.join("configs"))?;
+        let path = config_home.join("instances.toml");
+        let legacy = home.join("instances.toml");
+        let registry_path = if path.exists() { &path } else { &legacy };
+        let mut registry: Registry = if registry_path.exists() {
+            toml::from_str(&fs::read_to_string(registry_path)?)?
         } else {
             Registry::default()
         };
-        Ok(Self {
+        let runtime_path = home.join("runtime.json");
+        let runtime = if runtime_path.exists() {
+            serde_json::from_slice(&fs::read(runtime_path)?)?
+        } else {
+            RuntimeState {
+                log_levels: std::mem::take(&mut registry.log_levels),
+            }
+        };
+        let manager = Self {
+            publisher: None,
             home,
+            config_home,
+            runtime,
             bin,
             registry,
             running: HashMap::new(),
             exits: HashMap::new(),
-        })
+        };
+        // Copy legacy metadata once; never move a file still referenced by a core.
+        if !path.exists() {
+            manager.persist()?;
+        }
+        manager.persist_runtime()?;
+        Ok(manager)
+    }
+    fn persist_runtime(&self) -> Result<()> {
+        atomic_write(
+            &self.home.join("runtime.json"),
+            &serde_json::to_vec(&self.runtime)?,
+        )
     }
     fn persist(&self) -> Result<()> {
         atomic_write(
-            &self.home.join("instances.toml"),
+            &self.config_home.join("instances.toml"),
             toml::to_string_pretty(&self.registry)?.as_bytes(),
         )
     }
@@ -454,15 +499,31 @@ impl Manager {
         Ok(())
     }
     async fn validate(&self, kind: Kind, path: &Path) -> Result<()> {
-        read_config(path)?;
+        self.validate_text(kind, path, &read_config(path)?).await
+    }
+    async fn validate_text(&self, kind: Kind, path: &Path, text: &str) -> Result<()> {
+        astra_ipc::progress::report("Validate configuration", path.display().to_string());
+        use tokio::io::AsyncWriteExt;
         let output = timeout(
             Duration::from_secs(if kind == Kind::Rule { 90 } else { 20 }),
-            core_process(self.bin.join(kind.binary()))
-                .arg("--check")
-                .arg(path)
-                .env_remove("ASTRA_CONTROL_SOCKET")
-                .kill_on_drop(true)
-                .output(),
+            async {
+                let mut child = core_process(self.bin.join(kind.binary()))
+                    .arg("--check-stdin")
+                    .arg(path)
+                    .env_remove("ASTRA_CONTROL_SOCKET")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()?;
+                let mut stdin = child.stdin.take().context("Missing validation input")?;
+                stdin.write_all(text.as_bytes()).await?;
+                drop(stdin);
+                child
+                    .wait_with_output()
+                    .await
+                    .context("Configuration check failed")
+            },
         )
         .await
         .context("Configuration check timed out")??;
@@ -588,8 +649,10 @@ impl Manager {
                 self.validate(instance.kind, &instance.config).await?;
             }
         }
+        let total = plan.len() as u64;
         let mut started: Vec<String> = Vec::new();
-        for item in plan {
+        for (index, item) in plan.into_iter().enumerate() {
+            astra_ipc::progress::counted("Start dependency", item.clone(), index as u64, total);
             if self.running.contains_key(&item) {
                 continue;
             }
@@ -616,6 +679,7 @@ impl Manager {
                 }
                 return Err(error).with_context(|| format!("Start bound instance {item}"));
             }
+            astra_ipc::progress::counted("Dependency ready", item.clone(), index as u64 + 1, total);
             started.push(item);
         }
         Ok(())
@@ -626,6 +690,7 @@ impl Manager {
             !self.running.contains_key(name),
             "Instance is already running"
         );
+        astra_ipc::progress::report("Start core", name.to_owned());
         let instance = self.instance(name)?;
         let socket = self.socket(name);
         prepare_control_endpoint(&socket).await?;
@@ -637,7 +702,7 @@ impl Manager {
         let config = read_config(&instance.config)?;
         #[cfg(windows)]
         let elevate = instance.kind == Kind::Proxy
-            && toml::from_str::<toml::Value>(&config)?.get("tun").is_some()
+            && astra_ipc::runtime::load_overrides(&instance.config)?.tun == Some(true)
             && !astra_ipc::elevation::is_elevated()?;
         #[cfg(not(windows))]
         let elevate = false;
@@ -684,6 +749,9 @@ impl Manager {
             },
         );
         self.exits.remove(name);
+        self.notify();
+        let ready_started = tokio::time::Instant::now();
+        let mut last_progress = tokio::time::Instant::now() - Duration::from_secs(1);
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(if instance.kind == Kind::Rule {
                 60
@@ -693,6 +761,13 @@ impl Manager {
                 10
             });
         while tokio::time::Instant::now() < deadline {
+            if last_progress.elapsed() >= Duration::from_millis(300) {
+                astra_ipc::progress::report(
+                    "Wait for core readiness",
+                    format!("{} · {:.1}s", name, ready_started.elapsed().as_secs_f64()),
+                );
+                last_progress = tokio::time::Instant::now();
+            }
             self.reap()?;
             let run = self
                 .running
@@ -708,6 +783,7 @@ impl Manager {
         bail!("Core did not become ready; open logs for details")
     }
     async fn reload(&mut self, name: &str, path: &Path) -> Result<()> {
+        astra_ipc::progress::report("Reload core", name.to_owned());
         let i = self.instance(name)?;
         self.validate(i.kind, path).await?;
         let status = control::request(
@@ -727,6 +803,7 @@ impl Manager {
         Ok(())
     }
     async fn stop(&mut self, name: &str) -> Result<()> {
+        astra_ipc::progress::report("Drain and stop core", name.to_owned());
         self.reap()?;
         self.instance(name)?;
         if !self.running.contains_key(name) {
@@ -755,8 +832,65 @@ impl Manager {
         };
         self.exits.insert(name.to_owned(), state.into());
         self.running.remove(name);
+        self.notify();
         let _ = fs::remove_file(self.socket(name));
         Ok(())
+    }
+    #[cfg(windows)]
+    async fn elevate_runtime_tun(&mut self, name: &str) -> Result<Reply> {
+        let previous_pid = self
+            .running
+            .get(name)
+            .and_then(|running| running.child.id());
+        let instance = self.instance(name)?;
+        let active = control::config_snapshot(&self.socket(name)).await?;
+        anyhow::ensure!(
+            active.path == fs::canonicalize(&instance.config)?
+                && active.text == read_config(&instance.config)?,
+            "Configuration changed on disk; reload it before requesting an elevated TUN restart"
+        );
+        let previous = astra_ipc::runtime::load_overrides(&instance.config)?;
+        let mut next = previous.clone();
+        next.tun = Some(true);
+        let path = astra_ipc::storage::runtime_path(&instance.config, "overrides")?;
+        astra_ipc::progress::report("Request TUN permission","Restarting only this proxy core with administrator permission; the profile is unchanged");
+        astra_ipc::storage::write_json(&path, &next)?;
+        let result: Result<Reply> = async {
+            self.stop(name).await?;
+            self.start_one(name).await?;
+            let snapshot =
+                control::runtime(&self.socket(name), astra_ipc::runtime::Command::Snapshot).await?;
+            anyhow::ensure!(
+                self.running.get(name).and_then(|r| r.child.id()) == Some(snapshot.pid),
+                "Core PID changed during elevated restart"
+            );
+            Ok(Reply::text(serde_json::to_string(&snapshot)?))
+        }
+        .await;
+        if let Err(error) = result {
+            astra_ipc::storage::write_json(&path, &previous)
+                .context("Restore previous runtime switches after rejected TUN restart")?;
+            let _ = self.reap();
+            if self.running.contains_key(name)
+                && self
+                    .running
+                    .get(name)
+                    .and_then(|running| running.child.id())
+                    != previous_pid
+            {
+                self.stop(name).await.context(
+                    "Stop the replacement core before restoring previous runtime switches",
+                )?;
+            }
+            if !self.running.contains_key(name) {
+                self.start_one(name)
+                    .await
+                    .context("Restore previous proxy core after rejected TUN restart")?;
+            }
+            self.notify();
+            return Err(error);
+        }
+        result
     }
     async fn stop_all(&mut self) {
         // Drain proxies while their rule cores are still available.
@@ -774,7 +908,7 @@ impl Manager {
         }
     }
     fn level(&self, name: &str) -> LogLevel {
-        self.registry
+        self.runtime
             .log_levels
             .get(name)
             .copied()
@@ -811,7 +945,7 @@ impl Manager {
     }
     async fn create(&mut self, name: String, kind: Kind) -> Result<Reply> {
         self.check_name(&name)?;
-        let directory = self.home.join("configs");
+        let directory = self.config_home.join("configs");
         private_dir(&directory)?;
         let config = directory.join(format!("{name}.toml"));
         if ensure_config(kind, &config)? {
@@ -851,6 +985,42 @@ impl Manager {
     async fn action(&mut self, action: Action) -> Result<Reply> {
         self.reap()?;
         match action {
+            Action::StoragePaths => Ok(Reply::text(serde_json::to_string(&StoragePaths {
+                config: self.config_home.clone(),
+                state: self.home.clone(),
+            })?)),
+            Action::Runtime {
+                name,
+                command,
+                expected_pid,
+            } => {
+                let instance = self.instance(&name)?;
+                anyhow::ensure!(
+                    instance.kind == Kind::Proxy,
+                    "Runtime controls require a proxy instance"
+                );
+                let running = self.running.get(&name).context("Instance is not running")?;
+                let expected = running.child.id();
+                anyhow::ensure!(
+                    expected_pid.is_none() || expected_pid == expected,
+                    "Core PID changed; refresh before changing runtime state"
+                );
+                let response = control::runtime(&self.socket(&name), command.clone()).await;
+                #[cfg(windows)]
+                if matches!(command, astra_ipc::runtime::Command::Tun(true))
+                    && response
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().contains("administrator permission"))
+                {
+                    return self.elevate_runtime_tun(&name).await;
+                }
+                let snapshot = response?;
+                anyhow::ensure!(
+                    Some(snapshot.pid) == expected,
+                    "Core PID changed; retry the operation"
+                );
+                Ok(Reply::text(serde_json::to_string(&snapshot)?))
+            }
             Action::List => {
                 let mut reply = Reply::text("");
                 let mut details = HashMap::new();
@@ -910,6 +1080,9 @@ impl Manager {
                 bail!("Diagnostics require a dedicated connection")
             }
             Action::DiagnosticsStream { .. } => bail!("Diagnostics require a dedicated connection"),
+            Action::Session | Action::WatchList | Action::WatchRuntime { .. } => {
+                bail!("Transport action requires a dedicated connection")
+            }
             Action::NodeTags(name) => {
                 let json = serde_json::to_string(&self.node_tags(&name)?)?;
                 anyhow::ensure!(
@@ -953,9 +1126,9 @@ impl Manager {
                         .await
                         .context("Update core log level")?;
                 }
-                self.registry.log_levels.insert(name.clone(), level);
-                if let Err(error) = self.persist() {
-                    self.registry.log_levels.insert(name.clone(), previous);
+                self.runtime.log_levels.insert(name.clone(), level);
+                if let Err(error) = self.persist_runtime() {
+                    self.runtime.log_levels.insert(name.clone(), previous);
                     if self.running.contains_key(&name) {
                         let _ =
                             control::request(&self.socket(&name), Command::SetLogLevel(previous))
@@ -977,15 +1150,19 @@ impl Manager {
                 self.instance(&name)?;
                 let old = self.registry.clone();
                 self.registry.instances.retain(|i| i.name != name);
-                self.registry.log_levels.remove(&name);
+                let previous_level = self.runtime.log_levels.remove(&name);
                 self.registry.start_bindings.remove(&name);
                 for targets in self.registry.start_bindings.values_mut() {
                     targets.retain(|target| target != &name);
                 }
                 if let Err(e) = self.persist() {
                     self.registry = old;
+                    if let Some(level) = previous_level {
+                        self.runtime.log_levels.insert(name.clone(), level);
+                    }
                     return Err(e);
                 }
+                self.persist_runtime()?;
                 Ok(Reply::text("Instance removed; configuration retained"))
             }
             Action::Start(name) => {
@@ -1081,28 +1258,20 @@ impl Manager {
                     read_config(&i.config)? == original,
                     "File changed on disk; reopen before editing"
                 );
-                // Validate beside the original, preserving relative TLS/CA paths.
-                let temp = i
-                    .config
-                    .with_file_name(format!(".astra-check-{}.toml", std::process::id()));
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&temp)?;
-                let checked = async {
-                    file.write_all(text.as_bytes())?;
-                    file.sync_all()?;
-                    self.validate(i.kind, &temp).await
-                }
-                .await;
-                let _ = fs::remove_file(&temp);
-                checked?;
+                // Validate over stdin with the source path as the asset base.
+                // No scratch file is created in a possibly read-only config directory.
+                self.validate_text(i.kind, &i.config, &text).await?;
                 anyhow::ensure!(
                     read_config(&i.config)? == original,
                     "File changed during validation; reopen before editing"
                 );
-                let backup = i.config.with_extension("toml.bak");
+                astra_ipc::progress::report(
+                    "Save configuration",
+                    "Validation passed; writing private backup and atomic replacement",
+                );
+                let backups = self.home.join("backups");
+                private_dir(&backups)?;
+                let backup = backups.join(format!("{name}.toml.bak"));
                 atomic_write(&backup, original.as_bytes())?;
                 atomic_write(&i.config, text.as_bytes())?;
                 if self.running.contains_key(&name) {
@@ -1113,7 +1282,7 @@ impl Manager {
                     }
                 }
                 Ok(Reply::text(
-                    "Validated and saved; hot applied when running; previous file in .toml.bak",
+                    "Validated and saved; hot applied when running; previous file in state directory backups/",
                 ))
             }
             Action::CloneConfig(name, destination) => {
@@ -1173,6 +1342,7 @@ impl Manager {
             node_tags_supported: true,
             subscription_nodes_supported: true,
             diagnostics_supported: true,
+            runtime_supported: true,
             explanation_supported: true,
             bindings: if instance.kind == Kind::Rule {
                 self.bound_proxies(&instance.name)
@@ -1216,19 +1386,18 @@ impl Manager {
                 }
                 .into(),
             );
-            for (key, label) in [("socks5_listen", "SOCKS5"), ("http_listen", "HTTP")] {
+            for (key, label) in [
+                ("socks5_listen", "SOCKS5"),
+                ("http_listen", "HTTP"),
+                ("mixed_listen", "Mixed"),
+            ] {
                 if let Some(address) = config.get(key).and_then(toml::Value::as_str) {
                     details
                         .listeners
                         .push(format!("{label} {}", preview(address, 128)));
                 }
             }
-            for (key, mode) in [
-                ("tun", "TUN"),
-                ("system_proxy", "System proxy"),
-                ("tproxy", "TPROXY"),
-                ("redirect", "REDIRECT"),
-            ] {
+            for (key, mode) in [("tproxy", "TPROXY"), ("redirect", "REDIRECT")] {
                 if config.get(key).is_some() {
                     details.modes.push(mode.into());
                 }
@@ -1279,108 +1448,18 @@ impl Drop for SocketGuard {
     }
 }
 
+#[cfg(test)]
 pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
+    serve_with_config(home.clone(), home.join("config"), bin).await
+}
+pub async fn serve_with_config(home: PathBuf, config_home: PathBuf, bin: PathBuf) -> Result<()> {
     private_dir(&home)?;
     let socket = home.join("manager.sock");
     let listener = UnixListener::bind(&socket).context("Manager socket exists or path is too long; never remove a socket belonging to a running manager")?;
     let _guard = SocketGuard(socket.clone());
     set_private(&socket, 0o600)?;
-    let mut manager = Manager::load(home, bin)?;
-    let mut followers = tokio::task::JoinSet::new();
-    let mut diagnostics = tokio::task::JoinSet::new();
-    let signal = astra_ipc::shutdown_signal();
-    tokio::pin!(signal);
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                result = &mut signal => { result?; break; }
-                connection = listener.accept() => {
-                    let (mut stream, _) = connection?;
-                    let request = timeout(Duration::from_secs(2), astra_ipc::receive_management::<Request>(&mut stream)).await;
-                    let request = match request { Ok(Ok(r)) => r, _ => continue };
-                    if request.version == astra_ipc::API_VERSION {
-                        if let Action::DiagnosticsStream {name, targets} = &request.action {
-                            let plan = (|| { anyhow::ensure!(diagnostics.len() < 2, "Diagnostics are busy; retry shortly"); manager.diagnostic_plan(name) })();
-                            let targets = targets.clone();
-                            let (mut input, mut output) = tokio::io::split(stream);
-                            diagnostics.spawn(async move {
-                                use tokio::io::AsyncReadExt;
-                                let result = tokio::select! {
-                                    result = async { timeout(Duration::from_secs(45), plan?.stream(targets, &mut output)).await.context("Diagnostic stream timed out")? } => result,
-                                    _ = input.read_u8() => return,
-                                };
-                                if let Err(error) = result {
-                                    let mut reply = Reply::text(""); reply.error = Some(format!("{error:#}"));
-                                    let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut output, &reply)).await;
-                                }
-                            });
-                            continue;
-                        }
-                        let offline_refresh = matches!(&request.action, Action::UpdateSubscriptions(name) if !manager.running.contains_key(name));
-                        if matches!(&request.action, Action::Diagnostics(_) | Action::DiagnosticTargets(_) | Action::DiagnosticsSelected {..}) || offline_refresh {
-                            let name = match &request.action { Action::Diagnostics(name) | Action::DiagnosticTargets(name) | Action::DiagnosticsSelected {name, ..} | Action::UpdateSubscriptions(name) => name, _ => unreachable!() };
-                            let list = matches!(&request.action, Action::DiagnosticTargets(_));
-                            let targets = if let Action::DiagnosticsSelected {targets, ..} = &request.action { Some(targets.clone()) } else { None };
-                            let plan = (|| {
-                                anyhow::ensure!(diagnostics.len() < 2, "Diagnostics are busy; retry shortly");
-                                manager.diagnostic_plan(name)
-                            })();
-                            match plan {
-                                Ok(plan) => {
-                                    diagnostics.spawn(async move {
-                                        use tokio::io::AsyncReadExt;
-                                        let result = tokio::select! {
-                                            result = async { if offline_refresh { plan.run_refresh().await } else if !list && targets.is_none() { plan.run().await } else { plan.run_selection(targets, list).await } } => result,
-                                            _ = stream.read_u8() => return,
-                                        };
-                                        let reply = result.unwrap_or_else(|error| {
-                                            let mut reply = Reply::text("");
-                                            reply.error = Some(format!("{error:#}")); reply
-                                        });
-                                        let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut stream, &reply)).await;
-                                    });
-                                }
-                                Err(error) => {
-                                    let mut reply = Reply::text(""); reply.error = Some(format!("{error:#}"));
-                                    let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut stream, &reply)).await;
-                                }
-                            }
-                            continue;
-                        }
-                        if let Action::FollowLogs{name,cursor} = &request.action {
-                            let result = manager.instance(name).and_then(|_| {
-                                anyhow::ensure!(followers.len() < 16,"Too many log subscribers"); Ok(manager.log(name))
-                            });
-                            match result {
-                                Ok(path) => {
-                                    if matches!(timeout(Duration::from_secs(2),astra_ipc::send_management(&mut stream,&Reply::text("Streaming logs"))).await,Ok(Ok(()))) {
-                                        followers.spawn(crate::log_stream::serve(stream,path,*cursor));
-                                    }
-                                }
-                                Err(error) => { let mut reply = Reply::text(""); reply.error = Some(format!("{error:#}")); let _ = timeout(Duration::from_secs(2),astra_ipc::send_management(&mut stream,&reply)).await; }
-                            }
-                            continue;
-                        }
-                    }
-                    let shutdown = request.version == astra_ipc::API_VERSION && matches!(request.action, Action::Shutdown);
-                    let result = if request.version != astra_ipc::API_VERSION { Err(anyhow::anyhow!("Unsupported manager version")) } else { manager.action(request.action).await };
-                    let reply = result.unwrap_or_else(|e| { let mut r = Reply::text(""); r.error = Some(format!("{e:#}")); r });
-                    let _ = timeout(Duration::from_secs(2), astra_ipc::send_management(&mut stream, &reply)).await;
-                    if shutdown { break; }
-                }
-                _ = sleep(Duration::from_millis(500)) => { manager.reap()?; }
-                Some(_) = followers.join_next(), if !followers.is_empty() => {},
-                Some(_) = diagnostics.join_next(), if !diagnostics.is_empty() => {},
-            }
-        }
-        Ok(())
-    }.await;
-    manager.stop_all().await;
-    followers.abort_all();
-    while followers.join_next().await.is_some() {}
-    diagnostics.abort_all();
-    while diagnostics.join_next().await.is_some() {}
-    result
+    let manager = Manager::load_with_config(home, config_home, bin)?;
+    server::run(manager, listener).await
 }
 
 #[cfg(test)]
@@ -1691,6 +1770,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(status.rows[0].pid.is_none());
+        let mut push = crate::protocol::subscribe(&socket, Action::WatchList)
+            .await
+            .unwrap();
+        let state: Reply = timeout(
+            Duration::from_millis(200),
+            astra_ipc::receive_management(&mut push),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.rows[0].instance.name, "proxy");
+        let mut log = crate::log_stream::connect(&socket, "@tui".into(), None)
+            .await
+            .unwrap();
+        let event: LogEvent = timeout(
+            Duration::from_millis(200),
+            astra_ipc::receive_management(&mut log),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(event,LogEvent::Data{bytes,..}if String::from_utf8_lossy(&bytes).contains("manager"))
+        );
+        drop((push, log));
+
         assert!(update.await.unwrap().unwrap().text.contains("Updated 1"));
         let nodes = call(&socket, Action::SubscriptionNodes("proxy".into()))
             .await
@@ -1954,7 +2059,7 @@ mod tests {
             config,
         };
         let details = manager.details(&instance);
-        assert_eq!(details.modes, ["Standalone", "TUN"]);
+        assert_eq!(details.modes, ["Standalone"]);
         assert_eq!(details.listeners, ["HTTP 127.0.0.1:8080"]);
         assert_eq!(details.outbounds, ["edge", "PROXY [select]"]);
         assert_eq!(details.outbound_count, 2);
@@ -2133,6 +2238,38 @@ mod tests {
         assert!(ensure_config(Kind::Rule, &path).unwrap());
         assert!(!ensure_config(Kind::Rule, &path).unwrap());
     }
+    #[tokio::test]
+    async fn legacy_registry_migrates_and_runtime_changes_leave_configuration_untouched() {
+        let temp = Temp::new();
+        let state = temp.0.join("state");
+        let config = temp.0.join("settings");
+        private_dir(&state).unwrap();
+        let legacy = "[[instances]]\nname='proxy'\nkind='proxy'\nconfig='external.toml'\n[log_levels]\nproxy='debug'\n";
+        fs::write(state.join("instances.toml"), legacy).unwrap();
+        let mut manager =
+            Manager::load_with_config(state.clone(), config.clone(), PathBuf::new()).unwrap();
+        assert_eq!(manager.level("proxy"), LogLevel::Debug);
+        let registry = fs::read(config.join("instances.toml")).unwrap();
+        assert!(!String::from_utf8_lossy(&registry).contains("log_levels"));
+        manager
+            .action(Action::SetLogLevel {
+                name: "proxy".into(),
+                level: LogLevel::Trace,
+            })
+            .await
+            .unwrap();
+        assert_eq!(fs::read(config.join("instances.toml")).unwrap(), registry);
+        assert_eq!(
+            fs::read_to_string(state.join("instances.toml")).unwrap(),
+            legacy
+        );
+        let restored =
+            Manager::load_with_config(state.clone(), config.clone(), PathBuf::new()).unwrap();
+        assert_eq!(restored.level("proxy"), LogLevel::Trace);
+        assert!(!state.join("configs").exists());
+        assert!(config.join("configs").is_dir());
+    }
+
     #[test]
     fn atomic_save_and_private_permissions() {
         let temp = Temp::new();
@@ -2219,11 +2356,11 @@ mod tests {
         let rows = call(&socket, Action::List).await.unwrap().rows;
         assert_eq!(
             rows[0].instance.config,
-            canonical_home.join("configs/rules.toml")
+            canonical_home.join("config/configs/rules.toml")
         );
         assert_eq!(
             rows[1].instance.config,
-            canonical_home.join("configs/proxy.toml")
+            canonical_home.join("config/configs/proxy.toml")
         );
         let rule_config: toml::Value =
             toml::from_str(&fs::read_to_string(&rows[0].instance.config).unwrap()).unwrap();
@@ -2336,7 +2473,7 @@ mod tests {
         assert_eq!(manager.level("rules"), LogLevel::Error);
         assert_eq!(
             manager.instance("rules").unwrap().config,
-            canonical_home.join("configs/rules.toml")
+            canonical_home.join("config/configs/rules.toml")
         );
     }
     /// Requires freshly built core binaries; exercises the actual management IPC.
@@ -2432,7 +2569,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            fs::read_to_string(rule_path.with_extension("toml.bak")).unwrap(),
+            fs::read_to_string(home.join("backups/rules.toml.bak")).unwrap(),
             rule_text
         );
         assert!(!call(&socket, Action::List).await.unwrap().rows[0].changed);

@@ -11,6 +11,10 @@ pub mod elevation;
 pub mod groups;
 pub mod logging;
 pub mod platform;
+pub mod progress;
+pub mod runtime;
+pub mod session;
+pub mod storage;
 
 pub const API_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: u32 = 8192;
@@ -28,6 +32,7 @@ pub enum Inbound {
     Tun,
     Tproxy,
     Redirect,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]

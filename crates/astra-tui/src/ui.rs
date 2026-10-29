@@ -1,3 +1,7 @@
+mod background;
+mod dashboard;
+mod detached;
+mod live;
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
@@ -5,8 +9,8 @@ use crate::{i18n::t, tr};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -34,6 +38,7 @@ impl Drop for Screen {
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             crossterm::cursor::Show,
             LeaveAlternateScreen
         );
@@ -129,7 +134,7 @@ struct Recovery {
     message: String,
     resume: Resume,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Session {
     kind: Kind,
     selections: [usize; 2],
@@ -195,6 +200,20 @@ impl Session {
 
 struct Ui {
     session: Session,
+    page: usize,
+    tool_selection: usize,
+    runtime_snapshot: Option<astra_ipc::runtime::Snapshot>,
+    runtime_instance: String,
+    runtime_error: String,
+    runtime_sample: Instant,
+    rates: [u64; 2],
+    history: [std::collections::VecDeque<u64>; 2],
+    group_selection: usize,
+    connection_selection: usize,
+    connection_filter: String,
+    connection_filtering: bool,
+    runtime_picker: Option<(String, usize)>,
+    hits: std::cell::RefCell<Vec<(ratatui::layout::Rect, dashboard::Target)>>,
     rows: Vec<Row>,
     message: String,
     viewer: Option<logs::Viewer>,
@@ -212,6 +231,10 @@ struct Ui {
     help_scroll: Option<u16>,
     operation_steps: Vec<String>,
     operation_result: Option<String>,
+    tasks: background::Tasks,
+    tui_viewer: Option<logs::Viewer>,
+    operation_failed: bool,
+    ready_editors: HashMap<String, Editor>,
 }
 impl std::ops::Deref for Ui {
     type Target = Session;
@@ -230,6 +253,7 @@ enum Input {
     Quit,
     Run(Action, Option<(Prompt, String)>),
     ExternalEditor,
+    OpenWindow(crate::windows::Launch),
 }
 
 impl Ui {
@@ -305,6 +329,20 @@ impl Ui {
     fn new(session: Session) -> Self {
         Self {
             session,
+            page: 0,
+            tool_selection: 0,
+            runtime_snapshot: None,
+            runtime_instance: String::new(),
+            runtime_error: String::new(),
+            runtime_sample: Instant::now(),
+            rates: [0, 0],
+            history: Default::default(),
+            group_selection: 0,
+            connection_selection: 0,
+            connection_filter: String::new(),
+            connection_filtering: false,
+            runtime_picker: None,
+            hits: std::cell::RefCell::new(Vec::new()),
             rows: vec![],
             message: String::new(),
             viewer: None,
@@ -322,6 +360,10 @@ impl Ui {
             help_scroll: None,
             operation_steps: Vec::new(),
             operation_result: None,
+            tasks: Default::default(),
+            tui_viewer: None,
+            operation_failed: false,
+            ready_editors: HashMap::new(),
         }
     }
     fn index(&self) -> usize {
@@ -352,10 +394,10 @@ impl Ui {
         operations.extend([
             Operation::Edit,
             Operation::Logs,
+            Operation::Bind,
             Operation::Config,
             Operation::Copy,
         ]);
-        operations.insert(operations.len() - 2, Operation::Bind);
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
             operations.push(Operation::UpdateSubscriptions);
@@ -367,6 +409,27 @@ impl Ui {
             operations.push(Operation::Remove);
         }
         operations
+    }
+    fn switch_core(&mut self, kind: Kind) {
+        self.kind = kind;
+        self.tool_selection = 0;
+        if kind == Kind::Rule && matches!(self.page, 1 | 3) {
+            self.navigate(2);
+        }
+    }
+    fn tool_operations(&self) -> Vec<Operation> {
+        self.operations()
+            .into_iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operation::Logs
+                        | Operation::Diagnostics
+                        | Operation::UpdateSubscriptions
+                        | Operation::Explain
+                )
+            })
+            .collect()
     }
     fn open_bindings(&mut self, name: String, targets: Option<Vec<String>>) {
         let Some(kind) = self
@@ -451,7 +514,13 @@ impl Ui {
                     None
                 }
             }
-            Operation::Edit => Some(Action::Read(name)),
+            Operation::Edit => {
+                if let Some(editor) = self.ready_editors.remove(&name) {
+                    self.editor = Some(editor);
+                    return Input::Idle;
+                }
+                Some(Action::Read(name))
+            }
             Operation::Logs => Some(Action::Logs(name)),
             Operation::Diagnostics => {
                 if row.instance.kind != Kind::Proxy {
@@ -571,6 +640,9 @@ impl Ui {
         );
     }
     fn paste(&mut self, text: &str) {
+        if self.background_paste(text) {
+            return;
+        }
         if self.help_scroll.is_some() {
             return;
         }
@@ -599,6 +671,7 @@ impl Ui {
         }
     }
     fn fail(&mut self, error: impl std::fmt::Display, resume: Resume) {
+        self.operation_failed = true;
         self.recovery = Some(Recovery {
             message: error.to_string(),
             resume,
@@ -770,6 +843,53 @@ impl Ui {
         })
     }
     fn key(&mut self, key: event::KeyEvent) -> Input {
+        if let Some(input) = self.window_key(key) {
+            return input;
+        }
+        if let Some(input) = self.background_key(key) {
+            return input;
+        }
+        if self.live_input() {
+            if let Some(input) = self.live_key(key) {
+                return input;
+            }
+        }
+        if self.overview_input() {
+            if self.page == 4 {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.tool_selection = (self.tool_selection + 1)
+                            .min(self.tool_operations().len().saturating_sub(1));
+                        return Input::Idle;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.tool_selection = self.tool_selection.saturating_sub(1);
+                        return Input::Idle;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(op) = self
+                            .tool_operations()
+                            .get(
+                                self.tool_selection
+                                    .min(self.tool_operations().len().saturating_sub(1)),
+                            )
+                            .copied()
+                        {
+                            return self.operation(op);
+                        }
+                        return Input::Idle;
+                    }
+                    _ => {}
+                }
+            }
+            if let KeyCode::Char(c @ '1'..='5') = key.code {
+                return self.navigate((c as u8 - b'1') as usize);
+            }
+            if key.code == KeyCode::BackTab {
+                return self
+                    .navigate((self.page + dashboard::PAGES.len() - 1) % dashboard::PAGES.len());
+            }
+        }
         if self.help_scroll.is_some()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c')
@@ -1033,14 +1153,14 @@ impl Ui {
                 KeyCode::Char('q') => return Input::Quit,
                 KeyCode::Char('Q') => self.prompt(Prompt::Shutdown),
                 KeyCode::Tab => {
-                    self.kind = if self.kind == Kind::Proxy {
+                    self.switch_core(if self.kind == Kind::Proxy {
                         Kind::Rule
                     } else {
                         Kind::Proxy
-                    }
+                    });
                 }
-                KeyCode::Left | KeyCode::Char('h') => self.kind = Kind::Proxy,
-                KeyCode::Right | KeyCode::Char('l') => self.kind = Kind::Rule,
+                KeyCode::Left | KeyCode::Char('h') => self.switch_core(Kind::Proxy),
+                KeyCode::Right | KeyCode::Char('l') => self.switch_core(Kind::Rule),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selections[index] = self.selections[index].saturating_sub(1)
                 }
@@ -1068,7 +1188,12 @@ impl Ui {
                 }
                 KeyCode::Char('n') => self.prompt(Prompt::AddName),
                 KeyCode::Enter if name.is_some() => self.menu = Some(0),
-                KeyCode::Char(c) if name.is_some() => {
+                KeyCode::Char(c)
+                    if name.is_some()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     let operation = match c {
                         's' => Operation::Start,
                         'x' => Operation::Stop,
@@ -1106,13 +1231,14 @@ impl Ui {
         {
             return t(&self.message).to_owned();
         }
-        self.operation_steps.join("\n")
+        self.operation_steps.last().cloned().unwrap_or_default()
     }
     fn progress(
         &mut self,
         text: String,
         terminal: &mut Option<&mut Terminal<CrosstermBackend<Stdout>>>,
     ) {
+        astra_ipc::progress::report("UI", &text);
         if terminal.is_some() {
             self.operation_steps
                 .push(format!("{}. {}", self.operation_steps.len() + 1, text));
@@ -1129,38 +1255,6 @@ impl Ui {
     ) -> bool {
         self.execute_inner(socket, action, origin, None).await
     }
-    async fn execute_user(
-        &mut self,
-        socket: &std::path::Path,
-        action: Action,
-        origin: Option<(Prompt, String)>,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> bool {
-        self.operation_steps.clear();
-        self.operation_result = None;
-        self.message.clear();
-        let mut display = Some(&mut *terminal);
-        self.progress(
-            format!("{}: {}", t("Working…"), action_description(&action)),
-            &mut display,
-        );
-        let quit = self
-            .execute_inner(socket, action, origin, Some(&mut *terminal))
-            .await;
-        let result = if self.recovery.is_some() {
-            t("Operation failed; see details above").to_owned()
-        } else if self.editor.is_some() && self.message.is_empty() {
-            t("Ready for editing").to_owned()
-        } else if self.message.is_empty() {
-            t("Completed").to_owned()
-        } else {
-            t(&self.message).to_owned()
-        };
-        self.operation_steps
-            .push(format!("{}. {}", self.operation_steps.len() + 1, result));
-        self.operation_result = Some(self.message.clone());
-        quit
-    }
     async fn execute_inner(
         &mut self,
         socket: &std::path::Path,
@@ -1168,6 +1262,31 @@ impl Ui {
         mut origin: Option<(Prompt, String)>,
         mut terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>,
     ) -> bool {
+        if let Action::Runtime { name, command, .. } = &action {
+            self.progress(t("Applying runtime change").into(), &mut terminal);
+            match call(socket, action.clone()).await.and_then(|reply| {
+                Ok(serde_json::from_str::<astra_ipc::runtime::Snapshot>(
+                    &reply.text,
+                )?)
+            }) {
+                Ok(snapshot) => {
+                    self.accept_runtime(name.clone(), snapshot);
+                    self.message = t(
+                        if matches!(command, astra_ipc::runtime::Command::TestGroup(_)) {
+                            "Group test started"
+                        } else {
+                            "Runtime updated; profile unchanged"
+                        },
+                    )
+                    .into();
+                }
+                Err(error) => {
+                    self.operation_failed = true;
+                    self.message = format!("{error:#}");
+                }
+            }
+            return false;
+        }
         if let Action::Diagnostics(name) = &action {
             self.diagnostics = Some(crate::diagnostics::View::start(socket, name.clone()));
             self.message.clear();
@@ -1466,6 +1585,8 @@ impl Ui {
         }
     }
     fn render(&self, f: &mut Frame<'_>) {
+        self.hits.borrow_mut().clear();
+        let content_area = self.render_navigation(f);
         if let Some(view) = &self.diagnostics {
             view.render(f, f.area());
             if let Some(scroll) = self.help_scroll {
@@ -1477,22 +1598,15 @@ impl Ui {
                     f.area(),
                 );
             }
+            self.render_background(f);
             return;
         }
         let overview = self.editor.is_none() && self.viewer.is_none() && self.recovery.is_none();
         let operation_text = self.operation_text();
-        let operation_height = if operation_text.is_empty() {
-            0
-        } else {
-            (Paragraph::new(operation_text.as_str())
-                .wrap(Wrap { trim: false })
-                .line_count(f.area().width.saturating_sub(2).max(1)) as u16
-                + 2)
-            .min((f.area().height / 3).max(3))
-        };
+        let operation_height = 0;
         let detail_height = if self.prompt.is_some() {
             3
-        } else if overview {
+        } else if overview && self.page == 2 {
             (Paragraph::new(self.selection_status())
                 .wrap(Wrap { trim: false })
                 .line_count(f.area().width.max(1)) as u16)
@@ -1513,17 +1627,25 @@ impl Ui {
                 Constraint::Length(operation_height),
                 Constraint::Length(2),
             ])
-            .split(f.area());
+            .split(content_area);
         let tabs = match self.kind {
             Kind::Proxy => tr!("[ {} ]  {}", t("Proxy"), t("Rules")),
             Kind::Rule => tr!("{}  [ {} ]", t("Proxy"), t("Rules")),
         };
         f.render_widget(
-            Paragraph::new(format!("Astra  ·  {tabs}  ·  Tab"))
-                .block(Block::default().borders(Borders::ALL))
-                .style(Style::default().fg(Color::Cyan)),
+            Paragraph::new(format!(
+                "{}  ·  {tabs}",
+                if overview {
+                    t(dashboard::PAGES[self.page])
+                } else {
+                    "Astra"
+                }
+            ))
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(Color::Cyan)),
             chunks[0],
         );
+        self.header_hits(f, chunks[0]);
         if let Some(recovery) = &self.recovery {
             f.render_widget(
                 Paragraph::new(&*recovery.message)
@@ -1537,6 +1659,12 @@ impl Ui {
             editor.render(f, chunks[1]);
         } else if let Some(viewer) = &self.viewer {
             viewer.render(f, chunks[1]);
+        } else if self.page == 1 && self.live().is_some() {
+            self.render_live_groups(f, chunks[1]);
+        } else if self.page == 3 {
+            self.render_connections(f, chunks[1]);
+        } else if self.page == 0 || self.page == 4 {
+            self.render_dashboard(f, chunks[1]);
         } else {
             let items: Vec<ListItem> = self
                 .rows()
@@ -1622,6 +1750,7 @@ impl Ui {
                 .highlight_style(Style::default().bg(Color::Blue))
                 .highlight_symbol("› ");
             f.render_stateful_widget(list, chunks[1], &mut state);
+            self.list_hits(chunks[1], state.offset());
             if empty {
                 f.render_widget(
                     Paragraph::new(t("n to add an instance")),
@@ -1641,25 +1770,7 @@ impl Ui {
             String::new()
         };
         f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[2]);
-        if operation_height > 0 {
-            let operation_rows = Paragraph::new(operation_text.as_str())
-                .wrap(Wrap { trim: false })
-                .line_count(chunks[3].width.saturating_sub(2).max(1));
-            let operation_scroll = operation_rows
-                .saturating_sub(chunks[3].height.saturating_sub(2) as usize)
-                .min(u16::MAX as usize) as u16;
-            f.render_widget(
-                Paragraph::new(operation_text)
-                    .wrap(Wrap { trim: false })
-                    .scroll((operation_scroll, 0))
-                    .block(
-                        Block::default()
-                            .title(t("Operation status"))
-                            .borders(Borders::ALL),
-                    ),
-                chunks[3],
-            );
-        }
+        f.render_widget(Paragraph::new(operation_text), chunks[3]);
         let help = if self.recovery.is_some() {
             t("c retry · b cancel · ↑↓ scroll")
         } else if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
@@ -1671,7 +1782,7 @@ impl Ui {
         } else if self.editor.is_some() {
             t("↑↓ select · Enter edit · Ctrl-S save · ? all operations")
         } else {
-            t("↑↓ select · Enter actions · e edit · q quit · ? all operations")
+            t("1–5 pages · Shift-Tab previous · Tab core · ↑↓ select · Enter actions · q quit · ? help")
         };
         f.render_widget(
             Paragraph::new(help).style(Style::default().fg(Color::Gray)),
@@ -1715,6 +1826,7 @@ impl Ui {
                 height,
             );
             f.render_widget(Clear, popup);
+            self.hits.borrow_mut().clear();
             let (items, selected, title, help): (Vec<ListItem>, usize, String, &str) =
                 if let Some(picker) = &self.binding_picker {
                     (
@@ -1772,7 +1884,9 @@ impl Ui {
                 popup,
                 &mut state,
             );
+            self.menu_hits(popup, state.offset());
         }
+        self.render_runtime_picker(f);
         if let Some(scroll) = self.help_scroll {
             let text = crate::help::text(self.help_page());
             let popup = crate::help::popup(f.area(), &text);
@@ -1790,11 +1904,19 @@ impl Ui {
                 popup,
             );
         }
+        self.render_background(f);
     }
 }
 
-fn action_description(action: &Action) -> String {
+pub(crate) fn action_description(action: &Action) -> String {
     let (label, name) = match action {
+        Action::Logs(name) if name == "@tui" => ("TUI log", ""),
+        Action::Logs(name) => ("Logs", name.as_str()),
+        Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
+        Action::Runtime { name, .. } => ("Applying runtime change", name.as_str()),
+        Action::ExplainRoute { name, .. } => ("Route explanation", name.as_str()),
+        Action::Create { name, .. } => ("Create", name.as_str()),
+        Action::Add(instance) => ("Add", instance.name.as_str()),
         Action::Start(name) => ("Start", name.as_str()),
         Action::Stop(name) => ("Stop", name.as_str()),
         Action::Restart(name) => ("Restart", name.as_str()),
@@ -1832,11 +1954,22 @@ fn absolute(text: &str, directory: &std::path::Path) -> Result<PathBuf> {
     })
 }
 
-pub async fn run(socket: PathBuf) -> Result<()> {
-    let session_path = socket
-        .parent()
-        .context("Manager socket has no directory")?
-        .join("ui-session.json");
+pub async fn run(
+    socket: PathBuf,
+    context: crate::windows::Context,
+    launch: crate::windows::Launch,
+) -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(run_local(socket, context, launch))
+        .await
+}
+async fn run_local(
+    socket: PathBuf,
+    context: crate::windows::Context,
+    launch: crate::windows::Launch,
+) -> Result<()> {
+    let session_path =
+        launch.session_path(socket.parent().context("Manager socket has no directory")?)?;
     let mut ui = match Session::load(&session_path) {
         Ok(session) => Ui::new(session),
         Err(error) => {
@@ -1848,85 +1981,107 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             ui
         }
     };
-    let initial_list = call(&socket, Action::List).await;
-    let loaded = initial_list.is_ok();
-    if let Ok(reply) = initial_list {
-        ui.update_rows(reply);
+    if let Some(view) = launch.view {
+        if let Some(page) = view.page() {
+            ui.page = page;
+        }
     }
-    ui.refresh_node_tags(&socket).await;
+    if let Some(kind) = launch.kind {
+        ui.kind = kind;
+    }
+    let mut initial = Some(launch);
+    let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     enable_raw_mode()?;
     let _screen = Screen;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut jobs = background::Jobs::new(&socket);
+    let mut feeds = background::Feeds::new(&socket);
     if let Some(name) = ui.active_log.clone() {
-        ui.execute(&socket, Action::Logs(name), None).await;
+        jobs.start(&mut ui, Action::Logs(name), None);
     }
-    let mut refreshed = if loaded {
-        Instant::now()
-    } else {
-        Instant::now() - Duration::from_secs(3)
-    };
+    let mut refreshed = Instant::now() - crate::UI_REFRESH_INTERVAL;
+    let mut redraw = true;
     loop {
-        if let Some(view) = &mut ui.diagnostics {
-            view.poll();
-        }
-        let stream_error = ui
-            .viewer
-            .as_mut()
-            .and_then(|viewer| viewer.poll().map(|error| (viewer.name.clone(), error)));
-        if let Some((name, error)) = stream_error {
-            if ui.recovery.is_none() {
-                ui.fail(error, Resume::Request(Action::Logs(name)));
-                ui.checkpoint(&session_path);
+        tokio::task::yield_now().await;
+        if refreshed.elapsed() >= crate::UI_REFRESH_INTERVAL {
+            feeds.poll(&mut ui).await;
+            if feeds.ready {
+                if let Some(launch) = initial.take() {
+                    if let Some(action) = ui.apply_launch(&launch) {
+                        jobs.start(&mut ui, action, None);
+                    }
+                }
             }
-        }
-        if refreshed.elapsed() > Duration::from_secs(2)
-            && ui.editor.is_none()
-            && ui.prompt.is_none()
-            && ui.viewer.is_none()
-            && ui.recovery.is_none()
-            && ui.menu.is_none()
-            && ui.binding_picker.is_none()
-            && ui.diagnostics.is_none()
-            && !ui.refresh_paused
-        {
-            ui.execute(&socket, Action::List, None).await;
-            if ui.recovery.is_some() {
-                ui.checkpoint(&session_path);
+            let mut index = 0;
+            while index < opening.len() {
+                if opening[index].is_finished() {
+                    ui.message = match opening.remove(index).await {
+                        Ok(Ok(())) => t("Opened in a new window").into(),
+                        Ok(Err(error)) => format!("{}: {error:#}", t("Cannot open a new window")),
+                        Err(error) => error.to_string(),
+                    };
+                    ui.tasks.notice_message(&ui.message);
+                } else {
+                    index += 1;
+                }
             }
+            let quit = jobs.poll(&mut ui).await;
+            if jobs.take_changed() || quit {
+                let remembered = ui.checkpoint(&session_path);
+                if quit && remembered {
+                    break;
+                }
+            }
+            if let Some(view) = &mut ui.diagnostics {
+                view.poll();
+            }
+            if let Some(viewer) = &mut ui.viewer {
+                viewer.poll();
+            }
+            if let Some(viewer) = &mut ui.tui_viewer {
+                viewer.poll();
+            }
+            // Start the next period after processing; do not catch up missed ticks.
             refreshed = Instant::now();
+            redraw = true;
         }
-        if refreshed.elapsed() > Duration::from_secs(2)
-            && ui.editor.is_some()
-            && ui.prompt.is_none()
-            && ui.recovery.is_none()
-            && ui.help_scroll.is_none()
-        {
-            ui.refresh_subscription_nodes(&socket).await;
-            refreshed = Instant::now();
+        if redraw {
+            ui.draw(&mut terminal)?;
+            redraw = false;
         }
-        ui.draw(&mut terminal)?;
-        if !event::poll(Duration::from_millis(150))? {
+        if !event::poll(Duration::from_millis(35))? {
             continue;
         }
+        redraw = true;
         let input = match event::read()? {
             Event::Paste(text) if ui.recovery.is_none() => {
                 ui.paste(&text);
                 Input::Idle
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => ui.key(key),
+            Event::Mouse(mouse) => ui.mouse(mouse),
             _ => Input::Idle,
         };
         let quit = match input {
             Input::Quit => true,
             Input::Run(action, origin) => {
-                let quit = ui
-                    .execute_user(&socket, action, origin, &mut terminal)
-                    .await;
-                refreshed = Instant::now() - Duration::from_secs(3);
-                quit
+                jobs.start(&mut ui, action, origin);
+                false
             }
             Input::Idle => false,
+            Input::OpenWindow(launch) => {
+                if opening.len() < 4 {
+                    let context = context.clone();
+                    opening.push(tokio::task::spawn_blocking(move || context.open(&launch)));
+                }
+                false
+            }
             Input::ExternalEditor => {
                 let result = (|| -> Result<()> {
                     let command = crate::external_editor::command()?;
@@ -1942,6 +2097,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
                         execute!(
                             io::stdout(),
                             DisableBracketedPaste,
+                            DisableMouseCapture,
                             crossterm::cursor::Show,
                             LeaveAlternateScreen
                         )?;
@@ -1949,7 +2105,12 @@ pub async fn run(socket: PathBuf) -> Result<()> {
                     })();
                     // Always restore the TUI, including when the executable cannot start.
                     enable_raw_mode()?;
-                    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+                    execute!(
+                        io::stdout(),
+                        EnterAlternateScreen,
+                        EnableBracketedPaste,
+                        EnableMouseCapture
+                    )?;
                     terminal.clear()?;
                     launched?;
                     ui.read_external()
@@ -2025,52 +2186,14 @@ mod tests {
         ui
     }
     #[test]
-    fn operation_results_and_steps_render_separately_from_instance_details() {
-        use ratatui::{backend::TestBackend, Terminal};
-        for language in [
-            crate::i18n::Language::English,
-            crate::i18n::Language::Simplified,
-            crate::i18n::Language::Traditional,
-        ] {
-            crate::i18n::with_language(language, || {
-                let mut ui = sample_ui(true);
-                ui.message = "Stopped".into();
-                let details = ui.selection_status();
-                assert!(!details.contains(t("Stopped")));
-                assert_eq!(ui.operation_text(), t("Stopped"));
-                ui.operation_steps = vec![
-                    format!("1. {}", t("Working…")),
-                    format!("2. {}", t("Waiting for manager confirmation")),
-                    format!("3. {}", t("Stopped")),
-                ];
-                ui.operation_result = Some(ui.message.clone());
-                assert_eq!(ui.operation_text().lines().count(), 3);
-                let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
-                terminal.draw(|frame| ui.render(frame)).unwrap();
-                let buffer = terminal.backend().buffer();
-                let status_row = (0..30)
-                    .find(|y| {
-                        (0..110)
-                            .map(|x| buffer[(x, *y)].symbol())
-                            .collect::<String>()
-                            .replace(' ', "")
-                            .contains(&t("Operation status").replace(' ', ""))
-                    })
-                    .unwrap();
-                let result_row = (0..30)
-                    .find(|y| {
-                        (0..110)
-                            .map(|x| buffer[(x, *y)].symbol())
-                            .collect::<String>()
-                            .replace(' ', "")
-                            .contains(&format!("3.{}", t("Stopped").replace(' ', "")))
-                    })
-                    .unwrap();
-                assert!(result_row > status_row);
-                ui.message = "Started".into();
-                assert_eq!(ui.operation_text(), t("Started"));
-            });
-        }
+    fn operation_status_defaults_to_latest_line() {
+        let mut ui = sample_ui(true);
+        ui.operation_steps = vec!["first".into(), "latest".into()];
+        assert_eq!(ui.operation_text(), "latest");
+        assert_eq!(ui.operation_text().lines().count(), 1);
+        ui.message = "new result".into();
+        ui.operation_result = Some("old result".into());
+        assert_eq!(ui.operation_text(), "new result");
     }
     #[test]
     fn help_overlay_preserves_state_and_does_not_capture_question_marks_in_inputs() {
@@ -2786,8 +2909,8 @@ default_action = "direct"
             "proxy".into(),
             include_str!("../../../configs/proxy.toml").into(),
         );
-        // Select IPC connections after standalone settings, socket and listeners.
-        for _ in 0..5 {
+        // Select IPC connections after standalone settings, socket, listeners and authentication.
+        for _ in 0..7 {
             editor
                 .key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .unwrap();

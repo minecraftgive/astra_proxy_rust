@@ -7,7 +7,7 @@ use hyper_util::rt::TokioIo;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -19,6 +19,7 @@ struct Selection {
     checked: Option<Instant>,
     member: Option<String>,
     initialized: bool,
+    delays: Vec<(String, Option<u64>)>,
 }
 pub(crate) struct Groups {
     order: Vec<String>,
@@ -26,6 +27,9 @@ pub(crate) struct Groups {
     selections: RwLock<HashMap<String, Selection>>,
     pub sessions: Arc<super::group_sessions::Sessions>,
     active: AtomicBool,
+    sequence: AtomicU64,
+    testing: AtomicBool,
+    test_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 pub(crate) fn test_uri(url: &str) -> Result<http::Uri> {
     let uri: http::Uri = url.parse().context("invalid group test URL")?;
@@ -69,6 +73,9 @@ impl Groups {
             selections: RwLock::new(HashMap::new()),
             sessions: Arc::default(),
             active: AtomicBool::new(true),
+            sequence: AtomicU64::new(0),
+            testing: AtomicBool::new(false),
+            test_task: std::sync::Mutex::new(None),
             order,
         })
     }
@@ -78,9 +85,19 @@ impl Groups {
         group: &astra_ipc::groups::Group,
         path: &mut Vec<String>,
     ) -> Result<String> {
-        let target = group
+        let override_target = app
+            .overrides
+            .read()
+            .unwrap()
             .selected
+            .get(name)
+            .cloned()
+            .filter(|member| {
+                astra_ipc::groups::member_path(&app.config.proxy_groups, name, member).is_some()
+            });
+        let target = override_target
             .as_ref()
+            .or(group.selected.as_ref())
             .or_else(|| group.members.first())
             .context("proxy group has no members")?;
         let members = astra_ipc::groups::member_path(&app.config.proxy_groups, name, target)
@@ -155,13 +172,17 @@ impl Groups {
             } else {
                 guard
                     .get(&current)
-                    .and_then(|s| s.member.clone())
+                    .and_then(|s| self.member(group.mode, s))
                     .context("proxy group has no healthy members")?
             };
         };
-        let lease = self.sessions.lease(&path);
+        let mut lease = self.sessions.lease(&path);
+        lease.1 = Self::interface_for_path(app, &path);
         drop(guard);
         Ok((resolved, lease))
+    }
+    fn interface_for_path(app: &App, path: &[String]) -> Option<String> {
+        path.iter().find_map(|name| app.config.proxy_groups[name].interface.clone())
     }
     pub fn inherit(&mut self, old: &App, config: &crate::config::ProxyConfig) {
         self.sessions = old.groups.sessions.clone();
@@ -172,8 +193,8 @@ impl Groups {
                 .config
                 .proxy_groups
                 .get(name)
-                .is_some_and(|g| g.mode == Mode::Auto)
-                && group.mode == Mode::Auto
+                .is_some_and(|g| g.mode != Mode::Select)
+                && group.mode != Mode::Select
             {
                 if let Some(selection) = previous.get(name) {
                     if selection
@@ -194,6 +215,7 @@ impl Groups {
     pub fn committed(&self, old: &App, config: &crate::config::ProxyConfig) {
         let _guard = old.groups.selections.write().unwrap();
         old.groups.active.store(false, Ordering::Release);
+        old.groups.stop_test();
         for (name, previous) in &old.config.proxy_groups {
             let next = config.proxy_groups.get(name);
             let policy = next.unwrap_or(previous);
@@ -207,7 +229,7 @@ impl Groups {
                         != g.selected.as_ref().or_else(|| g.members.first())
             });
             let structural =
-                next.is_none_or(|g| g.mode != previous.mode || g.members != previous.members);
+                next.is_none_or(|g| g.mode != previous.mode || g.members != previous.members || g.interface != previous.interface);
             if (manual && policy.disconnect_on_manual)
                 || (structural && policy.disconnect_on_config_change)
             {
@@ -231,13 +253,8 @@ impl Groups {
             }
             if let Some(group) = app.config.proxy_groups.get(name) {
                 if group.mode == Mode::Select {
-                    if let Some(member) = group
-                        .selected
-                        .as_deref()
-                        .or_else(|| group.members.first().map(String::as_str))
-                    {
-                        pending.push(member);
-                    }
+                    // Refresh all nested automatic groups; manual overrides can name descendants.
+                    pending.extend(group.members.iter().map(String::as_str));
                 } else {
                     pending.extend(group.members.iter().map(String::as_str));
                 }
@@ -255,37 +272,40 @@ impl Groups {
                 if usable && self.locks[name].try_lock().is_err() {
                     continue;
                 }
-                self.refresh(app, name).await;
+                self.refresh(app, name, false).await;
             }
         }
         let resolved = self.cached(app, name)?;
         tracing::debug!(target: "astra_route", phase="group", group=%name, action=?resolved, "proxy group resolved");
         Ok(resolved)
     }
-    async fn refresh(&self, app: &App, name: &str) {
+    async fn refresh(&self, app: &App, name: &str, force: bool) {
         let group = &app.config.proxy_groups[name];
-        if group.mode != Mode::Auto || !self.active.load(Ordering::Acquire) {
+        if (group.mode == Mode::Select && !force) || !self.active.load(Ordering::Acquire) {
             return;
         }
         let _guard = self.locks[name].lock().await;
-        if self
-            .selections
-            .read()
-            .unwrap()
-            .get(name)
-            .and_then(|s| s.checked)
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(group.interval))
+        if !force
+            && self
+                .selections
+                .read()
+                .unwrap()
+                .get(name)
+                .and_then(|s| s.checked)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(group.interval))
         {
             return;
         }
         let results: Vec<_> = stream::iter(group.members.iter().cloned())
             .map(|member| async move {
                 let result = async {
-                    let action = self.cached(app, &member)?;
+                    let (action, mut path) = self.cached_path(app, &member)?;
+                    path.insert(0, name.to_owned());
+                    let interface = Self::interface_for_path(app, &path);
                     let start = Instant::now();
                     tokio::time::timeout(
                         Duration::from_millis(group.timeout_ms),
-                        probe(app, &action, &group.url),
+                        probe(app, &action, &group.url, interface.as_deref()),
                     )
                     .await??;
                     Ok::<_, anyhow::Error>(start.elapsed().as_millis() as u64)
@@ -304,16 +324,33 @@ impl Groups {
             return;
         }
         let selection = selections.entry(name.into()).or_default();
+        selection.delays = results.clone();
+        if group.mode == Mode::Select {
+            selection.checked = Some(Instant::now());
+            return;
+        }
         let best = results
             .iter()
             .filter_map(|(name, time)| time.map(|t| (name, t)))
-            .min_by_key(|(_, t)| *t);
+            .min_by_key(|(member, t)| {
+                if group.mode == Mode::Auto {
+                    *t
+                } else {
+                    group
+                        .members
+                        .iter()
+                        .position(|v| v == *member)
+                        .unwrap_or(usize::MAX) as u64
+                }
+            });
         let next = best.map(|(best, delay)| {
             if let Some((current, Some(current_delay))) = results
                 .iter()
                 .find(|(member, _)| Some(member) == selection.member.as_ref())
             {
-                if *current_delay <= delay.saturating_add(group.tolerance_ms) {
+                if group.mode == Mode::Auto
+                    && *current_delay <= delay.saturating_add(group.tolerance_ms)
+                {
                     return current.clone();
                 }
             }
@@ -344,9 +381,118 @@ impl Groups {
         selection.checked = Some(Instant::now());
         selection.initialized = true;
     }
+    fn member(&self, mode: Mode, selection: &Selection) -> Option<String> {
+        if mode == Mode::LoadBalance {
+            let healthy: Vec<_> = selection
+                .delays
+                .iter()
+                .filter(|(_, delay)| delay.is_some())
+                .map(|(name, _)| name)
+                .collect();
+            if healthy.is_empty() {
+                return None;
+            }
+            return Some(
+                healthy[self.sequence.fetch_add(1, Ordering::Relaxed) as usize % healthy.len()]
+                    .clone(),
+            );
+        }
+        selection.member.clone()
+    }
+    pub fn commit_overrides(
+        &self,
+        app: &App,
+        next: astra_ipc::runtime::Overrides,
+        disconnect: Option<&str>,
+    ) {
+        // The selected path and its cancellation epoch change as one operation.
+        let _guard = self.selections.write().unwrap();
+        *app.overrides.write().unwrap() = next;
+        if let Some(group) = disconnect {
+            self.sessions.disconnect(group, "manual");
+        }
+    }
+    pub fn stop_test(&self) {
+        if let Some(task) = self.test_task.lock().unwrap().take() {
+            task.abort();
+        }
+        self.testing.store(false, Ordering::Release);
+    }
+    pub fn request_test(app: std::sync::Arc<App>, name: String) -> Result<()> {
+        ensure!(
+            app.config.proxy_groups.contains_key(&name),
+            "unknown proxy group"
+        );
+        ensure!(
+            app.groups
+                .testing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a group test is already running"
+        );
+        let owner = app.clone();
+        let task = tokio::spawn(async move {
+            // Refresh dependencies first so nested automatic groups can be tested.
+            for dependency in &app.groups.order {
+                if dependency == &name {
+                    break;
+                }
+                app.groups.refresh(&app, dependency, false).await;
+            }
+            app.groups.refresh(&app, &name, true).await;
+            app.groups.testing.store(false, Ordering::Release);
+        });
+        *owner.groups.test_task.lock().unwrap() = Some(task);
+        Ok(())
+    }
+    pub fn snapshot(&self, app: &App) -> Vec<astra_ipc::runtime::Group> {
+        let selections = self.selections.read().unwrap();
+        let mut budget = 2048usize;
+        app.config
+            .proxy_groups
+            .iter()
+            .take(64)
+            .map(|(name, group)| {
+                let selection = selections.get(name);
+                let selected = if group.mode == Mode::Select {
+                    Self::manual_target(app, name, group, &mut Vec::new()).ok()
+                } else {
+                    selection.and_then(|s| s.member.clone())
+                };
+                let count = group.members.len().min(budget);
+                budget -= count;
+                astra_ipc::runtime::Group {
+                    name: name.clone(),
+                    mode: match group.mode {
+                        Mode::Select => "select",
+                        Mode::Auto => "url-test",
+                        Mode::Fallback => "fallback",
+                        Mode::LoadBalance => "load-balance",
+                    }
+                    .into(),
+                    selected,
+                    testing: self.testing.load(Ordering::Acquire),
+                    members: group
+                        .members
+                        .iter()
+                        .take(count)
+                        .map(|member| {
+                            let measured = selection
+                                .and_then(|s| s.delays.iter().find(|(name, _)| name == member));
+                            astra_ipc::runtime::Member {
+                                name: member.clone(),
+                                delay_ms: measured.and_then(|(_, delay)| *delay),
+                                alive: measured.map(|(_, delay)| delay.is_some()),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
     pub async fn refresh_all(&self, app: &App) {
         for name in &self.order {
-            self.refresh(app, name).await;
+            self.refresh(app, name, false).await;
         }
     }
 }
@@ -356,7 +502,7 @@ impl Drop for Driver {
         self.0.abort();
     }
 }
-async fn probe(app: &App, action: &RouteAction, url: &str) -> Result<()> {
+async fn probe(app: &App, action: &RouteAction, url: &str, interface: Option<&str>) -> Result<()> {
     let uri = test_uri(url)?;
     let host = uri.host().unwrap().trim_matches(['[', ']']);
     let target = Target {
@@ -369,7 +515,7 @@ async fn probe(app: &App, action: &RouteAction, url: &str) -> Result<()> {
                 80
             }),
     };
-    let mut connection: outbound::Stream = app.connect_resolved(&target, action).await?;
+    let mut connection: outbound::Stream = app.connect_resolved_on(&target, action, interface).await?;
     if uri.scheme_str() == Some("https") {
         use tokio_rustls::{
             rustls::{self, pki_types::ServerName, RootCertStore},
@@ -419,6 +565,52 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[test]
+    fn group_bindings_round_trip_and_reject_empty_names() {
+        let group: astra_ipc::groups::Group = toml::from_str("members=['DIRECT']\ninterface='虚拟网卡 VPN'\n").unwrap();
+        assert_eq!(group.interface.as_deref(), Some("虚拟网卡 VPN"));
+        let encoded = toml::to_string(&group).unwrap();
+        assert_eq!(toml::from_str::<astra_ipc::groups::Group>(&encoded).unwrap(), group);
+        for interface in ["", " ", "bad\nname"] {
+            let mut groups = std::collections::BTreeMap::new();
+            groups.insert("one".into(), astra_ipc::groups::Group {
+                interface: Some(interface.into()), members: vec!["DIRECT".into()], ..Default::default()
+            });
+            assert!(astra_ipc::groups::validate(&groups, &HashSet::new()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_groups_pin_the_outer_interface_and_isolate_pools() {
+        let text = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n[proxy_groups.outer]\nmembers=['child']\ninterface='Ethernet'\n[proxy_groups.child]\nmembers=['node']\ninterface='虚拟网卡 VPN'\n[proxy_groups.inherit]\nmembers=['child']\n";
+        let app = App::from_text(std::path::Path::new("group-bindings.toml"), text.into()).unwrap();
+        for (name, expected) in [("outer", "Ethernet"), ("child", "虚拟网卡 VPN"), ("inherit", "虚拟网卡 VPN")] {
+            let (action, lease) = app.resolve_session(&RouteAction::Proxy(name.into())).await.unwrap();
+            assert_eq!(action, RouteAction::Proxy("node".into()));
+            assert_eq!(lease.1.as_deref(), Some(expected));
+        }
+        let adapter = |name| match app.native_for(Some(name)).get("node").unwrap() {
+            crate::native::NativeOutbound::Adapter(adapter) => adapter.clone(),
+            _ => panic!("expected SOCKS adapter"),
+        };
+        assert!(!Arc::ptr_eq(&adapter("Ethernet"), &adapter("虚拟网卡 VPN")));
+        assert!(Arc::ptr_eq(&adapter("Ethernet"), &adapter("Ethernet")));
+        let (_, lease) = app.resolve_session(&RouteAction::Proxy("node".into())).await.unwrap();
+        assert!(lease.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_group_adapter_fails_closed_for_tcp_and_udp() {
+        let text = "standalone=true\nstandalone_outbound='bound'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.bound]\nmembers=['DIRECT']\ninterface='no-such-iface-zz9'\n";
+        let app = App::from_text(std::path::Path::new("group-bindings.toml"), text.into()).unwrap();
+        let action = RouteAction::Proxy("bound".into());
+        let target = Target { host: "127.0.0.1".into(), port: 1234 };
+        let error = app.connect(&target, &action).await.err().unwrap();
+        assert!(error.to_string().contains("does not exist"), "{error:#}");
+        let error = crate::udp::open_action(&app, &target, astra_ipc::Inbound::Socks5, "127.0.0.1:12345".parse().unwrap(), action).await.err().unwrap();
+        assert!(error.to_string().contains("does not exist"), "{error:#}");
+    }
+
     #[test]
     fn test_urls_reject_invalid_targets_and_allow_ipv6() {
         for url in [
@@ -503,6 +695,48 @@ mod tests {
     fn app(a: &Stub, b: &Stub, mode: &str, selected: &str, tolerance: u64) -> App {
         App::from_text(std::path::Path::new("groups.toml"), format!("standalone=true\nstandalone_outbound='main'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='http'\ntag='a'\nserver='{}'\n[[outbounds]]\nkind='http'\ntag='b'\nserver='{}'\n[proxy_groups.speed]\nmode='{mode}'\nmembers=['a','b']\nselected='{selected}'\nurl='http://example.test/204'\ninterval=1\ntimeout_ms=1000\ntolerance_ms={tolerance}\n[proxy_groups.main]\nmode='select'\nmembers=['speed','DIRECT']\nselected='speed'\n",a.address,b.address)).unwrap()
     }
+    #[tokio::test]
+    async fn fallback_uses_priority_and_load_balance_rotates_only_healthy_members() {
+        let a = stub(100, "a").await;
+        let b = stub(1, "b").await;
+        let action = RouteAction::Proxy("main".into());
+        let fallback = app(&a, &b, "fallback", "a", 0);
+        assert_eq!(
+            fallback.resolve_session(&action).await.unwrap().0,
+            RouteAction::Proxy("a".into())
+        );
+        a.healthy.store(false, Ordering::SeqCst);
+        expire(&fallback);
+        assert_eq!(
+            fallback.resolve_session(&action).await.unwrap().0,
+            RouteAction::Proxy("b".into())
+        );
+        a.healthy.store(true, Ordering::SeqCst);
+        expire(&fallback);
+        assert_eq!(
+            fallback.resolve_session(&action).await.unwrap().0,
+            RouteAction::Proxy("a".into())
+        );
+        let balanced = app(&a, &b, "load_balance", "a", 0);
+        for name in ["a", "b", "a", "b"] {
+            assert_eq!(
+                balanced.resolve_session(&action).await.unwrap().0,
+                RouteAction::Proxy(name.into())
+            );
+        }
+        a.healthy.store(false, Ordering::SeqCst);
+        expire(&balanced);
+        for _ in 0..3 {
+            assert_eq!(
+                balanced.resolve_session(&action).await.unwrap().0,
+                RouteAction::Proxy("b".into())
+            );
+        }
+        b.healthy.store(false, Ordering::SeqCst);
+        expire(&balanced);
+        assert!(balanced.resolve_session(&action).await.is_err());
+    }
+
     #[tokio::test]
     async fn parent_pins_descendant_without_changing_shared_child_selection() {
         let a = stub(1, "a").await;

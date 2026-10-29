@@ -16,6 +16,17 @@ pub struct ProxyConfig {
     pub shutdown_timeout_secs: u64,
     pub socks5_listen: Option<String>,
     pub http_listen: Option<String>,
+    pub mixed_listen: Option<String>,
+    #[serde(default)]
+    pub authentication: Vec<String>,
+    #[serde(rename = "allow_lan")]
+    pub _legacy_allow_lan: Option<bool>,
+    #[serde(default)]
+    pub lan_allowed_ips: Vec<ipnet::IpNet>,
+    #[serde(default)]
+    pub lan_disallowed_ips: Vec<ipnet::IpNet>,
+    #[serde(default)]
+    pub skip_auth_prefixes: Vec<ipnet::IpNet>,
     #[serde(default)]
     pub watch_config: bool,
     pub subscription: Option<astra_convert::subscription::Subscription>,
@@ -79,6 +90,7 @@ impl ProxyConfig {
     pub fn dns_only(&self) -> bool {
         self.socks5_listen.is_none()
             && self.http_listen.is_none()
+            && self.mixed_listen.is_none()
             && self.tun.is_none()
             && self.tproxy.is_none()
             && self.redirect.is_none()
@@ -152,12 +164,38 @@ impl ProxyConfig {
             !self.subscriptions.contains_key("__legacy__"),
             "reserved subscription name"
         );
+        anyhow::ensure!(
+            self.authentication.len() <= 64,
+            "at most 64 inbound users are allowed"
+        );
+        anyhow::ensure!(
+            self.lan_allowed_ips.len() <= 256
+                && self.lan_disallowed_ips.len() <= 256
+                && self.skip_auth_prefixes.len() <= 256,
+            "inbound ACL limit is 256 prefixes per list"
+        );
+        let mut users = std::collections::HashSet::new();
+        for credential in &self.authentication {
+            let (user, password) = credential
+                .split_once(':')
+                .context("authentication entries require username:password")?;
+            anyhow::ensure!(
+                !user.is_empty()
+                    && !password.is_empty()
+                    && user.len() <= 255
+                    && password.len() <= 255
+                    && !credential.contains(['\r', '\n'])
+                    && users.insert(user),
+                "invalid or duplicate inbound credentials"
+            );
+        }
         self.standalone_tag()?;
         crate::mode_config::validate(self)?;
         if !self.standalone && !self.dns_only() && self.rule_socket.is_empty() {
             bail!("rule_socket is required unless standalone = true");
         }
         if self.http_listen.is_none()
+            && self.mixed_listen.is_none()
             && self.socks5_listen.is_none()
             && self.tun.is_none()
             && self.tproxy.is_none()
@@ -229,7 +267,7 @@ impl ProxyConfig {
         astra_ipc::groups::validate(&self.proxy_groups, &map.keys().cloned().collect())
             .map_err(anyhow::Error::msg)?;
         for (name, group) in &self.proxy_groups {
-            if group.mode == astra_ipc::groups::Mode::Auto {
+            if group.mode != astra_ipc::groups::Mode::Select {
                 crate::proxy::groups::test_uri(&group.url)
                     .with_context(|| format!("proxy group {name}"))?;
             }
@@ -276,5 +314,31 @@ mod standalone_tests {
         let normal = config("rule_socket='/tmp/rules.sock'", 0);
         normal.validate().unwrap();
         assert_eq!(normal.standalone_tag().unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod inbound_acl_tests {
+    use super::*;
+    #[test]
+    fn lan_acl_and_authentication_exceptions_have_independent_precedence() {
+        let app = crate::App::from_text(std::path::Path::new("acl.toml"), "standalone=true\nstandalone_outbound='only'\nmixed_listen='0.0.0.0:7890'\nallow_lan=false\nauthentication=['alice:correct']\nlan_allowed_ips=['127.0.0.0/8','192.0.2.0/24']\nlan_disallowed_ips=['192.0.2.10/32']\nskip_auth_prefixes=['127.0.0.1/32']\n[proxy_groups.only]\nmembers=['DIRECT']\n".into()).unwrap();
+        assert!(app.inbound_allowed("127.0.0.1".parse().unwrap()));
+        assert!(!app.inbound_allowed("192.0.2.11".parse().unwrap()));
+        app.overrides.write().unwrap().allow_lan = Some(true);
+        assert!(app.inbound_allowed("192.0.2.11".parse().unwrap()));
+        assert!(!app.inbound_allowed("192.0.2.10".parse().unwrap()));
+        assert!(!app.inbound_allowed("198.51.100.1".parse().unwrap()));
+        assert!(app
+            .authentication(Some("127.0.0.1".parse().unwrap()))
+            .is_empty());
+        assert_eq!(
+            app.authentication(Some("192.0.2.11".parse().unwrap()))
+                .len(),
+            1
+        );
+        assert_eq!(app.authentication(None).len(), 1);
+        let bad: ProxyConfig = toml::from_str("authentication=['missing-separator']").unwrap();
+        assert!(bad.validate().is_err());
     }
 }

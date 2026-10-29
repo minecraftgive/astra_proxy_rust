@@ -23,11 +23,13 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
         if tun_enabled && !astra_ipc::elevation::is_elevated()? {
             let path = std::fs::canonicalize(path)?;
             // A separate elevated core keeps the calling shell/launcher unprivileged.
-            let log = path.with_extension("elevated.log");
+            let log = astra_ipc::storage::runtime_path(&path, "elevated-logs")?;
+            astra_ipc::storage::prepare_parent(&log)?;
             let socket = std::env::var_os("ASTRA_CONTROL_SOCKET")
                 .map(std::path::absolute)
                 .transpose()?
-                .unwrap_or_else(|| path.with_extension("elevated.sock"));
+                .unwrap_or(astra_ipc::storage::runtime_path(&path, "elevated-control")?);
+            astra_ipc::storage::prepare_parent(&socket)?;
             let level = std::env::var("ASTRA_LOG_LEVEL")
                 .or_else(|_| std::env::var("RUST_LOG"))
                 .unwrap_or_else(|_| "info".into());

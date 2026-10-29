@@ -127,7 +127,11 @@ impl Viewer {
         self.source = socket
             .parent()
             .unwrap_or(Path::new("."))
-            .join(format!("{}.log", self.name));
+            .join(if self.name == "@tui" {
+                "tui.log".to_owned()
+            } else {
+                format!("{}.log", self.name)
+            });
         let mut stream = crate::log_stream::connect(socket, self.name.clone(), self.cursor).await?;
         let (sender, receiver) = mpsc::channel(16);
         let task = tokio::spawn(async move {

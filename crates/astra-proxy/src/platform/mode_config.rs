@@ -2,7 +2,7 @@ use anyhow::{bail, ensure, Result};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemProxy {
     /// macOS network service names; empty discovers all enabled services.
@@ -26,10 +26,13 @@ fn local_proxy_address(listener: &str) -> Result<SocketAddr> {
 
 pub(crate) fn system_proxy_address(config: &crate::config::ProxyConfig) -> Result<SocketAddr> {
     #[cfg(windows)]
-    let listener = &config.http_listen;
+    let listener = config.http_listen.as_ref().or(config.mixed_listen.as_ref());
     #[cfg(not(windows))]
-    let listener = &config.socks5_listen;
-    let listener = listener.as_deref().ok_or_else(|| {
+    let listener = config
+        .socks5_listen
+        .as_ref()
+        .or(config.mixed_listen.as_ref());
+    let listener = listener.map(String::as_str).ok_or_else(|| {
         anyhow::anyhow!(
         "system_proxy requires an HTTP listener on Windows, or a SOCKS5 listener on macOS/Linux"
     )
@@ -67,6 +70,44 @@ pub struct Tun {
     #[serde(default = "auto_gateway")]
     pub sniff: bool,
 }
+impl Default for Tun {
+    fn default() -> Self {
+        Self {
+            name: None,
+            address: address(),
+            ipv6_address: None,
+            ipv6_prefix: ipv6_prefix(),
+            prefix: prefix(),
+            mtu: mtu(),
+            routes: vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()],
+            bypass: vec![],
+            gateway: None,
+            gateway6: None,
+            interface: None,
+            auto_interface: Some(true),
+            auto_gateway: true,
+            sniff: true,
+        }
+    }
+}
+/// Tables contain fixed network parameters, never on/off state. Defaults are
+/// created in memory when the user enables a mode through runtime control.
+pub(crate) fn runtime_modes(
+    config: &mut crate::config::ProxyConfig,
+    state: &astra_ipc::runtime::Overrides,
+) {
+    if state.system_proxy == Some(true) {
+        config.system_proxy.get_or_insert_with(SystemProxy::default);
+    } else {
+        config.system_proxy = None;
+    }
+    if state.tun == Some(true) {
+        config.tun.get_or_insert_with(Tun::default);
+    } else {
+        config.tun = None;
+    }
+}
+
 fn auto_gateway() -> bool {
     true
 }
@@ -91,7 +132,12 @@ pub struct Transparent {
 
 pub fn validate(config: &crate::config::ProxyConfig) -> Result<()> {
     let mut listeners = std::collections::HashSet::new();
-    for address in config.socks5_listen.iter().chain(&config.http_listen) {
+    for address in config
+        .socks5_listen
+        .iter()
+        .chain(&config.http_listen)
+        .chain(&config.mixed_listen)
+    {
         ensure!(
             listeners.insert(address.clone()),
             "inbound listeners must use distinct addresses"
@@ -253,5 +299,55 @@ impl Tun {
         } else {
             self.gateway.filter(IpAddr::is_ipv4)
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_mode_tests {
+    use super::*;
+    #[test]
+    fn fixed_tables_never_enable_runtime_modes_and_defaults_need_no_tables() {
+        let mut config:crate::config::ProxyConfig=toml::from_str("socks5_listen='127.0.0.1:1080'\nhttp_listen='127.0.0.1:8080'\n[system_proxy]\n[tun]\nname='fixed-network-parameters'\n").unwrap();
+        let state = astra_ipc::runtime::Overrides::default();
+        runtime_modes(&mut config, &state);
+        assert!(config.system_proxy.is_none());
+        assert!(config.tun.is_none());
+        let enabled = astra_ipc::runtime::Overrides {
+            system_proxy: Some(true),
+            tun: Some(true),
+            ..Default::default()
+        };
+        runtime_modes(&mut config, &enabled);
+        assert!(config.system_proxy.is_some());
+        assert_eq!(
+            system_proxy_address(&config).unwrap().port(),
+            if cfg!(windows) { 8080 } else { 1080 }
+        );
+        let tun = config.tun.as_ref().unwrap();
+        assert_eq!(tun.routes, ["0.0.0.0/1", "128.0.0.0/1"]);
+        assert!(tun.detects_interface());
+        runtime_modes(&mut config, &state);
+        assert!(config.system_proxy.is_none());
+        assert!(config.tun.is_none());
+    }
+    #[test]
+    fn explicit_fixed_tun_parameters_are_kept_only_while_enabled() {
+        let mut config: crate::config::ProxyConfig =
+            toml::from_str("[tun]\nname='my-device'\nmtu=1400\n").unwrap();
+        runtime_modes(
+            &mut config,
+            &astra_ipc::runtime::Overrides {
+                tun: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.tun.as_ref().unwrap().name.as_deref(),
+            Some("my-device")
+        );
+        assert_eq!(config.tun.as_ref().unwrap().mtu, 1400);
+        let without_listener: crate::config::ProxyConfig =
+            toml::from_str("standalone=true\n").unwrap();
+        assert!(system_proxy_address(&without_listener).is_err());
     }
 }

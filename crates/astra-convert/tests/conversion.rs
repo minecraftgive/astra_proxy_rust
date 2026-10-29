@@ -208,7 +208,7 @@ fn protocols_transports_and_rules() {
     let r = toml(&c.rules);
     assert_eq!(c.nodes, 7);
     assert_eq!(c.rule_count, 7);
-    assert_eq!(p["socks5_listen"].as_str(), Some("127.0.0.1:7890"));
+    assert_eq!(p["mixed_listen"].as_str(), Some("127.0.0.1:7890"));
     assert_eq!(r["default_action"].as_str(), Some("proxy:PROXY"));
     assert_eq!(p["proxy_groups"]["Proxy"]["mode"].as_str(), Some("select"));
     assert_eq!(
@@ -302,7 +302,11 @@ fn malformed_values_duplicates_and_authentication() {
     .unwrap();
     assert_eq!(
         toml(&c.proxy)["socks5_listen"].as_str(),
-        Some("127.0.0.1:1080")
+        Some("0.0.0.0:1080")
+    );
+    assert_eq!(
+        toml(&c.proxy)["authentication"][0].as_str(),
+        Some("user:password")
     );
     let c = convert("rules: ['DST-PORT,80-90,DIRECT', 'IP-CIDR,bad,DIRECT', 'NETWORK,icmp,DIRECT', 'DOMAIN,,DIRECT']", &Options::default()).unwrap();
     assert_eq!(c.rule_count, 0);
@@ -641,4 +645,31 @@ fn mihomo_dynamic_node_filters_survive_conversion() {
         astra_ipc::groups::expand(&groups, &std::collections::HashSet::from(["JP-a".into()]))
             .unwrap();
     assert_eq!(expanded["region"].members, ["JP-a"]);
+}
+
+#[test]
+fn mixed_authenticated_lan_and_new_group_modes_are_preserved() {
+    let converted = convert("mixed-port: 7890\nallow-lan: true\nauthentication: ['user:password']\nlan-allowed-ips: ['192.0.2.0/24']\nlan-disallowed-ips: ['192.0.2.10/32']\nskip-auth-prefixes: ['127.0.0.1/32']\nproxy-groups:\n  - name: Backup\n    type: fallback\n    proxies: [DIRECT]\n  - name: Balance\n    type: load-balance\n    strategy: round-robin\n    proxies: [DIRECT]\n", &Options::default()).unwrap();
+    let proxy = toml(&converted.proxy);
+    assert_eq!(proxy["mixed_listen"].as_str(), Some("0.0.0.0:7890"));
+    assert!(proxy.get("allow_lan").is_none());
+    assert_eq!(proxy["authentication"][0].as_str(), Some("user:password"));
+    assert_eq!(proxy["lan_allowed_ips"][0].as_str(), Some("192.0.2.0/24"));
+    assert_eq!(
+        proxy["lan_disallowed_ips"][0].as_str(),
+        Some("192.0.2.10/32")
+    );
+    assert_eq!(
+        proxy["skip_auth_prefixes"][0].as_str(),
+        Some("127.0.0.1/32")
+    );
+    assert_eq!(
+        proxy["proxy_groups"]["Backup"]["mode"].as_str(),
+        Some("fallback")
+    );
+    assert_eq!(
+        proxy["proxy_groups"]["Balance"]["mode"].as_str(),
+        Some("load_balance")
+    );
+    assert!(convert("lan-allowed-ips: ['invalid']", &Options::default()).is_err());
 }

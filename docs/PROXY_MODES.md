@@ -12,13 +12,13 @@
 | `[tproxy]` | Linux | 策略路由与 TPROXY 送入的 TCP/UDP | CAP_NET_ADMIN 或 CAP_NET_RAW、内核 TPROXY、nftables/iptables |
 | `[redirect]` | Linux | NAT REDIRECT 送入的 TCP | 外部 NAT 规则；UDP 使用 TPROXY |
 
-这些模式可并用；配置表存在即启用，删除整张表即可关闭。TPROXY/REDIRECT 在 macOS/Windows 的配置检查阶段就会被拒绝。普通监听、原生出站和 standalone 保持原有语义。Windows TUN、系统代理与普通 HTTP 转发已通过本机集成检查，范围及复现见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)。
+这些模式可并用。系统代理和 TUN 的启停已移出配置，保存在独立运行目录 `overrides/`；首次启动默认关闭，通过 TUI 的 S/T 或 `--runtime SOCKET system-proxy on|off`、`--runtime SOCKET tun on|off` 切换。对应配置表只定义固定网络参数，缺失时使用运行时默认参数；重置会关闭两种模式。TPROXY/REDIRECT 的监听定义仍属于固定入站配置。TPROXY/REDIRECT 在 macOS/Windows 的配置检查阶段就会被拒绝。普通监听、原生出站和 standalone 保持原有语义。Windows TUN、系统代理与普通 HTTP 转发已通过本机集成检查，范围及复现见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)。
 
 完整字段见 `example_proxy.toml`，精简模板见 `configs/modes.toml`。
 
 ## 系统代理
 
-代理配置顶层开启 SOCKS5 监听，然后添加表：
+固定监听在代理配置顶层设置；系统代理使用 TUI 的 S 开启，不需要添加配置表。仅需指定 macOS 网络服务时可保留固定参数表：
 
 ```toml
 socks5_listen = "127.0.0.1:1080"
@@ -27,7 +27,7 @@ socks5_listen = "127.0.0.1:1080"
 services = ["Wi-Fi"] # macOS；省略或 [] 自动发现启用的网络服务
 ```
 
-Linux GNOME 使用空表 `[system_proxy]`，不要填写 macOS 的服务名。服务运行在当前桌面用户的 D-Bus 会话中；无 GNOME 会话的 Linux 服务器使用 TUN/TPROXY。
+Linux GNOME 不需要 `[system_proxy]`，不要填写 macOS 的服务名。服务运行在当前桌面用户的 D-Bus 会话中；无 GNOME 会话的 Linux 服务器使用 TUN/TPROXY。
 
 macOS/Linux 系统集成使用 SOCKS，HTTP 入站在这两个平台仍只支持 CONNECT。启用时临时关闭优先级更高的 HTTP/HTTPS/PAC 自动设置，GNOME 清空 HTTP/HTTPS/FTP 代理 host；原值全部记录后才写入，正常停止或关闭此模式时恢复。系统代理仍由应用决定是否遵循，不能强制接管忽略代理的程序。已有需要认证的 macOS SOCKS 设置不能完整读回密码，因此会拒绝启用并保留原设置。
 
@@ -44,7 +44,7 @@ Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS �
 
 Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；发生崩溃时新实例会指出要恢复的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
 
-写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则在初始代理配置旁，例如 `configs/modes.system-proxy-state.toml`。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
+写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则写入 `~/.astra/runtime/system-proxy/<源路径摘要>.cache`（`ASTRA_RUNTIME_DIR` 可自定义根目录）。旧配置旁若存在未恢复记录，会提示先用恢复命令处理，避免遗漏旧的系统设置快照。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
 
 ```sh
 ./target/release/astra-proxy --restore-system-proxy /absolute/path/to/modes.system-proxy-state.toml
@@ -86,7 +86,7 @@ Linux/macOS 的进程需以具备建卡/改路由权限的身份运行。Windows
 
 TUI manager 持有系统返回的进程句柄，继续校验核心 PID、读取原实例日志、通过 IPC 热重载和优雅停止；IPC 失败或停止超时才通过持有的句柄强制终止。每次重启均重新判断权限，不保存持久管理员授权。UAC 必须使用原 Windows 账户，避免切换账户后操作错误的用户代理设置或失去私有 IPC 访问权限。
 
-直接运行 `astra-proxy.exe 配置文件` 也支持按需提权，原进程等待管理员核心退出，日志写入配置旁的同名 `.elevated.log`；Ctrl+C 会通过管理端点请求停止。没有指定 `ASTRA_CONTROL_SOCKET` 时使用配置旁的同名 `.elevated.sock` 作为 Windows 命名管道标识。普通权限实例通过热重载首次开启 TUN 时会拒绝候选配置并保留当前运行状态，需要重启该实例以请求 UAC。关闭 TUN 会清理设备和路由；该核心的管理员令牌持续到进程退出，若要恢复普通权限，应关闭 TUN 后重启实例。
+直接运行 `astra-proxy.exe 配置文件` 也支持按需提权，原进程等待管理员核心退出，日志写入独立运行目录的 `elevated-logs/<源路径摘要>.cache`；Ctrl+C 会通过管理端点请求停止。没有指定 `ASTRA_CONTROL_SOCKET` 时使用独立运行目录的 `elevated-control/<源路径摘要>.cache` 作为 Windows 命名管道标识。普通权限实例通过热重载首次开启 TUN 时会拒绝候选配置并保留当前运行状态，需要重启该实例以请求 UAC。关闭 TUN 会清理设备和路由；该核心的管理员令牌持续到进程退出，若要恢复普通权限，应关闭 TUN 后重启实例。
 
 Windows 使用 [Wintun 官方签名 DLL](https://www.wintun.net/)。运行前按 [安装说明](INSTALL.md) 准备匹配架构的 DLL 和许可文件；准备脚本只下载和复制文件，不加载驱动。DLL 默认从可执行文件目录按完整路径加载，也可由 `ASTRA_WINTUN_DLL` 指定可信路径。同名设备存在时尝试打开已有 Wintun 并建立会话，成功后按配置设置地址、MTU 和 metric；设备被占用、不是 Wintun 或无法访问时返回底层错误。退出时关闭本次会话和句柄，不卸载共享驱动；打开外部创建的设备不会取得其删除所有权。
 

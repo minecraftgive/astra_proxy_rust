@@ -142,6 +142,9 @@ struct State {
 }
 fn load(path: &std::path::Path) -> Result<(String, RuleConfig, RuleEngine)> {
     let text = std::fs::read_to_string(path)?;
+    load_text(path, text)
+}
+fn load_text(path: &std::path::Path, text: String) -> Result<(String, RuleConfig, RuleEngine)> {
     let config: RuleConfig = toml::from_str(&text)?;
     ResourceWatch::new(&config, path)?;
     let rules = RuleEngine::compile_at(
@@ -206,6 +209,19 @@ async fn main() -> Result<()> {
             astra_ipc::control::Command::Reload { path },
         )
         .await?;
+        return Ok(());
+    }
+    if first.as_deref() == Some("--check-stdin") {
+        use std::io::Read;
+        let path = args
+            .next()
+            .context("--check-stdin requires the configuration path")?;
+        let mut text = String::new();
+        std::io::stdin()
+            .take(480 * 1024 + 1)
+            .read_to_string(&mut text)?;
+        anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+        load_text(std::path::Path::new(&path), text)?;
         return Ok(());
     }
     let check = first.as_deref() == Some("--check");

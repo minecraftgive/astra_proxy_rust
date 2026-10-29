@@ -7,9 +7,13 @@ use tokio::{net::TcpStream, time::timeout};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
-    let (command, target) = timeout(HANDSHAKE_TIMEOUT, read_socks_request(&mut client))
-        .await
-        .context("SOCKS5 handshake timeout")??;
+    let users = app.authentication(client.peer_addr().ok().map(|s| s.ip()));
+    let (command, target) = timeout(
+        HANDSHAKE_TIMEOUT,
+        read_socks_request_with_auth(&mut client, users),
+    )
+    .await
+    .context("SOCKS5 handshake timeout")??;
     if command == 3 {
         return crate::udp::associate(client, target, app).await;
     }
@@ -49,4 +53,4 @@ pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
-use astra_protocols::socks5::{read_socks_request, reply_socks5};
+use astra_protocols::socks5::{read_socks_request_with_auth, reply_socks5};

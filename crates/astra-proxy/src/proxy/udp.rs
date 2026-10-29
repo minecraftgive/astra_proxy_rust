@@ -125,6 +125,7 @@ impl PacketConnection {
         let result: Result<usize> = tokio::select! {
             biased;
             _ = self.lease.cancelled() => bail!("proxy group switched; UDP flow closed"),
+            _ = super::traffic::Traffic::cancelled(&self.traffic) => bail!("UDP flow closed by user"),
             result = async { match &self.transport {
             PacketTransport::Direct(socket) => socket.send(bytes).await.map_err(Into::into),
             PacketTransport::Proxy(socket) => socket
@@ -154,6 +155,7 @@ impl PacketConnection {
         let result: Result<_> = tokio::select! {
             biased;
             _ = self.lease.cancelled() => bail!("proxy group switched; UDP flow closed"),
+            _ = super::traffic::Traffic::cancelled(&self.traffic) => bail!("UDP flow closed by user"),
             result = async {
             Ok(match &self.transport {
                 PacketTransport::Direct(socket) => (socket.recv(bytes).await?, socket.peer_addr()?),
@@ -200,9 +202,16 @@ pub(crate) async fn open_action(
     let restored = app.restore_fake_target(target)?;
     let target = &restored;
     let (action, lease) = app.resolve_session(&action).await?;
-    let traffic =
-        super::traffic::Traffic::new(Some(source), target, inbound, Network::Udp, &action);
-    let result: Result<PacketTransport> = async {
+    let interface = lease.1.as_deref().or_else(|| app.config.tun.as_ref().and_then(|tun| tun.interface.as_deref()));
+    let traffic = super::traffic::Traffic::new(
+        &app.metrics,
+        Some(source),
+        target,
+        inbound,
+        Network::Udp,
+        &action,
+    );
+    let result: Result<PacketTransport> = meow_common::outbound_iface::with_outbound_interface(interface, async {
         match action {
             RouteAction::Block => bail!("UDP blocked"),
             RouteAction::Direct => {
@@ -212,12 +221,7 @@ pub(crate) async fn open_action(
                     .into_iter()
                     .next()
                     .context("UDP destination has no addresses")?;
-                let interface = app
-                    .config
-                    .tun
-                    .as_ref()
-                    .and_then(|tun| tun.interface.as_deref());
-                if app.config.tun.is_some() {
+                if interface.is_some() || app.config.tun.is_some() {
                     destination = crate::egress::scoped_destination(destination, interface)?;
                 }
                 let socket = UdpSocket::bind(if destination.is_ipv4() {
@@ -240,7 +244,7 @@ pub(crate) async fn open_action(
             }
             RouteAction::Proxy(tag) => {
                 let outbound = app
-                    .native
+                    .native_for(interface)
                     .get(&tag)
                     .with_context(|| format!("outbound {tag} does not support UDP"))?;
                 Ok(PacketTransport::Proxy(
@@ -248,8 +252,8 @@ pub(crate) async fn open_action(
                 ))
             }
         }
-    }
-    .await;
+    })
+    .await?;
     match result {
         Ok(transport) => {
             if let Some(traffic) = &traffic {

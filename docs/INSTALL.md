@@ -30,7 +30,7 @@ python scripts/astra.py --debug --check
 python scripts/astra.py --debug
 ```
 
-归档仍使用 `.tar.gz`，程序带 `.exe` 后缀；可使用 Windows 自带 `tar` 解压。TUI 默认状态目录是 `%LOCALAPPDATA%/.astra/tui`（缺少 LOCALAPPDATA 时回退 USERPROFILE），支持空格、中文及超过 Unix socket 长度限制的状态路径。命名管道仅允许当前用户访问，状态文件和 TUI 保存的配置使用当前用户 ACL。
+归档仍使用 `.tar.gz`，程序带 `.exe` 后缀；可使用 Windows 自带 `tar` 解压。TUI 默认状态目录是 `%LOCALAPPDATA%/.astra/tui`，配置目录是 `%LOCALAPPDATA%/.astra/config`，订阅和远程资源缓存位于 `%LOCALAPPDATA%/.astra/runtime`（缺少 LOCALAPPDATA 时回退 USERPROFILE）。可分别用 `--state-dir`、`--config-dir` 和 `ASTRA_RUNTIME_DIR` 自定义，配置与状态目录不能重合或嵌套；支持空格、中文及超过 Unix socket 长度限制的状态路径。命名管道仅允许当前用户访问，状态文件和 TUI 保存的配置使用当前用户 ACL。
 
 默认 MSVC 构建动态依赖 `VCRUNTIME140.dll`，代理还依赖 `MSVCP140.dll`。目标 Windows 机器需要安装匹配架构且不旧于构建工具版本的 [Microsoft Visual C++ v14 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)。运行程序不需要 Rust、CMake、NASM 或 libclang。
 

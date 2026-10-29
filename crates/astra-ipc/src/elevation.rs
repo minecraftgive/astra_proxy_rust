@@ -201,6 +201,11 @@ pub fn core_arguments(
             .unwrap_or_default(),
         std::env::current_dir()?.into_os_string(),
         user_sid()?.into(),
+        std::env::var_os("ASTRA_RUNTIME_DIR")
+            .map(std::path::absolute)
+            .transpose()?
+            .map(|p| p.into_os_string())
+            .unwrap_or_default(),
     ])
 }
 pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
@@ -251,13 +256,18 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     if args.first().is_none_or(|arg| arg != "--windows-elevated") {
         return Ok(None);
     }
-    if args.len() != 8 || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
+    if args.len() != 9 || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "TUN elevation requires the original Windows account and an elevated token",
         ));
     }
     std::env::set_current_dir(&args[6])?;
+    if args[8].is_empty() {
+        std::env::remove_var("ASTRA_RUNTIME_DIR");
+    } else {
+        std::env::set_var("ASTRA_RUNTIME_DIR", &args[8]);
+    }
     if !args[2].is_empty() {
         std::env::set_var("ASTRA_CONTROL_SOCKET", &args[2]);
     } else {

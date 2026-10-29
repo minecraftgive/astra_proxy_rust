@@ -32,6 +32,7 @@ def main():
     binary = str(args.bin_dir.resolve()/executable('astra-proxy'))
     with tempfile.TemporaryDirectory(prefix='astra multi subscriptions ') as td, contextlib.ExitStack() as stack:
         directory = pathlib.Path(td)
+        runtime = directory / 'runtime'
         server = stack.enter_context(http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler))
         def node(name):
             return f'proxies: [{{name: {name}, type: socks5, server: 127.0.0.1, port: 1234}}]'
@@ -39,7 +40,6 @@ def main():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         stack.callback(server.shutdown)
         config = directory/'proxy.toml'
-        cache = config.with_suffix('.subscription-cache.json')
         control = directory/'control.sock'
         log_path = directory/'core.log'
         port = free_port()
@@ -51,14 +51,18 @@ def main():
         config.write_text(base+source('one', '/a')+source('two', '/b'), encoding='utf-8')
         with log_path.open('w', encoding='utf-8') as log:
             child = subprocess.Popen([binary, str(config)], stdout=log, stderr=subprocess.STDOUT,
-                env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(control)), **process_flags())
+                env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(control), ASTRA_RUNTIME_DIR=str(runtime)), **process_flags())
             def expect(names):
                 deadline = time.monotonic()+20
                 while time.monotonic() < deadline:
                     assert child.poll() is None, log_path.read_text(encoding='utf-8')
                     try:
                         import tomllib
-                        data = json.loads(cache.read_text(encoding='utf-8'))
+                        caches = list((runtime / 'subscriptions').glob('*.cache'))
+                        if len(caches) != 1:
+                            time.sleep(.1)
+                            continue
+                        data = json.loads(caches[0].read_text(encoding='utf-8'))
                         effective = tomllib.loads(data['effective'])
                         tags = {n['tag'] for n in effective['outbounds']}
                         if tags == set(names):
@@ -68,6 +72,7 @@ def main():
                                 assert len(owned) == 1, groups
                                 assert set(owned[0]['members']) == set(ownership['managed_nodes']), owned
                             assert groups['one']['include_in_proxy'] is False
+                            assert not config.with_suffix('.subscription-cache.json').exists(), 'core wrote cache beside source configuration'
                             return
                     except (OSError, KeyError, ValueError): pass
                     time.sleep(.1)

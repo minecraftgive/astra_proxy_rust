@@ -4,7 +4,7 @@ watch_config = true
 socks5_listen = "127.0.0.1:1080"
 http_listen = "127.0.0.1:8080"
 
-# Current-user Windows LAN HTTP/HTTPS proxy; no administrator required.
+# Current-user Windows LAN HTTP/HTTPS proxy; use TUI S to toggle, no table required.
 # [system_proxy]
 
 # Wintun requires administrator and the matching signed wintun.dll beside the EXE.

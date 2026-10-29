@@ -59,7 +59,7 @@ async fn tail(
     path: PathBuf,
     mut cursor: Option<LogCursor>,
 ) -> io::Result<()> {
-    let mut timer = interval(Duration::from_millis(200));
+    let mut timer = interval(crate::UI_REFRESH_INTERVAL);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut waiting = false;
     loop {

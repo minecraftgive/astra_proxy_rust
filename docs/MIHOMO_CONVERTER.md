@@ -65,11 +65,11 @@ target/release/astra-proxy converted/proxy.toml
 
 支持 YAML anchors 和合并键。数字形式的端口、密码和 short-id 按解析后的标量转换；带前导零的 short-id 等必须在源 YAML 中加引号。
 
-`skip-cert-verify` 忽略且输出提示，Astra 仍验证证书。不转换 CA、客户端证书、ECH、自定义 ALPN 等未映射 TLS 项；这些节点可能需要手工调整。入站认证无法映射，存在 `authentication` 时将监听限制为 `127.0.0.1`。
+`skip-cert-verify` 忽略且输出提示，Astra 仍验证证书。不转换 CA、客户端证书、ECH、自定义 ALPN 等未映射 TLS 项；这些节点可能需要手工调整。`authentication` 保留为用户名:密码列表，作用于 SOCKS5、HTTP CONNECT 和普通 HTTP 转发；`mixed-port` 对应原生混合端口。`allow-lan`、允许/拒绝来源网段和 `skip-auth-prefixes` 也会保留。
 
 ## 代理组和跳过策略
 
-`select` 和 `url-test` 保留为原生 `proxy_groups`，对应手动模式 `select` 和自动测速 `auto`。保留成员、有效的嵌套引用、url、interval、timeout、tolerance；`include-all-proxies`、`filter`、`exclude-filter` 映射为动态节点规则。`--select GROUP=MEMBER` 必须指定直接成员，并将该组改为手动选择此成员；不存在或不可转换的选择报错。原生组上限 128 个、总计 4096 个成员、嵌套最多 32 层，不允许循环。无法保留的组会带源行号提示；`fallback`、`load-balance` 延用首个可转换成员的固定动作，并提示没有保留其故障转移或负载均衡语义。链式 `relay` 组忽略。
+`select`、`url-test`、`fallback`、`load-balance` 保留为原生 `proxy_groups`，对应 `select`、`auto`、`fallback`、`load_balance`。fallback 按配置顺序选择健康成员；load_balance 在健康成员中按新流轮询，尚未实现 consistent-hashing 和 sticky-sessions。保留成员、有效的嵌套引用、url、interval、timeout、tolerance；`include-all-proxies`、`filter`、`exclude-filter` 映射为动态节点规则。`--select GROUP=MEMBER` 必须指定直接成员，并将该组改为手动选择此成员；不存在或不可转换的选择报错。原生组上限 128 个、总计 4096 个成员、嵌套最多 32 层，不允许循环。无法保留的组会带源行号提示；非轮询的 load-balance 策略不会保留原算法，请转换后确认组行为。链式 `relay` 组忽略。
 
 转换结果始终定义 `PROXY` 组，源配置未定义同名组时，默认动态包含所有已转换节点。所有代理动作（包括 MATCH/默认代理动作及 RULE-SET 的代理动作）统一写成 `proxy:PROXY`；明确的 DIRECT、REJECT 保持原动作，规则顺序不变。保留下来的其他组可在 PROXY 的 members 中引用，或手动调整原生规则指向这些组。`--select` 修改对应保留组的选择；该组被 PROXY 引用时才参与统一代理路径。节点使用保留名称 PROXY 时转换报错，需先改名。
 
@@ -151,7 +151,7 @@ astra-convert "https://example.com/clash?token=YOUR_TOKEN" -o configs/subscribed
 
 默认保留全部本地代理组，包括断开连接策略和选择。若更新移除了本地静态组正在引用的节点，此次更新会被拒绝；推荐使用动态成员筛选。开启导入订阅组后，本地同名组优先，订阅组会保留仍有效的手动选择及断开连接策略，连接切换遵守 `disconnect_on_*`。
 
-成功结果写入配置旁的 `*.subscription-cache.json`，保存节点、归属及对应配置。重启时先校验并恢复缓存，再检查订阅，断网时仍可使用最新成功节点。缓存损坏或本地配置发生改变时忽略旧缓存，重新从当前配置和链接建立状态。缓存文件包含节点凭据，权限与本地配置同样需要妥善保管。保存缓存失败会记录提示，不丢弃已经可用的运行节点。
+成功结果写入 `~/.astra/runtime/subscriptions/<源路径摘要>.cache`（可用 `ASTRA_RUNTIME_DIR` 指定根目录）；旧配置旁的 `*.subscription-cache.json` 只兼容读取，保存节点、归属及对应配置。重启时先校验并恢复缓存，再检查订阅，断网时仍可使用最新成功节点。缓存损坏或本地配置发生改变时忽略旧缓存，重新从当前配置和链接建立状态。缓存文件包含节点凭据，权限与本地配置同样需要妥善保管。保存缓存失败会记录提示，不丢弃已经可用的运行节点。
 
 每份 YAML/响应上限为 8 MiB，最多展开 32 个 providers、4096 个节点；核心仍校验自身节点与组的容量限制。HTTP 请求有超时、证书校验和有限重定向；更新日志不输出订阅链接或凭据。订阅的 interval 统一控制其中 providers 的检查周期。
 

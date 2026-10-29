@@ -14,7 +14,7 @@ use tokio::{
 
 #[derive(Default)]
 pub(crate) struct Sessions(Mutex<HashMap<String, watch::Sender<u64>>>);
-pub(crate) struct Lease(Vec<(watch::Receiver<u64>, u64)>);
+pub(crate) struct Lease(Vec<(watch::Receiver<u64>, u64)>, pub Option<String>);
 impl Sessions {
     pub fn lease(&self, path: &[String]) -> Lease {
         let mut groups = self.0.lock().unwrap();
@@ -30,6 +30,7 @@ impl Sessions {
                     (receiver, epoch)
                 })
                 .collect(),
+            None,
         )
     }
     pub fn disconnect(&self, group: &str, reason: &str) {

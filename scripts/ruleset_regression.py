@@ -2,10 +2,12 @@
 """Mihomo -> native rule providers, MMDB, updates and failed-update retention."""
 import argparse
 import contextlib
+import functools
 import http.server
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
@@ -36,6 +38,16 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix='astra-rule-sources-') as temporary, contextlib.ExitStack() as stack:
         root = Path(temporary)
+        runtime = root / 'runtime'
+        env = dict(os.environ, ASTRA_RUNTIME_DIR=str(runtime))
+        run = functools.partial(subprocess.run, env=env)
+
+        def cached_resource(payload):
+            matches = [path for path in (runtime / 'resources').glob('*.cache')
+                       if path.read_bytes() == payload]
+            assert len(matches) == 1, ('expected one runtime resource cache', matches)
+            return matches[0]
+
         source = root / 'source'
         source.mkdir()
         output = root / 'converted'
@@ -77,7 +89,7 @@ rules:
   - GEOIP,CN,REJECT,no-resolve
   - MATCH,REJECT
 ''', encoding='utf-8')
-        subprocess.run([str(binaries / executable('astra-convert')), str(yaml), '--strict', '--rule-socket', str(route), '-o', str(output)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(yaml), '--strict', '--rule-socket', str(route), '-o', str(output)], check=True, capture_output=True, timeout=10)
         assert state['requests'] == 0, 'converter must remain offline'
         rules = output / 'rule.toml'
         rules.write_text('watch_config=true\n' + rules.read_text(encoding='utf-8'), encoding='utf-8')
@@ -89,12 +101,12 @@ rules:
             log = root / f'{name}.log'
             output_log = stack.enter_context(log.open('w', encoding='utf-8'))
             binary = str(binaries / executable(name))
-            child = subprocess.Popen([binary, str(config)], stdout=output_log, stderr=subprocess.STDOUT, env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(control)), **process_flags())
+            child = subprocess.Popen([binary, str(config)], stdout=output_log, stderr=subprocess.STDOUT, env=dict(env, ASTRA_CONTROL_SOCKET=str(control)), **process_flags())
             children.append((child, control, log))
 
             def cleanup(child=child, binary=binary, control=control):
                 if child.poll() is None:
-                    result = subprocess.run([binary, '--stop', str(control)], capture_output=True, timeout=10)
+                    result = run([binary, '--stop', str(control)], capture_output=True, timeout=10)
                     if result.returncode:
                         child.kill()
                 child.wait(timeout=15)
@@ -128,7 +140,8 @@ rules:
         assert status() == 2, 'remote provider must block before local allow'
         state['payload'] = b'DOMAIN,unused.test\n'
         until(0)
-        cache = next((output / 'rule-cache').iterdir())
+        cache = cached_resource(state['payload'])
+        assert not (output / 'rule-cache').exists(), 'remote cache must stay outside configuration directory'
         cached = cache.read_bytes()
         requests = state['requests']
         state['payload'] = b'SRC-PORT,80\n'
@@ -155,10 +168,10 @@ rules:
         until(0)
         alternate = root / 'geoip.toml'
         alternate.write_text(f'socket={json.dumps(str(route))}\ndefault_action="direct"\ngeoip_database={json.dumps(database.as_posix())}\n[[rules]]\nkind="geoip"\nvalue="CN"\naction="block"\n', encoding='utf-8')
-        subprocess.run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(alternate)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(alternate)], check=True, capture_output=True, timeout=10)
         until(2)
         database.write_bytes(b'invalid-mmdb')
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--reload', str(children[0][1])], capture_output=True, timeout=10)
+        result = run([str(binaries / executable('astra-rule')), '--reload', str(children[0][1])], capture_output=True, timeout=10)
         assert result.returncode != 0 and status() == 2, 'invalid MMDB reload changed active rules'
         mmdb(database)
         ip_source = source / 'geoip.dat'
@@ -168,28 +181,29 @@ rules:
         ip_yaml.write_text(f"geodata-mode: true\ngeox-url: {{geoip: 'http://127.0.0.1:{provider_server.server_address[1]}/geoip'}}\nrule-providers: {{ips: {{type: inline, behavior: classical, payload: ['GEOIP,telegram,no-resolve']}}}}\nrules: ['RULE-SET,ips,REJECT,no-resolve','MATCH,DIRECT']\n", encoding='utf-8')
         ip_output = root / 'ip-converted'
         before = state['requests']
-        subprocess.run([str(binaries / executable('astra-convert')), str(ip_yaml), '--strict', '--rule-socket', str(route), '-o', str(ip_output)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(ip_yaml), '--strict', '--rule-socket', str(route), '-o', str(ip_output)], check=True, capture_output=True, timeout=10)
         assert state['requests'] == before, 'GeoIP conversion must remain offline'
         ip_config = ip_output / 'rule.toml'
         ip_config.write_text('geoip_interval=1\n' + ip_config.read_text(encoding='utf-8'), encoding='utf-8')
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(ip_config)], capture_output=True, timeout=10)
+        result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(ip_config)], capture_output=True, timeout=10)
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         until(2)
-        cached_ip = (ip_output / 'geoip/geoip.dat').read_bytes()
+        ip_cache = cached_resource(state['geoip'])
+        cached_ip = ip_cache.read_bytes()
         geoip(ip_source, category='missing')
         state['geoip'] = ip_source.read_bytes()
         time.sleep(1.3)
-        assert status() == 2 and (ip_output / 'geoip/geoip.dat').read_bytes() == cached_ip, 'missing GeoIP category replaced cache'
+        assert status() == 2 and ip_cache.read_bytes() == cached_ip, 'missing GeoIP category replaced cache'
         state['geoip'] = b'invalid-geoip-dat'
         time.sleep(1.3)
-        assert status() == 2 and (ip_output / 'geoip/geoip.dat').read_bytes() == cached_ip, 'invalid GeoIP update replaced cache'
+        assert status() == 2 and ip_cache.read_bytes() == cached_ip, 'invalid GeoIP update replaced cache'
         geoip(ip_source, networks=('192.0.2.0/24',))
         state['geoip'] = ip_source.read_bytes()
         until(0)
         # A failed explicit local switch keeps the currently applied generation.
         broken_ip = root / 'missing-category.toml'
         broken_ip.write_text(f'socket={json.dumps(str(route))}\ndefault_action="direct"\ngeoip_database={json.dumps(ip_source.as_posix())}\n[[rules]]\nkind="geoip"\nvalue="missing"\naction="block"\n', encoding='utf-8')
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(broken_ip)], capture_output=True, timeout=10)
+        result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(broken_ip)], capture_output=True, timeout=10)
         assert result.returncode != 0 and status() == 0
         site_source = source / 'geosite.dat'
         geosite(site_source, include_localhost=True)
@@ -197,7 +211,7 @@ rules:
         site_config = root / 'geosite.toml'
         def select_site(selector):
             site_config.write_text(f'socket={json.dumps(str(route))}\ndefault_action="direct"\ngeosite_database="site-cache.dat"\ngeosite_url="http://127.0.0.1:{provider_server.server_address[1]}/geosite"\ngeosite_interval=1\n[[rules]]\nkind="geosite"\nvalue="{selector}"\naction="block"\n', encoding='utf-8')
-            result = subprocess.run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(site_config)], capture_output=True, timeout=10)
+            result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(site_config)], capture_output=True, timeout=10)
             assert result.returncode == 0, result.stderr.decode(errors='replace')
         select_site('TEST')
         assert status('localhost') == 2
@@ -208,28 +222,31 @@ rules:
         assert status('suffix.test') == 2
         select_site('test@!cn')
         until(2, 'localhost')
-        cached_site = (root / 'site-cache.dat').read_bytes()
+        site_cache = cached_resource(state['geosite'])
+        cached_site = site_cache.read_bytes()
         state['geosite'] = cached_site.replace(b'TEST', b'NONE')
         time.sleep(1.3)
-        assert status('localhost') == 2 and (root / 'site-cache.dat').read_bytes() == cached_site
+        assert status('localhost') == 2 and site_cache.read_bytes() == cached_site
         state['geosite'] = b'invalid-database'
         time.sleep(1.3)
-        assert status('localhost') == 2 and (root / 'site-cache.dat').read_bytes() == cached_site
+        assert status('localhost') == 2 and site_cache.read_bytes() == cached_site
         # Check the converter's local-database override and classical GEOSITE provider.
         site_yaml = source / 'site.yaml'
         site_yaml.write_text("rule-providers: {sites: {type: inline, behavior: classical, payload: ['GEOSITE,test@!cn']}}\nrules: ['RULE-SET,sites,REJECT','MATCH,DIRECT']\n", encoding='utf-8')
         site_output = root / 'site-converted'
-        subprocess.run([str(binaries / executable('astra-convert')), str(site_yaml), '--strict', '--geosite-db', str(site_source), '--rule-socket', str(route), '-o', str(site_output)], check=True, capture_output=True, timeout=10)
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(site_output / 'rule.toml')], capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(site_yaml), '--strict', '--geosite-db', str(site_source), '--rule-socket', str(route), '-o', str(site_output)], check=True, capture_output=True, timeout=10)
+        result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(site_output / 'rule.toml')], capture_output=True, timeout=10)
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         assert status('localhost') == 2
         provider_server.shutdown()
         provider_server.server_close()
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--check', str(rules)], capture_output=True, timeout=20)
+        result = run([str(binaries / executable('astra-rule')), '--check', str(rules)], capture_output=True, timeout=20)
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         missing = output / 'missing-cache.toml'
-        missing.write_text(rules.read_text(encoding='utf-8').replace(cache.relative_to(output).as_posix(), 'rule-cache/missing.text'), encoding='utf-8')
-        result = subprocess.run([str(binaries / executable('astra-rule')), '--check', str(missing)], capture_output=True, timeout=20)
+        missing_text, replacements = re.subn(r'rule-cache/provider-\d+\.[a-z]+', 'rule-cache/missing.text', rules.read_text(encoding='utf-8'))
+        assert replacements == 1, 'expected one remote provider cache reference'
+        missing.write_text(missing_text, encoding='utf-8')
+        result = run([str(binaries / executable('astra-rule')), '--check', str(missing)], capture_output=True, timeout=20)
         assert result.returncode != 0, 'uncached remote failure must reject startup'
         assert cache.read_bytes() == cached
     print('PASS offline conversion, inline/file/HTTP providers, reference order, live updates, invalid-download cache retention, MMDB/GeoIP DAT/GEOSITE lookup, missing-category rejection, failed reload retention, offline cached startup')

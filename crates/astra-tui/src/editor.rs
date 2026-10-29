@@ -154,6 +154,8 @@ impl TextInput {
 // Keep the old draft representation so existing ui-session.json files migrate without loss.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Editor {
+    #[serde(skip)]
+    interfaces: Vec<String>,
     lines: Vec<String>,
     #[serde(default)]
     row: usize,
@@ -219,7 +221,7 @@ impl Spec {
     }
     fn secret(&self) -> bool {
         let key = self.key.to_ascii_lowercase();
-        key.contains("password")
+        (key.contains("password") || key == "authentication")
             || key == "uuid"
             || key.contains("authorization")
             || key.contains("token")
@@ -688,6 +690,15 @@ impl Editor {
                         .unwrap_or(false)))
     }
     fn reference_label(&self, doc: &DocumentMut, key: &str, tag: &str) -> String {
+        if key == "interface" && proxy_group_name(&self.form.path).is_some() && tag.is_empty() {
+            return t("Inherit default interface").to_owned();
+        }
+        if key == "interface" && last_key(&self.form.path) == Some("tun") && tag.is_empty() {
+            return t("Automatic interface").to_owned();
+        }
+        if tag.is_empty() {
+            return t("(未设置)").to_owned();
+        }
         if key == "selected" {
             if let Some(root) = proxy_group_name(&self.form.path) {
                 if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
@@ -702,10 +713,26 @@ impl Editor {
     pub fn subscription_page(&self) -> bool {
         self.document().ok().and_then(|doc|self.visible_rows(&doc).get(self.form.selected).map(FlatRow::path)).is_some_and(|path|matches!(path.first(),Some(Part::Key(key)) if matches!(key.as_str(),"subscription"|"subscriptions")))
     }
+    pub(crate) fn merge_metadata(&mut self, other: &Self) {
+        self.set_subscription_nodes(other.subscription_nodes.clone());
+        self.set_node_tags(other.node_tags.clone());
+    }
     pub fn set_node_tags(&mut self, tags: Vec<String>) {
         self.node_tags = tags;
     }
     fn reference_values(&self, doc: &DocumentMut, key: &str) -> Option<Vec<String>> {
+        if key == "interface" && (last_key(&self.form.path) == Some("tun") || proxy_group_name(&self.form.path).is_some()) {
+            let mut values = vec![String::new()];
+            values.extend(self.interfaces.iter().cloned());
+            // Retain an existing override when an adapter is temporarily absent.
+            if let Some(current) = table_at(doc.as_table(), &self.form.path)
+                .and_then(|table| table.get(key)).and_then(Item::as_str)
+                .filter(|name| !name.is_empty() && !values.iter().any(|v| v == name))
+            {
+                values.push(current.to_owned());
+            }
+            return Some(values);
+        }
         if key == "selected" && proxy_group_name(&self.form.path).is_some() {
             if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
                 if groups.contains_key(proxy_group_name(&self.form.path).unwrap()) {
@@ -1011,6 +1038,10 @@ impl Editor {
             Mode::Browse => {}
             _ => bail!(t("请先确认或取消当前条目窗口，再保存配置")),
         }
+        let mut doc = self.document()?;
+        if self.is_proxy(&doc) && doc.remove("allow_lan").is_some() {
+            self.update(doc);
+        }
         Ok(self.text())
     }
     fn schema_rows(&self, doc: &DocumentMut, path: &[Part]) -> Vec<Row> {
@@ -1058,6 +1089,11 @@ impl Editor {
                     ),
                     text("socks5_listen", t("SOCKS5 监听地址（留空禁用）"), "", false),
                     text("http_listen", t("HTTP 监听地址（留空禁用）"), "", false),
+                    text("mixed_listen", t("Mixed listener"), "", false),
+                    Spec {
+                        kind: Type::StringList,
+                        ..text("authentication", t("Inbound authentication"), "[]", false)
+                    },
                     number("ipc_connections", t("IPC 连接数"), 8, 1, 128),
                     number(
                         "decision_timeout_ms",
@@ -1106,6 +1142,23 @@ impl Editor {
                         1,
                         i64::MAX,
                     ),
+                    Spec {
+                        kind: Type::StringList,
+                        ..text("lan_allowed_ips", t("Allowed source CIDRs"), "[]", false)
+                    },
+                    Spec {
+                        kind: Type::StringList,
+                        ..text("lan_disallowed_ips", t("Blocked source CIDRs"), "[]", false)
+                    },
+                    Spec {
+                        kind: Type::StringList,
+                        ..text(
+                            "skip_auth_prefixes",
+                            t("Skip authentication for CIDRs"),
+                            "[]",
+                            false,
+                        )
+                    },
                 ]
             } else {
                 vec![
@@ -1163,7 +1216,14 @@ impl Editor {
             ]
         } else if path.len() == 2 && proxy_group_name(path).is_some() {
             let mut fields = vec![
-                choice("mode", t("Group mode"), "select", &["select", "auto"], true),
+                text("interface", t("Egress adapter (physical or virtual)"), "", false),
+                choice(
+                    "mode",
+                    t("Group mode"),
+                    "select",
+                    &["select", "auto", "fallback", "load_balance"],
+                    true,
+                ),
                 Spec {
                     kind: Type::StringList,
                     ..text("members", t("Group members"), "[]", false)
@@ -1198,7 +1258,7 @@ impl Editor {
                     },
                 );
             }
-            if get("mode") == "auto" {
+            if matches!(get("mode"), "auto" | "fallback" | "load_balance") {
                 fields.extend([
                     text(
                         "url",
@@ -1415,7 +1475,7 @@ impl Editor {
                 text("gateway6", t("原出口 IPv6 网关（可选）"), "", false),
                 text(
                     "interface",
-                    t("原出口接口（如 en0 / eth0 / Ethernet 或 Windows 索引）"),
+                    t("Egress adapter (physical or virtual)"),
                     "",
                     false,
                 ),
@@ -1685,6 +1745,9 @@ impl Editor {
         );
         if let Some(table) = table {
             for (key, item) in table.iter() {
+                if path.is_empty() && self.is_proxy(doc) && key == "allow_lan" {
+                    continue;
+                }
                 if (last_key(path) == Some("subscription")
                     || (path.len() == 2
                         && path.first() == Some(&Part::Key("subscriptions".into()))))
@@ -1693,8 +1756,9 @@ impl Editor {
                     continue;
                 }
                 if proxy_group_name(path).is_some()
-                    && ((get("mode") == "auto" && key == "selected")
-                        || (get("mode") != "auto"
+                    && ((matches!(get("mode"), "auto" | "fallback" | "load_balance")
+                        && key == "selected")
+                        || (!matches!(get("mode"), "auto" | "fallback" | "load_balance")
                             && matches!(key, "url" | "interval" | "timeout_ms" | "tolerance_ms")))
                 {
                     continue;
@@ -2118,6 +2182,13 @@ impl Editor {
         }
         let input = text;
         let spec = self.current_spec(&doc, &key)?;
+        let interface_selection = key == "interface" && last_key(&self.form.path) == Some("tun");
+        if interface_selection || (key == "interface" && proxy_group_name(&self.form.path).is_some()) {
+            anyhow::ensure!(
+                self.reference_values(&doc, &key).is_some_and(|values| values.contains(&input)),
+                t("Select a local network adapter with ↑↓")
+            );
+        }
         let previous_tag = if key == "tag" && node_index(&self.form.path).is_some() {
             let previous = table_at(doc.as_table(), &self.form.path)
                 .and_then(|t| t.get("tag"))
@@ -2202,6 +2273,9 @@ impl Editor {
                 None
             };
         let table = table_at_mut(doc.as_table_mut(), &self.form.path)?;
+        if interface_selection {
+            replace_field(table, "auto_interface", value(input.is_empty()));
+        }
         if remove {
             table.remove(&key);
         } else {
@@ -2355,6 +2429,12 @@ impl Editor {
                 }
             }
             FlatRow::Field { path, spec, .. } => {
+                if spec.key == "interface" && (last_key(&path) == Some("tun") || proxy_group_name(&path).is_some()) {
+                    let exclude = doc.get("tun").and_then(Item::as_table_like)
+                        .and_then(|table| table.get("name")).and_then(Item::as_str);
+                    self.interfaces = crate::network_interfaces::names(exclude)
+                        .context(t("Could not list local network adapters"))?;
+                }
                 if proxy_group_name(&path).is_some() && spec.key == "members" {
                     let name = proxy_group_name(&path).unwrap();
                     let chosen: Vec<String> = table_at(doc.as_table(), &path)
@@ -3435,7 +3515,7 @@ impl Editor {
                         let selected = input.candidate.as_ref().unwrap_or(&input.text);
                         let at = values.iter().position(|value| value == selected).unwrap_or(0);
                         let start = at.saturating_sub(2).min(values.len().saturating_sub(6));
-                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},if value.is_empty() {t("(未设置)").to_owned()} else {self.reference_label(&doc,key,value)})).collect::<Vec<_>>().join("\n")
+                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},self.reference_label(&doc,key,value))).collect::<Vec<_>>().join("\n")
                     }).unwrap_or_default();
                     let hint = if suggestions.is_some() { t("Type to filter · ↑↓ select · Tab complete · Enter confirm · Esc cancel") } else { t("Enter confirm · Esc cancel · Ctrl-U clear · F2 reveal") };
                     let text = format!("> {}\n{}\n{}\n{}",display.iter().collect::<String>(),choices,hint,spec.as_ref().map(|s|s.help.as_str()).unwrap_or(""));
@@ -4067,12 +4147,85 @@ mod tests {
         keys.iter().map(|k| Part::Key((*k).into())).collect()
     }
     #[test]
+    fn each_proxy_group_saves_its_own_adapter_without_changing_tun() {
+        let mut editor = Editor::new("proxy".into(), "standalone=true\n[tun]\nauto_interface=true\n[proxy_groups.one]\nmembers=['DIRECT']\n[proxy_groups.two]\nmembers=['DIRECT']\n".into());
+        for (group, adapter) in [("one", "Ethernet"), ("two", "虚拟网卡 VPN")] {
+            editor.form.path = path(&["proxy_groups", group]);
+            let doc = editor.document().unwrap();
+            editor.focus_field(&doc, &editor.form.path.clone(), "interface");
+            press(&mut editor, KeyCode::Enter);
+            editor.interfaces = vec!["Ethernet".into(), "虚拟网卡 VPN".into()];
+            editor.paste(adapter);
+            press(&mut editor, KeyCode::Enter);
+        }
+        let doc = editor.document().unwrap();
+        assert_eq!(doc["proxy_groups"]["one"]["interface"].as_str(), Some("Ethernet"));
+        assert_eq!(doc["proxy_groups"]["two"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+        assert!(doc["proxy_groups"]["one"].get("auto_interface").is_none());
+        assert_eq!(doc["tun"]["auto_interface"].as_bool(), Some(true));
+        editor.form.path = path(&["proxy_groups", "one"]);
+        field(&mut editor, "interface", "");
+        let doc = editor.document().unwrap();
+        assert!(doc["proxy_groups"]["one"].get("interface").is_none());
+        assert_eq!(doc["proxy_groups"]["two"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+    }
+
+    #[test]
+    fn egress_adapter_picker_selects_physical_virtual_and_automatic() {
+        let mut editor = native();
+        editor.form.path = path(&["tun"]);
+        let doc = editor.document().unwrap();
+        editor.focus_field(&doc, &path(&["tun"]), "interface");
+        press(&mut editor, KeyCode::Enter);
+        // Use deterministic names to exercise both physical and virtual adapters.
+        editor.interfaces = vec!["Ethernet".into(), "虚拟网卡 VPN".into()];
+        let doc = editor.document().unwrap();
+        let values = editor.suggestions(&doc, "interface", &TextInput::new(String::new())).unwrap();
+        assert!(values.contains(&"Ethernet".into()));
+        assert!(values.contains(&"虚拟网卡 VPN".into()));
+        editor.paste("虚拟");
+        press(&mut editor, KeyCode::Down);
+        press(&mut editor, KeyCode::Enter);
+        let doc = editor.document().unwrap();
+        assert_eq!(doc["tun"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+        assert_eq!(doc["tun"]["auto_interface"].as_bool(), Some(false));
+
+        editor.focus_field(&doc, &path(&["tun"]), "interface");
+        press(&mut editor, KeyCode::Enter);
+        editor.paste("not-a-local-adapter");
+        assert!(editor.key(key(KeyCode::Enter)).is_err());
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.document().unwrap()["tun"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+
+        let doc = editor.document().unwrap();
+        editor.focus_field(&doc, &path(&["tun"]), "interface");
+        press(&mut editor, KeyCode::Enter);
+        editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+        for language in [crate::i18n::Language::English, crate::i18n::Language::Simplified, crate::i18n::Language::Traditional] {
+            crate::i18n::with_language(language, || {
+                let mut terminal = Terminal::new(TestBackend::new(76, 20)).unwrap();
+                terminal.draw(|frame| editor.render(frame, frame.area())).unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                let label: String = t("Automatic interface").chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(compact.contains(&label), "{text}");
+            });
+        }
+        press(&mut editor, KeyCode::Enter);
+        let doc = editor.document().unwrap();
+        assert!(doc["tun"].get("interface").is_none());
+        assert_eq!(doc["tun"]["auto_interface"].as_bool(), Some(true));
+    }
+
+    #[test]
     fn proxy_modes_and_route_lists_keep_toml_types() {
         let mut e = native();
         field(&mut e, "watch_config", "true");
         e.form.path = path(&["tun"]);
         field(&mut e, "routes", "[\"0.0.0.0/1\", \"128.0.0.0/1\"]");
-        field(&mut e, "interface", "en0");
+        let interface = crate::network_interfaces::names(None).unwrap().remove(0);
+        field(&mut e, "interface", &interface);
         if cfg!(target_os = "macos") {
             e.form.path = path(&["system_proxy"]);
             field(&mut e, "services", "[\"Wi-Fi\"]");
@@ -4772,5 +4925,26 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+    #[test]
+    fn saving_removes_runtime_switch_but_keeps_network_parameters_and_conflict_base() {
+        let source="standalone=true\nallow_lan=true\nhttp_listen='127.0.0.1:8080'\n[system_proxy]\n[tun]\nmtu=1400\n";
+        let mut editor = Editor::new("proxy".into(), source.into()).with_kind(CoreKind::Proxy);
+        let doc = editor.document().unwrap();
+        assert!(!editor
+            .schema_rows(&doc, &[])
+            .iter()
+            .any(|row| matches!(row,Row::Field(spec)if spec.key=="allow_lan")));
+        let text = editor.prepare_save().unwrap();
+        let saved: toml::Value = toml::from_str(&text).unwrap();
+        assert!(saved.get("allow_lan").is_none());
+        assert_eq!(saved["tun"]["mtu"].as_integer(), Some(1400));
+        assert!(saved.get("system_proxy").is_some());
+        assert_eq!(editor.original, source);
     }
 }

@@ -25,9 +25,13 @@
 
 网络载荷始终留在 Proxy Core。TCP 连接建立时决定路由；UDP 按关联内的目标创建流并决定路由。既有流不会逐包查询规则，也不会因为 Rule Core 重启而重新选择出口。配置可通过 TUI、SIGHUP、管理 IPC 或文件监测热重载；规则版本通知使旧决策缓存失效。
 
+## 日常代理与运行时面板
+
+支持混合 SOCKS5/HTTP 入站、用户名/密码认证和来源网段控制；TUI 提供规则/全局/直连切换、实时选点和后台测速、fallback 与轮询负载均衡、实际上传/下载趋势及 TCP/UDP 连接关闭。模式、选择与开关独立持久化，不写回原配置。范围、快捷键、JSON 控制命令和未实现项见 [功能对照](docs/MIHOMO_FEATURES.md)。这不是 Mihomo 外部 API 的完整兼容实现。
+
 ## 系统接管与热重载
 
-提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。配置表可独立开启或关闭；TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置；节点切换默认保留既有连接，代理组可按手动、自动优选、故障、恢复和成员/模式变更分别配置是否断开旧连接，见 [代理组设置](docs/TUI.md#配置可选项与切换后的连接)。
+提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。系统代理/TUN/LAN 启停只保存在独立运行状态，默认关闭，使用 TUI S/T/A 切换；配置仅保留监听、节点、规则和固定网络参数，添加参数表不会隐式启用。TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置；节点切换默认保留既有连接，代理组可按手动、自动优选、故障、恢复和成员/模式变更分别配置是否断开旧连接，见 [代理组设置](docs/TUI.md#配置可选项与切换后的连接)。
 
 精简配置见 [configs/modes.toml](configs/modes.toml)，平台权限、TUN 防自环、透明代理路由、设置恢复及实测边界见 [模式与热重载说明](docs/PROXY_MODES.md)。设备和防火墙权限相关路径尚需目标机器验收，不能仅凭配置校验视为已接管系统流量。
 
@@ -64,7 +68,7 @@ python3 scripts/astra.py --bin-dir target/release --proxy /path/to/proxy-standal
 
 XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确认已排队 POST 后结束整个隧道；需要上传结束后继续接收响应的应用不能依赖该模式。普通互通测试是在收到回显后才关闭上传；严格半关闭测试使用 `--trailer`，当前 VLESS/Xray 路径仍有失败。
 
-`kind = "trojan_tls"` / `"vless_tls"` 是旧 TCP 配置，功能有限。新节点使用 `kind = "native"`，见 [配置说明](docs/NATIVE_PROTOCOLS.md)。入站无用户认证，默认只监听 loopback。
+`kind = "trojan_tls"` / `"vless_tls"` 是旧 TCP 配置，功能有限。新节点使用 `kind = "native"`，见 [配置说明](docs/NATIVE_PROTOCOLS.md)。入站可配置 SOCKS5/HTTP 用户认证与来源 CIDR 限制，默认只监听 loopback。
 
 ## 安装包
 
@@ -86,7 +90,7 @@ target/release/astra-rule --check converted/rule.toml
 target/release/astra-proxy --check converted/proxy.toml
 ```
 
-代理组固定为一个可用成员，不保留动态测速或故障转移；未知规则会跳过。详见 [转换范围和使用说明](docs/MIHOMO_CONVERTER.md)，本地示例见 [mihomo-example.yaml](configs/mihomo-example.yaml)。
+保留 select、url-test、fallback 和轮询 load-balance 代理组，以及混合端口、入站认证和来源 CIDR 限制；未知规则会跳过。详见 [转换范围和使用说明](docs/MIHOMO_CONVERTER.md)，本地示例见 [mihomo-example.yaml](configs/mihomo-example.yaml)。
 
 ### Astra 配置
 
@@ -106,7 +110,7 @@ python3 scripts/astra.py --check --proxy example_proxy.toml --rules example_rule
 ./scripts/build.sh
 ```
 
-Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；也可执行 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。
+Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；也可执行 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
 
 安装包输出到 `dist/`，包含 `astra-proxy`、`astra-rule`、`astra-tui`、配置、文档与依赖许可，并附 SHA-256 和验证报告。支持 `--debug`、`--build-only`、`--label`、`--output-dir`；详见 [构建与打包说明](docs/INSTALL.md)。
 
@@ -121,7 +125,7 @@ cargo test --workspace
 ./target/release/astra-tui
 ```
 
-按 Tab 切换 core，n 添加实例，s/x/r 启动、停止、重启，e 编辑配置。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
+按 1–5 或点击侧栏切换仪表盘、代理、配置、实时连接和工具，鼠标滚轮/方向键导航，Tab 切换 core，n 添加实例，s/x/r 启动、停止、重启，e 编辑配置。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
 
 本地直连示例：
 

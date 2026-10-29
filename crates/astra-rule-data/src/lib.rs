@@ -335,10 +335,16 @@ pub fn load_resource_with<T>(
     limit: u64,
     decode: impl Fn(&[u8]) -> Result<T>,
 ) -> Result<(Vec<u8>, T)> {
-    let path = resolve(base, path);
+    let source = resolve(base, path);
+    let path = if url.is_some() {
+        astra_ipc::storage::runtime_path(&source, "resources")?
+    } else {
+        source.clone()
+    };
     let read = || -> Result<(Vec<u8>, T)> {
         let mut data = Vec::new();
-        fs::File::open(&path)?
+        let input = if path.exists() { &path } else { &source };
+        fs::File::open(input)?
             .take(limit + 1)
             .read_to_end(&mut data)?;
         ensure!(data.len() as u64 <= limit, "resource exceeds size limit");
@@ -375,6 +381,7 @@ pub fn load_resource_with<T>(
         let parsed = decode(&data).context("downloaded resource is invalid")?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            astra_ipc::platform::set_private(parent, 0o700)?;
         }
         // Unique create-new temporary file; never truncate the active cache.
         let nonce = std::time::SystemTime::now()
@@ -446,6 +453,47 @@ mod tests {
         assert_eq!(calls.get(), 3); // one cached decode and one rejected candidate
         assert_eq!(fs::read(dir.join("cache")).unwrap(), b"42");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remote_download_uses_runtime_cache_without_overwriting_local_resource() {
+        use std::net::TcpListener;
+        let dir =
+            std::env::temp_dir().join(format!("astra-isolated-resource-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("resource");
+        fs::write(&source, b"original local resource").unwrap();
+        let runtime = astra_ipc::storage::runtime_path(&source, "resources").unwrap();
+        let _ = fs::remove_file(&runtime);
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/resource", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n42")
+                .unwrap();
+        });
+        let decode = |bytes: &[u8]| -> Result<u32> { Ok(std::str::from_utf8(bytes)?.parse()?) };
+        let (_, number) =
+            load_resource_with(&dir, "resource", Some(&url), 3600, 100, decode).unwrap();
+        worker.join().unwrap();
+        assert_eq!(number, 42);
+        assert_eq!(fs::read(&source).unwrap(), b"original local resource");
+        assert_eq!(fs::read(&runtime).unwrap(), b"42");
+        assert_eq!(
+            load_resource_with(&dir, "resource", Some(&url), 3600, 100, decode)
+                .unwrap()
+                .1,
+            42
+        );
+        fs::remove_file(runtime).unwrap();
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]

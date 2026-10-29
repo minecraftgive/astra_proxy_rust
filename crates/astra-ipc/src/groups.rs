@@ -9,10 +9,16 @@ pub enum Mode {
     Select,
     #[serde(alias = "url-test", alias = "url_test")]
     Auto,
+    Fallback,
+    #[serde(alias = "load-balance")]
+    LoadBalance,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Group {
+    /// Explicit per-group socket binding; absent means inherit the outer/default egress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
     /// Subscription source whose nodes form this group's managed membership.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<String>,
@@ -40,6 +46,7 @@ pub struct Group {
 impl Default for Group {
     fn default() -> Self {
         Self {
+            interface: None,
             subscription: None,
             include_in_proxy: true,
             mode: Mode::Select,
@@ -258,6 +265,9 @@ fn validate_expanded(
     }
     let mut total = 0;
     for (name, group) in groups {
+        if group.interface.as_ref().is_some_and(|name| name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control)) {
+            return Err(format!("proxy group {name}: invalid egress interface"));
+        }
         if name.trim().is_empty()
             || name.len() > 64
             || name.chars().any(char::is_control)
@@ -309,7 +319,7 @@ fn validate_expanded(
                 "proxy group {name}: invalid interval, timeout or tolerance"
             ));
         }
-        if group.mode == Mode::Auto
+        if group.mode != Mode::Select
             && !(group.url.starts_with("http://") || group.url.starts_with("https://"))
         {
             return Err(format!("proxy group {name}: test URL must use HTTP(S)"));

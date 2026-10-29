@@ -29,6 +29,10 @@ pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
             return crate::http_forward::handle(client, app).await;
         }
     }
+    let users = app.authentication(client.peer_addr().ok().map(|s| s.ip()));
+    if !super::authorize_connect(&mut client, users).await? {
+        return Ok(());
+    }
     let (target, tail) = match timeout(HANDSHAKE_TIMEOUT, read_connect(&mut client)).await {
         Ok(Ok(data)) => data,
         result => {

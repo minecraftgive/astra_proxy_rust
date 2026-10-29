@@ -106,6 +106,12 @@ pub async fn accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 use anyhow::Context;
 use std::net::{Ipv4Addr, Ipv6Addr};
 pub async fn read_socks_request(client: &mut TcpStream) -> Result<(u8, Target)> {
+    read_socks_request_with_auth(client, &[]).await
+}
+pub async fn read_socks_request_with_auth(
+    client: &mut TcpStream,
+    users: &[String],
+) -> Result<(u8, Target)> {
     if client.read_u8().await? != 5 {
         bail!("unsupported SOCKS version");
     }
@@ -115,11 +121,32 @@ pub async fn read_socks_request(client: &mut TcpStream) -> Result<(u8, Target)> 
     }
     let mut methods = vec![0; count];
     client.read_exact(&mut methods).await?;
-    if !methods.contains(&0) {
+    let method = if users.is_empty() { 0 } else { 2 };
+    if !methods.contains(&method) {
         client.write_all(&[5, 255]).await?;
-        bail!("SOCKS5 requires no-auth method");
+        bail!("SOCKS5 authentication method is not accepted");
     }
-    client.write_all(&[5, 0]).await?;
+    client.write_all(&[5, method]).await?;
+    if method == 2 {
+        ensure!(
+            client.read_u8().await? == 1,
+            "invalid SOCKS5 authentication version"
+        );
+        let count = client.read_u8().await? as usize;
+        let mut username = vec![0; count];
+        client.read_exact(&mut username).await?;
+        let count = client.read_u8().await? as usize;
+        let mut password = vec![0; count];
+        client.read_exact(&mut password).await?;
+        let valid = users
+            .iter()
+            .filter_map(|user| user.split_once(':'))
+            .any(|(user, pass)| {
+                secret(user.as_bytes(), &username) & secret(pass.as_bytes(), &password)
+            });
+        client.write_all(&[1, if valid { 0 } else { 1 }]).await?;
+        ensure!(valid, "SOCKS5 authentication failed");
+    }
     let mut request = [0; 4];
     client.read_exact(&mut request).await?;
     if request[0] != 5 || request[2] != 0 {

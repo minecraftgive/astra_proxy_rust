@@ -67,89 +67,10 @@ pub fn prepare_interface(tun: &mut crate::mode_config::Tun) -> Result<()> {
     Ok(())
 }
 
-/// Fill only a missing interface. Never rewrite a user's explicit selection.
-pub fn persist_interface(
-    path: &std::path::Path,
-    source: &str,
-    tun: &crate::mode_config::Tun,
-) -> Result<String> {
-    if tun.detects_interface() {
-        return Ok(source.to_owned());
-    }
-    use std::io::Write;
-    let mut document: toml_edit::DocumentMut = source.parse()?;
-    let table = document
-        .get_mut("tun")
-        .and_then(toml_edit::Item::as_table_like_mut)
-        .context("configuration has no TUN table")?;
-    if table.contains_key("interface") {
-        return Ok(source.to_owned());
-    }
-    let interface = tun
-        .interface
-        .as_deref()
-        .context("physical egress was not resolved")?;
-    table.insert("interface", toml_edit::value(interface));
-    let text = document.to_string();
-    let cache = crate::subscription::read(path, source);
-    anyhow::ensure!(
-        std::fs::read_to_string(path)? == source,
-        "configuration changed during egress detection; refusing to overwrite it"
-    );
-    let temporary = path.with_file_name(format!(
-        ".astra-egress-{}-{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    let result = (|| -> Result<()> {
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        anyhow::ensure!(
-            std::fs::read_to_string(path)? == source,
-            "configuration changed before egress save; refusing to overwrite it"
-        );
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result?;
-    if let Some(mut cache) = cache {
-        let migrate = (|| -> Result<()> {
-            let mut effective: toml_edit::DocumentMut = cache.effective.parse()?;
-            if let Some(table) = effective
-                .get_mut("tun")
-                .and_then(toml_edit::Item::as_table_like_mut)
-            {
-                if !table.contains_key("interface") {
-                    table.insert("interface", toml_edit::value(interface));
-                }
-            }
-            cache.base = text.clone();
-            cache.effective = effective.to_string();
-            crate::subscription::save(path, &cache)
-        })();
-        if let Err(error) = migrate {
-            tracing::warn!(%error, "egress saved but subscription cache could not be migrated");
-        }
-    }
-    tracing::info!(%interface, config=%path.display(), "physical egress saved to configuration");
-    Ok(text)
-}
-
 pub(crate) fn cache_interface(path: &std::path::Path, tun: &crate::mode_config::Tun) -> Result<()> {
     use std::io::Write;
-    let cache = path.with_extension("egress-cache.json");
+    let cache = astra_ipc::storage::runtime_path(path, "egress")?;
+    astra_ipc::storage::prepare_parent(&cache)?;
     let temporary = cache.with_file_name(format!(".astra-egress-{}.tmp", uuid::Uuid::new_v4()));
     let text = serde_json::to_vec_pretty(
         &serde_json::json!({"version":1,"interface":tun.interface,"gateway":tun.gateway,"gateway6":tun.gateway6,"auto_interface":tun.detects_interface(),"auto_gateway":tun.auto_gateway}),
@@ -300,6 +221,47 @@ pub async fn connect(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn concurrent_group_scopes_bind_real_tcp_and_udp_sockets_independently() {
+        use socket2_05 as socket2;
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
+        let mut pointer = std::ptr::null_mut();
+        assert_eq!(unsafe { GetIfTable2(&mut pointer) }, 0);
+        let rows = unsafe { std::slice::from_raw_parts((*pointer).Table.as_ptr(), (*pointer).NumEntries as usize) };
+        let adapters: Vec<_> = rows.iter().filter_map(|row| {
+            let mut ip = MIB_IPINTERFACE_ROW::default();
+            unsafe { InitializeIpInterfaceEntry(&mut ip) };
+            ip.Family = AF_INET;
+            ip.InterfaceIndex = row.InterfaceIndex;
+            if unsafe { GetIpInterfaceEntry(&mut ip) } != 0 { return None; }
+            let end = row.Alias.iter().position(|c| *c == 0).unwrap_or(row.Alias.len());
+            Some((String::from_utf16_lossy(&row.Alias[..end]), row.InterfaceIndex))
+        }).take(2).collect();
+        unsafe { FreeMibTable(pointer.cast()) };
+        assert_eq!(adapters.len(), 2, "two local IP adapters are required for this isolation check");
+        let check = |(name, index): (String, u32)| async move {
+            meow_common::outbound_iface::with_outbound_interface(Some(&name), async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    assert_eq!(meow_common::outbound_iface::outbound_interface().as_deref(), Some(name.as_str()));
+                    for (kind, protocol) in [(socket2::Type::STREAM, socket2::Protocol::TCP), (socket2::Type::DGRAM, socket2::Protocol::UDP)] {
+                        let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, Some(protocol)).unwrap();
+                        meow_common::outbound_iface::apply_outbound_interface(&socket, socket2::Domain::IPV4).unwrap();
+                        let mut value: u32 = 0;
+                        let mut size = std::mem::size_of_val(&value) as i32;
+                        assert_eq!(unsafe { getsockopt(socket.as_raw_socket() as SOCKET, IPPROTO_IP, IP_UNICAST_IF, (&mut value as *mut u32).cast(), &mut size) }, 0);
+                        // Windows returns this option in host order on reads.
+                        assert_eq!(value, index, "wrong interface for {name}");
+                    }
+                }
+            }).await.unwrap();
+        };
+        let mut adapters = adapters.into_iter();
+        tokio::join!(check(adapters.next().unwrap()), check(adapters.next().unwrap()));
+    }
+
     #[test]
     fn automatic_mode_stays_automatic_and_cache_is_only_diagnostic() {
         let directory =
@@ -311,19 +273,19 @@ mod tests {
         let mut tun: crate::mode_config::Tun = toml::from_str("auto_interface=true").unwrap();
         tun.interface = Some("Ethernet".into());
         tun.gateway = Some("192.0.2.1".parse().unwrap());
-        assert_eq!(persist_interface(&path, source, &tun).unwrap(), source);
+
         cache_interface(&path, &tun).unwrap();
         tun.interface = Some("Wi-Fi".into());
         tun.gateway = Some("192.0.2.254".parse().unwrap());
         cache_interface(&path, &tun).unwrap();
         let cache: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(path.with_extension("egress-cache.json")).unwrap(),
+            &std::fs::read(astra_ipc::storage::runtime_path(&path, "egress").unwrap()).unwrap(),
         )
         .unwrap();
         assert_eq!(cache["interface"], "Wi-Fi");
         assert_eq!(cache["gateway"], "192.0.2.254");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
-        std::fs::remove_file(path.with_extension("egress-cache.json")).unwrap();
+        std::fs::remove_file(astra_ipc::storage::runtime_path(&path, "egress").unwrap()).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
@@ -350,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_missing_interface_preserving_comments_cache_and_concurrent_edits() {
+    fn runtime_egress_does_not_rewrite_source_or_subscription_cache() {
         let directory = std::env::temp_dir().join(format!("astra-egress-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("config.toml");
@@ -358,32 +320,17 @@ mod tests {
         std::fs::write(&path, source).unwrap();
         let mut tun: crate::mode_config::Tun = toml::from_str("name='astra-test'").unwrap();
         tun.interface = Some("Ethernet 2".into());
-        crate::subscription::save(
-            &path,
-            &crate::subscription::Cache {
-                base: source.into(),
-                effective: format!("{source}\n# cached nodes\n"),
-                ownership: Default::default(),
-                subscriptions: Default::default(),
-            },
-        )
-        .unwrap();
-        let saved = persist_interface(&path, source, &tun).unwrap();
-        assert!(saved.contains("# user comment"));
-        assert!(saved.contains("name = 'astra-test' # keep"));
-        assert!(saved.contains("interface = \"Ethernet 2\""));
-        let cache = crate::subscription::read(&path, &saved).unwrap();
-        assert!(cache.effective.contains("# cached nodes"));
-        assert!(cache.effective.contains("interface = \"Ethernet 2\""));
-        tun.interface = Some("Wi-Fi".into());
-        assert_eq!(persist_interface(&path, &saved, &tun).unwrap(), saved);
+        cache_interface(&path, &tun).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::write(&path, "# edited meanwhile\n").unwrap();
-        assert!(persist_interface(&path, source, &tun).is_err());
+        tun.interface = Some("Wi-Fi".into());
+        cache_interface(&path, &tun).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# edited meanwhile\n"
         );
-        std::fs::remove_file(path.with_extension("subscription-cache.json")).unwrap();
+        std::fs::remove_file(astra_ipc::storage::runtime_path(&path, "egress").unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }

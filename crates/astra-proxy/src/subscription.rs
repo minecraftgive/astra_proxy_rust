@@ -150,15 +150,20 @@ pub(crate) struct Cache {
     #[serde(default)]
     pub subscriptions: std::collections::BTreeMap<String, Subscription>,
 }
-fn path(config: &Path) -> PathBuf {
-    config.with_extension("subscription-cache.json")
+fn path(config: &Path) -> Result<PathBuf> {
+    Ok(astra_ipc::storage::runtime_path(config, "subscriptions")?)
 }
 pub(crate) fn read(config: &Path, base: &str) -> Option<Cache> {
     let load = || -> Result<Cache> {
         let mut bytes = Vec::new();
-        std::fs::File::open(path(config))?
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
+        std::fs::File::open(if path(config)?.exists() {
+            path(config)?
+        } else {
+            // Read old sidecar caches for compatibility, but never update them.
+            config.with_extension("subscription-cache.json")
+        })?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
             "subscription cache too large"
@@ -308,7 +313,8 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
         data.len() <= 16 * 1024 * 1024,
         "subscription cache too large"
     );
-    let target = path(config);
+    let target = path(config)?;
+    astra_ipc::storage::prepare_parent(&target)?;
     let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -374,7 +380,7 @@ mod tests {
             .outbounds
             .contains_key("imported"));
         server.await.unwrap();
-        std::fs::remove_file(super::path(&path)).unwrap();
+        std::fs::remove_file(super::path(&path).unwrap()).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
@@ -469,10 +475,10 @@ mod tests {
         assert_eq!(app.config.proxy_groups["PROXY"].members, ["subscription"]);
         assert_eq!(app.source_text, base);
         assert!(read(&config, &format!("{base}\n# changed")).is_none());
-        std::fs::write(path(&config), b"invalid").unwrap();
+        std::fs::write(path(&config).unwrap(), b"invalid").unwrap();
         let app = cached_app(&config, App::from_text(&config, base.into()).unwrap());
         assert!(app.outbounds.is_empty());
-        std::fs::remove_file(path(&config)).unwrap();
+        std::fs::remove_file(path(&config).unwrap()).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 }

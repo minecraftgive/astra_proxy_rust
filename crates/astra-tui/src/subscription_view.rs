@@ -40,9 +40,16 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, SubscriptionNodes>> {
     // Core-owned snapshots are read locally; only names are sent to the editor.
     let cache = (|| -> Result<serde_json::Value> {
         let mut data = Vec::new();
-        std::fs::File::open(path.with_extension("subscription-cache.json"))?
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut data)?;
+        std::fs::File::open({
+            let runtime = astra_ipc::storage::runtime_path(path, "subscriptions")?;
+            if runtime.exists() {
+                runtime
+            } else {
+                path.with_extension("subscription-cache.json")
+            }
+        })?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut data)?;
         ensure!(data.len() <= 16 * 1024 * 1024, "Cache exceeds size limit");
         let cache: serde_json::Value = serde_json::from_slice(&data)?;
         ensure!(

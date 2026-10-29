@@ -1,3 +1,4 @@
+mod controls;
 use crate::{inbound, system_proxy, transparent, tun, App};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -73,7 +74,21 @@ impl State {
         Ok(true)
     }
     async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
+        astra_ipc::progress::report("Prepare runtime", path.display().to_string());
         let old = self.current.load_full();
+        candidate.metrics = old.metrics.clone();
+        candidate.overrides = if self.generation > 0 && path != self.path {
+            Arc::new(std::sync::RwLock::new(controls::load(&path)?))
+        } else {
+            old.overrides.clone()
+        };
+        {
+            let overrides = candidate.overrides.read().unwrap();
+            crate::mode_config::runtime_modes(&mut candidate.config, &overrides);
+        }
+        let legacy_journal = path.with_extension("system-proxy-state.toml");
+        anyhow::ensure!(candidate.config.system_proxy.is_none() || legacy_journal==self.system_journal || !legacy_journal.exists(),
+            "Legacy system proxy recovery record exists: {}. Stop the old core and run --restore-system-proxy before enabling",legacy_journal.display());
         if let (Some(candidate_dns), Some(old_dns)) = (&mut candidate.dns, &old.dns) {
             candidate_dns.inherit(old_dns)?;
         } else if old.dns.as_ref().is_some_and(|dns| dns.config.fake_ip) && candidate.dns.is_none()
@@ -98,12 +113,16 @@ impl State {
         if let Some(tun) = &mut candidate.config.tun {
             crate::egress::prepare_interface(tun)?;
         }
+        crate::mode_config::validate(&candidate.config)?;
         let mut keys = vec![];
         if let Some(addr) = &candidate.config.socks5_listen {
             keys.push(Key(Inbound::Socks5, addr.clone()));
         }
         if let Some(addr) = &candidate.config.http_listen {
             keys.push(Key(Inbound::HttpConnect, addr.clone()));
+        }
+        if let Some(addr) = &candidate.config.mixed_listen {
+            keys.push(Key(Inbound::Mixed, addr.clone()));
         }
         if let Some(settings) = &candidate.config.tproxy {
             keys.push(Key(Inbound::Tproxy, settings.listen.to_string()));
@@ -112,6 +131,10 @@ impl State {
             keys.push(Key(Inbound::Redirect, settings.listen.to_string()));
         }
         // All binds happen before committing. A failure drops only new resources.
+        astra_ipc::progress::report(
+            "Bind listeners",
+            format!("{} requested TCP listeners", keys.len()),
+        );
         let mut prepared = vec![];
         for key in &keys {
             if !self.listeners.contains_key(key) {
@@ -120,8 +143,14 @@ impl State {
                     .iter()
                     .find(|(old, _)| {
                         old.1 == key.1
-                            && matches!(old.0, Inbound::Socks5 | Inbound::HttpConnect)
-                            && matches!(key.0, Inbound::Socks5 | Inbound::HttpConnect)
+                            && matches!(
+                                old.0,
+                                Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
+                            )
+                            && matches!(
+                                key.0,
+                                Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
+                            )
                     })
                     .map(|(_, value)| value.socket.clone());
                 let listener = if let Some(socket) = reusable {
@@ -138,6 +167,10 @@ impl State {
                 prepared.push((key.clone(), listener));
             }
         }
+        astra_ipc::progress::report(
+            "Prepare network modes",
+            "Preparing TUN, DNS and system proxy resources",
+        );
         let replace_tun = candidate.config.tun != old.config.tun
             || (candidate.config.tun.is_some() && self.tunnel.is_none());
         let tunnel = if replace_tun {
@@ -163,8 +196,9 @@ impl State {
         let replace_system = candidate.config.system_proxy != old.config.system_proxy
             || (candidate.config.system_proxy.is_some()
                 && (self.listeners.is_empty() || system_listener_changed));
-        let mut text = candidate.source_text.clone();
-        // All protocols share this binding. A rejected reload drops the new
+        let text = candidate.source_text.clone();
+        // This is the default binding; a group can override it per connection.
+        // A rejected reload drops the new
         // owner and restores the previous owner; old sessions keep their sockets.
         let outbound_interface = candidate
             .config
@@ -202,17 +236,10 @@ impl State {
             client.start_observer();
         }
         // Prepare first; disconnect sessions only once the entire reload can commit.
-        if let Some(tun) = &candidate.config.tun {
-            match crate::egress::persist_interface(&path, &text, tun) {
-                Ok(saved) => {
-                    text = saved;
-                    candidate.source_text = text.clone();
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "physical egress is active but could not be saved")
-                }
-            }
-        }
+        astra_ipc::progress::report(
+            "Commit runtime",
+            "Resources ready; switching the active generation",
+        );
         self.group_worker.take();
         candidate.groups.inherit(&old, &candidate.config);
         candidate.groups.committed(&old, &candidate.config);
@@ -278,6 +305,7 @@ impl State {
     }
     async fn reload(&mut self, path: Option<PathBuf>) -> Result<()> {
         let path = std::fs::canonicalize(path.unwrap_or_else(|| self.path.clone()))?;
+        astra_ipc::progress::report("Read configuration", path.display().to_string());
         let load_path = path.clone();
         let app = tokio::task::spawn_blocking(move || {
             App::load(&load_path).map(|app| crate::subscription::cached_app(&load_path, app))
@@ -287,13 +315,17 @@ impl State {
     }
 }
 pub async fn run(path: PathBuf, app: App) -> Result<()> {
+    let system_journal = if let Some(socket) = std::env::var_os("ASTRA_CONTROL_SOCKET") {
+        PathBuf::from(socket).with_extension("system-proxy-state.toml")
+    } else {
+        astra_ipc::storage::runtime_path(&path, "system-proxy")?
+    };
+    astra_ipc::storage::prepare_parent(&system_journal)?;
+    *app.overrides.write().unwrap() = controls::load(&path)?;
     let current = Arc::new(ArcSwap::from_pointee(app));
     let mut state = State {
         generation: 0,
-        system_journal: std::env::var_os("ASTRA_CONTROL_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.clone())
-            .with_extension("system-proxy-state.toml"),
+        system_journal,
         text: String::new(),
         path: path.clone(),
         current: current.clone(),
@@ -520,7 +552,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
             }
         })
     };
-    let service = control.run_with_updates(
+    let service = control.run_with_runtime(
         |path| {
             let state = state.clone();
             async move {
@@ -564,6 +596,21 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                 Ok(())
             }
         },
+        |command| {
+            let state = state.clone();
+            let current = current.clone();
+            async move {
+                if matches!(command, astra_ipc::runtime::Command::Snapshot) {
+                    return Ok(controls::snapshot(&current));
+                }
+                state
+                    .lock()
+                    .await
+                    .runtime_control(command)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            }
+        },
     );
     let result = tokio::select! {
         result = service => result,
@@ -574,6 +621,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let mut state = state.lock().await;
     state.listeners.clear();
     state.group_worker.take();
+    state.current.load().groups.stop_test();
     state.tunnel.take();
     state.tproxy_udp.take();
     state.dns.take();
@@ -598,6 +646,13 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
             }
         };
         let app = current.load_full();
+        if matches!(
+            inbound,
+            Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
+        ) && !app.inbound_allowed(peer.ip())
+        {
+            continue;
+        }
         let Ok(permit) = app.permits.clone().acquire_owned().await else {
             return;
         };
@@ -609,6 +664,7 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
                 match inbound {
                     Inbound::Socks5 => inbound::handle_socks5(stream, app).await,
                     Inbound::HttpConnect => inbound::handle_http(stream, app).await,
+                    Inbound::Mixed => inbound::handle_mixed(stream, app).await,
                     Inbound::Tproxy | Inbound::Redirect => {
                         transparent::tcp(stream, app, inbound).await
                     }
