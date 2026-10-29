@@ -248,7 +248,7 @@ pub async fn subscribe(
 ) -> anyhow::Result<astra_ipc::platform::LocalStream> {
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        astra_ipc::platform::LocalStream::connect(socket),
+        astra_ipc::platform::connect_trusted(socket),
     )
     .await??;
     astra_ipc::send_management(

@@ -34,7 +34,7 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
                 .or_else(|_| std::env::var("RUST_LOG"))
                 .unwrap_or_else(|_| "info".into());
             let arguments =
-                astra_ipc::elevation::core_arguments(&path, Some(&socket), &log, &level)?;
+                astra_ipc::elevation::core_arguments(&path, Some(&socket), &log, &level, None)?;
             tracing::info!(log=%log.display(), "Windows TUN requests administrator permission for a separate proxy core");
             let mut child = tokio::task::spawn_blocking(move || {
                 astra_ipc::elevation::spawn(&std::env::current_exe()?, &arguments)

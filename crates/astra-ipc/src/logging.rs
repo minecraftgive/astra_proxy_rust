@@ -118,7 +118,80 @@ where
     }
 }
 
-pub fn init() -> io::Result<()> {
+/// Formatted events go to one writer thread instead of being written to
+/// stdout (usually a redirected log file) by the async worker that logged
+/// them. The thread batches whatever is queued into one buffered write.
+enum Message {
+    Line(Vec<u8>),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+static WRITER: OnceLock<std::sync::mpsc::SyncSender<Message>> = OnceLock::new();
+fn writer() -> &'static std::sync::mpsc::SyncSender<Message> {
+    WRITER.get_or_init(|| {
+        // Bounded: a stalled disk eventually applies backpressure rather than
+        // growing memory without limit.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Message>(16 * 1024);
+        std::thread::Builder::new()
+            .name("astra-log".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut out = io::BufWriter::with_capacity(64 * 1024, io::stdout());
+                let handle = |message, out: &mut io::BufWriter<io::Stdout>| match message {
+                    Message::Line(bytes) => {
+                        let _ = out.write_all(&bytes);
+                    }
+                    Message::Flush(done) => {
+                        let _ = out.flush();
+                        let _ = done.send(());
+                    }
+                };
+                while let Ok(message) = receiver.recv() {
+                    handle(message, &mut out);
+                    while let Ok(message) = receiver.try_recv() {
+                        handle(message, &mut out);
+                    }
+                    let _ = out.flush();
+                }
+            })
+            .expect("spawn log writer thread");
+        sender
+    })
+}
+/// One formatted event; queued as a whole when tracing drops the writer.
+struct Line(Vec<u8>);
+impl io::Write for Line {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Drop for Line {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            let _ = writer().send(Message::Line(std::mem::take(&mut self.0)));
+        }
+    }
+}
+/// Wait until queued log lines reach stdout.
+pub fn flush() {
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    if writer().send(Message::Flush(done)).is_ok() {
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+    }
+}
+/// Flushes queued log lines when the core's `main` returns.
+#[must_use = "dropping the guard immediately flushes too early"]
+pub struct Guard(());
+impl Drop for Guard {
+    fn drop(&mut self) {
+        flush();
+    }
+}
+
+pub fn init() -> io::Result<Guard> {
     let filter = match std::env::var("ASTRA_LOG_LEVEL") {
         Ok(level) => filter(&level)?,
         Err(_) => std::env::var("RUST_LOG")
@@ -132,13 +205,15 @@ pub fn init() -> io::Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(EventFormatter)
-                .with_ansi(io::stdout().is_terminal()),
+                .with_ansi(io::stdout().is_terminal())
+                .with_writer(|| Line(Vec::with_capacity(256))),
         )
         .try_init()
         .map_err(io::Error::other)?;
     FILTER
         .set(handle)
-        .map_err(|_| io::Error::other("log filter already initialized"))
+        .map_err(|_| io::Error::other("log filter already initialized"))?;
+    Ok(Guard(()))
 }
 
 pub fn set_level(level: LogLevel) -> io::Result<()> {
@@ -232,6 +307,18 @@ mod tests {
             emit();
             assert!(!String::from_utf8_lossy(&output.0.lock().unwrap()).contains("route-message"));
         });
+    }
+    #[test]
+    fn queued_lines_and_repeated_flushes_complete() {
+        use std::io::Write;
+        for index in 0..100 {
+            let mut line = Line(Vec::new());
+            write!(line, "line {index}").unwrap();
+        }
+        // An empty event queues nothing.
+        drop(Line(Vec::new()));
+        flush();
+        flush();
     }
     #[test]
     fn route_serialization_keeps_existing_wire_values() {

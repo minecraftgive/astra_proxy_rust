@@ -12,6 +12,8 @@ use std::{
 pub(super) struct SelfExclusion {
     // Only non-self/unknown UDP flows are cached. Never retain a positive PID
     // match after its socket closes and another process reuses the port.
+    // An active flow keeps its entry alive, so a steady stream (QUIC, games)
+    // is checked once rather than every 500 ms; 500 ms of silence ends it.
     udp_allowed: HashMap<(SocketAddr, SocketAddr), Instant>,
 }
 
@@ -44,13 +46,14 @@ impl SelfExclusion {
             SocketAddr::new(source, source_port),
             SocketAddr::new(destination, destination_port),
         );
-        if network == Network::Udp
-            && self
-                .udp_allowed
-                .get(&endpoints)
-                .is_some_and(|expires| *expires > Instant::now())
-        {
-            return false;
+        if network == Network::Udp {
+            if let Some(expires) = self.udp_allowed.get_mut(&endpoints) {
+                let now = Instant::now();
+                if *expires > now {
+                    *expires = now + Duration::from_millis(500);
+                    return false;
+                }
+            }
         }
         if super::process::is_self(network, endpoints.0, endpoints.1).await {
             return true;
@@ -134,9 +137,12 @@ mod tests {
             let destination = listener.local_addr().unwrap();
             let client = tokio::net::TcpStream::connect(destination).await.unwrap();
             let (_server, _) = listener.accept().await.unwrap();
+            let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+            // Ingress uses the shared owner snapshot (100 ms on Windows) and
+            // never dumps the table per packet; let it catch up.
+            tokio::time::sleep(Duration::from_millis(150)).await;
             let packet = owned_packet(Network::Tcp, client.local_addr().unwrap(), destination);
             assert!(exclusion.excludes(&packet).await);
-            let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
             let packet = owned_packet(Network::Udp, udp.local_addr().unwrap(), destination);
             for _ in 0..4 {
                 assert!(exclusion.excludes(&packet).await);

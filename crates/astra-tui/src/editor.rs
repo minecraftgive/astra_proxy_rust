@@ -721,12 +721,16 @@ impl Editor {
         self.node_tags = tags;
     }
     fn reference_values(&self, doc: &DocumentMut, key: &str) -> Option<Vec<String>> {
-        if key == "interface" && (last_key(&self.form.path) == Some("tun") || proxy_group_name(&self.form.path).is_some()) {
+        if key == "interface"
+            && (last_key(&self.form.path) == Some("tun")
+                || proxy_group_name(&self.form.path).is_some())
+        {
             let mut values = vec![String::new()];
             values.extend(self.interfaces.iter().cloned());
             // Retain an existing override when an adapter is temporarily absent.
             if let Some(current) = table_at(doc.as_table(), &self.form.path)
-                .and_then(|table| table.get(key)).and_then(Item::as_str)
+                .and_then(|table| table.get(key))
+                .and_then(Item::as_str)
                 .filter(|name| !name.is_empty() && !values.iter().any(|v| v == name))
             {
                 values.push(current.to_owned());
@@ -1106,7 +1110,7 @@ impl Editor {
                     number(
                         "shutdown_timeout_secs",
                         t("停止等待时间（秒）"),
-                        10,
+                        2,
                         0,
                         i64::MAX,
                     ),
@@ -1216,7 +1220,12 @@ impl Editor {
             ]
         } else if path.len() == 2 && proxy_group_name(path).is_some() {
             let mut fields = vec![
-                text("interface", t("Egress adapter (physical or virtual)"), "", false),
+                text(
+                    "interface",
+                    t("Egress adapter (physical or virtual)"),
+                    "",
+                    false,
+                ),
                 choice(
                     "mode",
                     t("Group mode"),
@@ -2183,9 +2192,12 @@ impl Editor {
         let input = text;
         let spec = self.current_spec(&doc, &key)?;
         let interface_selection = key == "interface" && last_key(&self.form.path) == Some("tun");
-        if interface_selection || (key == "interface" && proxy_group_name(&self.form.path).is_some()) {
+        if interface_selection
+            || (key == "interface" && proxy_group_name(&self.form.path).is_some())
+        {
             anyhow::ensure!(
-                self.reference_values(&doc, &key).is_some_and(|values| values.contains(&input)),
+                self.reference_values(&doc, &key)
+                    .is_some_and(|values| values.contains(&input)),
                 t("Select a local network adapter with ↑↓")
             );
         }
@@ -2429,9 +2441,14 @@ impl Editor {
                 }
             }
             FlatRow::Field { path, spec, .. } => {
-                if spec.key == "interface" && (last_key(&path) == Some("tun") || proxy_group_name(&path).is_some()) {
-                    let exclude = doc.get("tun").and_then(Item::as_table_like)
-                        .and_then(|table| table.get("name")).and_then(Item::as_str);
+                if spec.key == "interface"
+                    && (last_key(&path) == Some("tun") || proxy_group_name(&path).is_some())
+                {
+                    let exclude = doc
+                        .get("tun")
+                        .and_then(Item::as_table_like)
+                        .and_then(|table| table.get("name"))
+                        .and_then(Item::as_str);
                     self.interfaces = crate::network_interfaces::names(exclude)
                         .context(t("Could not list local network adapters"))?;
                 }
@@ -4159,15 +4176,24 @@ mod tests {
             press(&mut editor, KeyCode::Enter);
         }
         let doc = editor.document().unwrap();
-        assert_eq!(doc["proxy_groups"]["one"]["interface"].as_str(), Some("Ethernet"));
-        assert_eq!(doc["proxy_groups"]["two"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+        assert_eq!(
+            doc["proxy_groups"]["one"]["interface"].as_str(),
+            Some("Ethernet")
+        );
+        assert_eq!(
+            doc["proxy_groups"]["two"]["interface"].as_str(),
+            Some("虚拟网卡 VPN")
+        );
         assert!(doc["proxy_groups"]["one"].get("auto_interface").is_none());
         assert_eq!(doc["tun"]["auto_interface"].as_bool(), Some(true));
         editor.form.path = path(&["proxy_groups", "one"]);
         field(&mut editor, "interface", "");
         let doc = editor.document().unwrap();
         assert!(doc["proxy_groups"]["one"].get("interface").is_none());
-        assert_eq!(doc["proxy_groups"]["two"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+        assert_eq!(
+            doc["proxy_groups"]["two"]["interface"].as_str(),
+            Some("虚拟网卡 VPN")
+        );
     }
 
     #[test]
@@ -4180,7 +4206,9 @@ mod tests {
         // Use deterministic names to exercise both physical and virtual adapters.
         editor.interfaces = vec!["Ethernet".into(), "虚拟网卡 VPN".into()];
         let doc = editor.document().unwrap();
-        let values = editor.suggestions(&doc, "interface", &TextInput::new(String::new())).unwrap();
+        let values = editor
+            .suggestions(&doc, "interface", &TextInput::new(String::new()))
+            .unwrap();
         assert!(values.contains(&"Ethernet".into()));
         assert!(values.contains(&"虚拟网卡 VPN".into()));
         editor.paste("虚拟");
@@ -4195,20 +4223,34 @@ mod tests {
         editor.paste("not-a-local-adapter");
         assert!(editor.key(key(KeyCode::Enter)).is_err());
         press(&mut editor, KeyCode::Esc);
-        assert_eq!(editor.document().unwrap()["tun"]["interface"].as_str(), Some("虚拟网卡 VPN"));
+        assert_eq!(
+            editor.document().unwrap()["tun"]["interface"].as_str(),
+            Some("虚拟网卡 VPN")
+        );
 
         let doc = editor.document().unwrap();
         editor.focus_field(&doc, &path(&["tun"]), "interface");
         press(&mut editor, KeyCode::Enter);
-        editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
-        for language in [crate::i18n::Language::English, crate::i18n::Language::Simplified, crate::i18n::Language::Traditional] {
+        editor
+            .key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Simplified,
+            crate::i18n::Language::Traditional,
+        ] {
             crate::i18n::with_language(language, || {
                 let mut terminal = Terminal::new(TestBackend::new(76, 20)).unwrap();
-                terminal.draw(|frame| editor.render(frame, frame.area())).unwrap();
+                terminal
+                    .draw(|frame| editor.render(frame, frame.area()))
+                    .unwrap();
                 let buffer = terminal.backend().buffer();
                 let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
                 let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                let label: String = t("Automatic interface").chars().filter(|c| !c.is_whitespace()).collect();
+                let label: String = t("Automatic interface")
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
                 assert!(compact.contains(&label), "{text}");
             });
         }

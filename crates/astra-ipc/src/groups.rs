@@ -265,7 +265,9 @@ fn validate_expanded(
     }
     let mut total = 0;
     for (name, group) in groups {
-        if group.interface.as_ref().is_some_and(|name| name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control)) {
+        if group.interface.as_ref().is_some_and(|name| {
+            name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+        }) {
             return Err(format!("proxy group {name}: invalid egress interface"));
         }
         if name.trim().is_empty()

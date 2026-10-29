@@ -66,6 +66,9 @@ impl Prepared {
                     packet=udp.recv_from(&mut bytes)=>{
                         let Ok((size,peer))=packet else{break;};
                         let app=active.load_full();
+                        // DNS listeners follow the same LAN ACL as proxy inbounds;
+                        // a non-loopback bind must never become an open resolver.
+                        if !app.inbound_allowed(peer.ip()){continue;}
                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
                         if jobs.len()>=limit{continue;}
                         let request=bytes[..size].to_vec();let udp=udp.clone();
@@ -82,7 +85,8 @@ impl Prepared {
                 loop {tokio::select! {
                     Some(_)=jobs.join_next(),if !jobs.is_empty()=>{},
                     accepted=tcp.accept()=>{
-                        let Ok((stream,_peer))=accepted else{break;};let app=active.load_full();
+                        let Ok((stream,peer))=accepted else{break;};let app=active.load_full();
+                        if !app.inbound_allowed(peer.ip()){continue;}
                         let _=stream.set_nodelay(true);
                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
                         if jobs.len()>=limit{continue;}

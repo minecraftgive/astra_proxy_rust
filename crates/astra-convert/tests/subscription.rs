@@ -350,3 +350,44 @@ fn fetch_diagnostics_distinguish_html_yaml_and_unsupported_nodes() {
     .unwrap();
     assert!(diagnostics::error(&error).contains("download subscription: connection refused"));
 }
+
+#[test]
+fn remote_subscriptions_accept_http_refuse_downgrade_and_local_files() {
+    use astra_convert::subscription::{fetch_with, validate_redirect, Subscription};
+    for url in [
+        "http://example.com/sub",
+        "http://192.168.1.1/sub",
+        "http://[fd00::1]/sub",
+        "https://example.com/sub",
+        "http://127.0.0.1:8080/sub",
+        "http://localhost/sub",
+        "http://[::1]/sub",
+    ] {
+        assert!(validate_url(url).is_ok(), "{url}");
+    }
+    for url in [
+        "http://user:pass@example.com/sub",
+        "ftp://example.com/sub",
+        "file:///etc/passwd",
+    ] {
+        assert!(validate_url(url).is_err(), "{url}");
+    }
+    assert!(validate_redirect("https://example.com/a", "http://127.0.0.1/b").is_err());
+    assert!(validate_redirect("https://example.com/a", "https://cdn.example.com/b").is_ok());
+    assert!(validate_redirect("http://example.com/a", "http://cdn.example.com/b").is_ok());
+    assert!(validate_redirect("http://example.com/a", "https://cdn.example.com/b").is_ok());
+    let error = fetch_with(
+        &Subscription {
+            url: "https://subscription.test/list".into(),
+            ..Default::default()
+        },
+        std::path::Path::new("."),
+        &|_, _| Ok("proxy-providers: {p: {type: file, path: /etc/passwd}}".into()),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        format!("{error:#}").contains("local file providers"),
+        "{error:#}"
+    );
+}

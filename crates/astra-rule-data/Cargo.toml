@@ -11,6 +11,7 @@ serde.workspace = true
 serde_yaml = "0.9"
 ipnet = "2"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
 tracing.workspace = true
 
 prost = "0.14"

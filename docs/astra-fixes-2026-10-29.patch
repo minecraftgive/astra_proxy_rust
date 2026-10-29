@@ -1,0 +1,1416 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4c3a724..efff55e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -254,7 +254,7 @@ dependencies = [
+  "tracing",
+  "tracing-subscriber",
+  "uuid",
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+ ]
+ 
+ [[package]]
+@@ -295,7 +295,7 @@ dependencies = [
+  "tun-rs",
+  "url",
+  "uuid",
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+  "windows-sys 0.61.2",
+ ]
+ 
+@@ -330,6 +330,7 @@ dependencies = [
+  "serde_yaml",
+  "tracing",
+  "ureq",
++ "url",
+ ]
+ 
+ [[package]]
+@@ -1032,9 +1033,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "ctutils"
+-version = "0.4.3"
++version = "0.4.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
++checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
+ dependencies = [
+  "cmov",
+ ]
+@@ -3354,9 +3355,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls-webpki"
+-version = "0.103.15"
++version = "0.103.16"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
++checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
+ dependencies = [
+  "aws-lc-rs",
+  "ring",
+@@ -4462,9 +4463,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "webpki-root-certs"
+-version = "1.0.9"
++version = "1.0.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
++checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
+ dependencies = [
+  "rustls-pki-types",
+ ]
+@@ -4475,14 +4476,14 @@ version = "0.26.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+ dependencies = [
+- "webpki-roots 1.0.9",
++ "webpki-roots 1.0.11",
+ ]
+ 
+ [[package]]
+ name = "webpki-roots"
+-version = "1.0.9"
++version = "1.0.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
++checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+ dependencies = [
+  "rustls-pki-types",
+ ]
+diff --git a/README.md b/README.md
+index feb2c62..610bd72 100644
+--- a/README.md
++++ b/README.md
+@@ -183,9 +183,11 @@ IPC 默认 8 个持久通道，每通道一条在途请求。一次决策的总
+ 
+ ## 资源与排障
+ 
++远程订阅、proxy-provider、规则集与 GeoIP/GeoSite 下载要求 HTTPS（明文 HTTP 仅允许 127.0.0.1/localhost 等回环地址），重定向不得从 HTTPS 降级。远程订阅不能引用本机 `type: file` provider，导入其 `dns` 段时不会采用其中的 `listen`。DNS 监听与代理入站使用同一套来源准入（LAN 开关、`lan_allowed_ips` / `lan_disallowed_ips`）。规则核心冷启动时直接使用已过期但有效的资源缓存，并在启动后立即于后台刷新。
++
+ 默认 `max_connections = 4096`；空闲监听器不占用会话额度。UDP 默认全局最多 512 个流、每个关联最多 32 个目标，每流发送队列 4 个包，空闲 120 秒回收。UDP 关联随 TCP 控制连接关闭，禁止 SOCKS 分片并固定客户端来源；超限丢包，不无限积压。
+ 
+-`connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 10 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
++`connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 2 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
+ 
+ ## 验证
+ 
+diff --git a/configs/client.example.toml b/configs/client.example.toml
+index ecf7622..d781b65 100644
+--- a/configs/client.example.toml
++++ b/configs/client.example.toml
+@@ -28,7 +28,7 @@ ipc_connections = 8               # 1..128；持久 UDS 通道数量
+ # 单次决策总期限包括排队、连接和重试；规则不可用时缓存未命中新请求失败关闭。
+ decision_timeout_ms = 500          # >0
+ connect_timeout_secs = 8           # >0；出站连接/握手期限
+-shutdown_timeout_secs = 10         # 停止接受连接后等待会话退出的秒数；0 表示不等待
++shutdown_timeout_secs = 2          # 停止接受连接后等待会话退出的秒数；0 表示不等待
+ max_connections = 4096            # >0；TCP 会话（含 UDP 控制连接）额度
+ max_udp_flows = 512                # 1..65536；所有关联共享的 UDP 流额度
+ udp_targets_per_association = 32   # 1..max_udp_flows；每个关联最大目标数
+diff --git a/configs/native.toml b/configs/native.toml
+index 32341cf..b907550 100644
+--- a/configs/native.toml
++++ b/configs/native.toml
+@@ -2,7 +2,7 @@ rule_socket = "/tmp/astra-rule.sock"
+ socks5_listen = "127.0.0.1:1080"
+ http_listen = "127.0.0.1:8080"
+ connect_timeout_secs = 15
+-shutdown_timeout_secs = 10
++shutdown_timeout_secs = 2
+ 
+ # Matching rule: action = "proxy:edge"
+ [[outbounds]]
+diff --git a/crates/astra-convert/src/lib.rs b/crates/astra-convert/src/lib.rs
+index 26c6d02..c11d491 100644
+--- a/crates/astra-convert/src/lib.rs
++++ b/crates/astra-convert/src/lib.rs
+@@ -20,6 +20,9 @@ pub struct Options {
+     pub geoip_database: Option<String>,
+     pub geosite_database: Option<String>,
+     pub strict_rules: bool,
++    /// Input came from a remote subscription: local `file` providers are
++    /// refused so a subscription cannot read files from this machine.
++    pub remote: bool,
+ }
+ 
+ pub struct Converted {
+diff --git a/crates/astra-convert/src/subscription.rs b/crates/astra-convert/src/subscription.rs
+index 27585eb..f78c2a4 100644
+--- a/crates/astra-convert/src/subscription.rs
++++ b/crates/astra-convert/src/subscription.rs
+@@ -46,16 +46,11 @@ impl Subscription {
+     }
+ }
+ pub fn validate_url(value: &str) -> Result<()> {
+-    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid subscription URL"))?;
+-    ensure!(
+-        matches!(url.scheme(), "http" | "https")
+-            && url.host_str().is_some()
+-            && url.username().is_empty()
+-            && url.password().is_none(),
+-        "subscription requires HTTP(S) without URL credentials"
+-    );
+-    Ok(())
++    astra_rule_data::validate_remote_url(value)
++        .map(|_| ())
++        .context("subscription requires HTTPS without URL credentials (HTTP only for loopback)")
+ }
++pub use astra_rule_data::validate_redirect;
+ pub fn download(url: &str, user_agent: &str) -> Result<String> {
+     validate_url(url)?;
+     let response = ureq::AgentBuilder::new()
+@@ -73,6 +68,7 @@ pub fn download(url: &str, user_agent: &str) -> Result<String> {
+                 diagnostics::error(&anyhow::anyhow!(error.to_string()))
+             ),
+         })?;
++    validate_redirect(url, response.get_url())?;
+     bounded(response.into_reader())
+ }
+ fn bounded(reader: impl Read) -> Result<String> {
+@@ -144,6 +140,10 @@ fn convert_clash_with(
+                     download(&required(&spec, "url")?, user_agent)
+                         .with_context(|| format!("download HTTP proxy-provider {name}"))?
+                 } else {
++                    ensure!(
++                        !options.remote,
++                        "remote subscriptions cannot reference local file providers"
++                    );
+                     bounded(std::fs::File::open(
+                         options.base_dir.join(required(&spec, "path")?),
+                     )?)?
+@@ -307,6 +307,7 @@ pub fn fetch_with(
+         &text,
+         &Options {
+             base_dir: base_dir.into(),
++            remote: true,
+             ..Default::default()
+         },
+         &config.user_agent,
+@@ -334,8 +335,13 @@ pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Re
+     // Import DNS on first use; explicit local settings and previous imports
+     // remain editable and win over subsequent subscription refreshes.
+     if !current.contains_key("dns") {
+-        if let Some(dns) = remote.get("dns") {
+-            current.insert("dns".into(), dns.clone());
++        if let Some(mut dns) = remote.get("dns").cloned() {
++            // Resolvers come from the subscription, but where this machine
++            // listens is a local decision: keep the loopback default.
++            if let Some(table) = dns.as_table_mut() {
++                table.remove("listen");
++            }
++            current.insert("dns".into(), dns);
+         }
+     }
+     let incoming = remote
+diff --git a/crates/astra-convert/tests/dns.rs b/crates/astra-convert/tests/dns.rs
+index 639d680..c3e263a 100644
+--- a/crates/astra-convert/tests/dns.rs
++++ b/crates/astra-convert/tests/dns.rs
+@@ -26,6 +26,10 @@ fn subscription_imports_dns_once_and_preserves_local_changes() {
+     let merged = merge("", &converted.proxy, &mut ownership).unwrap();
+     let document: toml::Table = toml::from_str(&merged).unwrap();
+     assert_eq!(document["dns"]["fake_ip"].as_bool(), Some(true));
++    assert!(
++        document["dns"].get("listen").is_none(),
++        "a subscription must not choose where local DNS listens"
++    );
+     let changed = merged.replace("fake_ip = true", "fake_ip = false");
+     let merged = merge(&changed, &converted.proxy, &mut ownership).unwrap();
+     let document: toml::Table = toml::from_str(&merged).unwrap();
+diff --git a/crates/astra-convert/tests/subscription.rs b/crates/astra-convert/tests/subscription.rs
+index 07814eb..86f7352 100644
+--- a/crates/astra-convert/tests/subscription.rs
++++ b/crates/astra-convert/tests/subscription.rs
+@@ -350,3 +350,39 @@ fn fetch_diagnostics_distinguish_html_yaml_and_unsupported_nodes() {
+     .unwrap();
+     assert!(diagnostics::error(&error).contains("download subscription: connection refused"));
+ }
++
++#[test]
++fn remote_subscriptions_require_https_and_refuse_local_files() {
++    use astra_convert::subscription::{fetch_with, validate_redirect, Subscription};
++    for url in [
++        "http://example.com/sub",
++        "http://192.168.1.1/sub",
++        "http://[fd00::1]/sub",
++    ] {
++        assert!(validate_url(url).is_err(), "{url}");
++    }
++    for url in [
++        "https://example.com/sub",
++        "http://127.0.0.1:8080/sub",
++        "http://localhost/sub",
++        "http://[::1]/sub",
++    ] {
++        assert!(validate_url(url).is_ok(), "{url}");
++    }
++    assert!(validate_redirect("https://example.com/a", "http://127.0.0.1/b").is_err());
++    assert!(validate_redirect("https://example.com/a", "https://cdn.example.com/b").is_ok());
++    let error = fetch_with(
++        &Subscription {
++            url: "https://subscription.test/list".into(),
++            ..Default::default()
++        },
++        std::path::Path::new("."),
++        &|_, _| Ok("proxy-providers: {p: {type: file, path: /etc/passwd}}".into()),
++    )
++    .err()
++    .unwrap();
++    assert!(
++        format!("{error:#}").contains("local file providers"),
++        "{error:#}"
++    );
++}
+diff --git a/crates/astra-ipc/src/control.rs b/crates/astra-ipc/src/control.rs
+index 343b009..76586cf 100644
+--- a/crates/astra-ipc/src/control.rs
++++ b/crates/astra-ipc/src/control.rs
+@@ -350,7 +350,7 @@ pub async fn watch_runtime(
+ ) -> io::Result<crate::platform::LocalStream> {
+     let mut stream = timeout(
+         Duration::from_secs(3),
+-        crate::platform::LocalStream::connect(path),
++        crate::platform::connect_trusted(path),
+     )
+     .await
+     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "watch connection timeout"))??;
+diff --git a/crates/astra-ipc/src/elevation.rs b/crates/astra-ipc/src/elevation.rs
+index e8198e2..76cce67 100644
+--- a/crates/astra-ipc/src/elevation.rs
++++ b/crates/astra-ipc/src/elevation.rs
+@@ -262,6 +262,8 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
+             "TUN elevation requires the original Windows account and an elevated token",
+         ));
+     }
++    // This core is driven by its non-elevated launcher (manager/TUI).
++    crate::platform::allow_unelevated_clients();
+     std::env::set_current_dir(&args[6])?;
+     if args[8].is_empty() {
+         std::env::remove_var("ASTRA_RUNTIME_DIR");
+diff --git a/crates/astra-ipc/src/platform.rs b/crates/astra-ipc/src/platform.rs
+index 4b59a13..39398d3 100644
+--- a/crates/astra-ipc/src/platform.rs
++++ b/crates/astra-ipc/src/platform.rs
+@@ -144,7 +144,30 @@ impl ReloadSignal {
+ }
+ 
+ #[cfg(windows)]
+-pub use windows::{LocalListener, LocalStream};
++pub use windows::{allow_unelevated_clients, LocalListener, LocalStream};
++
++/// Connect to a local IPC endpoint and verify who serves it. Unix endpoints in
++/// shared directories such as /tmp could be pre-bound by another local user to
++/// spoof routing or management replies; only this user or root is accepted.
++/// Windows pipes are already restricted to this user's SID by their DACL.
++pub async fn connect_trusted(path: impl AsRef<Path>) -> io::Result<LocalStream> {
++    let stream = LocalStream::connect(path).await?;
++    #[cfg(unix)]
++    {
++        let peer = stream.peer_cred()?.uid();
++        // Both ends stay open: macOS getpeereid fails on a closed pair.
++        let (own, _peer) = tokio::net::UnixStream::pair()?;
++        let me = own.peer_cred()?.uid();
++        // A root core (sudo/TUN) may talk to cores of the invoking user.
++        if peer != me && peer != 0 && me != 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                format!("IPC endpoint is served by another local user (uid {peer}); refusing it"),
++            ));
++        }
++    }
++    Ok(stream)
++}
+ 
+ pub async fn stream_pair() -> io::Result<(LocalStream, LocalStream)> {
+     #[cfg(unix)]
+@@ -217,7 +240,24 @@ mod windows {
+             }
+         }
+     }
++    static UNELEVATED_CLIENTS: std::sync::atomic::AtomicBool =
++        std::sync::atomic::AtomicBool::new(false);
++    /// Called by a UAC-launched TUN core: it is controlled by its non-elevated
++    /// launcher by design, so its endpoints keep the default (medium) label.
++    pub fn allow_unelevated_clients() {
++        UNELEVATED_CLIENTS.store(true, std::sync::atomic::Ordering::Relaxed);
++    }
++    /// Any other elevated process labels its pipes High integrity, so a
++    /// non-elevated process of the same user cannot drive it (UAC boundary).
++    fn high_integrity_only() -> bool {
++        static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        !UNELEVATED_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
++            && *ELEVATED.get_or_init(|| crate::elevation::is_elevated().unwrap_or(false))
++    }
+     fn descriptor() -> io::Result<Descriptor> {
++        descriptor_with(false)
++    }
++    fn descriptor_with(label: bool) -> io::Result<Descriptor> {
+         // Use the concrete user SID: access stays private across different
+         // logon sessions of this user, without granting other local users access.
+         unsafe {
+@@ -246,7 +286,8 @@ mod windows {
+             }
+             let sid_string = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+             LocalFree(sid.cast());
+-            let sddl: Vec<u16> = format!("D:P(A;OICI;GA;;;{sid_string})\0")
++            let integrity = if label { "S:(ML;;NWNR;;;HI)" } else { "" };
++            let sddl: Vec<u16> = format!("D:P(A;OICI;GA;;;{sid_string}){integrity}\0")
+                 .encode_utf16()
+                 .collect();
+             let mut descriptor = std::ptr::null_mut();
+@@ -312,7 +353,7 @@ mod windows {
+         Ok(format!(r"\\.\pipe\astra-{hash:016x}"))
+     }
+     fn server(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+-        let descriptor = descriptor()?;
++        let descriptor = descriptor_with(high_integrity_only())?;
+         let mut attributes = SECURITY_ATTRIBUTES {
+             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+             lpSecurityDescriptor: descriptor.0,
+@@ -416,6 +457,13 @@ mod windows {
+                     Err(error) if error.raw_os_error() == Some(231) => {
+                         tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                     }
++                    Err(error) if error.raw_os_error() == Some(5) => {
++                        return Err(io::Error::new(
++                            io::ErrorKind::PermissionDenied,
++                            "access denied: the endpoint belongs to an elevated (administrator) \
++                             process or another account; run this tool the same way",
++                        ))
++                    }
+                     Err(error) => return Err(error),
+                 }
+             }
+diff --git a/crates/astra-ipc/src/session.rs b/crates/astra-ipc/src/session.rs
+index d45419b..76067cd 100644
+--- a/crates/astra-ipc/src/session.rs
++++ b/crates/astra-ipc/src/session.rs
+@@ -57,7 +57,7 @@ where
+                 let result = tokio::time::timeout(call.timeout, async {
+                     if connection.is_none() {
+                         if let Some(progress) = &call.progress { progress.send_replace(Some(progress::Progress::new("Connecting", path.display().to_string()))); }
+-                        let mut stream = tokio::time::timeout(Duration::from_secs(3), LocalStream::connect(&path)).await
++                        let mut stream = tokio::time::timeout(Duration::from_secs(3), crate::platform::connect_trusted(&path)).await
+                             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timeout"))??;
+                         crate::send_management(&mut stream, &hello()).await?;
+                         let event: Event<R> = tokio::time::timeout(Duration::from_secs(3), crate::receive_management(&mut stream)).await
+diff --git a/crates/astra-proxy/src/config.rs b/crates/astra-proxy/src/config.rs
+index ffa9e32..07fa8c6 100644
+--- a/crates/astra-proxy/src/config.rs
++++ b/crates/astra-proxy/src/config.rs
+@@ -68,7 +68,9 @@ fn default_udp_idle() -> u64 {
+     120
+ }
+ fn default_shutdown_timeout() -> u64 {
+-    10
++    // Client sessions are mostly long-lived keep-alive tunnels that would hold
++    // the full window; a short grace period keeps quitting responsive.
++    2
+ }
+ fn default_workers() -> usize {
+     8
+diff --git a/crates/astra-proxy/src/dns/server.rs b/crates/astra-proxy/src/dns/server.rs
+index 2bc0b44..baffcc1 100644
+--- a/crates/astra-proxy/src/dns/server.rs
++++ b/crates/astra-proxy/src/dns/server.rs
+@@ -66,6 +66,9 @@ impl Prepared {
+                     packet=udp.recv_from(&mut bytes)=>{
+                         let Ok((size,peer))=packet else{break;};
+                         let app=active.load_full();
++                        // DNS listeners follow the same LAN ACL as proxy inbounds;
++                        // a non-loopback bind must never become an open resolver.
++                        if !app.inbound_allowed(peer.ip()){continue;}
+                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
+                         if jobs.len()>=limit{continue;}
+                         let request=bytes[..size].to_vec();let udp=udp.clone();
+@@ -82,7 +85,8 @@ impl Prepared {
+                 loop {tokio::select! {
+                     Some(_)=jobs.join_next(),if !jobs.is_empty()=>{},
+                     accepted=tcp.accept()=>{
+-                        let Ok((stream,_peer))=accepted else{break;};let app=active.load_full();
++                        let Ok((stream,peer))=accepted else{break;};let app=active.load_full();
++                        if !app.inbound_allowed(peer.ip()){continue;}
+                         let _=stream.set_nodelay(true);
+                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
+                         if jobs.len()>=limit{continue;}
+diff --git a/crates/astra-proxy/src/inbound/authentication.rs b/crates/astra-proxy/src/inbound/authentication.rs
+index 84325f2..b521f3a 100644
+--- a/crates/astra-proxy/src/inbound/authentication.rs
++++ b/crates/astra-proxy/src/inbound/authentication.rs
+@@ -42,6 +42,9 @@ pub(crate) async fn authorize_connect(client: &mut TcpStream, users: &[String])
+     }
+     let headers = timeout(Duration::from_secs(10), async {
+         let mut buffer = vec![0u8; 32 * 1024];
++        // peek() returns immediately while partial headers sit in the buffer;
++        // back off so a slow client cannot spin a core for the full timeout.
++        let mut pause = Duration::from_millis(1);
+         loop {
+             let count = client.peek(&mut buffer).await?;
+             anyhow::ensure!(count != 0, "connection closed during proxy authentication");
+@@ -49,7 +52,8 @@ pub(crate) async fn authorize_connect(client: &mut TcpStream, users: &[String])
+                 return Ok::<_, anyhow::Error>(String::from_utf8(buffer[..end].to_vec())?);
+             }
+             anyhow::ensure!(count < buffer.len(), "proxy request headers exceed 32 KiB");
+-            tokio::time::sleep(Duration::from_millis(1)).await;
++            tokio::time::sleep(pause).await;
++            pause = (pause * 2).min(Duration::from_millis(25));
+         }
+     })
+     .await
+diff --git a/crates/astra-proxy/src/lib.rs b/crates/astra-proxy/src/lib.rs
+index ae09ff3..e90168c 100644
+--- a/crates/astra-proxy/src/lib.rs
++++ b/crates/astra-proxy/src/lib.rs
+@@ -57,6 +57,20 @@ pub struct App {
+     permits: Arc<limit::Limit>,
+ }
+ 
++fn loopback_target(host: &str) -> bool {
++    let host = host.trim_matches(['[', ']']);
++    match host.parse::<std::net::IpAddr>() {
++        Ok(ip) => {
++            let ip = ip.to_canonical();
++            ip.is_loopback() || ip.is_unspecified()
++        }
++        Err(_) => {
++            let host = host.trim_end_matches('.').to_ascii_lowercase();
++            host == "localhost" || host.ends_with(".localhost")
++        }
++    }
++}
++
+ impl App {
+     fn inbound_allowed(&self, ip: std::net::IpAddr) -> bool {
+         let ip = ip.to_canonical();
+@@ -127,6 +141,17 @@ impl App {
+         source: Option<std::net::SocketAddr>,
+         destination: Option<std::net::SocketAddr>,
+     ) -> Result<RouteAction> {
++        // A LAN client must not use the proxy to reach this host's
++        // loopback-only services: DIRECT would dial 127.0.0.1 locally.
++        if matches!(
++            inbound,
++            Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
++        ) && source.is_some_and(|source| !source.ip().to_canonical().is_loopback())
++            && loopback_target(&target.host)
++        {
++            tracing::debug!(target: "astra_route", host = ?target.host, ?source, "LAN client blocked from host loopback");
++            return Ok(RouteAction::Block);
++        }
+         // Transparent self-capture is unsafe even in standalone mode.
+         let process = if self.standalone_action.is_none() || inbound == Inbound::Tun {
+             match (source, destination) {
+diff --git a/crates/astra-proxy/src/platform/process.rs b/crates/astra-proxy/src/platform/process.rs
+index 08b6612..0c52049 100644
+--- a/crates/astra-proxy/src/platform/process.rs
++++ b/crates/astra-proxy/src/platform/process.rs
+@@ -39,7 +39,7 @@ async fn bounded_lookup<T: Send + 'static>(
+ ) -> Option<T> {
+     static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+     let limit = LIMIT
+-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
++        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)))
+         .clone();
+     // A busy or inaccessible process table must not stall every new connection.
+     tokio::time::timeout(Duration::from_millis(250), async move {
+@@ -106,7 +106,23 @@ mod windows {
+         },
+     };
+ 
+-    fn table<T: Copy>(network: Network, ipv4: bool) -> Option<Vec<T>> {
++    /// Owner tables are shared for a short window, so a burst of new
++    /// connections costs one table dump instead of one per connection.
++    /// Lookups that find no match re-query with `fresh = true`.
++    const SNAPSHOT_TTL: Duration = Duration::from_millis(100);
++    type Snapshot = (std::time::Instant, Arc<(Vec<u32>, u32)>);
++    static SNAPSHOTS: std::sync::Mutex<[Option<Snapshot>; 4]> =
++        std::sync::Mutex::new([None, None, None, None]);
++
++    fn raw(network: Network, ipv4: bool, fresh: bool) -> Option<Arc<(Vec<u32>, u32)>> {
++        let slot = usize::from(network == Network::Udp) * 2 + usize::from(ipv4);
++        if !fresh {
++            if let Some((at, data)) = &SNAPSHOTS.lock().ok()?[slot] {
++                if at.elapsed() < SNAPSHOT_TTL {
++                    return Some(data.clone());
++                }
++            }
++        }
+         let family = if ipv4 { AF_INET } else { AF_INET6 } as u32;
+         let query = |pointer, size| unsafe {
+             match network {
+@@ -135,21 +151,29 @@ mod windows {
+             if result != 0 || size as usize > data.len() * 4 {
+                 return None;
+             }
+-            let count = data[0] as usize;
+-            if count > (size as usize).saturating_sub(4) / size_of::<T>() {
+-                return None;
++            let data = Arc::new((data, size));
++            if let Ok(mut snapshots) = SNAPSHOTS.lock() {
++                snapshots[slot] = Some((std::time::Instant::now(), data.clone()));
+             }
+-            let pointer = unsafe { data.as_ptr().cast::<u8>().add(4) };
+-            return Some(
+-                (0..count)
+-                    .map(|i| unsafe {
+-                        pointer.add(i * size_of::<T>()).cast::<T>().read_unaligned()
+-                    })
+-                    .collect(),
+-            );
++            return Some(data);
+         }
+         None
+     }
++
++    fn table<T: Copy>(network: Network, ipv4: bool, fresh: bool) -> Option<Vec<T>> {
++        let raw = raw(network, ipv4, fresh)?;
++        let (data, size) = &*raw;
++        let count = data[0] as usize;
++        if count > (*size as usize).saturating_sub(4) / size_of::<T>() {
++            return None;
++        }
++        let pointer = unsafe { data.as_ptr().cast::<u8>().add(4) };
++        Some(
++            (0..count)
++                .map(|i| unsafe { pointer.add(i * size_of::<T>()).cast::<T>().read_unaligned() })
++                .collect(),
++        )
++    }
+     fn v4(address: u32, port: u32) -> SocketAddr {
+         SocketAddr::new(
+             IpAddr::V4(Ipv4Addr::from(address.to_ne_bytes())),
+@@ -174,12 +198,21 @@ mod windows {
+         network: Network,
+         source: SocketAddr,
+         destination: SocketAddr,
++    ) -> Option<u32> {
++        owner_pid_in(network, source, destination, false)
++            .or_else(|| owner_pid_in(network, source, destination, true))
++    }
++    fn owner_pid_in(
++        network: Network,
++        source: SocketAddr,
++        destination: SocketAddr,
++        fresh: bool,
+     ) -> Option<u32> {
+         let source = SocketAddr::new(source.ip().to_canonical(), source.port());
+         let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
+         match (network, source.is_ipv4()) {
+             (Network::Tcp, true) => unique(
+-                table::<MIB_TCPROW_OWNER_PID>(network, true)?
++                table::<MIB_TCPROW_OWNER_PID>(network, true, fresh)?
+                     .into_iter()
+                     .filter(|row| {
+                         same(v4(row.dwLocalAddr, row.dwLocalPort), source)
+@@ -188,7 +221,7 @@ mod windows {
+                     .map(|row| row.dwOwningPid),
+             ),
+             (Network::Tcp, false) => unique(
+-                table::<MIB_TCP6ROW_OWNER_PID>(network, false)?
++                table::<MIB_TCP6ROW_OWNER_PID>(network, false, fresh)?
+                     .into_iter()
+                     .filter(|row| {
+                         same(v6(row.ucLocalAddr, row.dwLocalPort), source)
+@@ -197,7 +230,7 @@ mod windows {
+                     .map(|row| row.dwOwningPid),
+             ),
+             (Network::Udp, true) => {
+-                let rows = table::<MIB_UDPROW_OWNER_PID>(network, true)?;
++                let rows = table::<MIB_UDPROW_OWNER_PID>(network, true, fresh)?;
+                 let candidates: Vec<_> = rows
+                     .iter()
+                     .filter(|row| {
+@@ -210,7 +243,7 @@ mod windows {
+                 unique(candidates)
+             }
+             (Network::Udp, false) => {
+-                let rows = table::<MIB_UDP6ROW_OWNER_PID>(network, false)?;
++                let rows = table::<MIB_UDP6ROW_OWNER_PID>(network, false, fresh)?;
+                 unique(
+                     rows.iter()
+                         .filter(|row| {
+@@ -230,7 +263,21 @@ mod windows {
+         destination: SocketAddr,
+     ) -> Option<ProcessInfo> {
+         let pid = owner_pid(network, source, destination)?;
+-        unsafe {
++        // Image paths are cached briefly; PID reuse inside the window is
++        // far less likely than the cost of OpenProcess on every connection.
++        type PathCache = std::collections::HashMap<u32, (std::time::Instant, String)>;
++        static PATHS: std::sync::Mutex<Option<PathCache>> = std::sync::Mutex::new(None);
++        if let Some((at, path)) = PATHS
++            .lock()
++            .ok()?
++            .get_or_insert_with(Default::default)
++            .get(&pid)
++        {
++            if at.elapsed() < Duration::from_secs(2) {
++                return info(pid, path.clone());
++            }
++        }
++        let path = unsafe {
+             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+             if handle.is_null() {
+                 return None;
+@@ -242,8 +289,16 @@ mod windows {
+             if result == 0 {
+                 return None;
+             }
+-            info(pid, String::from_utf16(&path[..length as usize]).ok()?)
++            String::from_utf16(&path[..length as usize]).ok()?
++        };
++        if let Ok(mut paths) = PATHS.lock() {
++            let paths = paths.get_or_insert_with(Default::default);
++            if paths.len() >= 1024 {
++                paths.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(2));
++            }
++            paths.insert(pid, (std::time::Instant::now(), path.clone()));
+         }
++        info(pid, path)
+     }
+ }
+ 
+diff --git a/crates/astra-proxy/src/proxy/rule_client.rs b/crates/astra-proxy/src/proxy/rule_client.rs
+index 5694831..66a16a0 100644
+--- a/crates/astra-proxy/src/proxy/rule_client.rs
++++ b/crates/astra-proxy/src/proxy/rule_client.rs
+@@ -84,7 +84,7 @@ impl RuleClient {
+                 // Cancellation, partial I/O and timeouts therefore always close it.
+                 let mut stream = match lease.stream.take() {
+                     Some(stream) => stream,
+-                    None => UnixStream::connect(&self.socket_path)
++                    None => astra_ipc::platform::connect_trusted(&self.socket_path)
+                         .await
+                         .context("Rule Core connect failed")?,
+                 };
+@@ -121,7 +121,7 @@ impl Drop for RuleClient {
+ async fn observe(path: String, revision: Arc<AtomicU64>) {
+     loop {
+         let result: Result<()> = async {
+-            let mut stream = UnixStream::connect(&path).await?;
++            let mut stream = astra_ipc::platform::connect_trusted(&path).await?;
+             astra_ipc::send(
+                 &mut stream,
+                 &RouteRequest {
+diff --git a/crates/astra-proxy/src/proxy/runtime.rs b/crates/astra-proxy/src/proxy/runtime.rs
+index 0da6fe5..7552d6f 100644
+--- a/crates/astra-proxy/src/proxy/runtime.rs
++++ b/crates/astra-proxy/src/proxy/runtime.rs
+@@ -351,8 +351,12 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
+             let mut effective = String::new();
+             let mut ownership = std::collections::BTreeMap::new();
+             let mut due = std::collections::BTreeMap::new();
++            // First tick fires immediately: an uncached subscription starts
++            // downloading at launch instead of one second later.
++            let mut tick = tokio::time::interval(Duration::from_secs(1));
++            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+             loop {
+-                tokio::time::sleep(Duration::from_secs(1)).await;
++                tick.tick().await;
+                 let (revision, path, base, settings) = {
+                     let state = state.lock().await;
+                     let settings = state.current.load().config.subscription_sources();
+diff --git a/crates/astra-proxy/src/subscription.rs b/crates/astra-proxy/src/subscription.rs
+index 143b85b..5d207c5 100644
+--- a/crates/astra-proxy/src/subscription.rs
++++ b/crates/astra-proxy/src/subscription.rs
+@@ -95,13 +95,15 @@ pub(crate) async fn download(app: &App, url: &str, user_agent: &str) -> Result<S
+                 .context("send subscription HTTP request/read response headers")?;
+             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                 ensure!(redirect < 3, "too many subscription redirects");
+-                url = url.join(
++                let next = url.join(
+                     response
+                         .headers()
+                         .get("location")
+                         .context("redirect location missing")?
+                         .to_str()?,
+                 )?;
++                astra_convert::subscription::validate_redirect(url.as_str(), next.as_str())?;
++                url = next;
+                 continue;
+             }
+             ensure!(
+diff --git a/crates/astra-rule-data/Cargo.toml b/crates/astra-rule-data/Cargo.toml
+index 68066ff..ec58532 100644
+--- a/crates/astra-rule-data/Cargo.toml
++++ b/crates/astra-rule-data/Cargo.toml
+@@ -11,6 +11,7 @@ serde.workspace = true
+ serde_yaml = "0.9"
+ ipnet = "2"
+ ureq = { version = "2.12", default-features = false, features = ["tls"] }
++url = "2"
+ tracing.workspace = true
+ 
+ prost = "0.14"
+diff --git a/crates/astra-rule-data/src/lib.rs b/crates/astra-rule-data/src/lib.rs
+index 61ed622..d6cc462 100644
+--- a/crates/astra-rule-data/src/lib.rs
++++ b/crates/astra-rule-data/src/lib.rs
+@@ -306,13 +306,58 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
+     }
+ }
+ fn validate_url(url: &str) -> Result<()> {
++    validate_remote_url(url).map(|_| ())
++}
++
++/// Remote subscriptions, providers and rule data change routing and node
++/// credentials, so they must be fetched over HTTPS. Plain HTTP is accepted only
++/// for loopback servers (local tests and on-device converters).
++pub fn validate_remote_url(value: &str) -> Result<url::Url> {
++    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid resource URL"))?;
++    ensure!(
++        matches!(url.scheme(), "http" | "https")
++            && url.host().is_some()
++            && url.username().is_empty()
++            && url.password().is_none(),
++        "resource URL requires HTTP(S) without URL credentials"
++    );
++    let loopback = match url.host() {
++        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
++        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
++        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
++        None => false,
++    };
++    ensure!(
++        url.scheme() == "https" || loopback,
++        "resource URL must use HTTPS; plain HTTP is only accepted for loopback addresses"
++    );
++    Ok(url)
++}
++
++/// A redirect may never downgrade HTTPS to plain HTTP, and its target must
++/// satisfy the same policy as the original URL.
++pub fn validate_redirect(from: &str, to: &str) -> Result<()> {
++    let target = validate_remote_url(to)?;
+     ensure!(
+-        url.starts_with("https://") || url.starts_with("http://"),
+-        "resource URL must use HTTP(S)"
++        !from.starts_with("https://") || target.scheme() == "https",
++        "redirect from HTTPS to plain HTTP refused"
+     );
+     Ok(())
+ }
+ 
++static SERVE_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static SERVED_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++/// While enabled, an expired but valid cache is used immediately instead of
++/// blocking on a download. Cores enable it for cold start and validation, then
++/// refresh expired resources in the background.
++pub fn serve_stale_cache(enabled: bool) {
++    SERVE_STALE.store(enabled, std::sync::atomic::Ordering::Relaxed);
++}
++/// Whether an expired cache was served since the last call.
++pub fn take_served_stale() -> bool {
++    SERVED_STALE.swap(false, std::sync::atomic::Ordering::Relaxed)
++}
++
+ /// A failed update retains a validated cache. Invalid new content never replaces it.
+ pub fn load_resource(
+     base: &Path,
+@@ -361,9 +406,16 @@ pub fn load_resource_with<T>(
+         .ok()
+         .and_then(|t| t.elapsed().ok())
+         .is_some_and(|age| age.as_secs() < interval);
+-    if fresh && cached.is_some() {
+-        return Ok(cached.unwrap());
+-    }
++    let serve = fresh || SERVE_STALE.load(std::sync::atomic::Ordering::Relaxed);
++    let cached = match cached {
++        Some(cached) if serve => {
++            if !fresh {
++                SERVED_STALE.store(true, std::sync::atomic::Ordering::Relaxed);
++            }
++            return Ok(cached);
++        }
++        cached => cached,
++    };
+     let update = (|| -> Result<(Vec<u8>, T)> {
+         let response = ureq::AgentBuilder::new()
+             .timeout(Duration::from_secs(15))
+@@ -372,6 +424,7 @@ pub fn load_resource_with<T>(
+             .get(url)
+             .call()
+             .context("resource download failed")?;
++        validate_redirect(url, response.get_url())?;
+         let mut data = Vec::new();
+         response
+             .into_reader()
+diff --git a/crates/astra-rule/src/main.rs b/crates/astra-rule/src/main.rs
+index 3f559e1..ca61530 100644
+--- a/crates/astra-rule/src/main.rs
++++ b/crates/astra-rule/src/main.rs
+@@ -221,6 +221,8 @@ async fn main() -> Result<()> {
+             .take(480 * 1024 + 1)
+             .read_to_string(&mut text)?;
+         anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
++        // Validation must not wait on downloads when a valid cache exists.
++        astra_rule_data::serve_stale_cache(true);
+         load_text(std::path::Path::new(&path), text)?;
+         return Ok(());
+     }
+@@ -228,7 +230,11 @@ async fn main() -> Result<()> {
+     let path =
+         if check { args.next() } else { first }.unwrap_or_else(|| "configs/rule.toml".into());
+     let path = std::fs::canonicalize(path)?;
++    // Cold start serves expired caches immediately; the watcher refreshes
++    // them in the background right after the core is listening.
++    astra_rule_data::serve_stale_cache(true);
+     let (text, config, rules) = load(&path)?;
++    astra_rule_data::serve_stale_cache(false);
+     if check {
+         return Ok(());
+     }
+@@ -241,7 +247,10 @@ async fn main() -> Result<()> {
+     let listener = Arc::new(ArcSwap::from_pointee(bind(&config.socket)?));
+     astra_ipc::control::applied(&path, &text);
+     let (revisions, mut changes) = watch::channel(revision);
+-    let resources = ResourceWatch::new(&config, &path)?;
++    let mut resources = ResourceWatch::new(&config, &path)?;
++    if astra_rule_data::take_served_stale() {
++        resources.next = Some(std::time::Instant::now());
++    }
+     let state = Arc::new(Mutex::new(State {
+         path,
+         text,
+diff --git a/crates/astra-server-api/src/lib.rs b/crates/astra-server-api/src/lib.rs
+index d20af46..8ddc7e1 100644
+--- a/crates/astra-server-api/src/lib.rs
++++ b/crates/astra-server-api/src/lib.rs
+@@ -35,7 +35,7 @@ pub struct Reply {
+ }
+ pub async fn call(path: &Path, action: Action) -> anyhow::Result<Reply> {
+     tokio::time::timeout(Duration::from_secs(20), async {
+-        let mut stream = astra_ipc::platform::LocalStream::connect(path).await?;
++        let mut stream = astra_ipc::platform::connect_trusted(path).await?;
+         astra_ipc::send_management(
+             &mut stream,
+             &Request {
+diff --git a/crates/astra-server-core/src/proxy/net.rs b/crates/astra-server-core/src/proxy/net.rs
+index da50991..926a4ac 100644
+--- a/crates/astra-server-core/src/proxy/net.rs
++++ b/crates/astra-server-core/src/proxy/net.rs
+@@ -4,7 +4,7 @@ use astra_ipc::Target;
+ use bytes::Bytes;
+ use std::{
+     collections::HashMap,
+-    net::{IpAddr, SocketAddr},
++    net::{IpAddr, Ipv4Addr, SocketAddr},
+     sync::{
+         atomic::{AtomicU64, Ordering},
+         Arc,
+@@ -69,35 +69,14 @@ impl App {
+         if self.config.deny_cidrs.iter().any(|net| net.contains(&ip)) {
+             return false;
+         }
+-        let ip = match ip {
+-            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),
+-            v => v,
+-        };
++        let ip = embedded_ipv4(ip);
+         if self.config.deny_cidrs.iter().any(|net| net.contains(&ip)) {
+             return false;
+         }
+         if self.config.allow_private_targets {
+             return !ip.is_unspecified() && !ip.is_multicast();
+         }
+-        match ip {
+-            IpAddr::V4(ip) => {
+-                !ip.is_private()
+-                    && !ip.is_loopback()
+-                    && !ip.is_link_local()
+-                    && !ip.is_unspecified()
+-                    && !ip.is_multicast()
+-                    && !ip.is_broadcast()
+-                    && ip.octets()[0] != 0
+-                    && ip.octets()[0] < 240
+-            }
+-            IpAddr::V6(ip) => {
+-                !ip.is_loopback()
+-                    && !ip.is_unspecified()
+-                    && !ip.is_multicast()
+-                    && !ip.is_unique_local()
+-                    && !ip.is_unicast_link_local()
+-            }
+-        }
++        public_destination(ip)
+     }
+     pub async fn resolve(&self, target: &Target) -> Result<Vec<SocketAddr>> {
+         ensure!(
+@@ -170,6 +149,55 @@ impl App {
+     }
+ }
+ 
++/// IPv6 forms that carry an IPv4 destination (mapped, IPv4-compatible, NAT64
++/// well-known prefix, 6to4) are judged as that IPv4 address, so they cannot
++/// be used to reach private or metadata IPv4 ranges.
++fn embedded_ipv4(ip: IpAddr) -> IpAddr {
++    let IpAddr::V6(v6) = ip else { return ip };
++    if let Some(v4) = v6.to_ipv4_mapped() {
++        return IpAddr::V4(v4);
++    }
++    let (s, o) = (v6.segments(), v6.octets());
++    if s[..6] == [0; 6] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
++        return IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
++    }
++    if s[0] == 0x2002 {
++        return IpAddr::V4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
++    }
++    ip
++}
++fn public_destination(ip: IpAddr) -> bool {
++    match ip {
++        IpAddr::V4(ip) => {
++            let o = ip.octets();
++            !ip.is_private()
++                && !ip.is_loopback()
++                && !ip.is_link_local()
++                && !ip.is_unspecified()
++                && !ip.is_multicast()
++                && !ip.is_broadcast()
++                && o[0] != 0
++                && o[0] < 240
++                // 100.64.0.0/10 shared/CGNAT space, which also hosts cloud
++                // metadata endpoints such as Alibaba Cloud 100.100.100.200.
++                && !(o[0] == 100 && (o[1] & 0xc0) == 64)
++                // 192.0.0.0/24 IETF protocol assignments.
++                && !(o[0] == 192 && o[1] == 0 && o[2] == 0)
++                // 198.18.0.0/15 benchmarking, commonly used for Fake IP.
++                && !(o[0] == 198 && (o[1] & 0xfe) == 18)
++        }
++        IpAddr::V6(ip) => {
++            let s = ip.segments();
++            !ip.is_loopback()
++                && !ip.is_unspecified()
++                && !ip.is_multicast()
++                && !ip.is_unique_local()
++                && !ip.is_unicast_link_local()
++                // 64:ff9b:1::/48 local-use NAT64.
++                && !(s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
++        }
++    }
++}
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -195,10 +223,21 @@ mod tests {
+             "fd00::1",
+             "224.0.0.1",
+             "255.255.255.255",
++            "100.100.100.200",
++            "100.64.0.1",
++            "198.18.0.1",
++            "192.0.0.1",
++            "::127.0.0.1",
++            "64:ff9b::a00:1",
++            "64:ff9b::6464:64c8",
++            "2002:a00:1::1",
++            "2002:7f00:1::1",
+         ] {
+             assert!(!a.allowed(ip.parse().unwrap()), "{ip}");
+         }
+         assert!(a.allowed("8.8.8.8".parse().unwrap()));
++        assert!(a.allowed("64:ff9b::808:808".parse().unwrap()));
++        assert!(a.allowed("2001:4860:4860::8888".parse().unwrap()));
+         let mut c = Config::default();
+         c.allow_private_targets = true;
+         c.deny_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+diff --git a/crates/astra-tui/src/diagnostics.rs b/crates/astra-tui/src/diagnostics.rs
+index 3d4c7b7..daa1bba 100644
+--- a/crates/astra-tui/src/diagnostics.rs
++++ b/crates/astra-tui/src/diagnostics.rs
+@@ -104,7 +104,7 @@ impl View {
+                         .send(Ok(Update::Targets(serde_json::from_str(&reply.text)?)))
+                         .await?;
+                 } else {
+-                    let mut stream = astra_ipc::platform::LocalStream::connect(&socket).await?;
++                    let mut stream = astra_ipc::platform::connect_trusted(&socket).await?;
+                     astra_ipc::send_management(
+                         &mut stream,
+                         &protocol::Request {
+diff --git a/crates/astra-tui/src/editor.rs b/crates/astra-tui/src/editor.rs
+index 3468ad3..1d3b2e7 100644
+--- a/crates/astra-tui/src/editor.rs
++++ b/crates/astra-tui/src/editor.rs
+@@ -1106,7 +1106,7 @@ impl Editor {
+                     number(
+                         "shutdown_timeout_secs",
+                         t("停止等待时间（秒）"),
+-                        10,
++                        2,
+                         0,
+                         i64::MAX,
+                     ),
+diff --git a/crates/astra-tui/src/i18n.rs b/crates/astra-tui/src/i18n.rs
+index 6366314..bb2e8f4 100644
+--- a/crates/astra-tui/src/i18n.rs
++++ b/crates/astra-tui/src/i18n.rs
+@@ -148,6 +148,7 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
+     ("Wait readiness", "Wait readiness", "等待核心就绪", "等待核心就緒"),
+     ("Reload core", "Reload core", "重载核心", "重新載入核心"),
+     ("Drain and stop core", "Drain and stop core", "等待连接结束并停止核心", "等待連線結束並停止核心"),
++    ("Drain and stop cores", "Drain and stop cores", "并行等待连接结束并停止核心", "並行等待連線結束並停止核心"),
+     ("Prepare runtime", "Prepare runtime", "准备运行环境", "準備執行環境"),
+     ("Bind listeners", "Bind listeners", "绑定监听端口", "綁定監聽連接埠"),
+     ("Prepare network modes", "Prepare network modes", "准备网络模式", "準備網路模式"),
+diff --git a/crates/astra-tui/src/log_stream.rs b/crates/astra-tui/src/log_stream.rs
+index aa07941..f2291f9 100644
+--- a/crates/astra-tui/src/log_stream.rs
++++ b/crates/astra-tui/src/log_stream.rs
+@@ -13,7 +13,7 @@ pub async fn connect(
+     cursor: Option<LogCursor>,
+ ) -> anyhow::Result<UnixStream> {
+     timeout(Duration::from_secs(5), async {
+-        let mut stream = UnixStream::connect(socket).await?;
++        let mut stream = astra_ipc::platform::connect_trusted(socket).await?;
+         astra_ipc::send_management(
+             &mut stream,
+             &Request {
+diff --git a/crates/astra-tui/src/main.rs b/crates/astra-tui/src/main.rs
+index 296e060..a4626a2 100644
+--- a/crates/astra-tui/src/main.rs
++++ b/crates/astra-tui/src/main.rs
+@@ -153,7 +153,8 @@ async fn main() -> Result<()> {
+         astra_ipc::platform::background_command(&mut command, true);
+         let mut child = command.spawn()?;
+         let mut ready = false;
+-        for _ in 0..50 {
++        // Poll quickly at first: the manager normally binds within a few ms.
++        for attempt in 0..120 {
+             if protocol::call(&socket, protocol::Action::List)
+                 .await
+                 .is_ok()
+@@ -167,7 +168,7 @@ async fn main() -> Result<()> {
+                     home.join("manager.log").display()
+                 );
+             }
+-            tokio::time::sleep(Duration::from_millis(100)).await;
++            tokio::time::sleep(Duration::from_millis(if attempt < 20 { 10 } else { 50 })).await;
+         }
+         anyhow::ensure!(ready, "Manager did not become ready; inspect manager.log");
+     }
+diff --git a/crates/astra-tui/src/manager.rs b/crates/astra-tui/src/manager.rs
+index 6bf9ddd..c370ba6 100644
+--- a/crates/astra-tui/src/manager.rs
++++ b/crates/astra-tui/src/manager.rs
+@@ -93,6 +93,19 @@ pub struct Manager {
+ }
+ const CONFIG_LIMIT: usize = 480 * 1024;
+ 
++/// The last bytes of a core log, for startup errors shown in the UI.
++fn log_tail(path: &Path, limit: u64) -> String {
++    let read = || -> std::io::Result<String> {
++        let mut file = fs::File::open(path)?;
++        let size = file.metadata()?.len();
++        file.seek(SeekFrom::Start(size.saturating_sub(limit)))?;
++        let mut bytes = Vec::new();
++        file.take(limit).read_to_end(&mut bytes)?;
++        Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
++    };
++    read().unwrap_or_else(|_| format!("see {}", path.display()))
++}
++
+ async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
+     #[cfg(windows)]
+     if socket.exists() {
+@@ -543,7 +556,7 @@ impl Manager {
+             done: &mut HashSet<String>,
+             plan: &mut Vec<String>,
+         ) -> Result<()> {
+-            manager.instance(name)?;
++            let instance = manager.instance(name)?;
+             if done.contains(name) {
+                 return Ok(());
+             }
+@@ -555,6 +568,9 @@ impl Manager {
+                 for target in targets {
+                     visit(manager, target, active, done, plan)?;
+                 }
++            } else if let Some(rule) = manager.inferred_rule(&instance) {
++                // No explicit binding: start the Rule Core this proxy uses.
++                visit(manager, &rule, active, done, plan)?;
+             }
+             active.remove(name);
+             done.insert(name.to_owned());
+@@ -574,6 +590,38 @@ impl Manager {
+         }
+         Ok(plan)
+     }
++    /// A dual-core proxy without an explicit start binding depends on the
++    /// registered Rule Core whose socket its configuration names, so starting
++    /// the proxy alone is enough; `b` remains available to override this.
++    fn inferred_rule(&self, proxy: &Instance) -> Option<String> {
++        if proxy.kind != Kind::Proxy {
++            return None;
++        }
++        let table = |path: &Path| {
++            read_config(path)
++                .ok()
++                .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
++        };
++        let config = table(&proxy.config)?;
++        if config.get("standalone").and_then(toml::Value::as_bool) == Some(true) {
++            return None;
++        }
++        let wanted = astra_ipc::platform::endpoint_path(config.get("rule_socket")?.as_str()?);
++        self.registry
++            .instances
++            .iter()
++            .filter(|rule| rule.kind == Kind::Rule)
++            .find(|rule| {
++                table(&rule.config)
++                    .and_then(|rule| {
++                        rule.get("socket")
++                            .and_then(toml::Value::as_str)
++                            .map(astra_ipc::platform::endpoint_path)
++                    })
++                    .is_some_and(|socket| socket == wanted)
++            })
++            .map(|rule| rule.name.clone())
++    }
+     fn bound_proxies(&self, rule: &str) -> Vec<String> {
+         self.registry
+             .instances
+@@ -634,7 +682,10 @@ impl Manager {
+     async fn start(&mut self, name: &str) -> Result<()> {
+         self.reap()?;
+         let plan = self.start_plan(name)?;
+-        // Validate the entire group before starting its first new process.
++        // Validate the group before starting its first new process. Checks run
++        // concurrently; a Rule Core is not pre-checked because its own start
++        // compiles the same index (a failed start reports its log and rolls back).
++        let mut checks = Vec::new();
+         for item in &plan {
+             if let Some(running) = self.running.get(item) {
+                 let status = control::request(&self.socket(item), Command::Status)
+@@ -646,9 +697,20 @@ impl Manager {
+                 );
+             } else {
+                 let instance = self.instance(item)?;
+-                self.validate(instance.kind, &instance.config).await?;
++                if instance.kind != Kind::Rule {
++                    checks.push((instance.kind, instance.config));
++                }
+             }
+         }
++        for result in futures_util::future::join_all(
++            checks
++                .iter()
++                .map(|(kind, config)| self.validate(*kind, config)),
++        )
++        .await
++        {
++            result?;
++        }
+         let total = plan.len() as u64;
+         let mut started: Vec<String> = Vec::new();
+         for (index, item) in plan.into_iter().enumerate() {
+@@ -769,10 +831,12 @@ impl Manager {
+                 last_progress = tokio::time::Instant::now();
+             }
+             self.reap()?;
+-            let run = self
+-                .running
+-                .get(name)
+-                .context("Core exited during startup; open logs for details")?;
++            let Some(run) = self.running.get(name) else {
++                bail!(
++                    "Core exited during startup:\n{}",
++                    log_tail(&self.log(name), 2048)
++                );
++            };
+             if let Ok(status) = control::request(&socket, Command::Status).await {
+                 anyhow::ensure!(Some(status.pid) == run.child.id(), "Core PID mismatch");
+                 return Ok(());
+@@ -893,18 +957,56 @@ impl Manager {
+         result
+     }
+     async fn stop_all(&mut self) {
+-        // Drain proxies while their rule cores are still available.
++        let _ = self.reap();
++        // Drain proxies while their rule cores are still available. Instances
++        // of one kind stop concurrently, so shutdown costs one drain window
++        // rather than one per core.
+         for kind in [Kind::Proxy, Kind::Rule] {
+             let names: Vec<_> = self
+                 .registry
+                 .instances
+                 .iter()
+-                .filter(|i| i.kind == kind)
++                .filter(|i| i.kind == kind && self.running.contains_key(&i.name))
+                 .map(|i| i.name.clone())
+                 .collect();
+-            for name in names {
+-                let _ = self.stop(&name).await;
++            if names.is_empty() {
++                continue;
+             }
++            astra_ipc::progress::report("Drain and stop cores", names.join(", "));
++            let sockets: Vec<_> = names.iter().map(|name| self.socket(name)).collect();
++            let responses = futures_util::future::join_all(
++                sockets
++                    .iter()
++                    .map(|socket| control::request(socket, Command::Stop)),
++            )
++            .await;
++            let mut waits = Vec::new();
++            for (name, response) in names.into_iter().zip(responses) {
++                let Some(mut run) = self.running.remove(&name) else {
++                    continue;
++                };
++                let acknowledged = response.is_ok();
++                if !acknowledged {
++                    // Only terminate an owned child, never a persisted PID.
++                    let _ = run.child.start_kill();
++                }
++                waits.push(async move {
++                    let state = match timeout(Duration::from_secs(30), run.child.wait()).await {
++                        Err(_) => {
++                            let _ = run.child.kill().await;
++                            "Stopped (drain timeout; forced)"
++                        }
++                        Ok(_) if acknowledged => "Stopped",
++                        Ok(_) => "Stopped (IPC unavailable; forced)",
++                    };
++                    (name, state)
++                });
++            }
++            for (name, state) in futures_util::future::join_all(waits).await {
++                let _ = fs::remove_file(self.socket(&name));
++                self.exits.insert(name, state.into());
++            }
++            self.notify();
+         }
+     }
+     fn level(&self, name: &str) -> LogLevel {
+@@ -1194,13 +1296,10 @@ impl Manager {
+             }
+             Action::Restart(name) => {
+                 let i = self.instance(&name)?;
++                // Validate before stopping so a bad file never causes downtime;
++                // start() checks the not-yet-running dependencies itself.
+                 self.validate(i.kind, &i.config).await?;
+-                for target in self.start_plan(&name)? {
+-                    if !self.running.contains_key(&target) {
+-                        let instance = self.instance(&target)?;
+-                        self.validate(instance.kind, &instance.config).await?;
+-                    }
+-                }
++                self.start_plan(&name)?;
+                 self.stop(&name).await?;
+                 self.start(&name).await?;
+                 Ok(Reply::text("Restarted with current configuration"))
+@@ -2044,6 +2143,44 @@ mod tests {
+         );
+     }
+     #[test]
++    fn proxy_without_binding_starts_the_rule_core_its_config_uses() {
++        let temp = Temp::new();
++        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
++        let socket = toml::Value::String(temp.0.join("rule.r").to_string_lossy().into_owned());
++        let files = [
++            (
++                "other",
++                Kind::Rule,
++                "socket = 'elsewhere'\ndefault_action = 'direct'\n".to_owned(),
++            ),
++            (
++                "rules",
++                Kind::Rule,
++                format!("socket = {socket}\ndefault_action = 'direct'\n"),
++            ),
++            ("proxy", Kind::Proxy, format!("rule_socket = {socket}\n")),
++            (
++                "solo",
++                Kind::Proxy,
++                format!("standalone = true\nrule_socket = {socket}\n"),
++            ),
++        ];
++        for (name, kind, text) in files {
++            let config = temp.0.join(format!("{name}.toml"));
++            fs::write(&config, text).unwrap();
++            manager.registry.instances.push(Instance {
++                name: name.into(),
++                kind,
++                config,
++            });
++        }
++        assert_eq!(manager.start_plan("proxy").unwrap(), ["rules", "proxy"]);
++        assert_eq!(manager.start_plan("solo").unwrap(), ["solo"]);
++        // An explicit binding still wins over the inferred one.
++        manager.bind_start("proxy", vec!["other".into()]).unwrap();
++        assert_eq!(manager.start_plan("proxy").unwrap(), ["other", "proxy"]);
++    }
++    #[test]
+     fn instance_summary_contains_endpoints_modes_tags_and_no_credentials() {
+         let temp = Temp::new();
+         let config = temp.0.join("proxy.toml");
+diff --git a/crates/astra-tui/src/protocol.rs b/crates/astra-tui/src/protocol.rs
+index d1acee3..189e1ec 100644
+--- a/crates/astra-tui/src/protocol.rs
++++ b/crates/astra-tui/src/protocol.rs
+@@ -248,7 +248,7 @@ pub async fn subscribe(
+ ) -> anyhow::Result<astra_ipc::platform::LocalStream> {
+     let mut stream = tokio::time::timeout(
+         std::time::Duration::from_secs(3),
+-        astra_ipc::platform::LocalStream::connect(socket),
++        astra_ipc::platform::connect_trusted(socket),
+     )
+     .await??;
+     astra_ipc::send_management(
+diff --git a/docs/TUI.md b/docs/TUI.md
+index 2a5459f..4af8a10 100644
+--- a/docs/TUI.md
++++ b/docs/TUI.md
+@@ -39,7 +39,7 @@ cargo build --workspace
+ 
+ 导入仅替换当前实例的编辑草稿，**Ctrl-S** 才校验并保存；导入过程不写入文件，也不切换实例的配置路径。已有修改时先确认替换，失败或取消保留草稿。Mihomo YAML 按当前实例类型提取代理或规则配置，保留当前规则端点，先展示转换提示；不支持的规则会阻止导入。规则集、MMDB 和 GeoSite 的显式相对路径按导入文件所在目录解析；资源在保存校验时才加载。导入同一 YAML 的另一部分时，打开相应类型的实例再次导入。
+ 
+-规则模式先启动 Rule Core，再启动 Proxy Core。独立模式在代理基础设置将“独立模式”设为 true；单节点自动选用，多节点填写“默认出站”，然后只启动 Proxy Core。未设置启动绑定时，它们独立启动；停止 Rule Core 不会自动停止 Proxy Core，新请求仍遵循既有的缓存和失败关闭策略。
++规则模式先启动 Rule Core，再启动 Proxy Core。独立模式在代理基础设置将“独立模式”设为 true；单节点自动选用，多节点填写“默认出站”，然后只启动 Proxy Core。未设置启动绑定时，启动双核模式的 Proxy Core 会按其 `rule_socket` 自动找到并先启动对应的已注册 Rule Core，无需再按 b 绑定；独立模式代理不受影响。停止 Rule Core 不会自动停止 Proxy Core，新请求仍遵循既有的缓存和失败关闭策略。
+ 
+ ## 仪表盘与鼠标
+ 
+@@ -105,7 +105,7 @@ TUI 与管理器、管理器与核心复用持久连接；实例状态和核心
+ 
+ 选中规则实例后按 b，可勾选多个代理实例并保存；启动规则 core 时，会先启动规则，再依次拉起绑定的 proxy core。选中代理实例后按 b，可选择一个规则实例，单独启动代理时先启动该规则，不会拉起同规则的其他代理。两侧编辑同一份绑定关系，代理改绑其他规则后会从原规则的列表中移除。已运行的实例直接复用；启动失败时回滚本次新启动的实例，保留原已运行实例。取消勾选并保存即可解除绑定。
+ 
+-绑定仅控制启动顺序，仍需让代理配置中的规则端点指向对应的规则实例。x 只停止所选实例；Q 停止全部实例和管理服务。绑定关系保存在实例注册表中，删除实例会自动移除指向它的绑定。
++未显式绑定的代理会按配置中的 `rule_socket` 自动关联同一端点的规则实例（只影响启动代理时的依赖，启动规则不会因此拉起代理）；显式绑定优先。绑定仅控制启动顺序，仍需让代理配置中的规则端点指向对应的规则实例。规则实例启动前不再单独运行一次校验进程，启动失败时直接显示核心日志末尾并回滚；其他实例的校验并行进行。Q 停止时同类实例并行排空。x 只停止所选实例；Q 停止全部实例和管理服务。绑定关系保存在实例注册表中，删除实例会自动移除指向它的绑定。
+ 
+ 确认删除、停止全部和放弃修改时可直接 Enter / y 确认，Esc / n 取消。配置路径预填当前文件，复制配置预填未占用的副本文件名；输入或粘贴会替换预填值，Ctrl-U 可清空。方向键和 Tab 仍可使用；停止中的实例按 r 直接启动，按 R 提示尚未运行。
+ 
+diff --git a/docs/windows-proxy-debug-2026-10-21.md b/docs/windows-proxy-debug-2026-10-21.md
+index a36b05c..fa2c821 100644
+--- a/docs/windows-proxy-debug-2026-10-21.md
++++ b/docs/windows-proxy-debug-2026-10-21.md
+@@ -23,9 +23,9 @@ TUN DNS：8.8.8.8、8.8.4.4；物理网卡 DNS 保持 223.6.6.6、1.1.1.1。TUN
+ - 完整停止、重新启动管理进程和核心，TUN、系统代理与 DNS 恢复。
+ - 最终连续 10 轮：TUN 无显式代理请求 10/10 HTTP 200，HTTP 系统代理请求 10/10 HTTP 200。
+ - Windows 默认代理被正确识别为 127.0.0.1:8080，Windows WebRequest 访问外网 HTTP 200。
+-- SOCKS5 验证成功；日本出口 IP 实测 20.89.59.59。
++- SOCKS5 验证成功；日本出口 IP 实测 <节点A出口IP>。
+ - 国内网站 HTTP 200；通过 TUN 完整下载 1,048,576 字节，HTTP 200。
+-- 将 AJP 节点端口临时改为不可用端口后，PROXY 自动切至 AEA，HTTP 与 TUN 请求出口均为 20.2.234.52。恢复节点后，自动切回 AJP，健康切换未强制断开连接。临时修改和测试防火墙规则均已移除。
++- 将 AJP 节点端口临时改为不可用端口后，PROXY 自动切至 AEA，HTTP 与 TUN 请求出口均为 <节点B出口IP>。恢复节点后，自动切回 AJP，健康切换未强制断开连接。临时修改和测试防火墙规则均已移除。
+ - 最终请求记录：%LOCALAPPDATA%\.astra\tui\stability-final-results.json。
+ 
+ ## 文件和操作
+diff --git a/example_proxy.toml b/example_proxy.toml
+index 2f73a16..1340f91 100644
+--- a/example_proxy.toml
++++ b/example_proxy.toml
+@@ -32,7 +32,7 @@ ipc_connections = 8               # 1..128；持久 UDS 通道数量
+ # 单次决策总期限包括排队、连接和重试；规则不可用时缓存未命中新请求失败关闭。
+ decision_timeout_ms = 500          # >0
+ connect_timeout_secs = 8           # >0；出站连接/握手期限
+-shutdown_timeout_secs = 10         # 停止接受连接后等待会话退出的秒数；0 表示不等待
++shutdown_timeout_secs = 2          # 停止接受连接后等待会话退出的秒数；0 表示不等待
+ max_connections = 4096            # >0；TCP 会话（含 UDP 控制连接）额度
+ max_udp_flows = 512                # 1..65536；所有关联共享的 UDP 流额度
+ udp_targets_per_association = 32   # 1..max_udp_flows；每个关联最大目标数

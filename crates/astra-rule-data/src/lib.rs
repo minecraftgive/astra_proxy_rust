@@ -306,11 +306,45 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
     }
 }
 fn validate_url(url: &str) -> Result<()> {
+    validate_remote_url(url).map(|_| ())
+}
+
+/// Remote subscriptions, providers and rule data accept HTTP(S) without URL
+/// credentials. Plain HTTP stays allowed for providers that offer no TLS.
+pub fn validate_remote_url(value: &str) -> Result<url::Url> {
+    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid resource URL"))?;
     ensure!(
-        url.starts_with("https://") || url.starts_with("http://"),
-        "resource URL must use HTTP(S)"
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "resource URL requires HTTP(S) without URL credentials"
+    );
+    Ok(url)
+}
+
+/// A redirect may never downgrade HTTPS to plain HTTP: a URL configured as
+/// HTTPS keeps its TLS protection. Configured plain HTTP may redirect anywhere.
+pub fn validate_redirect(from: &str, to: &str) -> Result<()> {
+    let target = validate_remote_url(to)?;
+    ensure!(
+        !from.starts_with("https://") || target.scheme() == "https",
+        "redirect from HTTPS to plain HTTP refused"
     );
     Ok(())
+}
+
+static SERVE_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SERVED_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// While enabled, an expired but valid cache is used immediately instead of
+/// blocking on a download. Cores enable it for cold start and validation, then
+/// refresh expired resources in the background.
+pub fn serve_stale_cache(enabled: bool) {
+    SERVE_STALE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+/// Whether an expired cache was served since the last call.
+pub fn take_served_stale() -> bool {
+    SERVED_STALE.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A failed update retains a validated cache. Invalid new content never replaces it.
@@ -361,9 +395,16 @@ pub fn load_resource_with<T>(
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age.as_secs() < interval);
-    if fresh && cached.is_some() {
-        return Ok(cached.unwrap());
-    }
+    let serve = fresh || SERVE_STALE.load(std::sync::atomic::Ordering::Relaxed);
+    let cached = match cached {
+        Some(cached) if serve => {
+            if !fresh {
+                SERVED_STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(cached);
+        }
+        cached => cached,
+    };
     let update = (|| -> Result<(Vec<u8>, T)> {
         let response = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(15))
@@ -372,6 +413,7 @@ pub fn load_resource_with<T>(
             .get(url)
             .call()
             .context("resource download failed")?;
+        validate_redirect(url, response.get_url())?;
         let mut data = Vec::new();
         response
             .into_reader()

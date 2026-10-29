@@ -153,7 +153,8 @@ async fn main() -> Result<()> {
         astra_ipc::platform::background_command(&mut command, true);
         let mut child = command.spawn()?;
         let mut ready = false;
-        for _ in 0..50 {
+        // Poll quickly at first: the manager normally binds within a few ms.
+        for attempt in 0..120 {
             if protocol::call(&socket, protocol::Action::List)
                 .await
                 .is_ok()
@@ -167,7 +168,7 @@ async fn main() -> Result<()> {
                     home.join("manager.log").display()
                 );
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(if attempt < 20 { 10 } else { 50 })).await;
         }
         anyhow::ensure!(ready, "Manager did not become ready; inspect manager.log");
     }

@@ -42,6 +42,9 @@ pub(crate) async fn authorize_connect(client: &mut TcpStream, users: &[String]) 
     }
     let headers = timeout(Duration::from_secs(10), async {
         let mut buffer = vec![0u8; 32 * 1024];
+        // peek() returns immediately while partial headers sit in the buffer;
+        // back off so a slow client cannot spin a core for the full timeout.
+        let mut pause = Duration::from_millis(1);
         loop {
             let count = client.peek(&mut buffer).await?;
             anyhow::ensure!(count != 0, "connection closed during proxy authentication");
@@ -49,7 +52,8 @@ pub(crate) async fn authorize_connect(client: &mut TcpStream, users: &[String]) 
                 return Ok::<_, anyhow::Error>(String::from_utf8(buffer[..end].to_vec())?);
             }
             anyhow::ensure!(count < buffer.len(), "proxy request headers exceed 32 KiB");
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(25));
         }
     })
     .await

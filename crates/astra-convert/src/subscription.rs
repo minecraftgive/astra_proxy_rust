@@ -46,16 +46,11 @@ impl Subscription {
     }
 }
 pub fn validate_url(value: &str) -> Result<()> {
-    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid subscription URL"))?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none(),
-        "subscription requires HTTP(S) without URL credentials"
-    );
-    Ok(())
+    astra_rule_data::validate_remote_url(value)
+        .map(|_| ())
+        .context("subscription requires HTTP(S) without URL credentials")
 }
+pub use astra_rule_data::validate_redirect;
 pub fn download(url: &str, user_agent: &str) -> Result<String> {
     validate_url(url)?;
     let response = ureq::AgentBuilder::new()
@@ -73,6 +68,7 @@ pub fn download(url: &str, user_agent: &str) -> Result<String> {
                 diagnostics::error(&anyhow::anyhow!(error.to_string()))
             ),
         })?;
+    validate_redirect(url, response.get_url())?;
     bounded(response.into_reader())
 }
 fn bounded(reader: impl Read) -> Result<String> {
@@ -144,6 +140,10 @@ fn convert_clash_with(
                     download(&required(&spec, "url")?, user_agent)
                         .with_context(|| format!("download HTTP proxy-provider {name}"))?
                 } else {
+                    ensure!(
+                        !options.remote,
+                        "remote subscriptions cannot reference local file providers"
+                    );
                     bounded(std::fs::File::open(
                         options.base_dir.join(required(&spec, "path")?),
                     )?)?
@@ -307,6 +307,7 @@ pub fn fetch_with(
         &text,
         &Options {
             base_dir: base_dir.into(),
+            remote: true,
             ..Default::default()
         },
         &config.user_agent,
@@ -334,8 +335,13 @@ pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Re
     // Import DNS on first use; explicit local settings and previous imports
     // remain editable and win over subsequent subscription refreshes.
     if !current.contains_key("dns") {
-        if let Some(dns) = remote.get("dns") {
-            current.insert("dns".into(), dns.clone());
+        if let Some(mut dns) = remote.get("dns").cloned() {
+            // Resolvers come from the subscription, but where this machine
+            // listens is a local decision: keep the loopback default.
+            if let Some(table) = dns.as_table_mut() {
+                table.remove("listen");
+            }
+            current.insert("dns".into(), dns);
         }
     }
     let incoming = remote

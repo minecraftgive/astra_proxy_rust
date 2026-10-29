@@ -88,6 +88,15 @@ pub fn request(input: &str) -> Result<RouteRequest> {
         process,
     })
 }
+/// A name without a dot (other than localhost) is a LAN/NetBIOS-style host,
+/// not the site the user most likely meant to query.
+fn single_label(host: &str) -> Option<&str> {
+    let host = host.trim_end_matches('.');
+    (!host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && !host.eq_ignore_ascii_case("localhost"))
+    .then_some(host)
+}
 fn action(value: &RouteAction) -> String {
     match value {
         RouteAction::Direct => "DIRECT".into(),
@@ -139,6 +148,14 @@ impl View {
         }
         if report.path.starts_with("rules[") {
             lines.push(t("Explicit rules take precedence over the default action").into());
+        }
+        if let Some(host) = single_label(&report.request.target.host) {
+            lines.push(String::new());
+            lines.push(tr!(
+                "\"{}\" has no domain suffix, so it is routed as a local hostname (geosite private matches every name without a dot); query a full domain such as {}.com",
+                host,
+                host
+            ));
         }
         lines.push(t("Query uses active rules; no traffic is forwarded").into());
         frame.render_widget(Clear, area);
@@ -204,6 +221,15 @@ mod tests {
         );
         for identity in ["relative/path", "'unterminated", "''"] {
             assert!(request(&format!("host tcp {identity}")).is_err());
+        }
+    }
+    #[test]
+    fn single_label_names_are_flagged_but_domains_and_addresses_are_not() {
+        for host in ["bilibili", "cloudflare", "escapefromtarkov."] {
+            assert!(single_label(host).is_some(), "{host}");
+        }
+        for host in ["bilibili.com", "localhost", "8.8.8.8", "2001:db8::1"] {
+            assert!(single_label(host).is_none(), "{host}");
         }
     }
     #[test]

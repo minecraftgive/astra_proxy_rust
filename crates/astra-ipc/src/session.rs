@@ -57,7 +57,7 @@ where
                 let result = tokio::time::timeout(call.timeout, async {
                     if connection.is_none() {
                         if let Some(progress) = &call.progress { progress.send_replace(Some(progress::Progress::new("Connecting", path.display().to_string()))); }
-                        let mut stream = tokio::time::timeout(Duration::from_secs(3), LocalStream::connect(&path)).await
+                        let mut stream = tokio::time::timeout(Duration::from_secs(3), crate::platform::connect_trusted(&path)).await
                             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timeout"))??;
                         crate::send_management(&mut stream, &hello()).await?;
                         let event: Event<R> = tokio::time::timeout(Duration::from_secs(3), crate::receive_management(&mut stream)).await

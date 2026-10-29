@@ -93,6 +93,33 @@ pub struct Manager {
 }
 const CONFIG_LIMIT: usize = 480 * 1024;
 
+/// Core logs are appended across restarts; once one passes this size it is
+/// moved to `<name>.log.1` (replacing the previous one) when the core starts.
+const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+fn rotate_log(path: &Path) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_ROTATE_BYTES) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = fs::remove_file(&old);
+        if let Err(error) = fs::rename(path, &old) {
+            eprintln!("Log rotation skipped for {}: {error}", path.display());
+        }
+    }
+}
+
+/// The last bytes of a core log, for startup errors shown in the UI.
+fn log_tail(path: &Path, limit: u64) -> String {
+    let read = || -> std::io::Result<String> {
+        let mut file = fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        file.seek(SeekFrom::Start(size.saturating_sub(limit)))?;
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+    };
+    read().unwrap_or_else(|_| format!("see {}", path.display()))
+}
+
 async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
     #[cfg(windows)]
     if socket.exists() {
@@ -543,7 +570,7 @@ impl Manager {
             done: &mut HashSet<String>,
             plan: &mut Vec<String>,
         ) -> Result<()> {
-            manager.instance(name)?;
+            let instance = manager.instance(name)?;
             if done.contains(name) {
                 return Ok(());
             }
@@ -555,6 +582,9 @@ impl Manager {
                 for target in targets {
                     visit(manager, target, active, done, plan)?;
                 }
+            } else if let Some(rule) = manager.inferred_rule(&instance) {
+                // No explicit binding: start the Rule Core this proxy uses.
+                visit(manager, &rule, active, done, plan)?;
             }
             active.remove(name);
             done.insert(name.to_owned());
@@ -573,6 +603,38 @@ impl Manager {
             }
         }
         Ok(plan)
+    }
+    /// A dual-core proxy without an explicit start binding depends on the
+    /// registered Rule Core whose socket its configuration names, so starting
+    /// the proxy alone is enough; `b` remains available to override this.
+    fn inferred_rule(&self, proxy: &Instance) -> Option<String> {
+        if proxy.kind != Kind::Proxy {
+            return None;
+        }
+        let table = |path: &Path| {
+            read_config(path)
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        };
+        let config = table(&proxy.config)?;
+        if config.get("standalone").and_then(toml::Value::as_bool) == Some(true) {
+            return None;
+        }
+        let wanted = astra_ipc::platform::endpoint_path(config.get("rule_socket")?.as_str()?);
+        self.registry
+            .instances
+            .iter()
+            .filter(|rule| rule.kind == Kind::Rule)
+            .find(|rule| {
+                table(&rule.config)
+                    .and_then(|rule| {
+                        rule.get("socket")
+                            .and_then(toml::Value::as_str)
+                            .map(astra_ipc::platform::endpoint_path)
+                    })
+                    .is_some_and(|socket| socket == wanted)
+            })
+            .map(|rule| rule.name.clone())
     }
     fn bound_proxies(&self, rule: &str) -> Vec<String> {
         self.registry
@@ -634,7 +696,10 @@ impl Manager {
     async fn start(&mut self, name: &str) -> Result<()> {
         self.reap()?;
         let plan = self.start_plan(name)?;
-        // Validate the entire group before starting its first new process.
+        // Validate the group before starting its first new process. Checks run
+        // concurrently; a Rule Core is not pre-checked because its own start
+        // compiles the same index (a failed start reports its log and rolls back).
+        let mut checks = Vec::new();
         for item in &plan {
             if let Some(running) = self.running.get(item) {
                 let status = control::request(&self.socket(item), Command::Status)
@@ -646,8 +711,19 @@ impl Manager {
                 );
             } else {
                 let instance = self.instance(item)?;
-                self.validate(instance.kind, &instance.config).await?;
+                if instance.kind != Kind::Rule {
+                    checks.push((instance.kind, instance.config));
+                }
             }
+        }
+        for result in futures_util::future::join_all(
+            checks
+                .iter()
+                .map(|(kind, config)| self.validate(*kind, config)),
+        )
+        .await
+        {
+            result?;
         }
         let total = plan.len() as u64;
         let mut started: Vec<String> = Vec::new();
@@ -684,7 +760,33 @@ impl Manager {
         }
         Ok(())
     }
+    /// Launch a Windows TUN proxy through UAC. `replaces` is a running core
+    /// the new one waits for, so the prompt is answered before that core stops.
+    #[cfg(windows)]
+    async fn spawn_elevated(&self, name: &str, replaces: Option<u32>) -> Result<ManagedChild> {
+        let instance = self.instance(name)?;
+        let exe = self.bin.join(instance.kind.binary());
+        let args = astra_ipc::elevation::core_arguments(
+            &fs::canonicalize(&instance.config)?,
+            Some(&self.socket(name)),
+            &self.log(name),
+            self.level(name).as_str(),
+            replaces,
+        )?;
+        astra_ipc::progress::report(
+            "Waiting for administrator approval",
+            format!("{name} · approve the Windows UAC prompt to run TUN"),
+        );
+        Ok(ManagedChild::Elevated(
+            tokio::task::spawn_blocking(move || astra_ipc::elevation::spawn(&exe, &args)).await??,
+        ))
+    }
     async fn start_one(&mut self, name: &str) -> Result<()> {
+        self.start_with(name, None).await
+    }
+    /// Start a core, or adopt `prepared`: an elevated replacement already
+    /// approved through UAC that binds the endpoint once its predecessor exits.
+    async fn start_with(&mut self, name: &str, prepared: Option<ManagedChild>) -> Result<()> {
         self.reap()?;
         anyhow::ensure!(
             !self.running.contains_key(name),
@@ -693,7 +795,12 @@ impl Manager {
         astra_ipc::progress::report("Start core", name.to_owned());
         let instance = self.instance(name)?;
         let socket = self.socket(name);
-        prepare_control_endpoint(&socket).await?;
+        let adopted = prepared.is_some();
+        if !adopted {
+            prepare_control_endpoint(&socket).await?;
+            // An adopted replacement already has the log open; never move it.
+            rotate_log(&self.log(name));
+        }
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -701,30 +808,20 @@ impl Manager {
             .open(self.log(name))?;
         let config = read_config(&instance.config)?;
         #[cfg(windows)]
-        let elevate = instance.kind == Kind::Proxy
-            && astra_ipc::runtime::load_overrides(&instance.config)?.tun == Some(true)
-            && !astra_ipc::elevation::is_elevated()?;
+        let elevate = adopted
+            || instance.kind == Kind::Proxy
+                && astra_ipc::runtime::load_overrides(&instance.config)?.tun == Some(true)
+                && !astra_ipc::elevation::is_elevated()?;
         #[cfg(not(windows))]
         let elevate = false;
         #[cfg(windows)]
-        let elevated = if elevate {
-            let exe = self.bin.join(instance.kind.binary());
-            let config = fs::canonicalize(&instance.config)?;
-            let args = astra_ipc::elevation::core_arguments(
-                &config,
-                Some(&socket),
-                &self.log(name),
-                self.level(name).as_str(),
-            )?;
-            Some(ManagedChild::Elevated(
-                tokio::task::spawn_blocking(move || astra_ipc::elevation::spawn(&exe, &args))
-                    .await??,
-            ))
-        } else {
-            None
+        let elevated = match prepared {
+            Some(child) => Some(child),
+            None if elevate => Some(self.spawn_elevated(name, None).await?),
+            None => None,
         };
         #[cfg(not(windows))]
-        let elevated: Option<ManagedChild> = None;
+        let elevated = prepared;
         let child = if let Some(child) = elevated {
             child
         } else {
@@ -769,10 +866,12 @@ impl Manager {
                 last_progress = tokio::time::Instant::now();
             }
             self.reap()?;
-            let run = self
-                .running
-                .get(name)
-                .context("Core exited during startup; open logs for details")?;
+            let Some(run) = self.running.get(name) else {
+                bail!(
+                    "Core exited during startup:\n{}",
+                    log_tail(&self.log(name), 2048)
+                );
+            };
             if let Ok(status) = control::request(&socket, Command::Status).await {
                 anyhow::ensure!(Some(status.pid) == run.child.id(), "Core PID mismatch");
                 return Ok(());
@@ -780,7 +879,10 @@ impl Manager {
             sleep(Duration::from_millis(50)).await;
         }
         self.stop(name).await?;
-        bail!("Core did not become ready; open logs for details")
+        bail!(
+            "Core did not become ready:\n{}",
+            log_tail(&self.log(name), 2048)
+        )
     }
     async fn reload(&mut self, name: &str, path: &Path) -> Result<()> {
         astra_ipc::progress::report("Reload core", name.to_owned());
@@ -803,6 +905,12 @@ impl Manager {
         Ok(())
     }
     async fn stop(&mut self, name: &str) -> Result<()> {
+        self.stop_core(name, true).await
+    }
+    /// `release_endpoint` is false when an approved replacement is waiting:
+    /// it binds the endpoint as soon as this core exits, so the marker must
+    /// not be removed after it (a stale one is recovered by its bind).
+    async fn stop_core(&mut self, name: &str, release_endpoint: bool) -> Result<()> {
         astra_ipc::progress::report("Drain and stop core", name.to_owned());
         self.reap()?;
         self.instance(name)?;
@@ -833,7 +941,9 @@ impl Manager {
         self.exits.insert(name.to_owned(), state.into());
         self.running.remove(name);
         self.notify();
-        let _ = fs::remove_file(self.socket(name));
+        if release_endpoint {
+            let _ = fs::remove_file(self.socket(name));
+        }
         Ok(())
     }
     #[cfg(windows)]
@@ -853,11 +963,22 @@ impl Manager {
         let mut next = previous.clone();
         next.tun = Some(true);
         let path = astra_ipc::storage::runtime_path(&instance.config, "overrides")?;
-        astra_ipc::progress::report("Request TUN permission","Restarting only this proxy core with administrator permission; the profile is unchanged");
+        // Ask for approval while the current core keeps serving; a cancelled
+        // or failed prompt leaves it running with its runtime state unchanged.
+        let replacement = self
+            .spawn_elevated(name, previous_pid)
+            .await
+            .context("TUN was not enabled; the running core was left unchanged")?;
+        astra_ipc::progress::report(
+            "Restart with TUN",
+            "Approved; handing over to the administrator core (the profile is unchanged)",
+        );
+        // The replacement reads the switches only after the old core exits.
         astra_ipc::storage::write_json(&path, &next)?;
         let result: Result<Reply> = async {
-            self.stop(name).await?;
-            self.start_one(name).await?;
+            // An early return drops (and so terminates) the replacement.
+            self.stop_core(name, false).await?;
+            self.start_with(name, Some(replacement)).await?;
             let snapshot =
                 control::runtime(&self.socket(name), astra_ipc::runtime::Command::Snapshot).await?;
             anyhow::ensure!(
@@ -893,18 +1014,56 @@ impl Manager {
         result
     }
     async fn stop_all(&mut self) {
-        // Drain proxies while their rule cores are still available.
+        let _ = self.reap();
+        // Drain proxies while their rule cores are still available. Instances
+        // of one kind stop concurrently, so shutdown costs one drain window
+        // rather than one per core.
         for kind in [Kind::Proxy, Kind::Rule] {
             let names: Vec<_> = self
                 .registry
                 .instances
                 .iter()
-                .filter(|i| i.kind == kind)
+                .filter(|i| i.kind == kind && self.running.contains_key(&i.name))
                 .map(|i| i.name.clone())
                 .collect();
-            for name in names {
-                let _ = self.stop(&name).await;
+            if names.is_empty() {
+                continue;
             }
+            astra_ipc::progress::report("Drain and stop cores", names.join(", "));
+            let sockets: Vec<_> = names.iter().map(|name| self.socket(name)).collect();
+            let responses = futures_util::future::join_all(
+                sockets
+                    .iter()
+                    .map(|socket| control::request(socket, Command::Stop)),
+            )
+            .await;
+            let mut waits = Vec::new();
+            for (name, response) in names.into_iter().zip(responses) {
+                let Some(mut run) = self.running.remove(&name) else {
+                    continue;
+                };
+                let acknowledged = response.is_ok();
+                if !acknowledged {
+                    // Only terminate an owned child, never a persisted PID.
+                    let _ = run.child.start_kill();
+                }
+                waits.push(async move {
+                    let state = match timeout(Duration::from_secs(30), run.child.wait()).await {
+                        Err(_) => {
+                            let _ = run.child.kill().await;
+                            "Stopped (drain timeout; forced)"
+                        }
+                        Ok(_) if acknowledged => "Stopped",
+                        Ok(_) => "Stopped (IPC unavailable; forced)",
+                    };
+                    (name, state)
+                });
+            }
+            for (name, state) in futures_util::future::join_all(waits).await {
+                let _ = fs::remove_file(self.socket(&name));
+                self.exits.insert(name, state.into());
+            }
+            self.notify();
         }
     }
     fn level(&self, name: &str) -> LogLevel {
@@ -1194,13 +1353,10 @@ impl Manager {
             }
             Action::Restart(name) => {
                 let i = self.instance(&name)?;
+                // Validate before stopping so a bad file never causes downtime;
+                // start() checks the not-yet-running dependencies itself.
                 self.validate(i.kind, &i.config).await?;
-                for target in self.start_plan(&name)? {
-                    if !self.running.contains_key(&target) {
-                        let instance = self.instance(&target)?;
-                        self.validate(instance.kind, &instance.config).await?;
-                    }
-                }
+                self.start_plan(&name)?;
                 self.stop(&name).await?;
                 self.start(&name).await?;
                 Ok(Reply::text("Restarted with current configuration"))
@@ -2042,6 +2198,62 @@ mod tests {
             manager.start_plan("proxy-b").unwrap(),
             ["rule-b", "proxy-b"]
         );
+    }
+    #[test]
+    fn large_logs_rotate_to_a_single_previous_file() {
+        let temp = Temp::new();
+        let log = temp.0.join("core.log");
+        let old = temp.0.join("core.log.1");
+        fs::write(&log, b"small").unwrap();
+        rotate_log(&log);
+        assert_eq!(fs::read(&log).unwrap(), b"small");
+        assert!(!old.exists());
+        fs::write(&old, b"older").unwrap();
+        fs::File::create(&log)
+            .unwrap()
+            .set_len(LOG_ROTATE_BYTES + 1)
+            .unwrap();
+        rotate_log(&log);
+        assert!(!log.exists());
+        assert_eq!(fs::metadata(&old).unwrap().len(), LOG_ROTATE_BYTES + 1);
+    }
+    #[test]
+    fn proxy_without_binding_starts_the_rule_core_its_config_uses() {
+        let temp = Temp::new();
+        let mut manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+        let socket = toml::Value::String(temp.0.join("rule.r").to_string_lossy().into_owned());
+        let files = [
+            (
+                "other",
+                Kind::Rule,
+                "socket = 'elsewhere'\ndefault_action = 'direct'\n".to_owned(),
+            ),
+            (
+                "rules",
+                Kind::Rule,
+                format!("socket = {socket}\ndefault_action = 'direct'\n"),
+            ),
+            ("proxy", Kind::Proxy, format!("rule_socket = {socket}\n")),
+            (
+                "solo",
+                Kind::Proxy,
+                format!("standalone = true\nrule_socket = {socket}\n"),
+            ),
+        ];
+        for (name, kind, text) in files {
+            let config = temp.0.join(format!("{name}.toml"));
+            fs::write(&config, text).unwrap();
+            manager.registry.instances.push(Instance {
+                name: name.into(),
+                kind,
+                config,
+            });
+        }
+        assert_eq!(manager.start_plan("proxy").unwrap(), ["rules", "proxy"]);
+        assert_eq!(manager.start_plan("solo").unwrap(), ["solo"]);
+        // An explicit binding still wins over the inferred one.
+        manager.bind_start("proxy", vec!["other".into()]).unwrap();
+        assert_eq!(manager.start_plan("proxy").unwrap(), ["other", "proxy"]);
     }
     #[test]
     fn instance_summary_contains_endpoints_modes_tags_and_no_credentials() {

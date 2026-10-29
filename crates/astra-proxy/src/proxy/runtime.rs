@@ -351,8 +351,12 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
             let mut effective = String::new();
             let mut ownership = std::collections::BTreeMap::new();
             let mut due = std::collections::BTreeMap::new();
+            // First tick fires immediately: an uncached subscription starts
+            // downloading at launch instead of one second later.
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tick.tick().await;
                 let (revision, path, base, settings) = {
                     let state = state.lock().await;
                     let settings = state.current.load().config.subscription_sources();

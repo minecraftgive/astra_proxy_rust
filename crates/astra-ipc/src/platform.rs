@@ -144,7 +144,30 @@ impl ReloadSignal {
 }
 
 #[cfg(windows)]
-pub use windows::{LocalListener, LocalStream};
+pub use windows::{allow_unelevated_clients, LocalListener, LocalStream};
+
+/// Connect to a local IPC endpoint and verify who serves it. Unix endpoints in
+/// shared directories such as /tmp could be pre-bound by another local user to
+/// spoof routing or management replies; only this user or root is accepted.
+/// Windows pipes are already restricted to this user's SID by their DACL.
+pub async fn connect_trusted(path: impl AsRef<Path>) -> io::Result<LocalStream> {
+    let stream = LocalStream::connect(path).await?;
+    #[cfg(unix)]
+    {
+        let peer = stream.peer_cred()?.uid();
+        // Both ends stay open: macOS getpeereid fails on a closed pair.
+        let (own, _peer) = tokio::net::UnixStream::pair()?;
+        let me = own.peer_cred()?.uid();
+        // A root core (sudo/TUN) may talk to cores of the invoking user.
+        if peer != me && peer != 0 && me != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("IPC endpoint is served by another local user (uid {peer}); refusing it"),
+            ));
+        }
+    }
+    Ok(stream)
+}
 
 pub async fn stream_pair() -> io::Result<(LocalStream, LocalStream)> {
     #[cfg(unix)]
@@ -217,7 +240,24 @@ mod windows {
             }
         }
     }
+    static UNELEVATED_CLIENTS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Called by a UAC-launched TUN core: it is controlled by its non-elevated
+    /// launcher by design, so its endpoints keep the default (medium) label.
+    pub fn allow_unelevated_clients() {
+        UNELEVATED_CLIENTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Any other elevated process labels its pipes High integrity, so a
+    /// non-elevated process of the same user cannot drive it (UAC boundary).
+    fn high_integrity_only() -> bool {
+        static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !UNELEVATED_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+            && *ELEVATED.get_or_init(|| crate::elevation::is_elevated().unwrap_or(false))
+    }
     fn descriptor() -> io::Result<Descriptor> {
+        descriptor_with(false)
+    }
+    fn descriptor_with(label: bool) -> io::Result<Descriptor> {
         // Use the concrete user SID: access stays private across different
         // logon sessions of this user, without granting other local users access.
         unsafe {
@@ -246,7 +286,8 @@ mod windows {
             }
             let sid_string = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
             LocalFree(sid.cast());
-            let sddl: Vec<u16> = format!("D:P(A;OICI;GA;;;{sid_string})\0")
+            let integrity = if label { "S:(ML;;NWNR;;;HI)" } else { "" };
+            let sddl: Vec<u16> = format!("D:P(A;OICI;GA;;;{sid_string}){integrity}\0")
                 .encode_utf16()
                 .collect();
             let mut descriptor = std::ptr::null_mut();
@@ -312,7 +353,7 @@ mod windows {
         Ok(format!(r"\\.\pipe\astra-{hash:016x}"))
     }
     fn server(name: &str, first: bool) -> io::Result<NamedPipeServer> {
-        let descriptor = descriptor()?;
+        let descriptor = descriptor_with(high_integrity_only())?;
         let mut attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -415,6 +456,13 @@ mod windows {
                     Ok(client) => return Ok(Self::Client(client)),
                     Err(error) if error.raw_os_error() == Some(231) => {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                    }
+                    Err(error) if error.raw_os_error() == Some(5) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "access denied: the endpoint belongs to an elevated (administrator) \
+                             process or another account; run this tool the same way",
+                        ))
                     }
                     Err(error) => return Err(error),
                 }

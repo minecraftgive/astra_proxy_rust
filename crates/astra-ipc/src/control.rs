@@ -350,7 +350,7 @@ pub async fn watch_runtime(
 ) -> io::Result<crate::platform::LocalStream> {
     let mut stream = timeout(
         Duration::from_secs(3),
-        crate::platform::LocalStream::connect(path),
+        crate::platform::connect_trusted(path),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "watch connection timeout"))??;

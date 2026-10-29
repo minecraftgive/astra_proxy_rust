@@ -4,7 +4,7 @@ use astra_ipc::Target;
 use bytes::Bytes;
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -69,35 +69,14 @@ impl App {
         if self.config.deny_cidrs.iter().any(|net| net.contains(&ip)) {
             return false;
         }
-        let ip = match ip {
-            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),
-            v => v,
-        };
+        let ip = embedded_ipv4(ip);
         if self.config.deny_cidrs.iter().any(|net| net.contains(&ip)) {
             return false;
         }
         if self.config.allow_private_targets {
             return !ip.is_unspecified() && !ip.is_multicast();
         }
-        match ip {
-            IpAddr::V4(ip) => {
-                !ip.is_private()
-                    && !ip.is_loopback()
-                    && !ip.is_link_local()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && !ip.is_broadcast()
-                    && ip.octets()[0] != 0
-                    && ip.octets()[0] < 240
-            }
-            IpAddr::V6(ip) => {
-                !ip.is_loopback()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && !ip.is_unique_local()
-                    && !ip.is_unicast_link_local()
-            }
-        }
+        public_destination(ip)
     }
     pub async fn resolve(&self, target: &Target) -> Result<Vec<SocketAddr>> {
         ensure!(
@@ -170,6 +149,55 @@ impl App {
     }
 }
 
+/// IPv6 forms that carry an IPv4 destination (mapped, IPv4-compatible, NAT64
+/// well-known prefix, 6to4) are judged as that IPv4 address, so they cannot
+/// be used to reach private or metadata IPv4 ranges.
+fn embedded_ipv4(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else { return ip };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let (s, o) = (v6.segments(), v6.octets());
+    if s[..6] == [0; 6] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    if s[0] == 0x2002 {
+        return IpAddr::V4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    ip
+}
+fn public_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let o = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && o[0] != 0
+                && o[0] < 240
+                // 100.64.0.0/10 shared/CGNAT space, which also hosts cloud
+                // metadata endpoints such as Alibaba Cloud 100.100.100.200.
+                && !(o[0] == 100 && (o[1] & 0xc0) == 64)
+                // 192.0.0.0/24 IETF protocol assignments.
+                && !(o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // 198.18.0.0/15 benchmarking, commonly used for Fake IP.
+                && !(o[0] == 198 && (o[1] & 0xfe) == 18)
+        }
+        IpAddr::V6(ip) => {
+            let s = ip.segments();
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                // 64:ff9b:1::/48 local-use NAT64.
+                && !(s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,10 +223,21 @@ mod tests {
             "fd00::1",
             "224.0.0.1",
             "255.255.255.255",
+            "100.100.100.200",
+            "100.64.0.1",
+            "198.18.0.1",
+            "192.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a00:1",
+            "64:ff9b::6464:64c8",
+            "2002:a00:1::1",
+            "2002:7f00:1::1",
         ] {
             assert!(!a.allowed(ip.parse().unwrap()), "{ip}");
         }
         assert!(a.allowed("8.8.8.8".parse().unwrap()));
+        assert!(a.allowed("64:ff9b::808:808".parse().unwrap()));
+        assert!(a.allowed("2001:4860:4860::8888".parse().unwrap()));
         let mut c = Config::default();
         c.allow_private_targets = true;
         c.deny_cidrs = vec!["127.0.0.0/8".parse().unwrap()];

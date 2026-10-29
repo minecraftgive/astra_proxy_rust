@@ -95,13 +95,15 @@ pub(crate) async fn download(app: &App, url: &str, user_agent: &str) -> Result<S
                 .context("send subscription HTTP request/read response headers")?;
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 ensure!(redirect < 3, "too many subscription redirects");
-                url = url.join(
+                let next = url.join(
                     response
                         .headers()
                         .get("location")
                         .context("redirect location missing")?
                         .to_str()?,
                 )?;
+                astra_convert::subscription::validate_redirect(url.as_str(), next.as_str())?;
+                url = next;
                 continue;
             }
             ensure!(

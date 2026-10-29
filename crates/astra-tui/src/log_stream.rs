@@ -13,7 +13,7 @@ pub async fn connect(
     cursor: Option<LogCursor>,
 ) -> anyhow::Result<UnixStream> {
     timeout(Duration::from_secs(5), async {
-        let mut stream = UnixStream::connect(socket).await?;
+        let mut stream = astra_ipc::platform::connect_trusted(socket).await?;
         astra_ipc::send_management(
             &mut stream,
             &Request {

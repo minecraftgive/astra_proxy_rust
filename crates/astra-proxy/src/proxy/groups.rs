@@ -182,7 +182,8 @@ impl Groups {
         Ok((resolved, lease))
     }
     fn interface_for_path(app: &App, path: &[String]) -> Option<String> {
-        path.iter().find_map(|name| app.config.proxy_groups[name].interface.clone())
+        path.iter()
+            .find_map(|name| app.config.proxy_groups[name].interface.clone())
     }
     pub fn inherit(&mut self, old: &App, config: &crate::config::ProxyConfig) {
         self.sessions = old.groups.sessions.clone();
@@ -228,8 +229,11 @@ impl Groups {
                         .or_else(|| previous.members.first())
                         != g.selected.as_ref().or_else(|| g.members.first())
             });
-            let structural =
-                next.is_none_or(|g| g.mode != previous.mode || g.members != previous.members || g.interface != previous.interface);
+            let structural = next.is_none_or(|g| {
+                g.mode != previous.mode
+                    || g.members != previous.members
+                    || g.interface != previous.interface
+            });
             if (manual && policy.disconnect_on_manual)
                 || (structural && policy.disconnect_on_config_change)
             {
@@ -515,7 +519,8 @@ async fn probe(app: &App, action: &RouteAction, url: &str, interface: Option<&st
                 80
             }),
     };
-    let mut connection: outbound::Stream = app.connect_resolved_on(&target, action, interface).await?;
+    let mut connection: outbound::Stream =
+        app.connect_resolved_on(&target, action, interface).await?;
     if uri.scheme_str() == Some("https") {
         use tokio_rustls::{
             rustls::{self, pki_types::ServerName, RootCertStore},
@@ -567,15 +572,24 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
     fn group_bindings_round_trip_and_reject_empty_names() {
-        let group: astra_ipc::groups::Group = toml::from_str("members=['DIRECT']\ninterface='虚拟网卡 VPN'\n").unwrap();
+        let group: astra_ipc::groups::Group =
+            toml::from_str("members=['DIRECT']\ninterface='虚拟网卡 VPN'\n").unwrap();
         assert_eq!(group.interface.as_deref(), Some("虚拟网卡 VPN"));
         let encoded = toml::to_string(&group).unwrap();
-        assert_eq!(toml::from_str::<astra_ipc::groups::Group>(&encoded).unwrap(), group);
+        assert_eq!(
+            toml::from_str::<astra_ipc::groups::Group>(&encoded).unwrap(),
+            group
+        );
         for interface in ["", " ", "bad\nname"] {
             let mut groups = std::collections::BTreeMap::new();
-            groups.insert("one".into(), astra_ipc::groups::Group {
-                interface: Some(interface.into()), members: vec!["DIRECT".into()], ..Default::default()
-            });
+            groups.insert(
+                "one".into(),
+                astra_ipc::groups::Group {
+                    interface: Some(interface.into()),
+                    members: vec!["DIRECT".into()],
+                    ..Default::default()
+                },
+            );
             assert!(astra_ipc::groups::validate(&groups, &HashSet::new()).is_err());
         }
     }
@@ -584,8 +598,15 @@ mod tests {
     async fn nested_groups_pin_the_outer_interface_and_isolate_pools() {
         let text = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n[proxy_groups.outer]\nmembers=['child']\ninterface='Ethernet'\n[proxy_groups.child]\nmembers=['node']\ninterface='虚拟网卡 VPN'\n[proxy_groups.inherit]\nmembers=['child']\n";
         let app = App::from_text(std::path::Path::new("group-bindings.toml"), text.into()).unwrap();
-        for (name, expected) in [("outer", "Ethernet"), ("child", "虚拟网卡 VPN"), ("inherit", "虚拟网卡 VPN")] {
-            let (action, lease) = app.resolve_session(&RouteAction::Proxy(name.into())).await.unwrap();
+        for (name, expected) in [
+            ("outer", "Ethernet"),
+            ("child", "虚拟网卡 VPN"),
+            ("inherit", "虚拟网卡 VPN"),
+        ] {
+            let (action, lease) = app
+                .resolve_session(&RouteAction::Proxy(name.into()))
+                .await
+                .unwrap();
             assert_eq!(action, RouteAction::Proxy("node".into()));
             assert_eq!(lease.1.as_deref(), Some(expected));
         }
@@ -595,7 +616,10 @@ mod tests {
         };
         assert!(!Arc::ptr_eq(&adapter("Ethernet"), &adapter("虚拟网卡 VPN")));
         assert!(Arc::ptr_eq(&adapter("Ethernet"), &adapter("Ethernet")));
-        let (_, lease) = app.resolve_session(&RouteAction::Proxy("node".into())).await.unwrap();
+        let (_, lease) = app
+            .resolve_session(&RouteAction::Proxy("node".into()))
+            .await
+            .unwrap();
         assert!(lease.1.is_none());
     }
 
@@ -604,10 +628,22 @@ mod tests {
         let text = "standalone=true\nstandalone_outbound='bound'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.bound]\nmembers=['DIRECT']\ninterface='no-such-iface-zz9'\n";
         let app = App::from_text(std::path::Path::new("group-bindings.toml"), text.into()).unwrap();
         let action = RouteAction::Proxy("bound".into());
-        let target = Target { host: "127.0.0.1".into(), port: 1234 };
+        let target = Target {
+            host: "127.0.0.1".into(),
+            port: 1234,
+        };
         let error = app.connect(&target, &action).await.err().unwrap();
         assert!(error.to_string().contains("does not exist"), "{error:#}");
-        let error = crate::udp::open_action(&app, &target, astra_ipc::Inbound::Socks5, "127.0.0.1:12345".parse().unwrap(), action).await.err().unwrap();
+        let error = crate::udp::open_action(
+            &app,
+            &target,
+            astra_ipc::Inbound::Socks5,
+            "127.0.0.1:12345".parse().unwrap(),
+            action,
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(error.to_string().contains("does not exist"), "{error:#}");
     }
 

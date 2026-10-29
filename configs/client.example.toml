@@ -28,7 +28,7 @@ ipc_connections = 8               # 1..128；持久 UDS 通道数量
 # 单次决策总期限包括排队、连接和重试；规则不可用时缓存未命中新请求失败关闭。
 decision_timeout_ms = 500          # >0
 connect_timeout_secs = 8           # >0；出站连接/握手期限
-shutdown_timeout_secs = 10         # 停止接受连接后等待会话退出的秒数；0 表示不等待
+shutdown_timeout_secs = 2          # 停止接受连接后等待会话退出的秒数；0 表示不等待
 max_connections = 4096            # >0；TCP 会话（含 UDP 控制连接）额度
 max_udp_flows = 512                # 1..65536；所有关联共享的 UDP 流额度
 udp_targets_per_association = 32   # 1..max_udp_flows；每个关联最大目标数

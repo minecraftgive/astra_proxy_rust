@@ -112,6 +112,9 @@ pub struct RuleEngine {
     countries: HashMap<String, Entry>,
     keywords: Vec<(String, Entry)>,
     regexes: Vec<(regex::Regex, Entry)>,
+    /// All `regexes` in one automaton: a lookup scans the domain once instead
+    /// of once per pattern. `None` only if the combined set exceeds its limits.
+    regex_set: Option<regex::RegexSet>,
     patterns: Vec<(String, Entry)>,
     subdomains: HashMap<String, Entry>,
     process_name: HashMap<String, Entry>,
@@ -126,6 +129,22 @@ pub struct RuleEngine {
 
 fn compile_regex(pattern: &str) -> Result<regex::Regex> {
     astra_rule_data::compile_domain_regex(pattern)
+}
+
+/// Each pattern was already validated alone by `compile_regex`; the set uses
+/// the same flags and a limit that grows with the number of patterns.
+fn regex_set(regexes: &[(regex::Regex, Entry)]) -> Option<regex::RegexSet> {
+    if regexes.is_empty() {
+        return None;
+    }
+    regex::RegexSetBuilder::new(regexes.iter().map(|(regex, _)| regex.as_str()))
+        .case_insensitive(true)
+        .size_limit((2 * 1024 * 1024 * regexes.len()).min(256 * 1024 * 1024))
+        .build()
+        .inspect_err(|error| {
+            tracing::warn!(%error, "domain regexes are matched one by one");
+        })
+        .ok()
 }
 
 fn geoip_interval() -> u64 {
@@ -387,6 +406,7 @@ impl RuleEngine {
             countries: HashMap::new(),
             keywords: Vec::new(),
             regexes: Vec::new(),
+            regex_set: None,
             patterns: Vec::new(),
             subdomains: HashMap::new(),
             process_name: HashMap::new(),
@@ -511,6 +531,7 @@ impl RuleEngine {
         }
         out.v4 = v4.into_iter().collect();
         out.v6 = v6.into_iter().collect();
+        out.regex_set = regex_set(&out.regexes);
         Ok(out)
     }
 
@@ -590,9 +611,18 @@ impl RuleEngine {
         if req.target.host.parse::<IpAddr>().is_err() {
             let domain = req.target.host.trim_end_matches('.').to_ascii_lowercase();
             consider(&mut best, self.exact.get(&domain));
-            for (pattern, entry) in &self.regexes {
-                if pattern.is_match(&domain) {
-                    consider(&mut best, Some(entry));
+            match &self.regex_set {
+                Some(set) => {
+                    for index in set.matches(&domain).iter() {
+                        consider(&mut best, Some(&self.regexes[index].1));
+                    }
+                }
+                None => {
+                    for (pattern, entry) in &self.regexes {
+                        if pattern.is_match(&domain) {
+                            consider(&mut best, Some(entry));
+                        }
+                    }
                 }
             }
             for (keyword, entry) in &self.keywords {
@@ -1165,6 +1195,41 @@ mod tests {
             let config:RuleConfig=toml::from_str(&format!("socket='/tmp/a'\ndefault_action='direct'\n[[rules]]\nkind='rule_set'\nvalue='a'\naction='block'\n{extra}")).unwrap();
             assert!(RuleEngine::compile(&config).is_err(), "{extra}");
         }
+    }
+    #[test]
+    fn regex_set_keeps_first_matching_rule_and_case_insensitivity() {
+        let engine = compile(
+            "[[rules]]
+kind='domain_suffix'
+value='early.test'
+action='direct'
+             [[rules]]
+kind='domain_regex'
+value='^a.*\\.test$'
+action='block'
+             [[rules]]
+kind='domain_regex'
+value='^ab'
+action='proxy:second'
+",
+        );
+        assert!(engine.regex_set.is_some());
+        assert_eq!(
+            engine.decide(&request("ABC.test", None)),
+            RouteAction::Block
+        );
+        assert_eq!(
+            engine.decide(&request("abc.other", None)),
+            RouteAction::Proxy("second".into())
+        );
+        assert_eq!(
+            engine.decide(&request("a.early.test", None)),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            engine.decide(&request("zzz", None)),
+            RouteAction::Proxy("edge".into())
+        );
     }
     #[test]
     fn geosite_dat_matches_types_filters_and_source_order() {

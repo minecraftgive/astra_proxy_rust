@@ -35,7 +35,7 @@ pub struct Reply {
 }
 pub async fn call(path: &Path, action: Action) -> anyhow::Result<Reply> {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let mut stream = astra_ipc::platform::LocalStream::connect(path).await?;
+        let mut stream = astra_ipc::platform::connect_trusted(path).await?;
         astra_ipc::send_management(
             &mut stream,
             &Request {

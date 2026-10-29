@@ -68,7 +68,9 @@ fn default_udp_idle() -> u64 {
     120
 }
 fn default_shutdown_timeout() -> u64 {
-    10
+    // Client sessions are mostly long-lived keep-alive tunnels that would hold
+    // the full window; a short grace period keeps quitting responsive.
+    2
 }
 fn default_workers() -> usize {
     8

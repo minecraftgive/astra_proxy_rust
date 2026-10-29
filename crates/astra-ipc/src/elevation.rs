@@ -16,8 +16,8 @@ use windows_sys::Win32::{
     System::{
         Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE},
         Threading::{
-            GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcessToken,
-            TerminateProcess, WaitForSingleObject,
+            GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcess, OpenProcessToken,
+            TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
         },
     },
     UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
@@ -182,11 +182,17 @@ impl Drop for ElevatedChild {
 
 /// UAC does not inherit the caller's environment or standard handles. Pass only
 /// the settings needed by the core, and keep the original user identity.
+///
+/// `replaces` names a running core this one takes over from: the elevated
+/// process is created (and UAC approved) while that core still serves, then
+/// waits for it to exit before loading its configuration. A cancelled prompt
+/// therefore leaves the running core untouched.
 pub fn core_arguments(
     config: &Path,
     socket: Option<&Path>,
     log: &Path,
     level: &str,
+    replaces: Option<u32>,
 ) -> io::Result<Vec<OsString>> {
     Ok(vec![
         "--windows-elevated".into(),
@@ -206,7 +212,34 @@ pub fn core_arguments(
             .transpose()?
             .map(|p| p.into_os_string())
             .unwrap_or_default(),
+        replaces
+            .map(|pid| pid.to_string())
+            .unwrap_or_default()
+            .into(),
     ])
+}
+/// How long a replacement core waits for its predecessor to drain and exit.
+const REPLACE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+fn wait_for_exit(pid: u32) -> io::Result<()> {
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        // ERROR_INVALID_PARAMETER: the predecessor has already exited.
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(87) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let handle = Handle(handle);
+    match unsafe { WaitForSingleObject(handle.0, REPLACE_WAIT.as_millis() as u32) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("previous core PID {pid} did not exit; elevated core not started"),
+        )),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
     let exe = wide(exe.as_os_str())?;
@@ -256,12 +289,14 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     if args.first().is_none_or(|arg| arg != "--windows-elevated") {
         return Ok(None);
     }
-    if args.len() != 9 || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
+    if args.len() != 10 || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "TUN elevation requires the original Windows account and an elevated token",
         ));
     }
+    // This core is driven by its non-elevated launcher (manager/TUI).
+    crate::platform::allow_unelevated_clients();
     std::env::set_current_dir(&args[6])?;
     if args[8].is_empty() {
         std::env::remove_var("ASTRA_RUNTIME_DIR");
@@ -292,6 +327,17 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     }
     // Standard handles stay valid until process exit.
     std::mem::forget(file);
+    if !args[9].is_empty() {
+        let pid = args[9]
+            .to_str()
+            .and_then(|pid| pid.parse().ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid predecessor PID")
+            })?;
+        // Ports, the TUN adapter and the control endpoint free up only once
+        // the predecessor is gone; an error here lands in the redirected log.
+        wait_for_exit(pid)?;
+    }
     Ok(Some(args[1].clone()))
 }
 
@@ -402,6 +448,18 @@ mod tests {
                 expected
             );
         }
+    }
+    #[test]
+    fn wait_for_exit_returns_once_the_process_is_gone() {
+        let mut child = std::process::Command::new(std::env::var_os("COMSPEC").unwrap())
+            .args(["/d", "/c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        drop(child);
+        wait_for_exit(pid).unwrap();
+        wait_for_exit(u32::MAX - 3).unwrap();
     }
     #[test]
     fn token_queries_work_without_elevation() {

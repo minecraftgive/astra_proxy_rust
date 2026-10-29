@@ -183,7 +183,7 @@ impl State {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
-    astra_ipc::logging::init()?;
+    let _log = astra_ipc::logging::init()?;
     let mut args = std::env::args().skip(1);
     let first = args.next();
     if first.as_deref() == Some("--stop") {
@@ -221,6 +221,8 @@ async fn main() -> Result<()> {
             .take(480 * 1024 + 1)
             .read_to_string(&mut text)?;
         anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+        // Validation must not wait on downloads when a valid cache exists.
+        astra_rule_data::serve_stale_cache(true);
         load_text(std::path::Path::new(&path), text)?;
         return Ok(());
     }
@@ -228,7 +230,11 @@ async fn main() -> Result<()> {
     let path =
         if check { args.next() } else { first }.unwrap_or_else(|| "configs/rule.toml".into());
     let path = std::fs::canonicalize(path)?;
+    // Cold start serves expired caches immediately; the watcher refreshes
+    // them in the background right after the core is listening.
+    astra_rule_data::serve_stale_cache(true);
     let (text, config, rules) = load(&path)?;
+    astra_rule_data::serve_stale_cache(false);
     if check {
         return Ok(());
     }
@@ -241,7 +247,10 @@ async fn main() -> Result<()> {
     let listener = Arc::new(ArcSwap::from_pointee(bind(&config.socket)?));
     astra_ipc::control::applied(&path, &text);
     let (revisions, mut changes) = watch::channel(revision);
-    let resources = ResourceWatch::new(&config, &path)?;
+    let mut resources = ResourceWatch::new(&config, &path)?;
+    if astra_rule_data::take_served_stale() {
+        resources.next = Some(std::time::Instant::now());
+    }
     let state = Arc::new(Mutex::new(State {
         path,
         text,

@@ -20,6 +20,9 @@ pub struct Options {
     pub geoip_database: Option<String>,
     pub geosite_database: Option<String>,
     pub strict_rules: bool,
+    /// Input came from a remote subscription: local `file` providers are
+    /// refused so a subscription cannot read files from this machine.
+    pub remote: bool,
 }
 
 pub struct Converted {

@@ -14,6 +14,11 @@ pub(crate) async fn lookup(
     bounded_lookup(network, source, destination, resolve).await
 }
 
+/// Runs for packets in the TUN reader, so on Windows it only consults the
+/// shared owner-table snapshot (refreshed at most every 100 ms) and never
+/// forces a fresh dump per packet. A socket opened since the last snapshot
+/// can be missed; routing then rejects that recaptured connection after
+/// its own, fresh lookup.
 pub(crate) async fn is_self(network: Network, source: SocketAddr, destination: SocketAddr) -> bool {
     bounded_lookup(
         network,
@@ -21,7 +26,7 @@ pub(crate) async fn is_self(network: Network, source: SocketAddr, destination: S
         destination,
         |network, source, destination| {
             #[cfg(windows)]
-            let pid = windows::owner_pid(network, source, destination);
+            let pid = windows::owner_pid_snapshot(network, source, destination);
             #[cfg(not(windows))]
             let pid = resolve(network, source, destination).map(|process| process.pid);
             pid.map(|pid| pid == std::process::id())
@@ -39,7 +44,7 @@ async fn bounded_lookup<T: Send + 'static>(
 ) -> Option<T> {
     static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let limit = LIMIT
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)))
         .clone();
     // A busy or inaccessible process table must not stall every new connection.
     tokio::time::timeout(Duration::from_millis(250), async move {
@@ -106,7 +111,23 @@ mod windows {
         },
     };
 
-    fn table<T: Copy>(network: Network, ipv4: bool) -> Option<Vec<T>> {
+    /// Owner tables are shared for a short window, so a burst of new
+    /// connections costs one table dump instead of one per connection.
+    /// Lookups that find no match re-query with `fresh = true`.
+    const SNAPSHOT_TTL: Duration = Duration::from_millis(100);
+    type Snapshot = (std::time::Instant, Arc<(Vec<u32>, u32)>);
+    static SNAPSHOTS: std::sync::Mutex<[Option<Snapshot>; 4]> =
+        std::sync::Mutex::new([None, None, None, None]);
+
+    fn raw(network: Network, ipv4: bool, fresh: bool) -> Option<Arc<(Vec<u32>, u32)>> {
+        let slot = usize::from(network == Network::Udp) * 2 + usize::from(ipv4);
+        if !fresh {
+            if let Some((at, data)) = &SNAPSHOTS.lock().ok()?[slot] {
+                if at.elapsed() < SNAPSHOT_TTL {
+                    return Some(data.clone());
+                }
+            }
+        }
         let family = if ipv4 { AF_INET } else { AF_INET6 } as u32;
         let query = |pointer, size| unsafe {
             match network {
@@ -135,20 +156,28 @@ mod windows {
             if result != 0 || size as usize > data.len() * 4 {
                 return None;
             }
-            let count = data[0] as usize;
-            if count > (size as usize).saturating_sub(4) / size_of::<T>() {
-                return None;
+            let data = Arc::new((data, size));
+            if let Ok(mut snapshots) = SNAPSHOTS.lock() {
+                snapshots[slot] = Some((std::time::Instant::now(), data.clone()));
             }
-            let pointer = unsafe { data.as_ptr().cast::<u8>().add(4) };
-            return Some(
-                (0..count)
-                    .map(|i| unsafe {
-                        pointer.add(i * size_of::<T>()).cast::<T>().read_unaligned()
-                    })
-                    .collect(),
-            );
+            return Some(data);
         }
         None
+    }
+
+    fn table<T: Copy>(network: Network, ipv4: bool, fresh: bool) -> Option<Vec<T>> {
+        let raw = raw(network, ipv4, fresh)?;
+        let (data, size) = &*raw;
+        let count = data[0] as usize;
+        if count > (*size as usize).saturating_sub(4) / size_of::<T>() {
+            return None;
+        }
+        let pointer = unsafe { data.as_ptr().cast::<u8>().add(4) };
+        Some(
+            (0..count)
+                .map(|i| unsafe { pointer.add(i * size_of::<T>()).cast::<T>().read_unaligned() })
+                .collect(),
+        )
     }
     fn v4(address: u32, port: u32) -> SocketAddr {
         SocketAddr::new(
@@ -175,11 +204,27 @@ mod windows {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Option<u32> {
+        owner_pid_in(network, source, destination, false)
+            .or_else(|| owner_pid_in(network, source, destination, true))
+    }
+    pub(super) fn owner_pid_snapshot(
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> Option<u32> {
+        owner_pid_in(network, source, destination, false)
+    }
+    fn owner_pid_in(
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+        fresh: bool,
+    ) -> Option<u32> {
         let source = SocketAddr::new(source.ip().to_canonical(), source.port());
         let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
         match (network, source.is_ipv4()) {
             (Network::Tcp, true) => unique(
-                table::<MIB_TCPROW_OWNER_PID>(network, true)?
+                table::<MIB_TCPROW_OWNER_PID>(network, true, fresh)?
                     .into_iter()
                     .filter(|row| {
                         same(v4(row.dwLocalAddr, row.dwLocalPort), source)
@@ -188,7 +233,7 @@ mod windows {
                     .map(|row| row.dwOwningPid),
             ),
             (Network::Tcp, false) => unique(
-                table::<MIB_TCP6ROW_OWNER_PID>(network, false)?
+                table::<MIB_TCP6ROW_OWNER_PID>(network, false, fresh)?
                     .into_iter()
                     .filter(|row| {
                         same(v6(row.ucLocalAddr, row.dwLocalPort), source)
@@ -197,7 +242,7 @@ mod windows {
                     .map(|row| row.dwOwningPid),
             ),
             (Network::Udp, true) => {
-                let rows = table::<MIB_UDPROW_OWNER_PID>(network, true)?;
+                let rows = table::<MIB_UDPROW_OWNER_PID>(network, true, fresh)?;
                 let candidates: Vec<_> = rows
                     .iter()
                     .filter(|row| {
@@ -210,7 +255,7 @@ mod windows {
                 unique(candidates)
             }
             (Network::Udp, false) => {
-                let rows = table::<MIB_UDP6ROW_OWNER_PID>(network, false)?;
+                let rows = table::<MIB_UDP6ROW_OWNER_PID>(network, false, fresh)?;
                 unique(
                     rows.iter()
                         .filter(|row| {
@@ -230,7 +275,21 @@ mod windows {
         destination: SocketAddr,
     ) -> Option<ProcessInfo> {
         let pid = owner_pid(network, source, destination)?;
-        unsafe {
+        // Image paths are cached briefly; PID reuse inside the window is
+        // far less likely than the cost of OpenProcess on every connection.
+        type PathCache = std::collections::HashMap<u32, (std::time::Instant, String)>;
+        static PATHS: std::sync::Mutex<Option<PathCache>> = std::sync::Mutex::new(None);
+        if let Some((at, path)) = PATHS
+            .lock()
+            .ok()?
+            .get_or_insert_with(Default::default)
+            .get(&pid)
+        {
+            if at.elapsed() < Duration::from_secs(2) {
+                return info(pid, path.clone());
+            }
+        }
+        let path = unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
                 return None;
@@ -242,8 +301,16 @@ mod windows {
             if result == 0 {
                 return None;
             }
-            info(pid, String::from_utf16(&path[..length as usize]).ok()?)
+            String::from_utf16(&path[..length as usize]).ok()?
+        };
+        if let Ok(mut paths) = PATHS.lock() {
+            let paths = paths.get_or_insert_with(Default::default);
+            if paths.len() >= 1024 {
+                paths.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(2));
+            }
+            paths.insert(pid, (std::time::Instant::now(), path.clone()));
         }
+        info(pid, path)
     }
 }
 

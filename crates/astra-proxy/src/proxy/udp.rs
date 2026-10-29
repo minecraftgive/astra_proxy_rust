@@ -202,7 +202,12 @@ pub(crate) async fn open_action(
     let restored = app.restore_fake_target(target)?;
     let target = &restored;
     let (action, lease) = app.resolve_session(&action).await?;
-    let interface = lease.1.as_deref().or_else(|| app.config.tun.as_ref().and_then(|tun| tun.interface.as_deref()));
+    let interface = lease.1.as_deref().or_else(|| {
+        app.config
+            .tun
+            .as_ref()
+            .and_then(|tun| tun.interface.as_deref())
+    });
     let traffic = super::traffic::Traffic::new(
         &app.metrics,
         Some(source),
@@ -211,49 +216,50 @@ pub(crate) async fn open_action(
         Network::Udp,
         &action,
     );
-    let result: Result<PacketTransport> = meow_common::outbound_iface::with_outbound_interface(interface, async {
-        match action {
-            RouteAction::Block => bail!("UDP blocked"),
-            RouteAction::Direct => {
-                let mut destination = app
-                    .lookup_real(&target.host, target.port)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .context("UDP destination has no addresses")?;
-                if interface.is_some() || app.config.tun.is_some() {
-                    destination = crate::egress::scoped_destination(destination, interface)?;
-                }
-                let socket = UdpSocket::bind(if destination.is_ipv4() {
-                    "0.0.0.0:0"
-                } else {
-                    "[::]:0"
-                })
-                .await?;
-                crate::egress::bind_interface(
-                    &socket,
-                    if destination.ip().is_loopback() {
-                        None
+    let result: Result<PacketTransport> =
+        meow_common::outbound_iface::with_outbound_interface(interface, async {
+            match action {
+                RouteAction::Block => bail!("UDP blocked"),
+                RouteAction::Direct => {
+                    let mut destination = app
+                        .lookup_real(&target.host, target.port)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .context("UDP destination has no addresses")?;
+                    if interface.is_some() || app.config.tun.is_some() {
+                        destination = crate::egress::scoped_destination(destination, interface)?;
+                    }
+                    let socket = UdpSocket::bind(if destination.is_ipv4() {
+                        "0.0.0.0:0"
                     } else {
-                        interface
-                    },
-                    destination.is_ipv4(),
-                )?;
-                socket.connect(destination).await?;
-                Ok(PacketTransport::Direct(socket))
+                        "[::]:0"
+                    })
+                    .await?;
+                    crate::egress::bind_interface(
+                        &socket,
+                        if destination.ip().is_loopback() {
+                            None
+                        } else {
+                            interface
+                        },
+                        destination.is_ipv4(),
+                    )?;
+                    socket.connect(destination).await?;
+                    Ok(PacketTransport::Direct(socket))
+                }
+                RouteAction::Proxy(tag) => {
+                    let outbound = app
+                        .native_for(interface)
+                        .get(&tag)
+                        .with_context(|| format!("outbound {tag} does not support UDP"))?;
+                    Ok(PacketTransport::Proxy(
+                        crate::native::connect_udp(outbound, target).await?,
+                    ))
+                }
             }
-            RouteAction::Proxy(tag) => {
-                let outbound = app
-                    .native_for(interface)
-                    .get(&tag)
-                    .with_context(|| format!("outbound {tag} does not support UDP"))?;
-                Ok(PacketTransport::Proxy(
-                    crate::native::connect_udp(outbound, target).await?,
-                ))
-            }
-        }
-    })
-    .await?;
+        })
+        .await?;
     match result {
         Ok(transport) => {
             if let Some(traffic) = &traffic {

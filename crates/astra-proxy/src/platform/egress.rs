@@ -229,37 +229,84 @@ mod tests {
         use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
         let mut pointer = std::ptr::null_mut();
         assert_eq!(unsafe { GetIfTable2(&mut pointer) }, 0);
-        let rows = unsafe { std::slice::from_raw_parts((*pointer).Table.as_ptr(), (*pointer).NumEntries as usize) };
-        let adapters: Vec<_> = rows.iter().filter_map(|row| {
-            let mut ip = MIB_IPINTERFACE_ROW::default();
-            unsafe { InitializeIpInterfaceEntry(&mut ip) };
-            ip.Family = AF_INET;
-            ip.InterfaceIndex = row.InterfaceIndex;
-            if unsafe { GetIpInterfaceEntry(&mut ip) } != 0 { return None; }
-            let end = row.Alias.iter().position(|c| *c == 0).unwrap_or(row.Alias.len());
-            Some((String::from_utf16_lossy(&row.Alias[..end]), row.InterfaceIndex))
-        }).take(2).collect();
+        let rows = unsafe {
+            std::slice::from_raw_parts((*pointer).Table.as_ptr(), (*pointer).NumEntries as usize)
+        };
+        let adapters: Vec<_> = rows
+            .iter()
+            .filter_map(|row| {
+                let mut ip = MIB_IPINTERFACE_ROW::default();
+                unsafe { InitializeIpInterfaceEntry(&mut ip) };
+                ip.Family = AF_INET;
+                ip.InterfaceIndex = row.InterfaceIndex;
+                if unsafe { GetIpInterfaceEntry(&mut ip) } != 0 {
+                    return None;
+                }
+                let end = row
+                    .Alias
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(row.Alias.len());
+                Some((
+                    String::from_utf16_lossy(&row.Alias[..end]),
+                    row.InterfaceIndex,
+                ))
+            })
+            .take(2)
+            .collect();
         unsafe { FreeMibTable(pointer.cast()) };
-        assert_eq!(adapters.len(), 2, "two local IP adapters are required for this isolation check");
+        assert_eq!(
+            adapters.len(),
+            2,
+            "two local IP adapters are required for this isolation check"
+        );
         let check = |(name, index): (String, u32)| async move {
             meow_common::outbound_iface::with_outbound_interface(Some(&name), async {
                 for _ in 0..8 {
                     tokio::task::yield_now().await;
-                    assert_eq!(meow_common::outbound_iface::outbound_interface().as_deref(), Some(name.as_str()));
-                    for (kind, protocol) in [(socket2::Type::STREAM, socket2::Protocol::TCP), (socket2::Type::DGRAM, socket2::Protocol::UDP)] {
-                        let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, Some(protocol)).unwrap();
-                        meow_common::outbound_iface::apply_outbound_interface(&socket, socket2::Domain::IPV4).unwrap();
+                    assert_eq!(
+                        meow_common::outbound_iface::outbound_interface().as_deref(),
+                        Some(name.as_str())
+                    );
+                    for (kind, protocol) in [
+                        (socket2::Type::STREAM, socket2::Protocol::TCP),
+                        (socket2::Type::DGRAM, socket2::Protocol::UDP),
+                    ] {
+                        let socket =
+                            socket2::Socket::new(socket2::Domain::IPV4, kind, Some(protocol))
+                                .unwrap();
+                        meow_common::outbound_iface::apply_outbound_interface(
+                            &socket,
+                            socket2::Domain::IPV4,
+                        )
+                        .unwrap();
                         let mut value: u32 = 0;
                         let mut size = std::mem::size_of_val(&value) as i32;
-                        assert_eq!(unsafe { getsockopt(socket.as_raw_socket() as SOCKET, IPPROTO_IP, IP_UNICAST_IF, (&mut value as *mut u32).cast(), &mut size) }, 0);
+                        assert_eq!(
+                            unsafe {
+                                getsockopt(
+                                    socket.as_raw_socket() as SOCKET,
+                                    IPPROTO_IP,
+                                    IP_UNICAST_IF,
+                                    (&mut value as *mut u32).cast(),
+                                    &mut size,
+                                )
+                            },
+                            0
+                        );
                         // Windows returns this option in host order on reads.
                         assert_eq!(value, index, "wrong interface for {name}");
                     }
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         };
         let mut adapters = adapters.into_iter();
-        tokio::join!(check(adapters.next().unwrap()), check(adapters.next().unwrap()));
+        tokio::join!(
+            check(adapters.next().unwrap()),
+            check(adapters.next().unwrap())
+        );
     }
 
     #[test]

@@ -57,6 +57,20 @@ pub struct App {
     permits: Arc<limit::Limit>,
 }
 
+fn loopback_target(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let ip = ip.to_canonical();
+            ip.is_loopback() || ip.is_unspecified()
+        }
+        Err(_) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+    }
+}
+
 impl App {
     fn inbound_allowed(&self, ip: std::net::IpAddr) -> bool {
         let ip = ip.to_canonical();
@@ -127,6 +141,17 @@ impl App {
         source: Option<std::net::SocketAddr>,
         destination: Option<std::net::SocketAddr>,
     ) -> Result<RouteAction> {
+        // A LAN client must not use the proxy to reach this host's
+        // loopback-only services: DIRECT would dial 127.0.0.1 locally.
+        if matches!(
+            inbound,
+            Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
+        ) && source.is_some_and(|source| !source.ip().to_canonical().is_loopback())
+            && loopback_target(&target.host)
+        {
+            tracing::debug!(target: "astra_route", host = ?target.host, ?source, "LAN client blocked from host loopback");
+            return Ok(RouteAction::Block);
+        }
         // Transparent self-capture is unsafe even in standalone mode.
         let process = if self.standalone_action.is_none() || inbound == Inbound::Tun {
             match (source, destination) {
@@ -333,7 +358,9 @@ impl App {
         self.connect_resolved_on(target, action, None).await
     }
     fn native_for(&self, interface: Option<&str>) -> &native::Registry {
-        interface.and_then(|name| self.native_interfaces.get(name)).unwrap_or(&self.native)
+        interface
+            .and_then(|name| self.native_interfaces.get(name))
+            .unwrap_or(&self.native)
     }
     async fn connect_resolved_on(
         &self,
@@ -341,10 +368,17 @@ impl App {
         action: &RouteAction,
         interface: Option<&str>,
     ) -> Result<outbound::Stream> {
-        let interface = interface.or_else(|| self.config.tun.as_ref().and_then(|tun| tun.interface.as_deref()));
+        let interface = interface.or_else(|| {
+            self.config
+                .tun
+                .as_ref()
+                .and_then(|tun| tun.interface.as_deref())
+        });
         meow_common::outbound_iface::with_outbound_interface(
-            interface, self.connect_resolved_inner(target, action, interface),
-        ).await?
+            interface,
+            self.connect_resolved_inner(target, action, interface),
+        )
+        .await?
     }
     async fn connect_resolved_inner(
         &self,
@@ -455,11 +489,19 @@ impl App {
         )?;
         // Multiplexed QUIC/TLS clients must never share a socket across bindings.
         let mut native_interfaces = HashMap::new();
-        for interface in config.proxy_groups.values().filter_map(|group| group.interface.as_ref()) {
+        for interface in config
+            .proxy_groups
+            .values()
+            .filter_map(|group| group.interface.as_ref())
+        {
             if !native_interfaces.contains_key(interface) {
-                native_interfaces.insert(interface.clone(), native::compile(
-                    &config.outbounds, path.parent().context("configuration has no parent")?,
-                )?);
+                native_interfaces.insert(
+                    interface.clone(),
+                    native::compile(
+                        &config.outbounds,
+                        path.parent().context("configuration has no parent")?,
+                    )?,
+                );
             }
         }
         let mut builder = Cache::builder().max_capacity(65_536);
@@ -623,7 +665,7 @@ pub async fn run() -> Result<()> {
         println!("{output}");
         return Ok(());
     }
-    astra_ipc::logging::init()?;
+    let _log = astra_ipc::logging::init()?;
     if first.as_deref() == Some("--runtime") {
         use astra_ipc::runtime::{Command, Mode};
         let socket = args

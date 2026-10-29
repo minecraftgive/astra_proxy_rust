@@ -183,9 +183,11 @@ IPC 默认 8 个持久通道，每通道一条在途请求。一次决策的总�
 
 ## 资源与排障
 
+远程订阅、proxy-provider、规则集与 GeoIP/GeoSite 下载支持 HTTP(S)（URL 中不得包含账号密码）；明文 HTTP 内容可被链路篡改，建议优先使用 HTTPS。配置为 HTTPS 的地址，重定向不得降级为 HTTP。远程订阅不能引用本机 `type: file` provider，导入其 `dns` 段时不会采用其中的 `listen`。DNS 监听与代理入站使用同一套来源准入（LAN 开关、`lan_allowed_ips` / `lan_disallowed_ips`）。规则核心冷启动时直接使用已过期但有效的资源缓存，并在启动后立即于后台刷新。
+
 默认 `max_connections = 4096`；空闲监听器不占用会话额度。UDP 默认全局最多 512 个流、每个关联最多 32 个目标，每流发送队列 4 个包，空闲 120 秒回收。UDP 关联随 TCP 控制连接关闭，禁止 SOCKS 分片并固定客户端来源；超限丢包，不无限积压。
 
-`connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 10 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
+`connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 2 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
 
 ## 验证
 

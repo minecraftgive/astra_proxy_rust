@@ -104,7 +104,7 @@ impl View {
                         .send(Ok(Update::Targets(serde_json::from_str(&reply.text)?)))
                         .await?;
                 } else {
-                    let mut stream = astra_ipc::platform::LocalStream::connect(&socket).await?;
+                    let mut stream = astra_ipc::platform::connect_trusted(&socket).await?;
                     astra_ipc::send_management(
                         &mut stream,
                         &protocol::Request {

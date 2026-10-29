@@ -26,6 +26,10 @@ fn subscription_imports_dns_once_and_preserves_local_changes() {
     let merged = merge("", &converted.proxy, &mut ownership).unwrap();
     let document: toml::Table = toml::from_str(&merged).unwrap();
     assert_eq!(document["dns"]["fake_ip"].as_bool(), Some(true));
+    assert!(
+        document["dns"].get("listen").is_none(),
+        "a subscription must not choose where local DNS listens"
+    );
     let changed = merged.replace("fake_ip = true", "fake_ip = false");
     let merged = merge(&changed, &converted.proxy, &mut ownership).unwrap();
     let document: toml::Table = toml::from_str(&merged).unwrap();
