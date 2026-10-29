@@ -24,7 +24,14 @@ const URL: &str = "https://api.ip.sb/ip";
 pub fn targets(app: &App) -> Vec<String> {
     std::iter::once("DIRECT".to_owned())
         .chain(app.config.outbounds.iter().map(|o| o.tag().to_owned()))
-        .chain(app.config.proxy_groups.keys().cloned())
+        // The built-in DIRECT group is covered by the direct check; REJECT has nothing to test.
+        .chain(
+            app.config
+                .proxy_groups
+                .keys()
+                .filter(|name| !astra_ipc::groups::builtin(name))
+                .cloned(),
+        )
         .collect()
 }
 pub async fn selected(app: &App, tags: &[String]) -> Result<Report> {
@@ -65,6 +72,7 @@ pub async fn run(app: &App) -> Report {
                 app.config
                     .proxy_groups
                     .keys()
+                    .filter(|name| !astra_ipc::groups::builtin(name))
                     .cloned()
                     .map(RouteAction::Proxy),
             ),

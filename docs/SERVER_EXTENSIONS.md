@@ -9,8 +9,8 @@
 | REALITY 密钥 | `reality_public_key` | `[listeners.reality].private_key` |
 | VLESS 加解密 | `encryption` 公钥字符串 | `[listeners.decryption].private_keys` |
 | Mux | `mux = "h2mux"` 等 | `multiplex = true` |
-| 构建 | `scripts/build.py` / `build.sh` | `scripts/build_server.py` |
-| 打包 | `scripts/package_release.py` | `scripts/package_server.py` |
+| 构建 | `scripts/build.py`（默认 `--role client`） | `scripts/build.py --role server` |
+| 打包 | `build.py --package` | `build.py --role server --package` |
 
 服务器端包只包含服务器核心与服务器 TUI，不携带客户端程序和客户端示例。客户端与服务端归档根目录分别为 `client/` 和 `server/`，每端仅包含自己的程序与一份完整示例配置。客户端运行所需 Wintun DLL 若存在，也作为运行二进制随包提供。说明和验证记录仅留在仓库。
 

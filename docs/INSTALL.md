@@ -21,9 +21,10 @@
 需要 Rust MSVC 工具链、Visual Studio C++ 构建工具及 Windows SDK、CMake、NASM（x64 的 BoringSSL 依赖）、libclang 和 Python 3.8+。NASM 可从 [官方发布目录](https://www.nasm.us/pub/nasm/releasebuilds/) 获取；将 `nasm.exe` 加入 PATH。libclang 可通过 LLVM 安装或 `python -m pip install --target .build-tools/windows/python libclang` 提供，系统安装时设置 `LIBCLANG_PATH` 指向包含 `libclang.dll` 的目录。构建脚本会识别项目内 `.build-tools/windows/nasm-*/nasm.exe` 和 `.build-tools/windows/python/clang/native/libclang.dll`。
 
 ```powershell
-./scripts/build.ps1                         # release 构建、测试、打包并验证
-./scripts/build.ps1 --debug --build-only    # debug 构建和测试
+./scripts/build.ps1                         # release 构建客户端（不测试、不打包）
+./scripts/build.ps1 --debug                 # debug 构建
 ./target/x86_64-pc-windows-msvc/debug/astra-tui.exe
+python scripts/test.py --debug              # 测试 debug 构建：单元、live 与本地回归
 # 已有普通 cargo build 的产物：
 python scripts/windows_regression.py --bin-dir target/debug
 python scripts/astra.py --debug --check
@@ -46,37 +47,54 @@ Windows 系统接管示例见 `configs/windows.toml`，两种模式默认均关�
 # 仅下载并核对 SHA-256、复制 DLL 与许可；此命令不加载或安装驱动。
 python scripts/install_wintun.py --bin-dir target/debug
 # 离线时用 --archive 指向官方 wintun-0.14.1.zip。
-# 构建脚本会把缓存中的 DLL 与许可复制进新产物；需要时可跳过所有测试：
-./scripts/build.ps1 --debug --skip-tests
+# 构建脚本会把缓存中的 DLL 与许可复制进新产物：
+./scripts/build.ps1 --debug
 ```
 
 默认从 `astra-proxy.exe` 旁加载 `wintun.dll`；`ASTRA_WINTUN_DLL` 可指定另一可信 DLL 的完整路径。精简包只复制运行 DLL；许可和来源信息保留在准备脚本的本地输出中。没有 DLL 时普通 SOCKS/HTTP 模式仍可运行，只有启用 TUN 才报缺少驱动。Wintun 版本、下载地址及固定 SHA-256 保存在准备脚本及本地来源记录中，来源是 [Wintun 官方发布](https://www.wintun.net/)。具体路由、权限、恢复说明见 [系统模式](PROXY_MODES.md)。
 
 ### Linux / macOS 构建
 
-需要 Rust、CMake、Clang/C++、libclang；Linux 构建产物仍需在目标机器验证。服务端通过独立的 build_server.py 构建，不混入客户端运行包。
+需要 Rust、CMake、Clang/C++、libclang；Linux 构建产物仍需在目标机器验证。
 
 ```sh
 ./scripts/build.sh
 ```
 
-脚本从任何工作目录执行均可。默认使用锁定依赖构建本机 release 版本，依次运行工作区测试、双 core 管理 IPC 测试，然后生成并验证包含四个客户端程序的压缩包。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建和打包阶段需要 Python 3.8+，分发程序无需 Python。
+`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖构建本机 release 版本的客户端程序，**不运行测试、不打包**。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.8+，分发程序无需 Python。
 
 ```sh
-./scripts/build.sh --debug                        # 调试构建并打包
-./scripts/build.sh --build-only                   # 只编译和测试
-./scripts/build.sh --label 0.1.0-tui --output-dir dist
-./scripts/build.sh --skip-tests                   # 显式跳过测试
+./scripts/build.sh --debug                        # 调试构建
+./scripts/build.sh --role server                  # 构建服务端（client / server / all）
+./scripts/build.sh --role all --package           # 构建并为客户端、服务端各生成一个压缩包
+./scripts/build.sh --package --label 0.1.0-tui --output-dir dist
 ```
 
-二进制输出位于 `target/<本机 Rust target>/release/`（调试版本为 `debug/`），支持 `CARGO_TARGET_DIR`。脚本仅打包当前机器平台，不进行交叉编译。默认标签来自客户端程序共同的 Cargo 版本；`--label` 可覆盖归档标签。分发目录仅生成 `.tar.gz`，SHA-256 输出到控制台；验证报告保存到仓库 `.test-tools/`（未跳过测试时）。同名输出会被替换，保留旧包时请使用不同标签或输出目录。
+二进制输出位于 `target/<本机 Rust target>/release/`（调试版本为 `debug/`），支持 `CARGO_TARGET_DIR`。脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自客户端程序共同的 Cargo 版本，`--label` 可覆盖；分发目录仅生成 `.tar.gz`，SHA-256 输出到控制台。同名输出会被替换，保留旧包时请使用不同标签或输出目录。客户端与服务端程序分别打包，互不混入。
 
-已有二进制也可以单独打包：
+解压包中的程序与完整示例配置直接位于 `client/` 或 `server/`，TUI 自动找到旁边的核心。
+
+### 测试
+
+测试与构建分开，由 `scripts/test.py` 针对 `build.py` 的产物运行；使用与构建相同的 `--debug` 选择：
 
 ```sh
-python3 scripts/package_release.py --bin-dir target/release
+python3 scripts/test.py                  # 默认：unit live client
+python3 scripts/test.py --debug unit     # 只跑工作区单元/集成测试
+python3 scripts/test.py server           # 服务端回归（先 build.py --role server）
+python3 scripts/test.py package          # 解压 dist/ 中的压缩包并启动验证（先 build.py --package）
+python3 scripts/test.py --keep-going     # 失败后继续，最后汇总
 ```
 
-解压包中的程序与完整示例配置直接位于 `client/` 或 `server/`，TUI 自动找到旁边的核心。归档验证检查精确文件集合、完整配置、TUI 管理 IPC、原生核心启动及 SOCKS5 回显。服务端包通过 `python scripts/package_server.py --bin-dir target/release` 单独生成。
+| 套件 | 内容 |
+|---|---|
+| `unit` | `cargo test --workspace` |
+| `live` | TUI 驱动真实 Proxy/Rule Core 的端到端测试 |
+| `client` | 订阅诊断、DNS、路由日志回归；Windows 另跑系统集成、规则集、代理组、单/多订阅回归 |
+| `server` | 服务端互通与生命周期回归 |
+| `package` | 归档文件集合、完整配置、TUI 管理 IPC、核心启动及 SOCKS5 回显；客户端报告写入 `.test-tools/` |
+| `release` | 完整协议矩阵门禁（`release_check.py`），需先用 `install_test_servers.py` 准备参考服务端 |
+
+单个回归脚本仍可直接运行，例如 `python scripts/windows_regression.py --bin-dir target/debug`。
 
 本机性能基线见 [PERFORMANCE.md](PERFORMANCE.md)。这些数字包含本地测试端开销，不能当作加密代理生产容量承诺。

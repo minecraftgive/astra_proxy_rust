@@ -109,18 +109,43 @@ impl Groups {
         path.extend(members[..members.len() - 1].iter().cloned());
         Ok(target.clone())
     }
-    fn cached(&self, app: &App, name: &str) -> Result<RouteAction> {
-        self.cached_path(app, name).map(|v| v.0)
+    /// The group a route action starts in; direct and block go through their built-in groups.
+    fn entry(app: &App, action: &RouteAction) -> Option<String> {
+        let name = match action {
+            RouteAction::Proxy(name) => name.as_str(),
+            RouteAction::Direct => "DIRECT",
+            RouteAction::Block => "REJECT",
+        };
+        app.config
+            .proxy_groups
+            .contains_key(name)
+            .then(|| name.to_owned())
     }
-    fn cached_path(&self, app: &App, name: &str) -> Result<(RouteAction, Vec<String>)> {
+    /// DIRECT/REJECT end the walk when named by their own group or when no such group exists.
+    fn terminal(app: &App, name: &str, parent: Option<&String>) -> Option<RouteAction> {
+        let action = match name {
+            "DIRECT" => RouteAction::Direct,
+            "REJECT" => RouteAction::Block,
+            _ => return None,
+        };
+        (parent.is_some_and(|p| p == name) || !app.config.proxy_groups.contains_key(name))
+            .then_some(action)
+    }
+    fn cached(&self, app: &App, name: &str) -> Result<RouteAction> {
+        self.cached_path(app, name, Vec::new()).map(|v| v.0)
+    }
+    /// `path` holds the groups already entered, so a group's own DIRECT/REJECT stays terminal.
+    fn cached_path(
+        &self,
+        app: &App,
+        name: &str,
+        mut path: Vec<String>,
+    ) -> Result<(RouteAction, Vec<String>)> {
         let mut name = name.to_owned();
-        let mut path = Vec::new();
         let selections = self.selections.read().unwrap();
         for _ in 0..=32 {
-            match name.as_str() {
-                "DIRECT" => return Ok((RouteAction::Direct, path)),
-                "REJECT" => return Ok((RouteAction::Block, path)),
-                _ => {}
+            if let Some(action) = Self::terminal(app, &name, path.last()) {
+                return Ok((action, path));
             }
             let Some(group) = app.config.proxy_groups.get(&name) else {
                 ensure!(
@@ -147,20 +172,17 @@ impl Groups {
         action: &RouteAction,
     ) -> Result<(RouteAction, super::group_sessions::Lease)> {
         self.resolve(app, action).await?;
-        let RouteAction::Proxy(name) = action else {
+        let Some(name) = Self::entry(app, action) else {
             return Ok((action.clone(), self.sessions.lease(&[])));
         };
         // A switch cannot race subscription: refresh holds the selection write lock
         // while it advances the cancellation epoch.
         let guard = self.selections.read().unwrap();
-        let mut current = name.clone();
-        let mut path = Vec::new();
+        let mut current = name;
+        let mut path: Vec<String> = Vec::new();
         let resolved = loop {
-            if current == "DIRECT" {
-                break RouteAction::Direct;
-            }
-            if current == "REJECT" {
-                break RouteAction::Block;
+            if let Some(action) = Self::terminal(app, &current, path.last()) {
+                break action;
             }
             let Some(group) = app.config.proxy_groups.get(&current) else {
                 break RouteAction::Proxy(current);
@@ -243,14 +265,12 @@ impl Groups {
         }
     }
     pub async fn resolve(&self, app: &App, action: &RouteAction) -> Result<RouteAction> {
-        let RouteAction::Proxy(name) = action else {
+        let Some(name) = Self::entry(app, action) else {
             return Ok(action.clone());
         };
-        if !app.config.proxy_groups.contains_key(name) {
-            return Ok(action.clone());
-        }
+        let name = name.as_str();
         let mut reachable = HashSet::new();
-        let mut pending = vec![name.as_str()];
+        let mut pending = vec![name];
         while let Some(name) = pending.pop() {
             if !reachable.insert(name) {
                 continue;
@@ -303,8 +323,7 @@ impl Groups {
         let results: Vec<_> = stream::iter(group.members.iter().cloned())
             .map(|member| async move {
                 let result = async {
-                    let (action, mut path) = self.cached_path(app, &member)?;
-                    path.insert(0, name.to_owned());
+                    let (action, path) = self.cached_path(app, &member, vec![name.to_owned()])?;
                     let interface = Self::interface_for_path(app, &path);
                     let start = Instant::now();
                     tokio::time::timeout(
@@ -624,6 +643,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_and_block_route_through_their_builtin_groups() {
+        let defaults = App::from_text(
+            std::path::Path::new("builtin-groups.toml"),
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n".into(),
+        )
+        .unwrap();
+        for (action, expected) in [
+            (RouteAction::Direct, RouteAction::Direct),
+            (RouteAction::Block, RouteAction::Block),
+            (RouteAction::Proxy("DIRECT".into()), RouteAction::Direct),
+        ] {
+            let (resolved, _) = defaults.resolve_session(&action).await.unwrap();
+            assert_eq!(resolved, expected);
+        }
+        // Rerouting the DIRECT group moves every direct decision, including other groups' DIRECT members.
+        let text = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n[proxy_groups.DIRECT]\nmembers=['DIRECT','node']\nselected='node'\ninterface='Ethernet'\n[proxy_groups.main]\nmembers=['DIRECT']\n";
+        let app = App::from_text(std::path::Path::new("builtin-groups.toml"), text.into()).unwrap();
+        for action in [RouteAction::Direct, RouteAction::Proxy("main".into())] {
+            let (resolved, lease) = app.resolve_session(&action).await.unwrap();
+            assert_eq!(resolved, RouteAction::Proxy("node".into()));
+            assert_eq!(lease.1.as_deref(), Some("Ethernet"));
+        }
+        assert_eq!(
+            app.resolve_action(&RouteAction::Block).await.unwrap(),
+            RouteAction::Block
+        );
+        assert!(!crate::diagnostics::targets(&app)
+            .iter()
+            .any(|tag| tag == "REJECT"));
+    }
+
+    #[tokio::test]
     async fn missing_group_adapter_fails_closed_for_tcp_and_udp() {
         let text = "standalone=true\nstandalone_outbound='bound'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.bound]\nmembers=['DIRECT']\ninterface='no-such-iface-zz9'\n";
         let app = App::from_text(std::path::Path::new("group-bindings.toml"), text.into()).unwrap();
@@ -792,7 +843,7 @@ mod tests {
             app.groups.resolve(&app, &child).await.unwrap(),
             RouteAction::Proxy("b".into())
         );
-        let (resolved, path) = app.groups.cached_path(&app, "main").unwrap();
+        let (resolved, path) = app.groups.cached_path(&app, "main", Vec::new()).unwrap();
         assert_eq!(resolved, RouteAction::Proxy("a".into()));
         assert_eq!(path, ["main", "speed"]);
         assert_eq!(

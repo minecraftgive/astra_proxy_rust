@@ -27,8 +27,8 @@
 ```sh
 cargo build --release --workspace
 python3 scripts/release_check.py --tls-python /path/to/python-with-tls13
-python3 scripts/package_release.py
-python3 scripts/package_regression.py dist/astra-0.1.0-darwin-arm64.tar.gz
+python3 scripts/build.py --package
+python3 scripts/test.py package
 ```
 
 最后一项解压测试的交付记录位于压缩包旁的 `.verification.json`。需要 CMake/Clang 的开发测试应在具备构建依赖的环境运行。普通运行包不需要这些工具，也不需要参考服务端。

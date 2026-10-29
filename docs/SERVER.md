@@ -5,12 +5,12 @@
 ## 构建与启动
 
 ```powershell
-python scripts/build_server.py
-./target/release/astra-server-core --init server.toml
-./target/release/astra-server-tui --config server.toml
+python scripts/build.py --role server
+./target/x86_64-pc-windows-msvc/release/astra-server-core --init server.toml
+./target/x86_64-pc-windows-msvc/release/astra-server-tui --config server.toml
 ```
 
-调试构建使用 `python scripts/build_server.py --debug`。Windows 原生编译所需工具与客户端相同，见 INSTALL.md；服务端运行不需要 Wintun 或管理员权限。Linux/macOS 使用相同 Python 构建入口，二进制没有 `.exe` 后缀。首次生成的配置只监听回环地址，包含随机 UUID。公网部署请先配置域名、TLS 证书及实际监听地址。完整字段示例见仓库 `configs/server.example.toml`。
+产物位于 `target/<本机 Rust target>/release/`，调试构建使用 `python scripts/build.py --role server --debug`。Windows 原生编译所需工具与客户端相同，见 INSTALL.md；服务端运行不需要 Wintun 或管理员权限。Linux/macOS 使用相同 Python 构建入口，二进制没有 `.exe` 后缀。首次生成的配置只监听回环地址，包含随机 UUID。公网部署请先配置域名、TLS 证书及实际监听地址。完整字段示例见仓库 `configs/server.example.toml`。
 
 TUI：`s` 启动，`x` 停止，`r` 重启，`l` 重载，`e` 编辑配置，`v` 校验，`i` 初始化；`q` 退出并保留核心运行，`Q` 停止核心并退出。编辑器取 VISUAL/EDITOR 指定的可执行文件，默认 Windows 记事本、Unix vi。状态页显示会话数、流量、监听和近期事件。日志不含用户凭据。
 
@@ -71,8 +71,8 @@ python scripts/server_regression.py --bin-dir target/debug --bad-auth
 python scripts/server_regression.py --bin-dir target/debug --deny-private
 python scripts/server_lifecycle.py --bin-dir target/debug
 python scripts/server_extensions_regression.py --bin-dir target/debug
-python scripts/package_server.py --bin-dir target/release
-python scripts/server_package_regression.py dist/astra-server-0.1.0-windows-AMD64.tar.gz
+python scripts/build.py --role server --package
+python scripts/test.py server package      # 回归 + 解压 dist/ 中的服务端包并验证
 ```
 
 互通脚本只启动 Astra 原生客户端和服务端，使用本地 TCP/UDP 回声目标与临时证书；不会启用 TUN 或系统代理。独立压缩包根目录为 `server/`，只含 `astra-server-core`、`astra-server-tui` 和一份完整 `server.example.toml`。Windows 程序带 `.exe` 后缀。说明、源码、许可材料与验证记录留在仓库，不放入运行包；验证记录见 `docs/SERVER_VERIFICATION.md`。

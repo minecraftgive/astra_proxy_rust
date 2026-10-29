@@ -70,7 +70,7 @@ def main():
                         if group.get('subscription') == '__legacy__']
         assert len(owned_groups) == 1, 'node subscription must generate one local subscription group'
         subscription_group_name, subscription_group = owned_groups[0]
-        assert set(groups) == {'PROXY', subscription_group_name}, 'node subscription imported remote groups'
+        assert set(groups) == {'PROXY', 'DIRECT', 'REJECT', subscription_group_name}, 'node subscription imported remote groups'
         assert subscription_group['members'] == parsed['subscription']['managed_nodes'], 'subscription group membership differs from owned nodes'
         assert subscription_group['include_in_proxy'] is True, 'subscription group must join PROXY by default'
         assert 'remote-only' not in groups, 'nodes-only import must exclude remote groups'

@@ -1780,7 +1780,8 @@ impl Ui {
         } else if self.viewer.is_some() {
             t("↑↓ scroll · Space pause · w wrap · Esc back · ? all operations")
         } else if self.editor.is_some() {
-            t("↑↓ select · Enter edit · Ctrl-S save · ? all operations")
+            // Editing keys sit in the editor's own hint bar; list the file-level ones here.
+            t("Ctrl-O import · F4 external editor · F5 read draft · Ctrl-C leave, keep draft")
         } else {
             t("1–5 pages · Shift-Tab previous · Tab core · ↑↓ select · Enter actions · q quit · ? help")
         };
@@ -2545,6 +2546,8 @@ mod tests {
     #[test]
     fn pasting_inside_a_field_keeps_field_editing_and_ctrl_o_does_not_discard_input() {
         let mut ui = import_ui();
+        // The first row is a boolean that toggles in place; open the next, text-like field.
+        press(&mut ui, KeyCode::Down);
         press(&mut ui, KeyCode::Enter);
         assert!(!ui.editor.as_ref().unwrap().browsing());
         ui.key(event::KeyEvent::new(

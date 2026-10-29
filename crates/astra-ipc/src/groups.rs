@@ -68,22 +68,38 @@ impl Default for Group {
         }
     }
 }
+/// DIRECT and REJECT are both terminal outbounds and built-in groups of the same name.
 pub fn builtin(name: &str) -> bool {
     matches!(name, "DIRECT" | "REJECT")
+}
+/// Groups every configuration has; they cannot be renamed or removed.
+pub fn reserved(name: &str) -> bool {
+    name == "PROXY" || builtin(name)
+}
+/// Whether `member` of `parent` leads into another group. Inside its own built-in
+/// group, DIRECT/REJECT names the terminal outbound; everywhere else, the group.
+pub fn group_edge(groups: &BTreeMap<String, Group>, parent: &str, member: &str) -> bool {
+    member != parent && groups.contains_key(member)
 }
 pub fn ensure_default(
     groups: &mut BTreeMap<String, Group>,
     nodes: &HashSet<String>,
 ) -> Result<(), String> {
-    if nodes.contains("PROXY") {
-        return Err(
-            "PROXY is reserved for the default proxy group; rename the outbound node".into(),
-        );
+    if let Some(name) = nodes.iter().find(|name| reserved(name)) {
+        return Err(format!(
+            "{name} is reserved for a built-in proxy group; rename the outbound node"
+        ));
     }
     groups.entry("PROXY".into()).or_insert_with(|| Group {
         include_all: true,
         ..Default::default()
     });
+    for name in ["DIRECT", "REJECT"] {
+        groups.entry(name.into()).or_insert_with(|| Group {
+            members: vec![name.into()],
+            ..Default::default()
+        });
+    }
     Ok(())
 }
 /// Resolve dynamic membership afresh from saved node/group definitions, without
@@ -128,7 +144,9 @@ pub fn expand(
                 source.include_all && !(name == "PROXY" && subscription_nodes.contains(*node))
             })
             .chain(groups.keys().filter(|g| {
+                // Built-in DIRECT/REJECT join only when listed explicitly.
                 *g != name
+                    && !builtin(g)
                     && (source.include_all_groups
                         || (name == "PROXY" && groups[*g].subscription.is_some()))
                     && !(name == "PROXY"
@@ -196,7 +214,7 @@ pub fn member_path(
             return Some(found);
         }
         for member in &group.members {
-            if groups.contains_key(member) && member != root {
+            if group_edge(groups, &name, member) && member != root {
                 let mut next = path.clone();
                 next.push(member.clone());
                 pending.push_back((member.clone(), next));
@@ -221,7 +239,9 @@ pub fn member_choices(groups: &BTreeMap<String, Group>, root: &str) -> Vec<Strin
             for member in &group.members {
                 if seen.insert(member.clone()) {
                     output.push(member.clone());
-                    visit(groups, member, depth + 1, seen, output);
+                    if group_edge(groups, name, member) {
+                        visit(groups, member, depth + 1, seen, output);
+                    }
                 }
             }
         }
@@ -274,7 +294,6 @@ fn validate_expanded(
             || name.len() > 64
             || name.chars().any(char::is_control)
             || nodes.contains(name)
-            || builtin(name)
         {
             return Err(format!(
                 "invalid, reserved or duplicate proxy group name: {name}"
@@ -295,6 +314,7 @@ fn validate_expanded(
         let mut seen = HashSet::new();
         for member in &group.members {
             if !seen.insert(member)
+                || (member == name && !builtin(name))
                 || (!builtin(member) && !nodes.contains(member) && !groups.contains_key(member))
             {
                 return Err(format!(
@@ -341,7 +361,7 @@ fn validate_expanded(
             return Err(format!("proxy group cycle or excessive nesting: {name}"));
         }
         for member in &groups[name].members {
-            if groups.contains_key(member) {
+            if group_edge(groups, name, member) {
                 visit(member, groups, active, done, order)?;
             }
         }
@@ -423,6 +443,39 @@ mod tests {
         );
         assert!(validate(&groups, &nodes).is_err());
         assert!(ensure_default(&mut BTreeMap::new(), &HashSet::from(["PROXY".into()])).is_err());
+    }
+    #[test]
+    fn direct_and_reject_are_builtin_groups_ending_in_their_own_outbound() {
+        let nodes = HashSet::from(["a".into()]);
+        let mut groups = BTreeMap::new();
+        ensure_default(&mut groups, &nodes).unwrap();
+        assert_eq!(groups["DIRECT"].members, ["DIRECT"]);
+        assert_eq!(groups["REJECT"].members, ["REJECT"]);
+        groups.insert(
+            "all".into(),
+            Group {
+                include_all_groups: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(expand(&groups, &nodes).unwrap()["all"].members, ["PROXY"]);
+        groups.get_mut("all").unwrap().members = vec!["DIRECT".into()];
+        assert!(validate(&groups, &nodes).is_ok());
+        assert_eq!(
+            member_path(&groups, "all", "DIRECT").unwrap(),
+            ["DIRECT"],
+            "another group's DIRECT member is the DIRECT group"
+        );
+        // DIRECT → PROXY → DIRECT is a real cycle once DIRECT stops ending in itself.
+        groups.get_mut("DIRECT").unwrap().members = vec!["PROXY".into()];
+        groups.get_mut("PROXY").unwrap().members = vec!["DIRECT".into()];
+        assert!(validate(&groups, &nodes).is_err());
+        groups.get_mut("PROXY").unwrap().members.clear();
+        groups.get_mut("all").unwrap().members = vec!["all".into()];
+        assert!(validate(&groups, &nodes).is_err(), "only built-ins may list themselves");
+        for name in ["DIRECT", "REJECT", "PROXY"] {
+            assert!(ensure_default(&mut BTreeMap::new(), &HashSet::from([name.into()])).is_err());
+        }
     }
     #[test]
     fn connection_policies_preserve_backward_compatible_defaults() {

@@ -418,7 +418,12 @@ impl Manager {
                 );
             }
             if let Some(groups) = config.get("proxy_groups").and_then(toml::Value::as_table) {
-                tags.extend(groups.keys().cloned());
+                tags.extend(
+                    groups
+                        .keys()
+                        .filter(|name| !astra_ipc::groups::builtin(name))
+                        .cloned(),
+                );
             }
             tags.insert("PROXY".into());
         }

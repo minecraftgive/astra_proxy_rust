@@ -5,7 +5,8 @@ use anyhow::{bail, Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
@@ -40,6 +41,11 @@ struct Form {
     expanded_proxy_groups: Vec<String>,
     #[serde(default)]
     rename_proxy_group: Option<String>,
+    /// Entry whose placeholder fields are being filled one after another.
+    #[serde(default)]
+    guide: Option<Path>,
+    #[serde(default)]
+    last_search: String,
     #[serde(skip)]
     vim_g: bool,
     #[serde(skip)]
@@ -65,6 +71,7 @@ enum Mode {
         key: Option<String>,
         index: Option<usize>,
     },
+    Search(TextInput),
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct TextInput {
@@ -171,7 +178,23 @@ pub(crate) struct Editor {
     node_tags: Vec<String>,
     #[serde(default)]
     subscription_nodes: std::collections::BTreeMap<String, crate::protocol::SubscriptionNodes>,
+    #[serde(skip)]
+    history: Vec<String>,
+    #[serde(skip)]
+    future: Vec<String>,
+    #[serde(skip)]
+    notice: Option<String>,
 }
+const HISTORY_LIMIT: usize = 200;
+// Template values of a new entry; guided filling stops on each of them.
+const PLACEHOLDERS: &[&str] = &[
+    "node.example.com",
+    "node.example.com:443",
+    "127.0.0.1:7890",
+    "change-me",
+    "00000000-0000-0000-0000-000000000001",
+    "example.com",
+];
 
 #[derive(Clone)]
 enum Type {
@@ -244,7 +267,6 @@ enum FlatRow {
     Field {
         path: Path,
         spec: Spec,
-        prefix: String,
     },
     Collection {
         path: Path,
@@ -785,6 +807,8 @@ impl Editor {
             };
             values.extend(
                 tags.into_iter()
+                    // direct / block already stand for the built-in DIRECT / REJECT groups.
+                    .filter(|tag| !(action && astra_ipc::groups::builtin(tag)))
                     .map(|tag| if action { format!("proxy:{tag}") } else { tag }),
             );
             return Some(values);
@@ -886,6 +910,15 @@ impl Editor {
                 group["include_all"] = value(true);
                 groups.insert("PROXY", Item::Table(group));
             }
+            // DIRECT/REJECT are built-in groups whose own member is the terminal outbound.
+            for name in ["DIRECT", "REJECT"] {
+                if groups.get(name).is_none() {
+                    let mut group = Table::new();
+                    group["mode"] = value("select");
+                    group["members"] = value(toml_edit::Array::from_iter([name]));
+                    groups.insert(name, Item::Table(group));
+                }
+            }
         }
         if self.is_proxy(&doc) {
             let mut data: toml::Table = toml::from_str(&doc.to_string())?;
@@ -908,7 +941,43 @@ impl Editor {
     }
     fn update(&mut self, mut doc: DocumentMut) {
         position_tables(doc.as_table_mut(), &mut 0);
-        self.lines = doc.to_string().split('\n').map(str::to_owned).collect();
+        let text = doc.to_string();
+        let previous = self.text();
+        if text != previous {
+            self.remember(previous);
+        }
+        self.lines = text.split('\n').map(str::to_owned).collect();
+    }
+    fn remember(&mut self, previous: String) {
+        self.history.push(previous);
+        if self.history.len() > HISTORY_LIMIT {
+            self.history.remove(0);
+        }
+        self.future.clear();
+    }
+    /// Steps the draft back (or forward) one edit; fold state is clamped to what still exists.
+    fn restore(&mut self, redo: bool) -> Result<()> {
+        let (from, to) = if redo {
+            (&mut self.future, &mut self.history)
+        } else {
+            (&mut self.history, &mut self.future)
+        };
+        let Some(text) = from.pop() else {
+            self.notice = Some(t(if redo { "Nothing to redo" } else { "Nothing to undo" }).into());
+            return Ok(());
+        };
+        to.push(self.lines.join("\n"));
+        self.lines = text.split('\n').map(str::to_owned).collect();
+        self.form.guide = None;
+        let doc = self.document()?;
+        let count = collection(&doc, &[Part::Key("outbounds".into())]).map_or(0, |a| a.len());
+        self.form.expanded_nodes.retain(|i| *i < count);
+        self.form.selected = self
+            .form
+            .selected
+            .min(self.visible_rows(&doc).len().saturating_sub(1));
+        self.notice = Some(t(if redo { "Redone" } else { "Undone" }).into());
+        Ok(())
     }
     pub fn normalize(&mut self) {
         self.row = 0;
@@ -1000,7 +1069,9 @@ impl Editor {
     }
     pub fn paste(&mut self, text: &str) {
         match &mut self.form.mode {
-            Mode::Field { input, .. } | Mode::Header(input) => input.insert(text),
+            Mode::Field { input, .. } | Mode::Header(input) | Mode::Search(input) => {
+                input.insert(text)
+            }
             _ => {}
         }
     }
@@ -1014,11 +1085,14 @@ impl Editor {
         candidate.subscription_nodes = self.subscription_nodes.clone();
         candidate.document()?;
         candidate.original = self.original.clone();
+        candidate.history = std::mem::take(&mut self.history);
+        candidate.remember(self.text());
         *self = candidate;
         Ok(())
     }
     pub fn cancel_input(&mut self) {
         self.form.mode = Mode::Browse;
+        self.form.guide = None;
         self.form.rename_rule_set = None;
         self.form.rename_proxy_group = None;
     }
@@ -1701,13 +1775,11 @@ impl Editor {
                     "auto：普通 TLS 选择 packet-up，REALITY 选择 stream-one；省略默认 stream-one",
                 )
                 .into(),
-                _ => {
-                    if field.required {
-                        t("必填项").into()
-                    } else {
-                        t("可选项；清空或按 d 可移除，使用 core 默认值").into()
-                    }
+                _ if matches!(field.kind, Type::Boolean) => {
+                    t("Enter / Space toggle · d reset to default").into()
                 }
+                _ if field.required => t("Enter edit · required").into(),
+                _ => t("Enter edit · d reset to default").into(),
             };
         }
         let platform = crate::availability::Platform::current();
@@ -1812,14 +1884,13 @@ impl Editor {
     }
     fn visible_rows(&self, doc: &DocumentMut) -> Vec<FlatRow> {
         let mut rows = Vec::new();
-        self.flatten_table(doc, &[], "", &mut rows);
+        self.flatten_table(doc, &[], &mut rows);
         rows
     }
     fn flatten_table(
         &self,
         doc: &DocumentMut,
         path: &[Part],
-        prefix: &str,
         output: &mut Vec<FlatRow>,
     ) {
         if path.len() > 32 {
@@ -1834,7 +1905,6 @@ impl Editor {
                 Row::Field(spec) => output.push(FlatRow::Field {
                     path: path.to_vec(),
                     spec,
-                    prefix: prefix.into(),
                 }),
                 Row::Group { key, label } => {
                     let mut child = path.to_vec();
@@ -1887,7 +1957,7 @@ impl Editor {
                                         label: tr!("节点 {} · {} [{}]", index + 1, tag, kind),
                                     });
                                     if self.form.expanded_nodes.contains(&index) {
-                                        self.flatten_table(doc, &item, "", output);
+                                        self.flatten_table(doc, &item, output);
                                     }
                                 } else {
                                     let label = tr!(
@@ -1898,12 +1968,7 @@ impl Editor {
                                         table.get("action").map(scalar).unwrap_or_default()
                                     );
                                     output.push(FlatRow::Rule { index, label });
-                                    self.flatten_table(
-                                        doc,
-                                        &item,
-                                        &tr!("规则 {}", index + 1),
-                                        output,
-                                    );
+                                    self.flatten_table(doc, &item, output);
                                 }
                             }
                         }
@@ -1936,14 +2001,7 @@ impl Editor {
                                 continue;
                             }
                         }
-                        let field_prefix = match key.as_str() {
-                            "config" => t("协议"),
-                            "tls" => "TLS",
-                            "transport" => t("传输"),
-                            "headers" => t("请求头"),
-                            _ => &label,
-                        };
-                        self.flatten_table(doc, &child, field_prefix, output);
+                        self.flatten_table(doc, &child, output);
                         if key == "headers" || (path.is_empty() && key == "subscriptions") {
                             output.push(FlatRow::AddHeader { path: child });
                         }
@@ -2468,7 +2526,8 @@ impl Editor {
                     options.extend(chosen.iter().cloned());
                     options.sort();
                     options.dedup();
-                    options.retain(|v| v != name);
+                    // A built-in group keeps its own terminal outbound as a choice.
+                    options.retain(|v| v != name || astra_ipc::groups::builtin(name));
                     self.form.path = path;
                     self.form.mode = Mode::Members {
                         options,
@@ -2481,12 +2540,26 @@ impl Editor {
                     .and_then(|t| t.get(&spec.key))
                     .map(scalar)
                     .unwrap_or(spec.default);
+                let toggle = matches!(spec.kind, Type::Boolean);
+                let input = if toggle {
+                    // Booleans flip in place instead of opening a true/false picker.
+                    TextInput::new((current != "true").to_string())
+                } else {
+                    TextInput::new(current)
+                };
                 self.form.path = path;
                 self.form.mode = Mode::Field {
                     key: spec.key,
-                    input: TextInput::new(current),
+                    input,
                     reveal: false,
                 };
+                if toggle {
+                    let result = self.commit_field();
+                    if result.is_err() {
+                        self.form.mode = Mode::Browse;
+                    }
+                    return result;
+                }
             }
             FlatRow::Node { index, .. } => {
                 if self.form.expanded_nodes.contains(&index) && !expand_only {
@@ -2553,6 +2626,266 @@ impl Editor {
         }
         Ok(())
     }
+    fn expand_all(&mut self, doc: &DocumentMut) {
+        self.form.expanded_collections =
+            vec!["rules".into(), "rule_sets".into(), "proxy_groups".into()];
+        self.form.expanded_rule_groups = collection(doc, &[Part::Key("rules".into())])
+            .map(|a| rule_groups(a).into_iter().map(|v| v.0).collect())
+            .unwrap_or_default();
+        self.form.expanded_rule_sets = doc
+            .get("rule_sets")
+            .and_then(Item::as_table_like)
+            .map(|t| t.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default();
+        self.form.expanded_proxy_groups = doc
+            .get("proxy_groups")
+            .and_then(Item::as_table_like)
+            .map(|t| t.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default();
+        self.form.expanded_nodes = (0..collection(doc, &[Part::Key("outbounds".into())])
+            .map(|a| a.len())
+            .unwrap_or(0))
+            .collect();
+    }
+    /// Identifies a row independently of fold state.
+    fn row_id(row: &FlatRow) -> (Path, String) {
+        let kind = match row {
+            FlatRow::Field { spec, .. } => spec.key.clone(),
+            FlatRow::Info { label, .. } => format!("info:{label}"),
+            FlatRow::RuleGroup { start, .. } => format!("group:{start}"),
+            FlatRow::AddHeader { .. } => "add".into(),
+            FlatRow::UpdateSubscriptions => "update".into(),
+            _ => String::new(),
+        };
+        (row.path(), kind)
+    }
+    fn search_text(doc: &DocumentMut, row: &FlatRow) -> String {
+        match row {
+            FlatRow::Field { path, spec, .. } => {
+                let value = table_at(doc.as_table(), path)
+                    .and_then(|t| t.get(&spec.key))
+                    .filter(|_| !spec.secret())
+                    .map(scalar)
+                    .unwrap_or_default();
+                format!("{} {} {value}", spec.label, spec.key)
+            }
+            FlatRow::Collection { label, .. }
+            | FlatRow::Node { label, .. }
+            | FlatRow::Rule { label, .. }
+            | FlatRow::RuleGroup { label, .. }
+            | FlatRow::Section { label, .. }
+            | FlatRow::Info { label, .. } => label.clone(),
+            FlatRow::AddHeader { .. } | FlatRow::UpdateSubscriptions => String::new(),
+        }
+        .to_lowercase()
+    }
+    /// Jumps to the next row containing `query`, opening folds on the way when needed.
+    fn search(&mut self, query: &str) -> Result<()> {
+        let doc = self.document()?;
+        let query = query.to_lowercase();
+        let current = self
+            .visible_rows(&doc)
+            .get(self.form.selected)
+            .map(Self::row_id);
+        let mut all = self.clone();
+        all.expand_all(&doc);
+        let rows = all.visible_rows(&doc);
+        let start = current
+            .and_then(|id| rows.iter().position(|row| Self::row_id(row) == id))
+            .map_or(0, |at| at + 1);
+        let Some(target) = (0..rows.len())
+            .map(|offset| &rows[(start + offset) % rows.len()])
+            .find(|row| Self::search_text(&doc, row).contains(&query))
+        else {
+            self.notice = Some(tr!("No match for \"{}\"", query));
+            return Ok(());
+        };
+        let id = Self::row_id(target);
+        let inside = matches!(
+            target,
+            FlatRow::Field { .. } | FlatRow::Info { .. } | FlatRow::AddHeader { .. }
+        );
+        self.reveal(&doc, &id.0, inside);
+        if let FlatRow::RuleGroup { start, .. } = target {
+            if !self.form.expanded_rule_groups.contains(start) {
+                self.form.expanded_rule_groups.push(*start);
+            }
+        }
+        if let Some(at) = self
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| Self::row_id(row) == id)
+        {
+            self.form.selected = at;
+        }
+        Ok(())
+    }
+    /// Opens every fold that hides the row at `path`; `inside` rows also need that table open.
+    fn reveal(&mut self, doc: &DocumentMut, path: &[Part], inside: bool) {
+        self.expand_rule_path(doc, path);
+        let open = if inside {
+            path
+        } else {
+            &path[..path.len().saturating_sub(1)]
+        };
+        if open.len() < 2 {
+            return;
+        }
+        let entry = &open[..2];
+        if let Some(name) = proxy_group_name(entry) {
+            if !self.form.expanded_proxy_groups.iter().any(|k| k == name) {
+                self.form.expanded_proxy_groups.push(name.into());
+            }
+        }
+        if let Some(name) = rule_set_name(entry) {
+            if !self.form.expanded_rule_sets.iter().any(|k| k == name) {
+                self.form.expanded_rule_sets.push(name.into());
+            }
+        }
+        if let Some(index) = node_index(entry) {
+            self.expand_node(index);
+        }
+    }
+    /// Copies the selected node or rule right below itself.
+    fn duplicate(&mut self) -> Result<()> {
+        let mut doc = self.document()?;
+        let path = self
+            .visible_rows(&doc)
+            .get(self.form.selected)
+            .map(FlatRow::path)
+            .unwrap_or_default();
+        let (kind, index) = item_index(&path).context(t("Select a node or rule to duplicate"))?;
+        let kind = kind.to_owned();
+        let array = collection_mut(&mut doc, &[Part::Key(kind.clone())])?;
+        let mut tables: Vec<Table> = array.iter().cloned().collect();
+        let mut copy = tables[index].clone();
+        if kind == "outbounds" {
+            let base = copy.get("tag").and_then(Item::as_str).unwrap_or("edge");
+            let base = base.to_owned();
+            let targets = proxy_targets(&doc);
+            let tag = (2..)
+                .map(|n| format!("{base}-{n}"))
+                .find(|tag| !targets.contains(tag))
+                .unwrap();
+            copy["tag"] = value(tag);
+        }
+        tables.insert(index + 1, copy);
+        *collection_mut(&mut doc, &[Part::Key(kind.clone())])? = tables.into_iter().collect();
+        if kind == "outbounds" {
+            for expanded in &mut self.form.expanded_nodes {
+                if *expanded > index {
+                    *expanded += 1;
+                }
+            }
+        }
+        self.update(doc);
+        let doc = self.document()?;
+        self.focus_item(&doc, &kind, index + 1);
+        self.notice = Some(t("Duplicated · u / Ctrl-Z undo").into());
+        Ok(())
+    }
+    /// Opens the next field of the guided entry that is required or still holds a template value.
+    fn guide_next(&mut self) -> Result<()> {
+        let Some(root) = self.form.guide.clone() else {
+            return Ok(());
+        };
+        let doc = self.document()?;
+        let rows = self.visible_rows(&doc);
+        let next = rows
+            .iter()
+            .enumerate()
+            .skip(self.form.selected + 1)
+            .find(|(_, row)| match row {
+                FlatRow::Field { path, spec, .. }
+                    if path.starts_with(&root) && !matches!(spec.kind, Type::Boolean) =>
+                {
+                    let current = table_at(doc.as_table(), path)
+                        .and_then(|t| t.get(&spec.key))
+                        .map(scalar);
+                    matches!(spec.key.as_str(), "tag" | "port" | "action")
+                        || current
+                            .as_deref()
+                            .is_some_and(|v| PLACEHOLDERS.contains(&v))
+                        || (spec.required && current.is_none())
+                }
+                _ => false,
+            })
+            .map(|(at, _)| at);
+        match next {
+            Some(at) => {
+                self.form.selected = at;
+                self.enter(false)?;
+            }
+            None => {
+                self.form.guide = None;
+                self.notice = Some(t("All template values replaced · Ctrl-S save").into());
+            }
+        }
+        Ok(())
+    }
+    fn confirm_delete(&mut self) -> Result<()> {
+        let Mode::Delete { key: field, index } = self.form.mode.clone() else {
+            return Ok(());
+        };
+        let (field, index) = (field.as_ref(), index.as_ref());
+        let mut doc = self.document()?;
+        if let Some(index) = index {
+            if self.form.path == vec![Part::Key("outbounds".into())] {
+                if let Some(tag) = collection(&doc, &self.form.path)
+                    .and_then(|a| a.get(*index))
+                    .and_then(|node| node.get("tag"))
+                    .and_then(Item::as_str)
+                {
+                    anyhow::ensure!(!proxy_references(&doc, tag), t("Proxy target is referenced; change its groups or default before deleting"));
+                }
+            }
+            collection_mut(&mut doc, &self.form.path)?.remove(*index);
+            if self.form.path == vec![Part::Key("outbounds".into())] {
+                let removed = *index;
+                self.form.expanded_nodes = self
+                    .form
+                    .expanded_nodes
+                    .iter()
+                    .filter_map(|i| {
+                        if *i == removed {
+                            None
+                        } else {
+                            Some(if *i > removed { *i - 1 } else { *i })
+                        }
+                    })
+                    .collect();
+            }
+        } else if let Some(field) = field {
+            if self.form.path == vec![Part::Key("proxy_groups".into())] {
+                anyhow::ensure!(!proxy_references(&doc, field), t("Proxy target is referenced; change its groups or default before deleting"));
+            }
+            if self.form.path == vec![Part::Key("rule_sets".into())] {
+                anyhow::ensure!(
+                    rule_set_references(&doc, Some(field)) == 0,
+                    t("Rule set is referenced; change its rules before deleting")
+                );
+            } else if self.form.path.is_empty() && field == "rule_sets" {
+                anyhow::ensure!(
+                    rule_set_references(&doc, None) == 0,
+                    t("Rule set is referenced; change its rules before deleting")
+                );
+            }
+            if table_at(doc.as_table(), &self.form.path)
+                .and_then(|t| t.get(field))
+                .is_some()
+            {
+                table_at_mut(doc.as_table_mut(), &self.form.path)?.remove(field);
+            }
+        }
+        self.update(doc);
+        self.cancel_input();
+        self.form.selected = self
+            .form
+            .selected
+            .min(self.visible_rows(&self.document()?).len().saturating_sub(1));
+        self.notice = Some(t("Deleted · u / Ctrl-Z undo").into());
+        Ok(())
+    }
     fn append(&mut self, mut table: Table) -> Result<()> {
         let mut doc = self.document()?;
         let array = collection_mut(&mut doc, &self.form.path)?;
@@ -2574,10 +2907,47 @@ impl Editor {
         let path = self.form.path.clone();
         let doc = self.document()?;
         self.focus_field(&doc, &path, "kind");
-        Ok(())
+        // Walk through the template values so a new entry needs no manual navigation.
+        self.form.guide = Some(path);
+        if last_key(&self.form.path) == Some("rules") {
+            self.enter(false)
+        } else {
+            self.guide_next()
+        }
     }
     pub fn key(&mut self, mut key: KeyEvent) -> Result<()> {
+        self.notice = None;
+        if let Mode::Search(input) = &mut self.form.mode {
+            match key.code {
+                KeyCode::Esc => self.cancel_input(),
+                KeyCode::Enter => {
+                    let query = input.text.trim().to_owned();
+                    self.cancel_input();
+                    if !query.is_empty() {
+                        self.form.last_search = query.clone();
+                        self.search(&query)?;
+                    }
+                }
+                _ => input.key(key),
+            }
+            return Ok(());
+        }
         if matches!(self.form.mode, Mode::Browse) {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('z') if ctrl => return self.restore(false),
+                KeyCode::Char('u') if key.modifiers.is_empty() => return self.restore(false),
+                KeyCode::Char('y') if ctrl => return self.restore(true),
+                KeyCode::Char('y') if key.modifiers.is_empty() => return self.duplicate(),
+                KeyCode::Char('/') => {
+                    let mut input = TextInput::new(self.form.last_search.clone());
+                    input.replace = true;
+                    self.form.mode = Mode::Search(input);
+                    return Ok(());
+                }
+                KeyCode::Char(' ') => key.code = KeyCode::Enter,
+                _ => {}
+            }
             if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
                 if !self.form.vim_g {
                     self.form.vim_g = true;
@@ -2603,27 +2973,7 @@ impl Editor {
                     }
                     KeyCode::Char('R') => {
                         let doc = self.document()?;
-                        self.form.expanded_collections =
-                            vec!["rules".into(), "rule_sets".into(), "proxy_groups".into()];
-                        self.form.expanded_rule_groups =
-                            collection(&doc, &[Part::Key("rules".into())])
-                                .map(|a| rule_groups(a).into_iter().map(|v| v.0).collect())
-                                .unwrap_or_default();
-                        self.form.expanded_rule_sets = doc
-                            .get("rule_sets")
-                            .and_then(Item::as_table_like)
-                            .map(|t| t.iter().map(|(name, _)| name.to_owned()).collect())
-                            .unwrap_or_default();
-                        self.form.expanded_proxy_groups = doc
-                            .get("proxy_groups")
-                            .and_then(Item::as_table_like)
-                            .map(|t| t.iter().map(|(name, _)| name.to_owned()).collect())
-                            .unwrap_or_default();
-                        self.form.expanded_nodes =
-                            (0..collection(&doc, &[Part::Key("outbounds".into())])
-                                .map(|a| a.len())
-                                .unwrap_or(0))
-                                .collect();
+                        self.expand_all(&doc);
                         return Ok(());
                     }
                     KeyCode::Char('c') => key.code = KeyCode::Left,
@@ -2728,7 +3078,8 @@ impl Editor {
                 return Ok(());
             }
             if key.code == KeyCode::Enter {
-                return self.commit_field();
+                self.commit_field()?;
+                return self.guide_next();
             }
             let doc = self.document()?;
             if matches!(
@@ -2823,7 +3174,7 @@ impl Editor {
                             !key.is_empty()
                                 && key.len() <= 64
                                 && !key.chars().any(char::is_control)
-                                && !astra_ipc::groups::builtin(&key),
+                                && !astra_ipc::groups::reserved(&key),
                             t("Enter a proxy group name")
                         );
                         let mut doc = self.document()?;
@@ -2934,66 +3285,11 @@ impl Editor {
             }
             return Ok(());
         }
-        if let Mode::Delete { key: field, index } = &self.form.mode {
+        // Only drafts saved by older versions still sit in this confirmation.
+        if matches!(self.form.mode, Mode::Delete { .. }) {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => self.cancel_input(),
-                KeyCode::Char('y') => {
-                    let mut doc = self.document()?;
-                    if let Some(index) = index {
-                        if self.form.path == vec![Part::Key("outbounds".into())] {
-                            if let Some(tag) = collection(&doc, &self.form.path)
-                                .and_then(|a| a.get(*index))
-                                .and_then(|node| node.get("tag"))
-                                .and_then(Item::as_str)
-                            {
-                                anyhow::ensure!(!proxy_references(&doc, tag), t("Proxy target is referenced; change its groups or default before deleting"));
-                            }
-                        }
-                        collection_mut(&mut doc, &self.form.path)?.remove(*index);
-                        if self.form.path == vec![Part::Key("outbounds".into())] {
-                            let removed = *index;
-                            self.form.expanded_nodes = self
-                                .form
-                                .expanded_nodes
-                                .iter()
-                                .filter_map(|i| {
-                                    if *i == removed {
-                                        None
-                                    } else {
-                                        Some(if *i > removed { *i - 1 } else { *i })
-                                    }
-                                })
-                                .collect();
-                        }
-                    } else if let Some(field) = field {
-                        if self.form.path == vec![Part::Key("proxy_groups".into())] {
-                            anyhow::ensure!(!proxy_references(&doc, field), t("Proxy target is referenced; change its groups or default before deleting"));
-                        }
-                        if self.form.path == vec![Part::Key("rule_sets".into())] {
-                            anyhow::ensure!(
-                                rule_set_references(&doc, Some(field)) == 0,
-                                t("Rule set is referenced; change its rules before deleting")
-                            );
-                        } else if self.form.path.is_empty() && field == "rule_sets" {
-                            anyhow::ensure!(
-                                rule_set_references(&doc, None) == 0,
-                                t("Rule set is referenced; change its rules before deleting")
-                            );
-                        }
-                        if table_at(doc.as_table(), &self.form.path)
-                            .and_then(|t| t.get(field))
-                            .is_some()
-                        {
-                            table_at_mut(doc.as_table_mut(), &self.form.path)?.remove(field);
-                        }
-                    }
-                    self.update(doc);
-                    self.cancel_input();
-                    self.form.selected = self
-                        .form
-                        .selected
-                        .min(self.visible_rows(&self.document()?).len().saturating_sub(1));
-                }
+                KeyCode::Char('y') | KeyCode::Enter => self.confirm_delete()?,
                 _ => {}
             }
             return Ok(());
@@ -3013,8 +3309,8 @@ impl Editor {
                 {
                     self.form.path = vec![Part::Key("proxy_groups".into())];
                     anyhow::ensure!(
-                        name != "PROXY",
-                        t("Default PROXY group cannot be renamed or deleted")
+                        !astra_ipc::groups::reserved(&name),
+                        t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
                     );
                     self.form.rename_proxy_group = Some(name.clone());
                     self.form.mode = Mode::Header(TextInput::new(name));
@@ -3097,72 +3393,88 @@ impl Editor {
                     self.append(table)?;
                 }
             }
-            KeyCode::Char('d') => match selected {
-                Some(FlatRow::Field { path, spec, .. }) => {
-                    anyhow::ensure!(!spec.required, t("必填项不能删除，请按 Enter 修改"));
-                    self.form.path = path;
-                    self.form.mode = Mode::Delete {
-                        key: Some(spec.key),
-                        index: None,
-                    };
-                }
-                Some(FlatRow::Node { index, .. }) => {
-                    if let Some(tag) = collection(&doc, &[Part::Key("outbounds".into())])
-                        .and_then(|a| a.get(index))
-                        .and_then(|node| node.get("tag"))
-                        .and_then(Item::as_str)
-                    {
-                        anyhow::ensure!(!proxy_references(&doc, tag), t("Proxy target is referenced; change its groups or default before deleting"));
-                    }
-                    self.form.path = vec![Part::Key("outbounds".into())];
-                    self.form.mode = Mode::Delete {
-                        key: None,
-                        index: Some(index),
-                    };
-                }
-                Some(FlatRow::Rule { index, .. }) => {
-                    self.form.path = vec![Part::Key("rules".into())];
-                    self.form.mode = Mode::Delete {
-                        key: None,
-                        index: Some(index),
-                    };
-                }
-                Some(FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. }) => {
-                    if let Some(name) = proxy_group_name(&path) {
+            KeyCode::Char('d') => {
+                match selected {
+                    Some(FlatRow::Field { path, spec, .. }) => {
+                        anyhow::ensure!(!spec.required, t("必填项不能删除，请按 Enter 修改"));
+                        // DIRECT/REJECT have no dynamic members to fall back on.
                         anyhow::ensure!(
-                            name != "PROXY",
-                            t("Default PROXY group cannot be renamed or deleted")
+                            !(spec.key == "members"
+                                && proxy_group_name(&path).is_some_and(astra_ipc::groups::builtin)),
+                            t("Choose at least one group member")
                         );
-                        anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
-                    }
-                    anyhow::ensure!(
-                        path != vec![Part::Key("proxy_groups".into())],
-                        t("Default PROXY group cannot be renamed or deleted")
-                    );
-                    if path == vec![Part::Key("outbounds".into())] {
-                        anyhow::ensure!(!collection(&doc, &path).is_some_and(|nodes| nodes.iter().filter_map(|n| n.get("tag").and_then(Item::as_str)).any(|tag| proxy_references(&doc, tag))), t("Proxy target is referenced; change its groups or default before deleting"));
-                    }
-                    if let Some(name) = rule_set_name(&path) {
-                        anyhow::ensure!(
-                            rule_set_references(&doc, Some(name)) == 0,
-                            t("Rule set is referenced; change its rules before deleting")
-                        );
-                    } else if last_key(&path) == Some("rule_sets") {
-                        anyhow::ensure!(
-                            rule_set_references(&doc, None) == 0,
-                            t("Rule set is referenced; change its rules before deleting")
-                        );
-                    }
-                    if let Some(Part::Key(key)) = path.pop() {
                         self.form.path = path;
                         self.form.mode = Mode::Delete {
-                            key: Some(key),
+                            key: Some(spec.key),
                             index: None,
                         };
                     }
+                    Some(FlatRow::Node { index, .. }) => {
+                        if let Some(tag) = collection(&doc, &[Part::Key("outbounds".into())])
+                            .and_then(|a| a.get(index))
+                            .and_then(|node| node.get("tag"))
+                            .and_then(Item::as_str)
+                        {
+                            anyhow::ensure!(!proxy_references(&doc, tag), t("Proxy target is referenced; change its groups or default before deleting"));
+                        }
+                        self.form.path = vec![Part::Key("outbounds".into())];
+                        self.form.mode = Mode::Delete {
+                            key: None,
+                            index: Some(index),
+                        };
+                    }
+                    Some(FlatRow::Rule { index, .. }) => {
+                        self.form.path = vec![Part::Key("rules".into())];
+                        self.form.mode = Mode::Delete {
+                            key: None,
+                            index: Some(index),
+                        };
+                    }
+                    Some(FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. }) => {
+                        if let Some(name) = proxy_group_name(&path) {
+                            anyhow::ensure!(
+                                !astra_ipc::groups::reserved(&name),
+                                t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
+                            );
+                            anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
+                        }
+                        anyhow::ensure!(
+                            path != vec![Part::Key("proxy_groups".into())],
+                            t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
+                        );
+                        if path == vec![Part::Key("outbounds".into())] {
+                            anyhow::ensure!(!collection(&doc, &path).is_some_and(|nodes| nodes.iter().filter_map(|n| n.get("tag").and_then(Item::as_str)).any(|tag| proxy_references(&doc, tag))), t("Proxy target is referenced; change its groups or default before deleting"));
+                        }
+                        if let Some(name) = rule_set_name(&path) {
+                            anyhow::ensure!(
+                                rule_set_references(&doc, Some(name)) == 0,
+                                t("Rule set is referenced; change its rules before deleting")
+                            );
+                        } else if last_key(&path) == Some("rule_sets") {
+                            anyhow::ensure!(
+                                rule_set_references(&doc, None) == 0,
+                                t("Rule set is referenced; change its rules before deleting")
+                            );
+                        }
+                        if let Some(Part::Key(key)) = path.pop() {
+                            self.form.path = path;
+                            self.form.mode = Mode::Delete {
+                                key: Some(key),
+                                index: None,
+                            };
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+                // Deleting is immediate; undo replaces the old confirmation step.
+                if matches!(self.form.mode, Mode::Delete { .. }) {
+                    let result = self.confirm_delete();
+                    if result.is_err() {
+                        self.cancel_input();
+                    }
+                    result?;
+                }
+            }
             KeyCode::Char('K') | KeyCode::Char('J') => {
                 let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
                 let (kind, index) =
@@ -3195,13 +3507,75 @@ impl Editor {
         }
         Ok(())
     }
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let dirty = if self.text() != self.original {
-            t(" *未保存")
-        } else {
-            ""
+    /// Indentation level of a row; replaces the old "Rule 3 / " style label prefixes.
+    fn depth(row: &FlatRow) -> usize {
+        let depth = match row {
+            FlatRow::Field { path, .. } => {
+                path.len() + usize::from(path.first() == Some(&Part::Key("rules".into())))
+            }
+            FlatRow::Section { path, .. } => path.len().saturating_sub(1),
+            FlatRow::Info { path, .. } | FlatRow::AddHeader { path } => path.len(),
+            FlatRow::Collection { .. } => 0,
+            FlatRow::Node { .. } | FlatRow::RuleGroup { .. } | FlatRow::UpdateSubscriptions => 1,
+            FlatRow::Rule { .. } => 2,
         };
-        let title = tr!("Configuration · {}{}", self.name, dirty);
+        depth.min(6)
+    }
+    /// Browse-time hints that say nothing once a field is already open.
+    fn generic_help(help: &str) -> bool {
+        [
+            "Enter / Space toggle · d reset to default",
+            "Enter edit · required",
+            "Enter edit · d reset to default",
+        ]
+        .iter()
+        .any(|generic| t(generic) == help)
+    }
+    fn hint(&self, row: Option<&FlatRow>) -> String {
+        if self.form.guide.is_some() {
+            return t("Filling new entry · Enter next field · Esc stop").into();
+        }
+        match row {
+            Some(row)
+                if proxy_group_name(&row.path()).is_some()
+                    || row.path() == vec![Part::Key("proxy_groups".into())] =>
+            {
+                t("Enter edit/fold · n new group · r rename · d delete").into()
+            }
+            Some(FlatRow::RuleGroup { .. }) | Some(FlatRow::Collection { .. }) => {
+                t("Enter / ←→ fold · n add · zM/zR fold/open all").into()
+            }
+            Some(row) if rule_set_name(&row.path()).is_some() => {
+                t("Enter expand/collapse · r rename · e enable/disable · d delete").into()
+            }
+            Some(FlatRow::Field { spec, .. }) => spec.help.clone(),
+            Some(FlatRow::Node { .. }) => t("Enter fold · y duplicate · d delete · K/J move").into(),
+            Some(FlatRow::Rule { .. }) => t("y duplicate · d delete · K/J move").into(),
+            Some(FlatRow::Section { path, .. }) if last_key(path) == Some("tls") => {
+                t("Enter 启用/关闭 TLS；字段始终平铺；d 删除本分组参数").into()
+            }
+            Some(FlatRow::AddHeader { path }) => t(if last_key(path) == Some("subscriptions") {
+                "Enter add subscription · n add · d remove · Ctrl-S save and update"
+            } else {
+                "Enter 新增请求头；已有请求头直接在上方修改"
+            })
+            .into(),
+            _ => t("Enter edit · n add").into(),
+        }
+    }
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let dirty = self.text() != self.original;
+        let mut title = vec![Span::raw(format!(
+            " {} ",
+            tr!("Configuration · {}{}", self.name, "")
+        ))];
+        if dirty {
+            title.push(Span::styled(
+                tr!("● {} ", t("unsaved")),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        let title = Line::from(title);
         let Ok(doc) = self.document() else {
             frame.render_widget(
                 Paragraph::new(t(
@@ -3213,6 +3587,10 @@ impl Editor {
             );
             return;
         };
+        // Fields changed since the last save carry a marker in the left gutter.
+        let mut saved = Editor::new(String::new(), self.original.clone());
+        saved.kind = self.kind;
+        let saved = saved.document().ok();
         let rows = self.visible_rows(&doc);
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -3223,110 +3601,119 @@ impl Editor {
         } else {
             None
         };
+        let label_column = rows
+            .iter()
+            .filter_map(|row| match row {
+                FlatRow::Field { spec, .. } => {
+                    Some(Self::depth(row) * 2 + Span::raw(spec.label.as_str()).width() + 2)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .min((sections[0].width as usize * 2 / 5).max(16));
+        let fold = |open: bool| if open { "▾ " } else { "▸ " };
+        let dim = Style::default().fg(Color::DarkGray);
+        let heading = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         let items: Vec<ListItem> = rows
             .iter()
             .map(|row| {
-                let (content, style) = match row {
-                    FlatRow::Field { path, spec, prefix } => {
+                let indent = "  ".repeat(Self::depth(row));
+                let mut changed = false;
+                let mut spans: Vec<Span> = match row {
+                    FlatRow::Field { path, spec, .. } => {
                         let table = table_at(doc.as_table(), path);
                         let current = table.and_then(|t| t.get(&spec.key));
+                        changed = saved.as_ref().is_some_and(|saved| {
+                            table_at(saved.as_table(), path)
+                                .and_then(|t| t.get(&spec.key))
+                                .map(scalar)
+                                != current.map(scalar)
+                        });
                         let tls_disabled = last_key(path) == Some("tls") && table.is_none();
-                        let text = if tls_disabled {
-                            t("[TLS 未启用；可直接填写或在 TLS 行启用]").into()
+                        let mut label = format!("{indent}{}", spec.label);
+                        let width = Span::raw(label.as_str()).width();
+                        label.push_str(&" ".repeat(label_column.saturating_sub(width).max(2)));
+                        let value = if tls_disabled {
+                            Span::styled(t("TLS off · filling any field enables it"), dim)
+                        } else if matches!(spec.kind, Type::Boolean) {
+                            let on = current.map(scalar).unwrap_or(spec.default.clone()) == "true";
+                            let text = format!("{} {on}", if on { "[x]" } else { "[ ]" });
+                            if current.is_some() {
+                                Span::styled(
+                                    text,
+                                    Style::default().fg(if on { Color::Green } else { Color::Reset }),
+                                )
+                            } else {
+                                Span::styled(tr!("{} · {}", text, t("default")), dim)
+                            }
                         } else if let Some(item) = current {
                             let text = scalar(item);
                             if spec.secret() && !text.is_empty() {
-                                "••••••••".into()
+                                Span::raw("••••••••")
+                            } else if PLACEHOLDERS.contains(&text.as_str()) {
+                                Span::styled(
+                                    tr!("{}  ← {}", text, t("template value")),
+                                    Style::default().fg(Color::Yellow),
+                                )
                             } else {
-                                text.replace('\n', " ↵ ")
+                                Span::raw(text.replace('\n', " ↵ "))
                             }
                         } else if spec.required {
-                            tr!(
-                                "[必填，尚未设置；建议 {}]",
-                                if spec.secret() {
-                                    t("输入凭据")
-                                } else {
-                                    &spec.default
-                                }
+                            Span::styled(
+                                tr!(
+                                    "{} · {}",
+                                    t("required"),
+                                    if spec.secret() {
+                                        t("输入凭据")
+                                    } else {
+                                        &spec.default
+                                    }
+                                ),
+                                Style::default().fg(Color::Yellow),
                             )
+                        } else if spec.default.is_empty() {
+                            Span::styled("—", dim)
                         } else {
-                            tr!(
-                                "[未设置{}]",
-                                if spec.default.is_empty() {
-                                    String::new()
-                                } else {
-                                    tr!("，默认 {}", spec.default)
-                                }
-                            )
+                            Span::styled(tr!("{} {}", t("default"), spec.default), dim)
                         };
-                        let prefix = if prefix.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{prefix} / ")
-                        };
-                        (
-                            format!(
-                                "{}{}{}{}  :  {}",
-                                if node_index(path).is_some() { "  " } else { "" },
-                                prefix,
-                                spec.label,
-                                if spec.required && !tls_disabled {
-                                    " *"
-                                } else {
-                                    ""
-                                },
-                                text
-                            ),
-                            Style::default(),
-                        )
+                        vec![Span::raw(label), value]
                     }
                     FlatRow::Collection { path, label } => {
                         let count = collection(&doc, path).map(|a| a.len()).unwrap_or(0);
-                        (
-                            if last_key(path) == Some("rules") {
-                                format!(
-                                    "{} {} ({count})",
-                                    if self.form.expanded_collections.contains(&"rules".into()) {
-                                        "▾"
-                                    } else {
-                                        "▸"
-                                    },
-                                    label
-                                )
-                            } else {
-                                tr!("── {}（{} 条） · n 新增 ──", label, count)
-                            },
-                            Style::default().fg(Color::Cyan),
-                        )
+                        let mark = if last_key(path) == Some("rules") {
+                            fold(self.form.expanded_collections.contains(&"rules".into()))
+                        } else {
+                            "  "
+                        };
+                        vec![
+                            Span::styled(format!("{indent}{mark}{label}"), heading),
+                            Span::styled(tr!("  {} · n add", count), dim),
+                        ]
                     }
-                    FlatRow::Node { index, label } => (
+                    FlatRow::Node { index, label } => vec![Span::styled(
                         format!(
-                            "{} {label}",
-                            if self.form.expanded_nodes.contains(index) {
-                                "▾"
-                            } else {
-                                "▸"
-                            }
+                            "{indent}{}{label}",
+                            fold(self.form.expanded_nodes.contains(index))
                         ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )],
+                    FlatRow::Rule { label, .. } => vec![Span::styled(
+                        format!("{indent}{label}"),
                         Style::default().fg(Color::Cyan),
-                    ),
-                    FlatRow::Rule { label, .. } => {
-                        (format!("── {label} ──"), Style::default().fg(Color::Cyan))
-                    }
-                    FlatRow::RuleGroup { start, end, label } => (
-                        tr!(
-                            "{} {} · rules {}–{}",
-                            if self.form.expanded_rule_groups.contains(start) {
-                                "▾"
-                            } else {
-                                "▸"
-                            },
-                            label,
-                            start + 1,
-                            end + 1
+                    )],
+                    FlatRow::RuleGroup { start, end, label } => vec![
+                        Span::styled(
+                            format!(
+                                "{indent}{}{label}",
+                                fold(self.form.expanded_rule_groups.contains(start))
+                            ),
+                            Style::default().fg(Color::Cyan),
                         ),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                        Span::styled(tr!(" · rules {}–{}", start + 1, end + 1), dim),
+                    ],
                     FlatRow::Section { path, label } => {
                         let suffix = if proxy_group_name(path).is_some() {
                             let group = table_at(doc.as_table(), path);
@@ -3384,60 +3771,64 @@ impl Editor {
                         let mark = if path.len() == 1
                             && matches!(last_key(path), Some("rule_sets" | "proxy_groups"))
                         {
-                            if self
-                                .form
-                                .expanded_collections
-                                .iter()
-                                .any(|v| Some(v.as_str()) == last_key(path))
-                            {
-                                "▾"
-                            } else {
-                                "▸"
-                            }
+                            fold(
+                                self.form
+                                    .expanded_collections
+                                    .iter()
+                                    .any(|v| Some(v.as_str()) == last_key(path)),
+                            )
                         } else if let Some(name) = proxy_group_name(path) {
-                            if self.form.expanded_proxy_groups.iter().any(|v| v == name) {
-                                "▾"
-                            } else {
-                                "▸"
-                            }
+                            fold(self.form.expanded_proxy_groups.iter().any(|v| v == name))
                         } else {
                             rule_set_name(path)
                                 .map(|name| {
-                                    if self.form.expanded_rule_sets.iter().any(|key| key == name) {
-                                        "▾"
-                                    } else {
-                                        "▸"
-                                    }
+                                    fold(self.form.expanded_rule_sets.iter().any(|key| key == name))
                                 })
-                                .unwrap_or("──")
+                                .unwrap_or("§ ")
                         };
-                        (
-                            format!("  {mark} {label}{suffix}"),
-                            Style::default().fg(Color::Gray),
-                        )
-                    }
-                    FlatRow::UpdateSubscriptions => (
-                        tr!("↻ {} · Ctrl-R", t("Update subscriptions")),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    FlatRow::Info { label, .. } => {
-                        (label.clone(), Style::default().fg(Color::Cyan))
-                    }
-                    FlatRow::AddHeader { path } => (
-                        t(if last_key(path) == Some("subscriptions") {
-                            "  + Add subscription (Enter)"
+                        let style = if path.len() == 1 {
+                            heading
                         } else {
-                            "  ＋ 新增请求头（Enter）"
-                        })
-                        .into(),
+                            Style::default().fg(Color::Cyan)
+                        };
+                        vec![
+                            Span::styled(format!("{indent}{mark}{label}"), style),
+                            Span::styled(suffix, dim),
+                        ]
+                    }
+                    FlatRow::UpdateSubscriptions => vec![Span::styled(
+                        tr!("{}↻ {} · Ctrl-R", indent, t("Update subscriptions")),
                         Style::default().fg(Color::Cyan),
-                    ),
+                    )],
+                    FlatRow::Info { label, .. } => {
+                        vec![Span::styled(format!("{indent}{label}"), dim)]
+                    }
+                    FlatRow::AddHeader { path } => vec![Span::styled(
+                        format!(
+                            "{indent}{}",
+                            t(if last_key(path) == Some("subscriptions") {
+                                "+ Add subscription (Enter)"
+                            } else {
+                                "＋ 新增请求头（Enter）"
+                            })
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    )],
                 };
-                ListItem::new(content).style(style)
+                spans.insert(
+                    0,
+                    if changed {
+                        Span::styled("● ", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::raw("  ")
+                    },
+                );
+                ListItem::new(Line::from(spans))
             })
             .collect();
+        let items_empty = items.is_empty();
         let mut state = ListState::default();
-        if !items.is_empty() {
+        if !items_empty {
             let selected = self.form.selected.min(items.len() - 1);
             state = state.with_offset(
                 selected.saturating_sub(sections[0].height.saturating_sub(2) as usize / 3),
@@ -3446,73 +3837,78 @@ impl Editor {
         }
         frame.render_stateful_widget(
             List::new(items)
-                .highlight_symbol("› ")
                 .highlight_style(Style::default().bg(Color::Blue))
                 .block(Block::default().title(title).borders(Borders::ALL)),
             sections[0],
             &mut state,
         );
-        let hint = match rows.get(self.form.selected) {
-            Some(row)
-                if proxy_group_name(&row.path()).is_some()
-                    || row.path() == vec![Part::Key("proxy_groups".into())] =>
-            {
-                t("Enter edit/fold · n new group · r rename · d delete · Ctrl-S apply").into()
-            }
-            Some(FlatRow::RuleGroup { .. }) | Some(FlatRow::Collection { .. }) => {
-                t("j/k move · h/l fold/open · gg/G first/last · zM/zR fold/open all").into()
-            }
-            Some(row) if rule_set_name(&row.path()).is_some() => {
-                t("Enter expand/collapse · r rename · e enable/disable · d delete").into()
-            }
-            Some(FlatRow::Field { spec, .. }) => spec.help.clone(),
-            Some(FlatRow::Node { .. }) => {
-                t("Enter 展开/收起节点；展开后全部参数平铺；d 删除；K/J 调整顺序").into()
-            }
-            Some(FlatRow::Rule { .. }) => {
-                t("规则字段已在下方平铺；d 删除整条规则；K/J 上移/下移").into()
-            }
-            Some(FlatRow::Section { path, .. }) if last_key(path) == Some("tls") => {
-                t("Enter 启用/关闭 TLS；字段始终平铺；d 删除本分组参数").into()
-            }
-            Some(FlatRow::AddHeader { path }) => t(if last_key(path) == Some("subscriptions") {
-                "Enter add subscription · n add · d remove · Ctrl-S save and update"
-            } else {
-                "Enter 新增请求头；已有请求头直接在上方修改"
-            })
-            .into(),
-            _ => t("全部参数在同一页；↑↓ 选择，Enter 编辑，n 新增，Ctrl-S 校验保存").into(),
+        let first = if let Mode::Search(input) = &self.form.mode {
+            let mut text: Vec<char> = input.text.chars().collect();
+            text.insert(input.cursor.min(text.len()), '▏');
+            Line::from(vec![
+                Span::styled(
+                    format!(" / {}", text.iter().collect::<String>()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(tr!("   {}", t("Enter jump · Esc cancel")), dim),
+            ])
+        } else if let Some(notice) = &self.notice {
+            Line::styled(format!(" {notice}"), Style::default().fg(Color::Green))
+        } else {
+            Line::styled(
+                format!(" {}", self.hint(rows.get(self.form.selected))),
+                Style::default().fg(Color::Cyan),
+            )
         };
-        frame.render_widget(
-            Paragraph::new(if self.browsing() {
-                t("Enter edit · Ctrl-S save · ? all operations").to_owned()
-            } else {
-                hint
-            })
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
-            sections[1],
+        let second = Line::styled(
+            format!(
+                " {}",
+                t("/ search · u undo · Ctrl-Y redo · Ctrl-S save · ? all keys · Esc back")
+            ),
+            dim,
         );
-        if !matches!(self.form.mode, Mode::Browse) {
+        frame.render_widget(Paragraph::new(vec![first, second]), sections[1]);
+        if !matches!(self.form.mode, Mode::Browse | Mode::Search(_)) {
             let height = match &self.form.mode {
                 Mode::NewOutbound(_) => 15,
                 Mode::Members { .. } => 15,
-                Mode::Field { key, input, .. } => self
-                    .suggestions(&doc, key, input)
-                    .map(|values| (values.len().min(6) as u16 + 6).max(8))
-                    .unwrap_or(8),
+                Mode::Field { key, input, .. } => {
+                    let choices = self
+                        .suggestions(&doc, key, input)
+                        .map_or(0, |values| values.len().clamp(1, 6) as u16);
+                    let help = self
+                        .current_spec(&doc, key)
+                        .is_ok_and(|spec| !Self::generic_help(&spec.help));
+                    choices + u16::from(help) + 4
+                }
                 _ => 7,
             };
-            let popup = Rect {
-                x: area.x
-                    + area
-                        .width
-                        .saturating_sub(area.width.saturating_sub(4).min(76))
-                        / 2,
+            let width = area.width.saturating_sub(4).min(76);
+            let mut popup = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
                 y: area.y + area.height.saturating_sub(height) / 2,
-                width: area.width.saturating_sub(4).min(76),
+                width,
                 height: height.min(area.height),
             };
+            // A field editor opens right under its row, so the label stays in sight.
+            if matches!(self.form.mode, Mode::Field { .. }) && !items_empty {
+                let row = sections[0].y
+                    + 1
+                    + (self.form.selected.saturating_sub(state.offset())) as u16;
+                let left = area.x + 3 + label_column as u16;
+                let room = area.right().saturating_sub(left + 1);
+                if room >= 32 {
+                    popup.x = left;
+                    popup.width = room.min(76);
+                } else {
+                    popup.x = area.right().saturating_sub(width + 1).max(area.x);
+                }
+                popup.y = if row + 1 + popup.height <= sections[0].bottom() {
+                    row + 1
+                } else {
+                    row.saturating_sub(popup.height).max(area.y)
+                };
+            }
             frame.render_widget(Clear, popup);
             match &self.form.mode {
                 Mode::Members { options, chosen, cursor } => {
@@ -3535,8 +3931,16 @@ impl Editor {
                         values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},self.reference_label(&doc,key,value))).collect::<Vec<_>>().join("\n")
                     }).unwrap_or_default();
                     let hint = if suggestions.is_some() { t("Type to filter · ↑↓ select · Tab complete · Enter confirm · Esc cancel") } else { t("Enter confirm · Esc cancel · Ctrl-U clear · F2 reveal") };
-                    let text = format!("> {}\n{}\n{}\n{}",display.iter().collect::<String>(),choices,hint,spec.as_ref().map(|s|s.help.as_str()).unwrap_or(""));
-                    frame.render_widget(Paragraph::new(text).wrap(Wrap{trim:false}).block(Block::default().title(spec.as_ref().map(|s|s.label.as_str()).unwrap_or(key)).borders(Borders::ALL).style(Style::default().fg(Color::Cyan))),popup);
+                    let help = spec.as_ref().map(|s| s.help.as_str()).filter(|help| !Self::generic_help(help)).unwrap_or("");
+                    let text = [format!("> {}", display.iter().collect::<String>()), choices, help.into(), hint.into()]
+                        .into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
+                    let paragraph = Paragraph::new(text).wrap(Wrap{trim:false});
+                    // Wrapped help lines on narrow screens must not push the key hints out.
+                    let mut popup = popup;
+                    popup.height = (paragraph.line_count(popup.width.saturating_sub(2).max(1)) as u16 + 2).min(area.height);
+                    popup.y = popup.y.min(area.bottom().saturating_sub(popup.height));
+                    frame.render_widget(Clear, popup);
+                    frame.render_widget(paragraph.block(Block::default().title(spec.as_ref().map(|s|s.label.as_str()).unwrap_or(key)).borders(Borders::ALL).style(Style::default().fg(Color::Cyan))),popup);
                 }
                 Mode::NewOutbound(selected) => {
                     let mut state = ListState::default().with_selected(Some(*selected));
@@ -3544,7 +3948,7 @@ impl Editor {
                 }
                 Mode::Header(input) => frame.render_widget(Paragraph::new(if last_key(&self.form.path)==Some("subscriptions") {tr!("Subscription name: {}▏\nEnter confirm · Esc cancel", input.text)} else if last_key(&self.form.path)==Some("proxy_groups") {tr!("Proxy group name: {}▏\nEnter confirm · Esc cancel", input.text)} else if self.form.rename_rule_set.is_some() {tr!("Rename rule set: {}▏\nEnter confirm · Esc cancel",input.text)}else if last_key(&self.form.path)==Some("rule_sets") {tr!("规则集名称：{}▏\nEnter 创建 · Esc 取消",input.text)}else{tr!("请求头名称：{}▏\nEnter 继续设置值 · Esc 取消",input.text)}).block(Block::default().title(if last_key(&self.form.path)==Some("subscriptions") {t("Subscriptions")} else if last_key(&self.form.path)==Some("proxy_groups") {t("Proxy groups")}else if last_key(&self.form.path)==Some("rule_sets"){t("规则集")}else{t("新增请求头")}).borders(Borders::ALL)),popup),
                 Mode::Delete{..} => frame.render_widget(Paragraph::new(t("删除所选条目/分组？\n只修改草稿，Ctrl-S 后写入配置。\ny 确认删除 · n / Esc 取消")).wrap(Wrap{trim:false}).block(Block::default().title(t("确认删除")).borders(Borders::ALL).style(Style::default().fg(Color::Yellow))),popup),
-                Mode::Browse => {}
+                Mode::Browse | Mode::Search(_) => {}
             }
         }
     }
@@ -3799,6 +4203,18 @@ mod tests {
         assert!(
             matches!(editor.visible_rows(&doc).get(editor.form.selected), Some(FlatRow::Field{path:p,spec,..}) if p == &path && spec.key == key)
         );
+        if let Some(FlatRow::Field { spec, .. }) = editor.visible_rows(&doc).get(editor.form.selected) {
+            if matches!(spec.kind, Type::Boolean) {
+                let current = table_at(doc.as_table(), &path)
+                    .and_then(|t| t.get(key))
+                    .map(scalar)
+                    .unwrap_or(spec.default.clone());
+                if current != text {
+                    press(editor, KeyCode::Enter);
+                }
+                return;
+            }
+        }
         press(editor, KeyCode::Enter);
         editor.paste(text);
         press(editor, KeyCode::Enter);
@@ -4055,6 +4471,55 @@ mod tests {
             e.document().unwrap()["proxy_groups"]["my-group"]["members"][0].as_str(),
             Some("a")
         );
+    }
+    #[test]
+    fn direct_and_reject_groups_are_built_in_editable_and_protected() {
+        let mut e = Editor::new("p".into(), "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='a'\nserver='127.0.0.1:1081'".into())
+            .with_kind(CoreKind::Proxy);
+        let doc = e.document().unwrap();
+        assert_eq!(doc["proxy_groups"]["DIRECT"]["members"][0].as_str(), Some("DIRECT"));
+        assert_eq!(doc["proxy_groups"]["REJECT"]["members"][0].as_str(), Some("REJECT"));
+        let direct = vec![Part::Key("proxy_groups".into()), Part::Key("DIRECT".into())];
+        e.reveal(&doc, &direct, true);
+        let header = e
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Section { path, .. } if path == &direct))
+            .unwrap();
+        for code in [KeyCode::Char('r'), KeyCode::Char('d')] {
+            e.form.selected = header;
+            assert!(e.key(key(code)).is_err());
+            e.focus_field(&doc, &direct, "members");
+            assert!(e.key(key(code)).is_err());
+            assert_eq!(
+                e.document().unwrap()["proxy_groups"]["DIRECT"]["members"][0].as_str(),
+                Some("DIRECT")
+            );
+        }
+        // Its own terminal outbound stays selectable next to the nodes.
+        let doc = e.document().unwrap();
+        e.focus_field(&doc, &direct, "members");
+        press(&mut e, KeyCode::Enter);
+        let Mode::Members { options, cursor, .. } = &mut e.form.mode else {
+            panic!("expected picker");
+        };
+        assert!(options.contains(&"DIRECT".into()) && options.contains(&"a".into()));
+        *cursor = options.iter().position(|v| v == "a").unwrap();
+        press(&mut e, KeyCode::Char(' '));
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(
+            e.document().unwrap()["proxy_groups"]["DIRECT"]["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Rule actions keep direct / block rather than repeating proxy:DIRECT.
+        let mut r = rules();
+        r.set_node_tags(vec!["DIRECT".into(), "edge".into()]);
+        r.form.path = vec![Part::Key("rules".into()), Part::Index(0)];
+        let values = r.reference_values(&r.document().unwrap(), "action").unwrap();
+        assert!(values.contains(&"proxy:edge".into()) && !values.contains(&"proxy:DIRECT".into()));
     }
     #[test]
     fn changing_rule_kind_uses_real_references_and_resets_incompatible_values() {
@@ -4460,6 +4925,9 @@ mod tests {
         let mut e = rules();
         e.form.path = path(&["rules"]);
         press(&mut e, KeyCode::Char('n'));
+        // A new rule opens its fields one after another; stop and edit them directly.
+        assert!(matches!(&e.form.mode, Mode::Field { key, .. } if key == "kind"));
+        press(&mut e, KeyCode::Esc);
         field(&mut e, "value", "new.example");
         field(&mut e, "action", "proxy:edge");
         press(&mut e, KeyCode::Esc);
@@ -4469,10 +4937,11 @@ mod tests {
         assert_eq!(a.get(1).unwrap()["value"].as_str(), Some("new.example"));
         let before = e.text();
         press(&mut e, KeyCode::Char('d'));
-        press(&mut e, KeyCode::Char('n'));
+        assert_ne!(e.text(), before);
+        press(&mut e, KeyCode::Char('u'));
         assert_eq!(e.text(), before);
-        press(&mut e, KeyCode::Char('d'));
-        press(&mut e, KeyCode::Char('y'));
+        e.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(
             e.document().unwrap()["rules"]
                 .as_array_of_tables()
@@ -4496,6 +4965,8 @@ mod tests {
             e.document().unwrap()["outbounds"][0]["kind"].as_str(),
             Some("native")
         );
+        assert!(matches!(&e.form.mode, Mode::Field { key, .. } if key == "tag"));
+        press(&mut e, KeyCode::Esc);
         e.form.path.push(Part::Key("config".into()));
         field(&mut e, "server", "my.node.example");
         field(&mut e, "protocol", "tuic");
@@ -4658,7 +5129,6 @@ mod tests {
             .position(|r| matches!(r,FlatRow::Section{path,..} if path == &tls_path))
             .unwrap();
         press(&mut e, KeyCode::Char('d'));
-        press(&mut e, KeyCode::Char('y'));
         assert!(table_at(e.document().unwrap().as_table(), &e.form.path)
             .unwrap()
             .get("tls")
@@ -4868,7 +5338,6 @@ mod tests {
         assert_eq!(doc["outbounds"][1]["tag"].as_str(), Some("edge"));
         e.focus_item(&doc, "outbounds", 0);
         press(&mut e, KeyCode::Char('d'));
-        press(&mut e, KeyCode::Char('y'));
         assert_eq!(e.form.expanded_nodes, vec![0]);
         let mut restored: Editor =
             serde_json::from_slice(&serde_json::to_vec(&e).unwrap()).unwrap();
@@ -4988,5 +5457,214 @@ mod runtime_profile_tests {
         assert_eq!(saved["tun"]["mtu"].as_integer(), Some(1400));
         assert!(saved.get("system_proxy").is_some());
         assert_eq!(editor.original, source);
+    }
+}
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    fn press(editor: &mut Editor, code: KeyCode) {
+        editor.key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+    fn ctrl(editor: &mut Editor, c: char) {
+        editor
+            .key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            .unwrap();
+    }
+    fn screen(editor: &Editor, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| editor.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn proxy() -> Editor {
+        Editor::new(
+            "proxy".into(),
+            include_str!("../../../configs/native.toml").into(),
+        )
+        .with_kind(CoreKind::Proxy)
+    }
+    #[test]
+    fn booleans_toggle_in_place_and_every_edit_can_be_undone_and_redone() {
+        let mut e = proxy();
+        let original = e.text();
+        let doc = e.document().unwrap();
+        e.focus_field(&doc, &[], "watch_config");
+        press(&mut e, KeyCode::Char(' '));
+        assert!(matches!(e.form.mode, Mode::Browse));
+        assert_eq!(e.document().unwrap()["watch_config"].as_bool(), Some(true));
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.document().unwrap()["watch_config"].as_bool(), Some(false));
+        press(&mut e, KeyCode::Char('u'));
+        assert_eq!(e.document().unwrap()["watch_config"].as_bool(), Some(true));
+        ctrl(&mut e, 'z');
+        assert_eq!(e.text(), original);
+        press(&mut e, KeyCode::Char('u'));
+        assert_eq!(e.text(), original);
+        ctrl(&mut e, 'y');
+        ctrl(&mut e, 'y');
+        assert_eq!(e.document().unwrap()["watch_config"].as_bool(), Some(false));
+        // A new edit drops the redo branch.
+        press(&mut e, KeyCode::Char('u'));
+        press(&mut e, KeyCode::Enter);
+        ctrl(&mut e, 'y');
+        assert_eq!(e.document().unwrap()["watch_config"].as_bool(), Some(false));
+    }
+    #[test]
+    fn deleting_is_immediate_and_reverts_with_undo() {
+        let mut e = proxy();
+        let original = e.text();
+        let doc = e.document().unwrap();
+        e.focus_field(&doc, &[], "connect_timeout_secs");
+        press(&mut e, KeyCode::Char('d'));
+        assert!(matches!(e.form.mode, Mode::Browse));
+        assert!(e.document().unwrap().get("connect_timeout_secs").is_none());
+        assert!(screen(&e, 100, 30).contains("u/Ctrl-Z"));
+        press(&mut e, KeyCode::Char('u'));
+        assert_eq!(e.text(), original);
+        // A blocked delete leaves no confirmation dialog behind.
+        let doc = e.document().unwrap();
+        e.focus_field(&doc, &[], "rule_socket");
+        assert!(e.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).is_err());
+        assert!(matches!(e.form.mode, Mode::Browse));
+    }
+    #[test]
+    fn new_node_walks_through_template_values_then_stops() {
+        let mut e = proxy();
+        e.form.path = vec![Part::Key("outbounds".into())];
+        press(&mut e, KeyCode::Char('n'));
+        press(&mut e, KeyCode::Down);
+        press(&mut e, KeyCode::Down);
+        press(&mut e, KeyCode::Enter);
+        let mut opened = Vec::new();
+        for value in ["hk-1", "hk.example.net", "8443", "11111111-2222-3333-4444-555555555555", "hk.example.net"] {
+            let Mode::Field { key, .. } = &e.form.mode else {
+                panic!("guided filling stopped early after {opened:?}");
+            };
+            opened.push(key.clone());
+            e.paste(value);
+            press(&mut e, KeyCode::Enter);
+        }
+        assert_eq!(opened, ["tag", "server", "port", "uuid", "server_name"]);
+        assert!(matches!(e.form.mode, Mode::Browse));
+        assert!(e.form.guide.is_none());
+        let doc = e.document().unwrap();
+        let node = &doc["outbounds"][1];
+        assert_eq!(node["tag"].as_str(), Some("hk-1"));
+        assert_eq!(node["config"]["server"].as_str(), Some("hk.example.net"));
+        assert_eq!(node["config"]["tls"]["server_name"].as_str(), Some("hk.example.net"));
+        // Esc ends the walk and keeps what was entered so far.
+        press(&mut e, KeyCode::Char('n'));
+        press(&mut e, KeyCode::Enter);
+        e.paste("socks-a");
+        press(&mut e, KeyCode::Enter);
+        assert!(matches!(&e.form.mode, Mode::Field { key, .. } if key == "server"));
+        press(&mut e, KeyCode::Esc);
+        assert!(e.form.guide.is_none());
+        assert_eq!(e.document().unwrap()["outbounds"][2]["tag"].as_str(), Some("socks-a"));
+    }
+    #[test]
+    fn new_rule_opens_kind_value_and_action_in_turn() {
+        let mut e = Editor::new(
+            "rules".into(),
+            include_str!("../../../configs/rule.toml").into(),
+        )
+        .with_kind(CoreKind::Rule);
+        e.form.path = vec![Part::Key("rules".into())];
+        press(&mut e, KeyCode::Char('n'));
+        press(&mut e, KeyCode::Enter);
+        e.paste("video.example");
+        press(&mut e, KeyCode::Enter);
+        e.paste("block");
+        press(&mut e, KeyCode::Enter);
+        assert!(matches!(e.form.mode, Mode::Browse));
+        let doc = e.document().unwrap();
+        let rules = doc["rules"].as_array_of_tables().unwrap();
+        let rule = rules.get(rules.len() - 1).unwrap();
+        assert_eq!(rule["kind"].as_str(), Some("domain_suffix"));
+        assert_eq!(rule["value"].as_str(), Some("video.example"));
+        assert_eq!(rule["action"].as_str(), Some("block"));
+    }
+    #[test]
+    fn duplicating_a_node_inserts_a_unique_copy_below_it() {
+        let mut e = proxy();
+        let doc = e.document().unwrap();
+        e.focus_item(&doc, "outbounds", 0);
+        press(&mut e, KeyCode::Char('y'));
+        press(&mut e, KeyCode::Char('y'));
+        let doc = e.document().unwrap();
+        let nodes = doc["outbounds"].as_array_of_tables().unwrap();
+        let tags: Vec<_> = nodes.iter().map(|n| n["tag"].as_str().unwrap()).collect();
+        assert_eq!(tags, ["edge", "edge-2", "edge-2-2"]);
+        assert_eq!(
+            nodes.get(2).unwrap()["config"]["uuid"].as_str(),
+            nodes.get(0).unwrap()["config"]["uuid"].as_str()
+        );
+        assert!(matches!(
+            e.visible_rows(&doc).get(e.form.selected),
+            Some(FlatRow::Node { index: 2, .. })
+        ));
+    }
+    #[test]
+    fn search_reaches_fields_inside_collapsed_entries_and_wraps() {
+        let mut e = Editor::new(
+            "rules".into(),
+            include_str!("../../../configs/rule.toml").into(),
+        )
+        .with_kind(CoreKind::Rule);
+        assert!(!e.form.expanded_collections.contains(&"rules".into()));
+        press(&mut e, KeyCode::Char('/'));
+        e.paste("blocked.test");
+        press(&mut e, KeyCode::Enter);
+        let doc = e.document().unwrap();
+        assert!(matches!(
+            e.visible_rows(&doc).get(e.form.selected),
+            Some(FlatRow::Rule { index: 1, .. })
+        ));
+        // `/` reopens with the previous query; Enter moves to the next match.
+        press(&mut e, KeyCode::Char('/'));
+        press(&mut e, KeyCode::Enter);
+        assert!(matches!(
+            e.visible_rows(&doc).get(e.form.selected),
+            Some(FlatRow::Field { spec, .. }) if spec.key == "value"
+        ));
+        press(&mut e, KeyCode::Char('/'));
+        e.paste("no-such-thing");
+        press(&mut e, KeyCode::Enter);
+        assert!(screen(&e, 100, 30).contains("no-such-thing"));
+    }
+    #[test]
+    fn form_aligns_values_marks_changes_and_shows_hints_in_three_languages() {
+        let mut e = proxy();
+        let doc = e.document().unwrap();
+        e.focus_field(&doc, &[], "connect_timeout_secs");
+        press(&mut e, KeyCode::Enter);
+        e.paste("30");
+        press(&mut e, KeyCode::Enter);
+        for (language, hint, unsaved) in [
+            (crate::i18n::Language::English, "dresettodefault", "unsaved"),
+            (crate::i18n::Language::Simplified, "d恢复默认", "未保存"),
+            (crate::i18n::Language::Traditional, "d恢復預設", "未儲存"),
+        ] {
+            crate::i18n::with_language(language, || {
+                let text = screen(&e, 100, 30);
+                assert!(text.contains(hint), "{text}");
+                assert!(text.contains(unsaved), "{text}");
+                let marked: Vec<_> = text.lines().filter(|l| l.contains('●')).collect();
+                assert!(marked.iter().any(|l| l.contains("30")), "{text}");
+                assert_eq!(marked.len(), 2, "{text}");
+                for (w, h) in [(40, 10), (12, 6)] {
+                    screen(&e, w, h);
+                }
+            });
+        }
     }
 }

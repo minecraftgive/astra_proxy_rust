@@ -198,7 +198,12 @@ fn node_import_ignores_remote_rules_groups_and_listeners_by_default() {
     let proxy: toml::Value = toml::from_str(&converted.proxy).unwrap();
     assert_eq!(converted.nodes, 1);
     assert_eq!(proxy["socks5_listen"].as_str(), Some("127.0.0.1:1080"));
-    assert_eq!(proxy["proxy_groups"].as_table().unwrap().len(), 1);
+    // PROXY plus the built-in DIRECT and REJECT groups.
+    assert_eq!(proxy["proxy_groups"].as_table().unwrap().len(), 3);
+    assert_eq!(
+        proxy["proxy_groups"]["DIRECT"]["members"].as_array().unwrap()[0].as_str(),
+        Some("DIRECT")
+    );
     assert!(proxy.get("tun").is_none());
     assert!(convert_nodes(input, &Options::default(), "test", true).is_err());
     let mut owned = Subscription {

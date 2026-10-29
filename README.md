@@ -104,15 +104,16 @@ python3 scripts/astra.py --check --proxy example_proxy.toml --rules example_rule
 
 目标平台：Linux/macOS/Windows。Windows 本地 IPC 使用仅当前用户可访问的命名管道，支持双核心、独立代理及 TUI；已加入 Wintun 与当前用户系统 HTTP/HTTPS 代理实现，已通过系统 HTTP/HTTPS、恢复和 TUN 双栈专用地址转发检查，全局路由接管尚未验收。透明代理 TPROXY/REDIRECT 仍仅限 Linux。加密协议矩阵的既有验收环境为 macOS arm64，Windows 本地验证范围见 [安装说明](docs/INSTALL.md)。需要 Rust 工具链、CMake、Clang/C++ 与 libclang；Windows x64 另需 MSVC C++ 工具和 NASM。Python 3 用于构建、启动和测试脚本。
 
-编译、测试并分发客户端原生程序：
+编译客户端原生程序（默认 release，不测试、不打包）：
 
 ```sh
 ./scripts/build.sh
+python3 scripts/test.py        # 测试与构建分开运行
 ```
 
-Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；也可执行 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
+Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；两者都转调 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
 
-安装包输出到 `dist/`，包含 `astra-proxy`、`astra-rule`、`astra-tui`、配置、文档与依赖许可，并附 SHA-256 和验证报告。支持 `--debug`、`--build-only`、`--label`、`--output-dir`；详见 [构建与打包说明](docs/INSTALL.md)。
+加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--debug`、`--role client|server|all`、`--package`、`--label`、`--output-dir`；测试套件见 `scripts/test.py --help`，详见 [构建与打包说明](docs/INSTALL.md)。
 
 ```sh
 cargo build --release
