@@ -1,4 +1,0 @@
-https://raw.githubusercontent.com/knurling-rs/defmt/719491ca3529abd07205165b9b10e4d988552bc2/LICENSE-MIT
-https://raw.githubusercontent.com/knurling-rs/defmt/719491ca3529abd07205165b9b10e4d988552bc2/LICENSE-APACHE
-Retrieved from the crate source commit recorded in defmt-0.3.101/.cargo_vcs_info.json.
-The compatibility crate in defmt-03 uses the shared repository MIT OR Apache-2.0 license.

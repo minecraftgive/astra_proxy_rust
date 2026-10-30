@@ -1,4 +1,0 @@
-https://raw.githubusercontent.com/JulianSchmid/etherparse/93c7f0bb136f42692d69365e4799d6a4e71fd8b8/LICENSE-MIT
-https://raw.githubusercontent.com/JulianSchmid/etherparse/93c7f0bb136f42692d69365e4799d6a4e71fd8b8/LICENSE-APACHE
-Retrieved from the crate source commit recorded in etherparse-0.16.0/.cargo_vcs_info.json.
-The etherparse crate uses the shared repository MIT OR Apache-2.0 license.
