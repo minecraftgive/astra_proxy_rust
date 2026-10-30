@@ -1,6 +1,7 @@
 //! Overview page and shared mouse hit testing. Never synthesize telemetry.
 use super::shell::{duration, CONNECTIONS, LOGS, PAGES, PROXIES};
 use super::*;
+use astra_ipc::runtime::Mode;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
@@ -25,12 +26,36 @@ pub(super) enum Target {
     Connection(usize),
     Connect,
     Palette(usize),
-    /// Make the n-th proxy instance the active profile.
-    Activate(usize),
     NetTools,
 }
 
 /// Panels use the terminal's own background so light and dark themes both read well.
+fn short_rate(value: u64) -> String {
+    if value >= 1 << 20 {
+        format!("{:.1}M", value as f64 / (1u64 << 20) as f64)
+    } else if value >= 1 << 10 {
+        format!("{:.1}K", value as f64 / (1u64 << 10) as f64)
+    } else {
+        value.to_string()
+    }
+}
+
+/// Current instance state as the uppercase colour code used by the layouts.
+fn indicator_state(row: &Row) -> (&'static str, Color) {
+    if row.pid.is_some() {
+        ("●G", Color::Green)
+    } else if row.state == "Starting" || row.state == "Stopping" {
+        ("●Y", Color::Yellow)
+    } else if row.state == "Unresponsive"
+        || row.state.starts_with("Exited")
+        || row.state.starts_with("Failed")
+    {
+        ("●R", Color::Red)
+    } else {
+        ("○", MUTED)
+    }
+}
+
 pub(super) fn card(title: &str) -> Block<'_> {
     Block::default()
         .title(format!(" {} ", t(title)))
@@ -127,7 +152,306 @@ impl Ui {
         {
             notices.push((Color::Red, t("Configuration unavailable · e edit").into()));
         }
+        // Warnings that persist still disappear after a short delay; errors stay until fixed.
+        let now = Instant::now();
+        let mut seen = self.notice_since.borrow_mut();
+        seen.retain(|message, _| notices.iter().any(|(_, text)| text == message));
+        notices.retain(|(color, message)| {
+            *color != Color::Yellow
+                || now.duration_since(*seen.entry(message.clone()).or_insert(now))
+                    < Duration::from_secs(15)
+        });
         notices
+    }
+
+    pub(super) fn overview_header_height(&self, width: u16) -> u16 {
+        if width < 80 {
+            6
+        } else {
+            5
+        }
+    }
+
+    /// One bordered panel for the active instance, its profile and the page tabs.
+    pub(super) fn render_overview_header(&self, f: &mut Frame<'_>, area: Rect) {
+        let Some(row) = self.active_proxy() else {
+            return;
+        };
+        if area.width < 4 || area.height < 3 {
+            return;
+        }
+        let narrow = area.width < 80;
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(MUTED);
+        let dark = Style::default().fg(Color::DarkGray);
+        let failed = row.state.starts_with("Exited") || row.state == "Unresponsive";
+        let (dot, color, state) = if row.pid.is_some() {
+            ("●", Color::Green, t("Connected"))
+        } else if failed {
+            ("●", Color::Red, t("Failed"))
+        } else {
+            ("○", MUTED, t("Not connected"))
+        };
+        let mut title = vec![Span::styled(" Astra", bold.fg(BLUE))];
+        if narrow {
+            title.push(Span::styled(" · ", dark));
+            title.push(Span::styled(row.instance.name.clone(), bold));
+            title.push(Span::styled(" · ", dark));
+            title.push(Span::styled(
+                format!("{dot} {state}"),
+                Style::default().fg(color),
+            ));
+            if row.pid.is_some() {
+                title.push(Span::styled(
+                    format!(" · {} {}", t("Up"), duration(row.uptime)),
+                    muted,
+                ));
+            }
+        }
+        title.push(Span::raw(" "));
+        let block = Block::default()
+            .title(Line::from(title))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(dark);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let mode_style = |mode: Mode| match mode {
+            Mode::Rule => Style::default().fg(Color::Cyan),
+            Mode::Global => Style::default().fg(BLUE),
+            Mode::Direct => Style::default().fg(Color::Green),
+        };
+        let mut status = Vec::new();
+        if narrow {
+            // The title already carries the profile name, state and uptime.
+            status.push(Span::raw(" "));
+        } else {
+            status.push(Span::styled(format!(" {dot} "), Style::default().fg(color)));
+            status.push(Span::styled(row.instance.name.clone(), bold));
+            status.push(Span::styled(
+                format!(" {state}"),
+                Style::default().fg(color),
+            ));
+            if row.pid.is_some() {
+                status.push(Span::styled(format!(" {}", duration(row.uptime)), muted));
+            }
+        }
+        if let Some(snapshot) = self.live() {
+            if !narrow {
+                status.push(Span::styled("  │  ", dark));
+            }
+            status.push(Span::styled(
+                t(match snapshot.mode {
+                    Mode::Rule => "Rule",
+                    Mode::Global => "Global",
+                    Mode::Direct => "Direct",
+                }),
+                bold.patch(mode_style(snapshot.mode)),
+            ));
+            let (chain, delay, alive) = live::exit_chain(snapshot);
+            if !chain.is_empty() {
+                status.push(Span::styled(format!("  ·  {} ", t("Exit")), muted));
+                for (index, hop) in chain.iter().enumerate() {
+                    if index > 0 {
+                        status.push(Span::styled(" ▸ ", dark));
+                    }
+                    status.push(if index + 1 == chain.len() {
+                        Span::styled(hop.clone(), bold.fg(BLUE))
+                    } else {
+                        Span::raw(hop.clone())
+                    });
+                }
+                status.push(Span::raw("  "));
+                status.push(live::delay_span(delay, alive));
+            }
+        } else if narrow {
+            status.push(Span::styled(t("Waiting for runtime data…"), muted));
+        } else {
+            status.push(Span::styled(
+                format!("  ·  {}", t("Waiting for runtime data…")),
+                muted,
+            ));
+        }
+        let compact = area.width < 110;
+        let rates = self.rate_spans(compact);
+        Self::render_right_aligned(
+            f,
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            status,
+            rates,
+        );
+
+        let mut meta = vec![Span::raw(" ")];
+        if let Some(details) = self.details.get(&row.instance.name) {
+            if !details.listeners.is_empty() {
+                meta.push(Span::raw(details.listeners.join(" · ")));
+            }
+            if details.outbound_count > 0 {
+                if !details.listeners.is_empty() {
+                    meta.push(Span::styled("  ·  ", muted));
+                }
+                meta.push(Span::styled(
+                    tr!("{} outbounds", details.outbound_count),
+                    muted,
+                ));
+            }
+        }
+        if let Some(rule) = self.active_rule() {
+            if meta.len() > 1 {
+                meta.push(Span::styled("  ·  ", muted));
+            }
+            meta.push(Span::styled(tr!("Rule core {}", rule.instance.name), muted));
+        }
+        if meta.len() == 1 {
+            meta.push(Span::styled(t("No listener details yet."), muted));
+        }
+        let meta_row = inner.y + 1;
+        if meta_row < inner.bottom() {
+            f.render_widget(
+                Paragraph::new(Line::from(meta)),
+                Rect::new(inner.x, meta_row, inner.width, 1),
+            );
+        }
+
+        if narrow {
+            if inner.height >= 4 {
+                let buttons = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+                self.render_header_buttons(f, buttons, row);
+            }
+        } else {
+            let buttons = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            self.render_header_buttons(f, buttons, row);
+        }
+        // Span the whole panel so the separator replaces the side borders.
+        self.render_embedded_page_bar(f, Rect::new(area.x, inner.bottom() - 1, area.width, 1));
+    }
+
+    fn rate_spans(&self, compact: bool) -> Vec<Span<'static>> {
+        let style = |value: u64, color: Color| {
+            if value == 0 {
+                Style::default().fg(MUTED)
+            } else {
+                Style::default().fg(color)
+            }
+        };
+        if compact {
+            vec![
+                Span::styled(
+                    format!("↑{}/s", short_rate(self.rates[0])),
+                    style(self.rates[0], Color::Magenta),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("↓{}/s", short_rate(self.rates[1])),
+                    style(self.rates[1], Color::Cyan),
+                ),
+                Span::raw(" "),
+            ]
+        } else {
+            vec![
+                Span::styled(
+                    format!("↑ {}/s", live::bytes(self.rates[0])),
+                    style(self.rates[0], Color::Magenta),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("↓ {}/s", live::bytes(self.rates[1])),
+                    style(self.rates[1], Color::Cyan),
+                ),
+                Span::raw(" "),
+            ]
+        }
+    }
+
+    fn render_right_aligned(
+        f: &mut Frame<'_>,
+        area: Rect,
+        mut left: Vec<Span<'static>>,
+        right: Vec<Span<'static>>,
+    ) {
+        let left_width: usize = left.iter().map(Span::width).sum();
+        let right_width: usize = right.iter().map(Span::width).sum();
+        if !right.is_empty() && left_width + right_width < area.width as usize {
+            left.push(Span::raw(
+                " ".repeat(area.width as usize - left_width - right_width),
+            ));
+            left.extend(right);
+        }
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+    }
+
+    fn render_header_buttons(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
+        if area.width < 24 {
+            return;
+        }
+        let label = if row.pid.is_some() {
+            "c Disconnect"
+        } else {
+            "c Connect"
+        };
+        let width = Line::from(t(label)).width() as u16 + 2;
+        let c_x = area.right().saturating_sub(width + 1);
+        if c_x > area.x + 2 {
+            self.button(f, Rect::new(c_x, area.y, width, 1), label, Target::Connect);
+        }
+        let tools = "N Network tools";
+        let tools_width = Line::from(t(tools)).width() as u16 + 2;
+        let n_x = c_x.saturating_sub(tools_width + 1);
+        if n_x > area.x + 2 {
+            self.button(
+                f,
+                Rect::new(n_x, area.y, tools_width, 1),
+                tools,
+                Target::NetTools,
+            );
+        }
+    }
+
+    /// Page tabs drawn on a separator row inside the merged Astra panel.
+    fn render_embedded_page_bar(&self, f: &mut Frame<'_>, area: Rect) {
+        if area.width < 3 || area.height == 0 {
+            return;
+        }
+        let border = Style::default().fg(Color::DarkGray);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("├", border),
+                Span::styled("─".repeat(area.width.saturating_sub(2) as usize), border),
+                Span::styled("┤", border),
+            ])),
+            area,
+        );
+        let compact = area.width < 100;
+        let mut x = area.x + 2;
+        for (index, page) in PAGES.iter().enumerate() {
+            let label = if compact && index != self.page {
+                format!(" {} ", index + 1)
+            } else {
+                format!(" {} {} ", index + 1, t(page))
+            };
+            let width = Line::from(label.as_str()).width() as u16;
+            if x + width + 1 >= area.right() {
+                break;
+            }
+            let rect = Rect::new(x, area.y, width, 1);
+            f.render_widget(
+                Paragraph::new(label).style(if index == self.page {
+                    Style::default()
+                        .bg(BLUE)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                }),
+                rect,
+            );
+            self.hit(rect, Target::Page(index));
+            x = x.saturating_add(width + 1);
+        }
     }
 
     pub(super) fn render_overview(&self, f: &mut Frame<'_>, area: Rect) {
@@ -144,7 +468,6 @@ impl Ui {
         };
         let notices = self.notices();
         let bands = Layout::vertical([
-            Constraint::Length(5),
             Constraint::Length(if notices.is_empty() {
                 0
             } else {
@@ -154,7 +477,6 @@ impl Ui {
             Constraint::Min(0),
         ])
         .split(area);
-        self.render_hero(f, bands[0], row);
         if !notices.is_empty() {
             let lines: Vec<_> = notices
                 .into_iter()
@@ -169,50 +491,165 @@ impl Ui {
                 Paragraph::new(lines)
                     .wrap(Wrap { trim: false })
                     .block(card("Attention")),
-                bands[1],
+                bands[0],
             );
         }
-        self.render_runtime_modes(f, bands[2]);
-        self.render_overview_cards(f, bands[3], row);
+        self.render_runtime_modes(f, bands[1]);
+        self.render_overview_cards(f, bands[2], row);
     }
 
-    /// Compact traffic and group summary on top; busiest connections and profiles below.
-    /// Wide terminals use two columns, narrow ones stack the most useful cards.
+    /// Connections are the main area; errors sit above, groups below or beside.
     fn render_overview_cards(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
         if area.height < 3 {
             return;
         }
-        let top_height = 7.min(area.height);
-        let rows =
-            Layout::vertical([Constraint::Length(top_height), Constraint::Min(0)]).split(area);
-        if area.width >= 100 {
-            let top = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(rows[0]);
-            self.render_traffic(f, top[0], row);
-            self.render_group_summary(f, top[1]);
-            if rows[1].height >= 4 {
-                let bottom =
-                    Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-                        .split(rows[1]);
-                self.render_top_connections(f, bottom[0]);
-                self.render_profile_switcher(f, bottom[1]);
-            }
-        } else {
+        if self.traffic_expanded && area.width >= 80 && area.height >= 10 {
+            let requested = ((area.height as u32 * 40 / 100) as u16).clamp(6, 14);
+            let traffic_height = requested.min(area.height.saturating_sub(4));
+            let rows = Layout::vertical([Constraint::Length(traffic_height), Constraint::Min(0)])
+                .split(area);
             self.render_traffic(f, rows[0], row);
-            if rows[1].height >= 4 {
-                let bottom =
-                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(rows[1]);
-                self.render_group_summary(f, bottom[0]);
-                self.render_top_connections(f, bottom[1]);
-            }
+            self.render_overview_main(f, rows[1], row);
+        } else {
+            self.render_overview_main(f, area, row);
         }
     }
 
-    fn render_group_summary(&self, f: &mut Frame<'_>, area: Rect) {
-        let block = card("Proxy groups · 2");
+    fn render_overview_main(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
+        if area.width >= 120 {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
+                    .split(area);
+            if let Some(snapshot) = self.live() {
+                self.overview_scroll_limit.set(snapshot.connections.len());
+            }
+            self.render_overview_connections(f, columns[0], false);
+            self.render_snapshot(f, columns[1]);
+            return;
+        }
+        let narrow = area.width < 80;
+        let groups_height = 6.min(area.height.saturating_sub(4));
+        let groups_visible = groups_height >= 4;
+        let (limit, groups_start) = match self.live() {
+            Some(snapshot) if narrow && groups_visible => (
+                snapshot.connections.len() + snapshot.groups.len(),
+                self.overview_scroll
+                    .saturating_sub(snapshot.connections.len()),
+            ),
+            Some(snapshot) => (snapshot.connections.len(), 0),
+            None => (0, 0),
+        };
+        self.overview_scroll_limit.set(limit);
+        if groups_visible {
+            let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(groups_height)])
+                .split(area);
+            self.render_overview_connections(f, rows[0], narrow);
+            let title = self
+                .live()
+                .map(|snapshot| tr!("PROXY GROUPS · {}", snapshot.groups.len()))
+                .unwrap_or_else(|| t("PROXY GROUPS").to_owned());
+            self.render_groups_panel(f, rows[1], &title, true, groups_start);
+        } else {
+            self.render_overview_connections(f, area, narrow);
+        }
+        let _ = row;
+    }
+
+    fn render_snapshot(&self, f: &mut Frame<'_>, area: Rect) {
+        let block = card("SNAPSHOT");
         let inner = block.inner(area);
         f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let muted = Style::default().fg(MUTED);
+        f.render_widget(
+            Paragraph::new(self.instance_indicator()),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        let footer = inner.height >= 6;
+        let bottom = if footer {
+            inner.bottom() - 1
+        } else {
+            inner.bottom()
+        };
+        let mut y = inner.y + 1;
+        if bottom.saturating_sub(y) >= 4 {
+            y += 1;
+            let label = self
+                .live()
+                .map(|snapshot| tr!("PROXY GROUPS · {}", snapshot.groups.len()))
+                .unwrap_or_else(|| t("PROXY GROUPS").to_owned());
+            f.render_widget(
+                Paragraph::new(Span::styled(label, muted)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+        self.render_group_rows(
+            f,
+            Rect::new(inner.x, y, inner.width, bottom.saturating_sub(y)),
+            0,
+        );
+        if footer {
+            f.render_widget(
+                Paragraph::new(Span::styled(format!(" {}", t("p switch profiles")), muted)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+    }
+
+    fn render_groups_panel(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        indicator: bool,
+        start: usize,
+    ) {
+        let block = card(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let mut y = inner.y;
+        if indicator {
+            f.render_widget(
+                Paragraph::new(self.instance_indicator()),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+        self.render_group_rows(
+            f,
+            Rect::new(inner.x, y, inner.width, inner.bottom().saturating_sub(y)),
+            start,
+        );
+    }
+
+    fn instance_indicator(&self) -> Line<'static> {
+        let mut spans = vec![Span::raw(" ")];
+        if let Some(proxy) = self.active_proxy() {
+            let (flag, color) = indicator_state(proxy);
+            spans.push(Span::styled(flag.to_owned(), Style::default().fg(color)));
+            spans.push(Span::raw(format!(" {} · P", proxy.instance.name)));
+        }
+        spans.push(Span::raw("   "));
+        if let Some(rule) = self.active_rule() {
+            let (flag, color) = indicator_state(rule);
+            spans.push(Span::styled(flag.to_owned(), Style::default().fg(color)));
+            spans.push(Span::raw(format!(" {} · R", rule.instance.name)));
+        } else {
+            spans.push(Span::styled("○ — · R", Style::default().fg(MUTED)));
+        }
+        Line::from(spans)
+    }
+
+    fn render_group_rows(&self, f: &mut Frame<'_>, area: Rect, start: usize) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let Some(snapshot) = self.live() else {
             let outbounds = self
                 .active_proxy()
@@ -227,7 +664,7 @@ impl Ui {
                 })
                 .wrap(Wrap { trim: false })
                 .style(Style::default().fg(MUTED)),
-                inner.inner(ratatui::layout::Margin::new(1, 0)),
+                area.inner(ratatui::layout::Margin::new(1, 0)),
             );
             return;
         };
@@ -238,15 +675,13 @@ impl Ui {
             .max()
             .unwrap_or(0)
             .min(18);
-        for (index, group) in snapshot
-            .groups
-            .iter()
-            .take(inner.height as usize)
-            .enumerate()
-        {
+        let visible = area.height as usize;
+        let total = snapshot.groups.len();
+        let start = start.min(total.saturating_sub(visible.max(1)));
+        for (offset, group) in snapshot.groups.iter().skip(start).take(visible).enumerate() {
             let selected = group.selected.as_deref().unwrap_or("—");
             let member = group.members.iter().find(|m| m.name == selected);
-            let rect = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+            let rect = Rect::new(area.x, area.y + offset as u16, area.width, 1);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
@@ -269,16 +704,17 @@ impl Ui {
                 ])),
                 rect,
             );
-            self.hit(rect, Target::Group(index));
+            self.hit(rect, Target::Group(start + offset));
         }
-        if snapshot.groups.len() > inner.height as usize && inner.height > 0 {
-            let more = format!(" +{} ", snapshot.groups.len() - inner.height as usize + 1);
+        let hidden = total.saturating_sub(start + visible);
+        if hidden > 0 && area.height > 0 {
+            let more = format!(" +{hidden} ");
             let width = more.len() as u16;
             f.render_widget(
                 Paragraph::new(more).style(Style::default().fg(MUTED)),
                 Rect::new(
-                    inner.right().saturating_sub(width),
-                    inner.bottom() - 1,
+                    area.right().saturating_sub(width),
+                    area.bottom() - 1,
                     width,
                     1,
                 ),
@@ -286,11 +722,21 @@ impl Ui {
         }
     }
 
-    fn render_top_connections(&self, f: &mut Frame<'_>, area: Rect) {
-        let block = card("Busiest connections · 3");
+    fn render_overview_connections(&self, f: &mut Frame<'_>, area: Rect, narrow: bool) {
+        if area.width < 4 || area.height < 3 {
+            return;
+        }
+        let active = self.live().map_or(0, |snapshot| snapshot.active);
+        let title = if narrow {
+            tr!("CONNECTIONS · {} active · sorted by traffic", active)
+        } else {
+            tr!("LIVE CONNECTIONS · {} active · sorted by traffic", active)
+        };
+        let block = card(&title);
         let inner = block.inner(area);
         f.render_widget(block, area);
         self.hit(area, Target::Page(CONNECTIONS));
+        self.render_border_sparkline(f, area, &title);
         let Some(snapshot) = self.live() else {
             f.render_widget(
                 Paragraph::new(t("Connections appear after connecting."))
@@ -308,11 +754,48 @@ impl Ui {
             );
             return;
         }
-        let shown: Vec<_> = connections
-            .into_iter()
-            .take(inner.height as usize)
-            .collect();
-        // Columns: target, outbound sized to the longest shown name, then 25 for both counters.
+        let footer = if inner.height >= 4 { 1 } else { 0 };
+        let list = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(footer),
+        );
+        if narrow {
+            self.render_connection_rows_narrow(f, list, &connections);
+        } else {
+            self.render_connection_rows(f, list, &connections);
+        }
+        if footer > 0 {
+            let text = if narrow {
+                tr!("↑↓ scroll · PgUp/PgDn · Enter open")
+            } else {
+                tr!(
+                    "Enter open · {}",
+                    if self.traffic_expanded {
+                        t("z collapse")
+                    } else {
+                        t("z chart")
+                    }
+                )
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(crate::theme::key_hints(&format!(" {text}")))),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+    }
+
+    fn render_connection_rows(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        connections: &[&astra_ipc::runtime::Connection],
+    ) {
+        let visible = area.height as usize;
+        let start = self
+            .overview_scroll
+            .min(connections.len().saturating_sub(visible.max(1)));
         let fit = |text: String, width: usize| {
             if Line::from(text.as_str()).width() > width {
                 text.chars()
@@ -323,17 +806,19 @@ impl Ui {
                 text
             }
         };
-        let outbound_width = shown
+        let outbound_width = connections
             .iter()
             .map(|c| Line::from(c.outbound.as_str()).width())
             .max()
             .unwrap_or(0)
             .clamp(6, 24);
-        let host_width = (inner.width as usize)
-            .saturating_sub(outbound_width + 29)
+        let host_width = (area.width as usize)
+            .saturating_sub(outbound_width + 27)
             .clamp(12, 48);
-        let lines: Vec<_> = shown
+        let lines: Vec<_> = connections
             .iter()
+            .skip(start)
+            .take(visible)
             .map(|c| {
                 let target = fit(format!("{}:{}", c.host, c.port), host_width);
                 let outbound = fit(c.outbound.clone(), outbound_width);
@@ -356,172 +841,108 @@ impl Ui {
                 ])
             })
             .collect();
-        f.render_widget(Paragraph::new(lines), inner);
-    }
-
-    fn render_profile_switcher(&self, f: &mut Frame<'_>, area: Rect) {
-        let block = card("Profiles · p switch");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let active = self.active_proxy().map(|r| r.instance.name.as_str());
-        let proxies = self.rows.iter().filter(|r| r.instance.kind == Kind::Proxy);
-        for (index, row) in proxies.take(inner.height as usize).enumerate() {
-            let running = row.pid.is_some();
-            let failed = row.state.starts_with("Exited") || row.state == "Unresponsive";
-            let is_active = active == Some(row.instance.name.as_str());
-            let rect = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        if running || failed { " ● " } else { " ○ " },
-                        Style::default().fg(if running {
-                            Color::Green
-                        } else if failed {
-                            Color::Red
-                        } else {
-                            MUTED
-                        }),
-                    ),
-                    Span::styled(
-                        row.instance.name.clone(),
-                        if is_active {
-                            Style::default().fg(BLUE).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled(
-                        format!(
-                            "  {}{}",
-                            t(&row.state),
-                            if running {
-                                format!(" {}", duration(row.uptime))
-                            } else {
-                                String::new()
-                            }
-                        ),
-                        Style::default().fg(MUTED),
-                    ),
-                ])),
-                rect,
+        f.render_widget(Paragraph::new(lines), area);
+        for index in 0..connections.len().saturating_sub(start).min(visible) {
+            self.hit(
+                Rect::new(area.x + 1, area.y + index as u16, area.width - 2, 1),
+                Target::Connection(start + index),
             );
-            self.hit(rect, Target::Activate(index));
         }
     }
 
-    fn render_hero(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let failed = row.state.starts_with("Exited") || row.state == "Unresponsive";
-        let (dot, color, state) = if row.pid.is_some() {
-            ("●", Color::Green, t("Profile connected"))
-        } else if failed {
-            ("●", Color::Red, t("Failed"))
-        } else {
-            ("○", MUTED, t("Not connected"))
+    fn render_connection_rows_narrow(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        connections: &[&astra_ipc::runtime::Connection],
+    ) {
+        let visible = (area.height as usize / 2).max(1);
+        let start = self
+            .overview_scroll
+            .min(connections.len().saturating_sub(visible));
+        let fit = |text: String, width: usize| {
+            if Line::from(text.as_str()).width() > width {
+                text.chars()
+                    .take(width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…"
+            } else {
+                text
+            }
         };
-        let mut first = vec![
-            Span::styled(format!(" {dot} "), Style::default().fg(color)),
-            Span::styled(state, bold.fg(color)),
-            Span::raw("  "),
-            Span::styled(row.instance.name.clone(), bold),
-        ];
-        if row.pid.is_some() {
-            first.push(Span::styled(
-                format!("  ·  {} {}", t("Up"), duration(row.uptime)),
-                Style::default().fg(MUTED),
-            ));
-        }
-        let mut lines = vec![Line::from(first)];
-        if let Some(snapshot) = self.live() {
-            let (chain, delay, alive) = live::exit_chain(snapshot);
-            let mut spans = vec![Span::styled(
-                format!(" {}  ", t("Exit")),
-                Style::default().fg(MUTED),
-            )];
-            for (index, hop) in chain.iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled(" ▸ ", Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(if index + 1 == chain.len() {
-                    Span::styled(hop.clone(), bold.fg(BLUE))
-                } else {
-                    Span::raw(hop.clone())
-                });
+        for (offset, c) in connections.iter().skip(start).take(visible).enumerate() {
+            let y = area.y + (offset * 2) as u16;
+            if y + 1 >= area.bottom() {
+                break;
             }
-            spans.push(Span::raw("  "));
-            spans.push(live::delay_span(delay, alive));
-            lines.push(Line::from(spans));
-        } else if row.pid.is_some() {
-            let waiting = if self.runtime_error.is_empty() {
-                t("Waiting for runtime data…")
-            } else {
-                &self.runtime_error
-            };
-            lines.push(Line::styled(
-                format!(" {waiting}"),
-                Style::default().fg(MUTED),
-            ));
-        } else if failed {
-            lines.push(Line::styled(
-                format!(" {}", t("L logs · e edit · c retry")),
-                Style::default().fg(Color::Red),
-            ));
-        } else {
-            lines.push(Line::styled(
-                format!(
+            f.render_widget(
+                Paragraph::new(Line::from(Span::raw(format!(
                     " {}",
-                    t("c connect · the mode and takeover switches apply once connected")
-                ),
-                Style::default().fg(MUTED),
-            ));
-        }
-        let mut meta = vec![];
-        if let Some(d) = self.details.get(&row.instance.name) {
-            if !d.listeners.is_empty() {
-                meta.push(d.listeners.join(" · "));
-            }
-            if d.outbound_count > 0 {
-                meta.push(tr!("{} outbounds", d.outbound_count));
-            }
-        }
-        meta.push(match self.active_rule() {
-            Some(rule) => tr!("Rule core {}", rule.instance.name),
-            None => t("No rule core").into(),
-        });
-        lines.push(Line::styled(
-            format!(" {}", meta.join("  ·  ")),
-            Style::default().fg(MUTED),
-        ));
-        f.render_widget(Paragraph::new(lines).block(card("Profile")), area);
-        if area.width >= 60 {
-            let label = if row.pid.is_some() {
-                "c Disconnect"
-            } else {
-                "c Connect"
-            };
-            let width = Line::from(t(label)).width() as u16 + 2;
-            let x = area.right() - width - 2;
-            self.button(
-                f,
-                Rect::new(x, area.y + 1, width, 1),
-                label,
-                Target::Connect,
+                    fit(format!("{}:{}", c.host, c.port), area.width as usize - 2)
+                )))),
+                Rect::new(area.x, y, area.width, 1),
             );
-            let tools = "N Network tools";
-            let tools_width = Line::from(t(tools)).width() as u16 + 2;
-            if area.width >= 90 && x > area.x + tools_width + 40 {
-                self.button(
-                    f,
-                    Rect::new(x - tools_width - 1, area.y + 1, tools_width, 1),
-                    tools,
-                    Target::NetTools,
-                );
-            }
+            let counters = format!("↓{}  ↑{}", live::bytes(c.download), live::bytes(c.upload));
+            let counter_width = Line::from(counters.as_str()).width();
+            let route_width = (area.width as usize)
+                .saturating_sub(counter_width + 3)
+                .max(6);
+            let route = fit(format!("{} · {}", c.outbound, c.network), route_width);
+            let route_spans = vec![
+                Span::raw(format!(" {route:<route_width$} ")),
+                Span::styled(
+                    format!(
+                        "{:>width$}",
+                        format!("↓{}", live::bytes(c.download)),
+                        width = counter_width.saturating_sub(
+                            Line::from(format!("↑{}", live::bytes(c.upload))).width() + 2
+                        )
+                    ),
+                    crate::theme::volume_style(c.download),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("↑{}", live::bytes(c.upload)),
+                    crate::theme::volume_style(c.upload),
+                ),
+            ];
+            f.render_widget(
+                Paragraph::new(Line::from(route_spans)),
+                Rect::new(area.x, y + 1, area.width, 1),
+            );
+            self.hit(
+                Rect::new(area.x + 1, y, area.width.saturating_sub(2), 2),
+                Target::Connection(start + offset),
+            );
         }
+    }
+
+    fn render_border_sparkline(&self, f: &mut Frame<'_>, area: Rect, title: &str) {
+        let len = self.history[0].len().min(self.history[1].len());
+        let data: Vec<u64> = (0..len)
+            .map(|index| self.history[0][index].saturating_add(self.history[1][index]))
+            .collect();
+        if data.len() < 2 || data.iter().all(|value| *value == 0) {
+            return;
+        }
+        let title_width = Line::from(title).width() as u16;
+        let room = area.width.saturating_sub(title_width + 8).min(24);
+        if room < 8 {
+            return;
+        }
+        let width = room as usize;
+        let tail = &data[data.len().saturating_sub(width)..];
+        f.render_widget(
+            Sparkline::default()
+                .data(tail)
+                .style(Style::default().fg(Color::Cyan)),
+            Rect::new(area.right() - room - 2, area.y, room, 1),
+        );
     }
 
     fn render_traffic(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
-        let block = card("Traffic");
+        let title = tr!("Traffic · z collapse");
+        let block = card(&title);
         let inner = block.inner(area);
         f.render_widget(block, area);
         let Some(snapshot) = self.live() else {
@@ -690,11 +1111,6 @@ impl Ui {
                 self.open_runtime_group();
                 Input::Idle
             }
-            Some(Target::Activate(index)) if self.can_switch_page() => {
-                self.selections[0] = index;
-                self.kind = Kind::Proxy;
-                Input::Idle
-            }
             Some(Target::Member(index)) => self.choose_runtime_member(index),
             Some(Target::Connection(index)) => {
                 self.connection_selection = index;
@@ -784,6 +1200,194 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+    fn live_sample() -> Ui {
+        use astra_ipc::runtime::{Connection, Group, Member, Snapshot};
+        let mut ui = sample();
+        ui.accept_runtime(
+            "proxy-00".into(),
+            Snapshot {
+                pid: 100,
+                mode: Mode::Rule,
+                system_proxy: true,
+                active: 3,
+                total: 9,
+                upload: 50_000,
+                download: 900_000,
+                // Deliberately unsorted: the Overview orders by total traffic.
+                connections: vec![
+                    Connection {
+                        id: 3,
+                        source: None,
+                        host: "data.bilibili.com".into(),
+                        port: 443,
+                        network: "Udp".into(),
+                        inbound: "Tun".into(),
+                        outbound: "DIRECT".into(),
+                        upload: 353_500,
+                        download: 87_600,
+                        elapsed_ms: 3000,
+                    },
+                    Connection {
+                        id: 2,
+                        source: None,
+                        host: "claude.ai".into(),
+                        port: 443,
+                        network: "Tcp".into(),
+                        inbound: "Mixed".into(),
+                        outbound: "AJP-80-Direct-Vision".into(),
+                        upload: 1_400_000,
+                        download: 44_900,
+                        elapsed_ms: 3000,
+                    },
+                    Connection {
+                        id: 1,
+                        source: None,
+                        host: "j-cn-live-comet.chat.bilibili.com".into(),
+                        port: 2245,
+                        network: "Tcp".into(),
+                        inbound: "Mixed".into(),
+                        outbound: "DIRECT".into(),
+                        upload: 18_800,
+                        download: 19_800_000,
+                        elapsed_ms: 3000,
+                    },
+                ],
+                groups: vec![
+                    Group {
+                        name: "PROXY".into(),
+                        mode: "select".into(),
+                        selected: Some("AJP-80-Direct-Vision".into()),
+                        testing: false,
+                        members: vec![Member {
+                            name: "AJP-80-Direct-Vision".into(),
+                            delay_ms: Some(38),
+                            alive: Some(true),
+                        }],
+                    },
+                    Group {
+                        name: "DIRECT".into(),
+                        mode: "select".into(),
+                        selected: Some("DIRECT".into()),
+                        testing: false,
+                        members: vec![],
+                    },
+                ],
+                ..Snapshot::default()
+            },
+        );
+        ui.rates = [2_300, 762_900];
+        for value in 0..64u64 {
+            ui.history[0].push_back(if value % 3 == 0 { 2_300 } else { 0 });
+            ui.history[1].push_back(762_900 - value * 8_000);
+        }
+        ui
+    }
+    #[test]
+    fn overview_attention_hides_warnings_but_keeps_errors() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = sample();
+            ui.rows[0].state = "Exited(1)".into();
+            ui.rows[0].pid = None;
+            ui.rows[0].changed = true;
+            assert_eq!(ui.notices().len(), 2, "error and warning both shown");
+            let old = Instant::now().checked_sub(Duration::from_secs(16)).unwrap();
+            for shown in ui.notice_since.borrow_mut().values_mut() {
+                *shown = old;
+            }
+            let notices = ui.notices();
+            assert_eq!(notices.len(), 1, "warning timed out");
+            assert_eq!(notices[0].0, Color::Red, "error persists");
+            assert!(notices[0].1.contains("Core stopped unexpectedly"));
+        });
+    }
+    #[test]
+    fn overview_layout_prioritizes_connections_and_adapts_to_width() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let ui = live_sample();
+            let text = screen(&render(&ui, 140, 40));
+            assert_eq!(text.matches("Astra").count(), 1);
+            assert!(text.contains("├─ 1 Overview"));
+            assert!(text.contains("LIVE CONNECTIONS · 3 active · sorted by traffic"));
+            assert!(text.contains("SNAPSHOT"));
+            assert!(text.contains("●G proxy-00 · P"));
+            assert!(text.contains("CONTROLS"));
+            assert!(text.contains("S System proxy ●"));
+            assert!(text.contains("N Network tools"));
+            assert!(
+                "▁▂▃▄▅▆▇█".chars().any(|glyph| text.contains(glyph)),
+                "embedded traffic chart missing"
+            );
+            let order = ["j-cn-live-comet", "claude.ai", "data.bilibili.com"]
+                .map(|host| text.find(host).unwrap());
+            assert!(
+                order.windows(2).all(|pair| pair[0] < pair[1]),
+                "connections are not sorted by traffic: {order:?}"
+            );
+
+            let text = screen(&render(&ui, 100, 30));
+            assert!(text.contains("PROXY GROUPS · 2"));
+            assert!(!text.contains("SNAPSHOT"));
+            assert!(text.contains("m Rule"));
+            assert!(text.contains("S System proxy ●"));
+
+            let text = screen(&render(&ui, 70, 30));
+            assert!(text.contains("Astra · proxy-00 · ● Connected"));
+            assert_eq!(text.matches("Connected").count(), 1);
+            assert!(text.contains("├─ 1 Overview"));
+            assert!(text.contains("DIRECT · Tcp"));
+            assert!(text.contains("S proxy ●"));
+            assert!(text.contains("A LAN ○"));
+            assert!(!text.contains("SNAPSHOT"));
+        });
+    }
+    #[test]
+    fn overview_expands_traffic_and_stays_stable_in_small_windows() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = live_sample();
+            ui.key(event::KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+            let text = screen(&render(&ui, 140, 40));
+            assert!(text.contains("Traffic · z collapse"));
+            assert!(text.contains("z collapse"));
+            ui.key(event::KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+            assert!(!screen(&render(&ui, 140, 40)).contains("Traffic"));
+            for (width, height) in [(1, 1), (8, 4), (20, 6), (60, 20), (90, 24)] {
+                let _ = render(&ui, width, height);
+            }
+        });
+    }
+    #[test]
+    fn narrow_overview_scrolls_from_connections_into_proxy_groups() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            use astra_ipc::runtime::{Group, Member};
+            let mut ui = live_sample();
+            let mut snapshot = ui.live().unwrap().clone();
+            for index in 0..10 {
+                snapshot.groups.push(Group {
+                    name: format!("GROUP-{index}"),
+                    mode: "select".into(),
+                    selected: Some(format!("node-{index}")),
+                    testing: false,
+                    members: vec![Member {
+                        name: format!("node-{index}"),
+                        delay_ms: Some(20 + index),
+                        alive: Some(true),
+                    }],
+                });
+            }
+            ui.accept_runtime("proxy-00".into(), snapshot);
+            let _ = render(&ui, 70, 30);
+            let limit = ui.overview_scroll_limit.get();
+            assert_eq!(limit, 15);
+            for _ in 0..limit {
+                ui.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            let text = screen(&render(&ui, 70, 30));
+            assert!(
+                text.contains("GROUP-9"),
+                "proxy groups did not scroll: {text}"
+            );
+        });
     }
     #[test]
     fn mouse_navigation_actions_scrolling_and_modal_capture() {

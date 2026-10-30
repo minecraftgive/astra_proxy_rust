@@ -55,12 +55,12 @@
 - `cargo test -p astra-rule-data -p astra-rule -p astra-convert`：58 项通过，1 项手动性能测试按原设置忽略。
 - 新增测试覆盖按需索引、大小写/重复选择、IPv4/IPv6/mapped/inverse 一致性、未引用分类的坏数据、缺失分类、未知字段/字段乱序/截断，以及解析结果复用和坏更新回退。
 - `scripts/ruleset_regression.py`：通过规则集在线更新、失效下载缓存保留、MMDB/GeoIP DAT/GEOSITE 查询、缺失分类拒绝、失败重载保留与离线缓存启动等端到端检查。测试组合为新 Rule Core、新构建的 converter 和发行目录中的 Proxy Core。
-- `cargo build --release -p astra-rule` 已完成；产物在 `target/release/astra-rule.exe`。本次未替换发行目录或重启正在运行的核心。
+- `cargo build --release -p astra-rule` 已完成；产物在 `target/<本机 Rust target>/release/astra-rule.exe`。本次未替换发行目录或重启正在运行的核心。
 
 本机留存了修改前的基线程序，可以重复测试：
 
 ```powershell
-python scripts/windows_rule_memory.py --before .test-tools/rule-memory/astra-rule-before.exe --after target/release/astra-rule.exe --config "$env:LOCALAPPDATA/.astra/tui/configs/t2.toml" --output .test-tools/rule-memory/results.json
+python scripts/windows_rule_memory.py --before .test-tools/rule-memory/astra-rule-before.exe --after target/<本机 Rust target>/release/astra-rule.exe --config "$env:LOCALAPPDATA/.astra/tui/configs/t2.toml" --output .test-tools/rule-memory/results.json
 ```
 
 测试脚本针对包含 GEOIP、GEOSITE 数据库路径的内联规则配置；有外部 `rule_sets` 时会明确拒绝，避免改变相对路径或误触远端更新。

@@ -283,6 +283,10 @@ async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Resu
     }
     result
 }
+const MANAGEMENT_RELOAD_TIMEOUT_SECS: u64 = 65;
+const MANAGEMENT_UPDATE_TIMEOUT_SECS: u64 = 65;
+const MANAGEMENT_DEFAULT_TIMEOUT_SECS: u64 = 3;
+
 pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Status> {
     if matches!(
         command,
@@ -297,10 +301,15 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
             "Use the matching management helper for this command",
         ));
     }
-    let seconds = if matches!(command, Command::Reload { .. }) {
-        65
-    } else {
-        3
+    // Reload and subscription refreshes may involve configuration/resource work
+    // bounded by the management server's 60-second operation deadline. The
+    // refresh command currently acknowledges scheduling rather than waiting for
+    // every download, but use the same deadline so a slow connection/handshake
+    // cannot report a false timeout for an accepted mutation.
+    let seconds = match command {
+        Command::Reload { .. } => MANAGEMENT_RELOAD_TIMEOUT_SECS,
+        Command::UpdateSubscriptions => MANAGEMENT_UPDATE_TIMEOUT_SECS,
+        _ => MANAGEMENT_DEFAULT_TIMEOUT_SECS,
     };
     match rpc(path, command, seconds).await? {
         Response::Status(status) => {

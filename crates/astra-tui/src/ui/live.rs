@@ -1,6 +1,6 @@
 //! Proxies and Connections pages, driven by the active profile's runtime snapshot.
 use super::dashboard::{card, Target, BLUE, MUTED};
-use super::shell::{CONNECTIONS, PROXIES};
+use super::shell::{CONNECTIONS, OVERVIEW, PROXIES};
 use super::*;
 use astra_ipc::runtime::{Command, Mode, Snapshot};
 use ratatui::{
@@ -295,6 +295,44 @@ impl Ui {
             };
         }
         let snapshot = self.live()?;
+        if self.page == OVERVIEW {
+            let count = self
+                .overview_scroll_limit
+                .get()
+                .max(snapshot.connections.len());
+            match key.code {
+                KeyCode::Char('z') => {
+                    self.traffic_expanded = !self.traffic_expanded;
+                    return Some(Input::Idle);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.overview_scroll = (self.overview_scroll + 1).min(count.saturating_sub(1));
+                    return Some(Input::Idle);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                    return Some(Input::Idle);
+                }
+                KeyCode::PageDown => {
+                    self.overview_scroll = (self.overview_scroll + 5).min(count.saturating_sub(1));
+                    return Some(Input::Idle);
+                }
+                KeyCode::PageUp => {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(5);
+                    return Some(Input::Idle);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.overview_scroll = 0;
+                    return Some(Input::Idle);
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.overview_scroll = count.saturating_sub(1);
+                    return Some(Input::Idle);
+                }
+                KeyCode::Enter => return Some(self.navigate(CONNECTIONS)),
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('0') => return Some(self.runtime_action(Command::Reset)),
             KeyCode::Char('m') => {
@@ -386,17 +424,59 @@ impl Ui {
         let Some(snapshot) = self.live() else {
             return;
         };
-        if area.height < 3 {
+        if area.width < 4 || area.height < 3 {
             return;
         }
-        let cells = Layout::horizontal([Constraint::Ratio(1, 6); 6]).split(area);
+        let block = card("CONTROLS");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let area = inner;
+        let compact = area.width < 90;
+        let switches = [
+            (
+                'S',
+                if compact {
+                    t("proxy")
+                } else {
+                    t("System proxy")
+                },
+                snapshot.system_proxy,
+                Command::SystemProxy(!snapshot.system_proxy),
+            ),
+            (
+                'T',
+                if compact { t("TUN") } else { t("TUN · admin") },
+                snapshot.tun,
+                Command::Tun(!snapshot.tun),
+            ),
+            (
+                'A',
+                if compact { t("LAN") } else { t("Allow LAN") },
+                snapshot.allow_lan,
+                Command::AllowLan(!snapshot.allow_lan),
+            ),
+        ];
+        let switch_width =
+            |key: char, label: &str| Line::from(format!(" {key} {label} ○ ")).width() as u16 + 2;
+        let cells = Layout::horizontal([
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(switch_width(switches[0].0, switches[0].1)),
+            Constraint::Length(switch_width(switches[1].0, switches[1].1)),
+            Constraint::Min(0),
+        ])
+        .split(area);
         for (index, mode) in [Mode::Rule, Mode::Global, Mode::Direct].iter().enumerate() {
             let label = t(match mode {
                 Mode::Rule => "Rule",
                 Mode::Global => "Global",
                 Mode::Direct => "Direct",
             });
-            let rect = cells[index].inner(ratatui::layout::Margin::new(1, 1));
+            let rect = cells[index].inner(ratatui::layout::Margin::new(1, 0));
             f.render_widget(
                 Paragraph::new(format!(" m {label} ")).style(if snapshot.mode == *mode {
                     Style::default()
@@ -410,30 +490,8 @@ impl Ui {
             );
             self.hit(rect, Target::Runtime(Command::SetMode(*mode)));
         }
-        for (index, key, label, enabled, command) in [
-            (
-                3,
-                'S',
-                t("System proxy"),
-                snapshot.system_proxy,
-                Command::SystemProxy(!snapshot.system_proxy),
-            ),
-            (
-                4,
-                'T',
-                t("TUN · admin"),
-                snapshot.tun,
-                Command::Tun(!snapshot.tun),
-            ),
-            (
-                5,
-                'A',
-                t("Allow LAN"),
-                snapshot.allow_lan,
-                Command::AllowLan(!snapshot.allow_lan),
-            ),
-        ] {
-            let rect = cells[index].inner(ratatui::layout::Margin::new(1, 1));
+        for (index, (key, label, enabled, command)) in switches.into_iter().enumerate() {
+            let rect = cells[index + 3].inner(ratatui::layout::Margin::new(1, 0));
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw(format!(" {key} {label} ")),
@@ -1002,6 +1060,9 @@ mod tests {
         let mut snapshot = ui.live().unwrap().clone();
         snapshot.tun = true;
         ui.accept_runtime("proxy".into(), snapshot);
+        // Overview folds its status into the Astra header; the standalone status bar
+        // still serves every other page, so test it there.
+        ui.navigate(PROXIES);
         ui.rates = [0, 48_000];
         let bar = |ui: &Ui, width: u16| {
             let mut t = ratatui::Terminal::new(TestBackend::new(width, 12)).unwrap();

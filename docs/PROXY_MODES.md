@@ -1,6 +1,6 @@
 # 系统接管模式与配置热重载
 
-运行本次构建的 `target/release/astra-proxy`、`astra-rule` 和 `astra-tui`。管理与路由 IPC 已更新为 v3，旧程序与新程序不能混用。后台 TUI 管理服务也需在更新后重新启动；停止已有实例会断开其连接，请在合适的时间操作。
+运行本次构建的 `target/<本机 Rust target>/release/astra-proxy`、`astra-rule` 和 `astra-tui`。管理与路由 IPC 已更新为 v3，旧程序与新程序不能混用。后台 TUI 管理服务也需在更新后重新启动；停止已有实例会断开其连接，请在合适的时间操作。
 
 ## 选择接管方式
 
@@ -47,7 +47,7 @@ Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程�
 写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则写入 `~/.astra/runtime/system-proxy/<源路径摘要>.cache`（`ASTRA_RUNTIME_DIR` 可自定义根目录）。旧配置旁若存在未恢复记录，会提示先用恢复命令处理，避免遗漏旧的系统设置快照。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
 
 ```sh
-./target/release/astra-proxy --restore-system-proxy /absolute/path/to/modes.system-proxy-state.toml
+./target/<本机 Rust target>/release/astra-proxy --restore-system-proxy /absolute/path/to/modes.system-proxy-state.toml
 ```
 
 恢复失败会保留文件供重试。正常退出后文件删除。不要删除尚未恢复的文件。
@@ -151,10 +151,10 @@ REDIRECT 示例：在自己管理的 NAT PREROUTING 链中将指定 LAN 的 TCP 
 需要可确认结果的脚本控制时，启动时指定管理 socket（0600、父目录应仅当前用户可访问）：
 
 ```sh
-ASTRA_CONTROL_SOCKET=/tmp/astra-proxy-control.sock ./target/release/astra-proxy /path/to/proxy-standalone.toml
+ASTRA_CONTROL_SOCKET=/tmp/astra-proxy-control.sock ./target/<本机 Rust target>/release/astra-proxy /path/to/proxy-standalone.toml
 # 另一个终端：
-./target/release/astra-proxy --reload /tmp/astra-proxy-control.sock
-./target/release/astra-proxy --switch /tmp/astra-proxy-control.sock /absolute/path/to/other-proxy.toml
+./target/<本机 Rust target>/release/astra-proxy --reload /tmp/astra-proxy-control.sock
+./target/<本机 Rust target>/release/astra-proxy --switch /tmp/astra-proxy-control.sock /absolute/path/to/other-proxy.toml
 # 规则核心同样支持 --reload / --switch，目标为其独立管理 socket。
 ```
 
@@ -173,8 +173,8 @@ TCP/UDP 限额跨配置版本共享；降低额度不切断已有会话，降到
 Linux 专用透明 socket、原目的地址解析和出口绑定代码通过 x86_64-unknown-linux-gnu 交叉编译检查。Linux 运行、系统桌面设置和防火墙端到端仍需在 Linux 目标机器验收；Windows 的本机测试不能替代 Linux 验收。
 
 ```sh
-python3 scripts/reload_regression.py --bin-dir target/release
-python3 scripts/standalone_regression.py --bin-dir target/release
+python3 scripts/reload_regression.py --bin-dir target/<本机 Rust target>/release
+python3 scripts/standalone_regression.py --bin-dir target/<本机 Rust target>/release
 cargo test -p astra-proxy tun::tests
 ```
 

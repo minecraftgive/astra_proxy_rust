@@ -149,6 +149,7 @@ pub enum Action {
     /// Streams `astra_ipc::nettool::Event`s; the manager fills the request's configuration.
     NetTool {
         name: String,
+        #[serde(with = "json_text")]
         request: astra_ipc::nettool::Request,
     },
     StoragePaths,
@@ -185,6 +186,24 @@ impl Reply {
             rows: vec![],
             text: text.into(),
         }
+    }
+}
+/// Management frames are bincode, which cannot decode serde-tagged enums such as
+/// `nettool::Egress` and `nettool::Probe`; fields holding them cross as JSON text.
+mod json_text {
+    use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<T: Serialize, S: Serializer>(
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde_json::to_string(value)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        serde_json::from_str(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -265,4 +284,68 @@ pub async fn subscribe(
     )
     .await?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_ipc::nettool::{Egress, Probe};
+
+    #[tokio::test]
+    async fn network_tool_requests_survive_management_frames() {
+        let (mut client, mut server) = astra_ipc::platform::stream_pair().await.unwrap();
+        let egresses = [
+            Egress::System,
+            Egress::Interface("以太网 2".into()),
+            Egress::Outbound("HK 01".into()),
+        ];
+        let probes = [
+            Probe::Dns {
+                name: "example.test".into(),
+                record: "AAAA".into(),
+                server: "tls://1.1.1.1".into(),
+            },
+            Probe::Tcp {
+                host: "2001:db8::1".into(),
+                port: 443,
+            },
+            Probe::Icmp {
+                host: "192.0.2.1".into(),
+            },
+        ];
+        for (egress, probe) in egresses.into_iter().zip(probes) {
+            let request = astra_ipc::nettool::Request {
+                config: "standalone=true\n".into(),
+                egress: egress.clone(),
+                probe: probe.clone(),
+                count: 3,
+                interval_ms: 200,
+                timeout_ms: 3000,
+            };
+            astra_ipc::send_management(
+                &mut client,
+                &Request {
+                    version: astra_ipc::API_VERSION,
+                    action: Action::NetTool {
+                        name: "proxy".into(),
+                        request,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let received: Request = astra_ipc::receive_management(&mut server).await.unwrap();
+            let (name, request) = match received.action {
+                Action::NetTool { name, request } => (name, request),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(name, "proxy");
+            assert_eq!((request.egress, request.probe), (egress, probe));
+            assert_eq!(
+                (request.count, request.interval_ms, request.timeout_ms),
+                (3, 200, 3000)
+            );
+            assert_eq!(request.config, "standalone=true\n");
+        }
+    }
 }

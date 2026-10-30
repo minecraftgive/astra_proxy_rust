@@ -4,13 +4,13 @@
 
 ```sh
 cargo build --release -p astra-convert
-target/release/astra-convert configs/mihomo-rulesets-example.yaml -o converted
+target/<本机 Rust target>/release/astra-convert configs/mihomo-rulesets-example.yaml -o converted
 # 指定代理组成员；多个代理组可重复 --select：
-target/release/astra-convert your-mihomo.yaml -o your-config --select 'Proxy=节点名称'
+target/<本机 Rust target>/release/astra-convert your-mihomo.yaml -o your-config --select 'Proxy=节点名称'
 # 只解析检查，不创建输出目录：
-target/release/astra-convert your-mihomo.yaml --check
+target/<本机 Rust target>/release/astra-convert your-mihomo.yaml --check
 # 标准输入：
-cat your-mihomo.yaml | target/release/astra-convert - -o converted-stdin
+cat your-mihomo.yaml | target/<本机 Rust target>/release/astra-convert - -o converted-stdin
 ```
 
 未指定 `-o/--output-dir` 时，`proxy.toml` 和 `rule.toml` 输出到输入 YAML 所在目录；输入为 `-`（stdin）时输出到当前工作目录。`--base-dir` 仅影响资源路径解析，不改变输出位置。已有文件不会覆盖，Unix 下新文件权限为 `0600`。两份配置默认共用 `/tmp/astra-rule.sock`，可用 `--rule-socket /path/to/rule.sock` 修改。多实例应使用不同的 socket 和监听端口。
@@ -18,11 +18,11 @@ cat your-mihomo.yaml | target/release/astra-convert - -o converted-stdin
 转换后用核心检查实际协议参数，再启动：
 
 ```sh
-target/release/astra-rule --check converted/rule.toml
-target/release/astra-proxy --check converted/proxy.toml
+target/<本机 Rust target>/release/astra-rule --check converted/rule.toml
+target/<本机 Rust target>/release/astra-proxy --check converted/proxy.toml
 # 两个终端分别运行：
-target/release/astra-rule converted/rule.toml
-target/release/astra-proxy converted/proxy.toml
+target/<本机 Rust target>/release/astra-rule converted/rule.toml
+target/<本机 Rust target>/release/astra-proxy converted/proxy.toml
 ```
 
 转换器的 `--check` 只检查解析和映射，并输出跳过摘要；核心的 `--check` 进一步验证协议和加密参数。这些检查均不能证明节点在线、凭据有效或服务端互通。

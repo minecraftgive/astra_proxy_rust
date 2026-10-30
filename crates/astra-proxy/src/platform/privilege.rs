@@ -1,4 +1,4 @@
-//! Privilege handling for standalone Windows TUN launches.
+//! Privilege handling for standalone TUN launches.
 use anyhow::Result;
 use std::path::Path;
 
@@ -14,7 +14,36 @@ pub fn bootstrap() -> Result<Option<String>> {
     Ok(None)
 }
 
+#[cfg(target_os = "linux")]
+fn has_net_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+        })
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1 << 12) != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_net_admin() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn has_tun_privilege() -> bool {
+    (unsafe { libc::geteuid() } == 0) || (cfg!(target_os = "linux") && has_net_admin())
+}
+
 pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
+    #[cfg(unix)]
+    if tun_enabled && !has_tun_privilege() {
+        anyhow::bail!(
+            "TUN requires root or CAP_NET_ADMIN; restart Astra with sudo in your terminal. Astra never reads the sudo password."
+        );
+    }
     #[cfg(not(windows))]
     let _ = (path, tun_enabled);
     #[cfg(windows)]

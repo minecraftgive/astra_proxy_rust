@@ -232,6 +232,12 @@ struct Ui {
     history: [std::collections::VecDeque<u64>; 2],
     group_selection: usize,
     connection_selection: usize,
+    overview_scroll: usize,
+    /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
+    overview_scroll_limit: std::cell::Cell<usize>,
+    traffic_expanded: bool,
+    /// First time each warning was shown; warnings hide after a short delay.
+    notice_since: std::cell::RefCell<HashMap<String, Instant>>,
     connection_filter: String,
     connection_filtering: bool,
     runtime_picker: Option<(String, usize)>,
@@ -366,6 +372,10 @@ impl Ui {
             history: Default::default(),
             group_selection: 0,
             connection_selection: 0,
+            overview_scroll: 0,
+            overview_scroll_limit: Default::default(),
+            traffic_expanded: false,
+            notice_since: Default::default(),
             connection_filter: String::new(),
             connection_filtering: false,
             runtime_picker: None,

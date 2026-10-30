@@ -173,6 +173,43 @@ fn local_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn resource_unavailable(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    (text.contains("resource download failed")
+        || text.contains("no such file")
+        || text.contains("not found")
+        || text.contains("timed out")
+        || text.contains("connection refused")
+        || text.contains("network is unreachable"))
+        && !text.contains("invalid")
+        && !text.contains("unsupported")
+        && !text.contains("corrupt")
+        && !text.contains("category not found")
+}
+
+fn skip_unavailable_rules(
+    rules: &mut Vec<RuleSpec>,
+    sources: &mut [RuleSource],
+    skip: impl Fn(&RuleSpec) -> bool,
+) {
+    let original = std::mem::take(rules);
+    let mut retained = Vec::with_capacity(original.len());
+    let mut start = 0;
+    for source in sources {
+        let end = source.end.min(original.len());
+        retained.extend(
+            original[start..end]
+                .iter()
+                .filter(|rule| !skip(rule))
+                .cloned(),
+        );
+        source.end = retained.len();
+        start = end;
+    }
+    retained.extend(original[start..].iter().filter(|rule| !skip(rule)).cloned());
+    *rules = retained;
+}
+
 fn parse_action(input: &str) -> Result<RouteAction> {
     match input {
         "direct" => Ok(RouteAction::Direct),
@@ -263,12 +300,19 @@ impl RuleEngine {
                 if !source.enabled {
                     return Ok(());
                 }
-                cache.insert(
-                    spec.value.clone(),
-                    source
-                        .load(base)
-                        .with_context(|| format!("load rule-set {}", spec.value))?,
-                );
+                let loaded = source
+                    .load(base)
+                    .with_context(|| format!("load rule-set {}", spec.value));
+                let loaded = match loaded {
+                    Ok(value) => value,
+                    Err(error) if resource_unavailable(&error) => {
+                        tracing::warn!(rule_set=%spec.value, error=%error, "rule-set unavailable; skipping dependent rules");
+                        cache.insert(spec.value.clone(), Vec::new());
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                cache.insert(spec.value.clone(), loaded);
             }
             active.push(spec.value.clone());
             for matcher in cache[&spec.value].clone() {
@@ -303,78 +347,99 @@ impl RuleEngine {
             });
         }
         if rules.iter().any(|rule| rule.kind == "geosite") {
-            let path = config
-                .geosite_database
-                .as_deref()
-                .context("GEOSITE rules require geosite_database (geosite.dat)")?;
-            let selectors: Vec<_> = rules
-                .iter()
-                .filter(|r| r.kind == "geosite")
-                .map(|r| r.value.clone())
-                .collect();
-            let bytes = astra_rule_data::load_resource(
-                base,
-                path,
-                config.geosite_url.as_deref(),
-                config.geosite_interval,
-                128 * 1024 * 1024,
-                |bytes| {
-                    let db = astra_rule_data::geosite::Database::decode(bytes)?;
-                    let mut count = rules.iter().filter(|rule| rule.kind != "geosite").count();
-                    for selector in &selectors {
-                        let entries = db.expand(selector)?;
-                        count += entries.len();
-                        anyhow::ensure!(
-                            count <= 1_000_000,
-                            "expanded rules exceed 1000000 entries"
-                        );
-                        for matcher in entries {
-                            if matcher.kind == "domain_regex" {
-                                compile_regex(&matcher.value)?;
-                            } else if matcher.kind == "domain_keyword" {
-                                anyhow::ensure!(
-                                    !matcher.value.chars().any(char::is_whitespace),
-                                    "invalid GEOSITE keyword"
-                                );
-                            } else {
-                                normalize_domain(&matcher.value)?;
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            let database = astra_rule_data::geosite::Database::decode(&bytes)?;
-            let mut expanded = Vec::new();
-            let mut input = rules.into_iter();
-            let mut previous_end = 0;
-            for source in &mut sources {
-                let count = source.end - previous_end;
-                previous_end = source.end;
-                for rule in input.by_ref().take(count) {
-                    if rule.kind == "geosite" {
-                        for matcher in database.expand(&rule.value)? {
+            let path = match config.geosite_database.as_deref() {
+                Some(path) => path,
+                None => {
+                    tracing::warn!("GEOSITE database unavailable; skipping dependent rules");
+                    skip_unavailable_rules(&mut rules, &mut sources, |rule| rule.kind == "geosite");
+                    ""
+                }
+            };
+            if path.is_empty() {
+                // The remaining rules do not require a GEOSITE database.
+            } else {
+                let selectors: Vec<_> = rules
+                    .iter()
+                    .filter(|r| r.kind == "geosite")
+                    .map(|r| r.value.clone())
+                    .collect();
+                let bytes = astra_rule_data::load_resource(
+                    base,
+                    path,
+                    config.geosite_url.as_deref(),
+                    config.geosite_interval,
+                    128 * 1024 * 1024,
+                    |bytes| {
+                        let db = astra_rule_data::geosite::Database::decode(bytes)?;
+                        let mut count = rules.iter().filter(|rule| rule.kind != "geosite").count();
+                        for selector in &selectors {
+                            let entries = db.expand(selector)?;
+                            count += entries.len();
                             anyhow::ensure!(
-                                expanded.len() < 1_000_000,
+                                count <= 1_000_000,
                                 "expanded rules exceed 1000000 entries"
                             );
-                            expanded.push(RuleSpec {
-                                kind: matcher.kind,
-                                value: matcher.value,
-                                action: rule.action.clone(),
-                            });
+                            for matcher in entries {
+                                if matcher.kind == "domain_regex" {
+                                    compile_regex(&matcher.value)?;
+                                } else if matcher.kind == "domain_keyword" {
+                                    anyhow::ensure!(
+                                        !matcher.value.chars().any(char::is_whitespace),
+                                        "invalid GEOSITE keyword"
+                                    );
+                                } else {
+                                    normalize_domain(&matcher.value)?;
+                                }
+                            }
                         }
-                    } else {
-                        anyhow::ensure!(
-                            expanded.len() < 1_000_000,
-                            "expanded rules exceed 1000000 entries"
-                        );
-                        expanded.push(rule);
+                        Ok(())
+                    },
+                );
+                let bytes = match bytes {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if resource_unavailable(&error) => {
+                        tracing::warn!(error=%error, "GEOSITE database unavailable; skipping dependent rules");
+                        skip_unavailable_rules(&mut rules, &mut sources, |rule| {
+                            rule.kind == "geosite"
+                        });
+                        None
                     }
+                    Err(error) => return Err(error),
+                };
+                if let Some(bytes) = bytes {
+                    let database = astra_rule_data::geosite::Database::decode(&bytes)?;
+                    let mut expanded = Vec::new();
+                    let mut input = rules.into_iter();
+                    let mut previous_end = 0;
+                    for source in &mut sources {
+                        let count = source.end - previous_end;
+                        previous_end = source.end;
+                        for rule in input.by_ref().take(count) {
+                            if rule.kind == "geosite" {
+                                for matcher in database.expand(&rule.value)? {
+                                    anyhow::ensure!(
+                                        expanded.len() < 1_000_000,
+                                        "expanded rules exceed 1000000 entries"
+                                    );
+                                    expanded.push(RuleSpec {
+                                        kind: matcher.kind,
+                                        value: matcher.value,
+                                        action: rule.action.clone(),
+                                    });
+                                }
+                            } else {
+                                anyhow::ensure!(
+                                    expanded.len() < 1_000_000,
+                                    "expanded rules exceed 1000000 entries"
+                                );
+                                expanded.push(rule);
+                            }
+                        }
+                        source.end = expanded.len();
+                    }
+                    rules = expanded;
                 }
-                source.end = expanded.len();
             }
-            rules = expanded;
         }
         let geoip_categories = rules
             .iter()
@@ -382,19 +447,33 @@ impl RuleEngine {
             .map(|r| astra_rule_data::geoip::category(&r.value))
             .collect::<Result<Vec<_>>>()?;
         let geoip = if !geoip_categories.is_empty() {
-            let path = config
-                .geoip_database
-                .as_deref()
-                .context("GEOIP rules require geoip_database (MMDB or geoip.dat)")?;
-            let (_, database) = astra_rule_data::load_resource_with(
-                base,
-                path,
-                config.geoip_url.as_deref(),
-                config.geoip_interval,
-                128 * 1024 * 1024,
-                |bytes| GeoDatabase::decode(bytes, &geoip_categories),
-            )?;
-            Some(database)
+            let path = config.geoip_database.as_deref();
+            if let Some(path) = path {
+                match astra_rule_data::load_resource_with(
+                    base,
+                    path,
+                    config.geoip_url.as_deref(),
+                    config.geoip_interval,
+                    128 * 1024 * 1024,
+                    |bytes| GeoDatabase::decode(bytes, &geoip_categories),
+                ) {
+                    Ok((_, database)) => Some(database),
+                    Err(error) if resource_unavailable(&error) => {
+                        tracing::warn!(error=%error, "GEOIP database unavailable; skipping dependent rules");
+                        skip_unavailable_rules(&mut rules, &mut sources, |rule| {
+                            rule.kind == "geoip" && !rule.value.eq_ignore_ascii_case("LAN")
+                        });
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                tracing::warn!("GEOIP database unavailable; skipping dependent rules");
+                skip_unavailable_rules(&mut rules, &mut sources, |rule| {
+                    rule.kind == "geoip" && !rule.value.eq_ignore_ascii_case("LAN")
+                });
+                None
+            }
         } else {
             None
         };
@@ -925,10 +1004,11 @@ mod tests {
         for host in ["localhost", "example.com", "192.0.2.1", "2001:db9::1"] {
             assert_eq!(engine.decide(&request(host, None)), RouteAction::Direct);
         }
-        let missing: RuleConfig = toml::from_str("socket='/tmp/a'\ndefault_action='direct'\ngeoip_database='geoip.dat'\n[[rules]]\nkind='geoip'\nvalue='missing'\naction='block'").unwrap();
-        assert!(
-            format!("{:#}", RuleEngine::compile_at(&missing, &dir).unwrap_err())
-                .contains("category not found")
+        let missing: RuleConfig = toml::from_str("socket='/tmp/a'\ndefault_action='direct'\ngeoip_database='missing.dat'\n[[rules]]\nkind='geoip'\nvalue='missing'\naction='block'").unwrap();
+        let missing_engine = RuleEngine::compile_at(&missing, &dir).unwrap();
+        assert_eq!(
+            missing_engine.decide(&request("203.0.113.1", None)),
+            RouteAction::Direct
         );
         std::fs::write(&path, b"invalid dat").unwrap();
         assert!(RuleEngine::compile_at(&config, &dir).is_err());
@@ -1021,7 +1101,11 @@ mod tests {
         assert_eq!(decision.action, RouteAction::Direct);
         assert!(decision.path.to_string().starts_with("rules[2]"));
         config.rule_sets.get_mut("ads").unwrap().enabled = true;
-        assert!(RuleEngine::compile(&config).is_err());
+        let engine = RuleEngine::compile(&config).unwrap();
+        assert_eq!(
+            engine.decide(&request("anything.test", None)),
+            RouteAction::Proxy("fallback".into())
+        );
     }
     #[test]
     fn native_inline_yaml_and_text_providers_have_identical_decisions() {
@@ -1295,7 +1379,11 @@ action='proxy:second'
             engine.decide(&request("rx42.test", None)),
             RouteAction::Block
         );
-        assert!(RuleEngine::compile_at(&config_for("missing"), &dir).is_err());
+        let missing = RuleEngine::compile_at(&config_for("missing"), &dir).unwrap();
+        assert_eq!(
+            missing.decide(&request("unrelated.example", None)),
+            RouteAction::Proxy("edge".into())
+        );
         std::fs::write(dir.join("geosite.dat"), b"invalid").unwrap();
         assert!(RuleEngine::compile_at(&config_for("test"), &dir).is_err());
         std::fs::remove_file(dir.join("geosite.dat")).unwrap();

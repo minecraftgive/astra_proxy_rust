@@ -55,7 +55,7 @@ python scripts/install_wintun.py --bin-dir target/debug
 
 ### Linux / macOS 构建
 
-需要 Rust、CMake、Clang/C++、libclang；Linux 构建产物仍需在目标机器验证。
+需要 Rust、CMake、Clang/C++、libclang；Linux 构建产物仍需在目标机器验证。启用 Unix TUN 或需要特权路由时，请在终端中用 `sudo` 重新启动对应程序；Astra 不读取、保存或转发 sudo 密码，也不会在 TUI 中提供密码输入框。普通 SOCKS/HTTP 模式无需 root。
 
 ```sh
 ./scripts/build.sh
