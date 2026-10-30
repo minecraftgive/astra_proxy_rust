@@ -226,10 +226,13 @@ impl Guard {
         lock.sync_all()?;
         guard.lock = Some(lock);
         // Only DIRECT + PROXY: temporarily suppress PAC and auto-detection.
-        // HTTP/HTTPS both target the local HTTP proxy (HTTPS uses CONNECT).
+        // A bare host:port (the form Windows Settings writes) sends every
+        // scheme to the local HTTP proxy; HTTPS uses CONNECT. Per-scheme
+        // `http=…;https=…` lists are misread by clients that parse the value
+        // as a single address.
         write(&Settings {
             flags: PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
-            server: Some(format!("http={address};https={address}")),
+            server: Some(address.to_string()),
             bypass: Some("<local>".into()),
             auto_config_url: Some(String::new()),
         })?;

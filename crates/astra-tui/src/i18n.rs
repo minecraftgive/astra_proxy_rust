@@ -130,6 +130,8 @@ macro_rules! tr {
     ($source:literal $(, $arg:expr)* $(,)?) => { $crate::i18n::message($source, &[$(format!("{}", $arg)),*]) };
 }
 const CATALOG: &[(&str, &str, &str, &str)] = &[
+    ("v select · V all/clear · K/J move · m move selection here", "v select · V all/clear · K/J move · m move selection here", "v 勾选 · V 全选/清空 · K/J 移动 · m 移到光标前", "v 勾選 · V 全選/清空 · K/J 移動 · m 移到游標前"),
+    ("selected · v toggle · V all/clear · K/J move · m move before cursor", "selected · v toggle · V all/clear · K/J move · m move before cursor", "条已选 · v 勾选 · V 全选/清空 · K/J 移动 · m 移到光标前", "條已選 · v 勾選 · V 全選/清空 · K/J 移動 · m 移到游標前"),
     ("Opened in a new window", "Opened in a new window", "已在新窗口打开", "已在新視窗開啟"),
     ("Cannot open a new window", "Cannot open a new window", "无法打开新窗口", "無法開啟新視窗"),
     ("Use Alt+1–6 to open a page; the current draft stays here", "Use Alt+1–6 to open a page; the current draft stays here", "使用 Alt+1～6 打开页面；当前草稿保留在此窗口", "使用 Alt+1～6 開啟頁面；目前草稿保留在此視窗"),

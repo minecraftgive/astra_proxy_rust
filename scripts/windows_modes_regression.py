@@ -256,7 +256,7 @@ def system_proxy(args, directory):
         try:
             core.ready()
             active = proxy_state()
-            assert active['flags'] == 3 and active['server'] == f'http=127.0.0.1:{http_port};https=127.0.0.1:{http_port}', active
+            assert active['flags'] == 3 and active['server'] == f'127.0.0.1:{http_port}', active
             assert not active['pac'] and core.journal.exists()
             body = wininet_get(f'http://system-proxy.astra.invalid:{origin.server_port}/wininet')
             assert body == b'astra-system-proxy:/wininet'+bytes(range(256))*256

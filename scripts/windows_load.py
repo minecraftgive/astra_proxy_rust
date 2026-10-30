@@ -134,7 +134,7 @@ def run(args,report):
             for case,listener,owner in [('baseline-upstream-udp',port,None),('astra-socks-udp',local,core)]:
                 cases.extend((case,'socks-udp','127.0.0.1',listener,n,owner) for n in (64,1200))
         elif args.mode=='system-proxy':
-            active=proxy_state();assert active['server']==f'http=127.0.0.1:{http_port};https=127.0.0.1:{http_port}'
+            active=proxy_state();assert active['server']==f'127.0.0.1:{http_port}'
             cases=[('system-connect','connect','127.0.0.1',http_port,n,core) for n in (64,65536,1048576)]
         else:
             assert powershell(query)=='2'
