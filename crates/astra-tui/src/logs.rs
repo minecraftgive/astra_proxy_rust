@@ -559,19 +559,12 @@ impl Viewer {
                     Some(LogLevel::Route) => Color::Cyan,
                     _ => Color::White,
                 };
-                let highlight = !self.settings.search.is_empty()
-                    && line
-                        .text
-                        .to_lowercase()
-                        .contains(&self.settings.search.to_lowercase());
-                Line::styled(
-                    line.text.clone(),
-                    if highlight {
-                        Style::default().fg(Color::Black).bg(Color::Yellow)
-                    } else {
-                        Style::default().fg(color)
-                    },
-                )
+                // Only the matching text is marked; the rest keeps its level color.
+                Line::from(crate::theme::mark_matches(
+                    &line.text,
+                    &self.settings.search,
+                    Style::default().fg(color),
+                ))
             })
             .collect();
         let title = tr!(
@@ -664,7 +657,7 @@ impl Viewer {
                 frame.render_stateful_widget(
                     List::new(choices.into_iter().map(ListItem::new))
                         .highlight_symbol("› ")
-                        .highlight_style(Style::default().bg(Color::Blue))
+                        .highlight_style(crate::theme::selected())
                         .block(
                             Block::default()
                                 .title(if display {

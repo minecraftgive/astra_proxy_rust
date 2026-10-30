@@ -137,7 +137,7 @@ impl Ui {
             None,
         )
     }
-    fn active_operation(&mut self, operation: Operation) -> Input {
+    pub(super) fn active_operation(&mut self, operation: Operation) -> Input {
         if self.active_proxy().is_none() {
             self.message = t("No profile yet · 6 then n to create one").into();
             return Input::Idle;
@@ -163,6 +163,22 @@ impl Ui {
         if (control && key.code == KeyCode::Char('k')) || key.code == KeyCode::Char(':') {
             self.palette = Some(Palette::default());
             return Some(Input::Idle);
+        }
+        let find = (control && key.code == KeyCode::Char('f'))
+            || (key.code == KeyCode::Char('/') && !control);
+        if find {
+            match self.page {
+                PROXIES | PROFILES => {
+                    self.prompt(Prompt::Find(self.page));
+                    return Some(Input::Idle);
+                }
+                RULES => return Some(self.rule_search()),
+                CONNECTIONS => {
+                    self.connection_filtering = true;
+                    return Some(Input::Idle);
+                }
+                _ => {}
+            }
         }
         if key
             .modifiers
@@ -201,15 +217,14 @@ impl Ui {
             (OVERVIEW | PROXIES, KeyCode::Char('D')) => {
                 self.active_operation(Operation::Diagnostics)
             }
+            (OVERVIEW | PROXIES, KeyCode::Char('N')) => self.active_operation(Operation::NetTools),
             (OVERVIEW, KeyCode::Char('L')) => {
                 match self.active_proxy().map(|r| r.instance.name.clone()) {
                     Some(name) => self.open_logs(name),
                     None => Input::Idle,
                 }
             }
-            (RULES, KeyCode::Char('t' | '/') | KeyCode::Enter) => {
-                self.rule_operation(Operation::Explain)
-            }
+            (RULES, KeyCode::Char('t') | KeyCode::Enter) => self.rule_operation(Operation::Explain),
             (RULES, KeyCode::Char('e')) => self.rule_operation(Operation::Edit),
             (LOGS, KeyCode::Enter | KeyCode::Char('[' | ']')) => {
                 match self.log_source(key.code != KeyCode::Char(']')) {
@@ -219,6 +234,114 @@ impl Ui {
             }
             _ => return None,
         })
+    }
+    /// Opens the profile's rule core in the editor and starts its search.
+    fn rule_search(&mut self) -> Input {
+        if self.active_rule().is_none() {
+            self.message = t("No rule core for this profile · bind one with b in Profiles").into();
+            return Input::Idle;
+        }
+        self.search_on_open = true;
+        let input = self.rule_operation(Operation::Edit);
+        self.apply_pending_search();
+        input
+    }
+    pub(super) fn apply_pending_search(&mut self) {
+        if !self.search_on_open {
+            return;
+        }
+        if self.editor.as_ref().is_some_and(Editor::browsing) {
+            self.search_on_open = false;
+            if let Some(editor) = self.editor.as_mut() {
+                let _ = editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+            }
+        }
+    }
+    /// Jumps to the next group/member (Proxies) or instance (Profiles) containing `query`.
+    pub(super) fn find(&mut self, page: usize, query: &str) -> bool {
+        let query = query.to_lowercase();
+        let hit = |text: &str| text.to_lowercase().contains(&query);
+        if page == PROXIES {
+            let Some(snapshot) = self.live() else {
+                return false;
+            };
+            // Candidates in display order: each group, then its members.
+            let mut found = vec![];
+            for (g, group) in snapshot.groups.iter().enumerate() {
+                if hit(&group.name) {
+                    found.push((g, None, group.name.clone()));
+                }
+                for (m, member) in group.members.iter().enumerate() {
+                    if hit(&member.name) {
+                        found.push((g, Some(m), group.name.clone()));
+                    }
+                }
+            }
+            let order = |g: usize, m: Option<usize>| (g, m.map_or(0, |m| m + 1));
+            let current = order(
+                self.group_selection,
+                self.runtime_picker.as_ref().map(|(_, cursor)| *cursor),
+            );
+            let Some((g, m, name)) = found
+                .iter()
+                .find(|(g, m, _)| order(*g, *m) > current)
+                .or(found.first())
+                .cloned()
+            else {
+                return false;
+            };
+            self.group_selection = g;
+            self.runtime_picker = m.map(|m| (name, m));
+            return true;
+        }
+        let text = |row: &Row| {
+            let mut text = format!("{} {}", row.instance.name, row.instance.config.display());
+            if let Some(d) = self.details.get(&row.instance.name) {
+                text.push(' ');
+                text.push_str(&d.listeners.join(" "));
+                text.push(' ');
+                text.push_str(&d.outbounds.join(" "));
+            }
+            text
+        };
+        let other = if self.kind == Kind::Proxy {
+            Kind::Rule
+        } else {
+            Kind::Proxy
+        };
+        let list = |kind: Kind| -> Vec<&Row> {
+            self.rows
+                .iter()
+                .filter(|r| r.instance.kind == kind)
+                .collect()
+        };
+        let selected = self.selections[self.index()];
+        let same = list(self.kind);
+        // After the selection, then the other list, then wrap around.
+        let candidates = (selected + 1..same.len())
+            .map(|i| (self.kind, i, same[i]))
+            .chain(
+                list(other)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (other, i, r)),
+            )
+            .chain(
+                (0..=selected.min(same.len().saturating_sub(1)))
+                    .filter(|&i| i < same.len())
+                    .map(|i| (self.kind, i, same[i])),
+            );
+        let Some((kind, index)) = candidates
+            .filter(|(_, _, row)| hit(&text(row)))
+            .map(|(kind, index, _)| (kind, index))
+            .next()
+        else {
+            return false;
+        };
+        self.kind = kind;
+        let slot = self.index();
+        self.selections[slot] = index;
+        true
     }
     /// Proxy log first; `]` (or a second press) moves to the profile's rule core.
     pub(super) fn log_source(&self, proxy: bool) -> Option<String> {
@@ -232,6 +355,14 @@ impl Ui {
     }
     /// `[` / `]` and page numbers while a log is open on the Logs page.
     pub(super) fn viewer_page_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        if self.page == LOGS
+            && key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let viewer = self.viewer.as_mut().filter(|v| v.browsing())?;
+            viewer.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+            return Some(Input::Idle);
+        }
         if self.page != LOGS
             || !self.viewer.as_ref().is_some_and(logs::Viewer::browsing)
             || key
@@ -404,6 +535,13 @@ impl Ui {
             "Node tests · exit IP",
             "D",
             Run::Op(Operation::Diagnostics),
+            no_profile,
+        );
+        add(
+            "Proxies",
+            "Network tools · DNS / TCP / ICMP",
+            "N",
+            Run::Op(Operation::NetTools),
             no_profile,
         );
         add(
@@ -612,28 +750,21 @@ impl Ui {
         .split(area);
         self.render_status_bar(f, rows[0]);
         self.render_page_bar(f, rows[1]);
-        // Keys on the left; the latest operation result on the right when it fits.
-        let hint = self.hint();
-        let result = self.operation_text().replace(['\n', '\r'], " ");
-        let room = rows[3].width as usize;
-        let used = Line::from(hint.as_str()).width();
-        let shown = Line::from(result.as_str()).width();
-        let mut spans = vec![Span::styled(hint, Style::default().fg(MUTED))];
-        if !result.is_empty() && used + shown + 4 <= room {
-            spans.push(Span::raw(" ".repeat(room - used - shown - 1)));
-            spans.push(Span::styled(result, Style::default().fg(Color::Cyan)));
-        }
+        // This page's keys, whole entries only; results live in the status line below.
+        let spans = crate::theme::key_hints_fit(&self.hint(), rows[3].width as usize, t("? more"));
         f.render_widget(Paragraph::new(Line::from(spans)), rows[3]);
         rows[2]
     }
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let bold = Style::default().add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(MUTED);
         let sep = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-        let mut spans = vec![Span::styled(" Astra", bold.fg(BLUE)), sep()];
+        let brand = vec![Span::styled(" Astra", bold.fg(BLUE)), sep()];
         let Some(row) = self.active_proxy() else {
+            let mut spans = brand;
             spans.push(Span::styled(
                 t("No profile yet · 6 then n to create one"),
-                Style::default().fg(MUTED),
+                muted,
             ));
             f.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
@@ -645,60 +776,104 @@ impl Ui {
         } else {
             ("○ ", MUTED, t("Not connected"))
         };
-        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>() as u16;
-        let start = width(&spans);
-        spans.extend([
-            Span::styled(dot, Style::default().fg(color)),
-            Span::styled(row.instance.name.clone(), bold),
-            Span::raw(" "),
-            Span::styled(state, Style::default().fg(color)),
-        ]);
-        if row.pid.is_some() {
-            spans.push(Span::styled(
-                format!(" {}", duration(row.uptime)),
-                Style::default().fg(MUTED),
-            ));
-        }
-        // Clicking the profile segment connects or disconnects, like the GUI switch.
-        self.hit(
-            Rect::new(area.x + start, area.y, width(&spans) - start, 1).intersection(area),
-            Target::Connect,
-        );
-        if let Some(snapshot) = self.live() {
-            spans.push(sep());
-            spans.push(Span::styled(
-                t(match snapshot.mode {
-                    Mode::Rule => "Rule",
-                    Mode::Global => "Global",
-                    Mode::Direct => "Direct",
-                }),
-                bold,
-            ));
-            spans.push(sep());
-            for (label, on) in [
-                (t("System proxy"), snapshot.system_proxy),
-                ("TUN", snapshot.tun),
-                ("LAN", snapshot.allow_lan),
-            ] {
-                spans.push(Span::raw(format!("{label} ")));
-                spans.push(Span::styled(
-                    if on { "● " } else { "○ " },
-                    Style::default().fg(if on { Color::Green } else { MUTED }),
+        let live = self.live();
+        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        // Detail levels, richest first; the first that fits the bar is drawn, so a
+        // narrow terminal drops rates, off switches, uptime, the state word, then
+        // the switches and finally the mode.
+        const LAST: usize = 6;
+        for level in 0..=LAST {
+            let mut profile = vec![
+                Span::styled(dot, Style::default().fg(color)),
+                Span::styled(row.instance.name.clone(), bold),
+            ];
+            if level < 4 {
+                profile.push(Span::styled(
+                    format!(" {state}"),
+                    Style::default().fg(color),
                 ));
             }
-            if area.width >= 100 {
-                spans.push(sep());
-                spans.push(Span::styled(
-                    format!("↑ {}/s ", live::bytes(self.rates[0])),
-                    Style::default().fg(Color::Magenta),
-                ));
-                spans.push(Span::styled(
-                    format!("↓ {}/s", live::bytes(self.rates[1])),
-                    Style::default().fg(BLUE),
-                ));
+            if level < 3 && row.pid.is_some() {
+                profile.push(Span::styled(format!(" {}", duration(row.uptime)), muted));
+            }
+            let mut left = brand.clone();
+            let start = width(&left);
+            left.extend(profile);
+            let end = width(&left);
+            let mut right = vec![];
+            if let Some(snapshot) = live {
+                let (mode, mode_color) = match snapshot.mode {
+                    Mode::Rule => ("Rule", Color::Cyan),
+                    Mode::Global => ("Global", BLUE),
+                    Mode::Direct => ("Direct", Color::Green),
+                };
+                if level < 6 {
+                    left.push(sep());
+                    left.push(Span::styled(t(mode), bold.fg(mode_color)));
+                }
+                let switches = [
+                    (t("System proxy"), snapshot.system_proxy),
+                    ("TUN", snapshot.tun),
+                    ("LAN", snapshot.allow_lan),
+                ];
+                // Full: every switch with its state. Compact: only those that are on.
+                let shown: Vec<_> = switches
+                    .iter()
+                    .filter(|(_, on)| level < 2 || (*on && level < 5))
+                    .collect();
+                if !shown.is_empty() {
+                    left.push(sep());
+                    for (index, (label, on)) in shown.into_iter().enumerate() {
+                        if index > 0 {
+                            left.push(Span::raw("  "));
+                        }
+                        let style = if *on {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            muted
+                        };
+                        left.push(Span::styled(
+                            format!("{} {label}", if *on { "●" } else { "○" }),
+                            style,
+                        ));
+                    }
+                }
+                if level == 0 {
+                    // Rates sit at the right edge; idle traffic is muted rather than loud.
+                    let rate = |arrow: &str, bytes: u64, active: Color| {
+                        Span::styled(
+                            format!("{arrow} {}/s", live::bytes(bytes)),
+                            if bytes == 0 {
+                                muted
+                            } else {
+                                Style::default().fg(active)
+                            },
+                        )
+                    };
+                    right = vec![
+                        rate("↑", self.rates[0], Color::Magenta),
+                        Span::raw("  "),
+                        rate("↓", self.rates[1], Color::Cyan),
+                        Span::raw(" "),
+                    ];
+                }
+            }
+            let used = width(&left) + width(&right);
+            if used <= area.width as usize || level == LAST {
+                if !right.is_empty() {
+                    left.push(Span::raw(" ".repeat(area.width as usize - used)));
+                    left.extend(right);
+                }
+                // Clicking the profile segment connects or disconnects, like the GUI switch.
+                self.hit(
+                    Rect::new(area.x + start as u16, area.y, (end - start) as u16, 1)
+                        .intersection(area),
+                    Target::Connect,
+                );
+                f.render_widget(Paragraph::new(Line::from(left)), area);
+                return;
             }
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
     fn render_page_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let mut x = area.x + 1;
@@ -748,15 +923,15 @@ impl Ui {
         } else if self.viewer.is_some() {
             "[ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
         } else if self.runtime_picker.is_some() {
-            "↑↓ member · Enter select · t test · Esc groups"
+            "↑↓ member · Enter select · / find · t test · Esc groups"
         } else {
             match self.page {
-                OVERVIEW => "c connect/disconnect · m mode · S system proxy · T TUN · A LAN · r apply · e edit · L logs",
-                PROXIES => "↑↓ group · Enter members · t test · D node tests · U update subscriptions · m mode",
+                OVERVIEW => "c connect/disconnect · m mode · S system proxy · T TUN · A LAN · r apply · e edit · L logs · N network tools",
+                PROXIES => "↑↓ group · Enter members · / find · t test · D node tests · U update subscriptions",
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
-                RULES => "t test a route · e edit rules · [ ] in Logs for rule core log",
+                RULES => "t test a route · / search rules · e edit rules",
                 LOGS => "Enter open · [ proxy log · ] rule core log · F7 TUI log",
-                _ => "↑↓ select · Space/c connect · Enter actions · e edit · n new · Tab proxy/rule cores",
+                _ => "↑↓ select · / find · Space/c connect · Enter actions · e edit · n new · Tab proxy/rule cores",
             }
         };
         format!(" {}", t(text))
@@ -829,7 +1004,7 @@ impl Ui {
         );
         f.render_stateful_widget(
             List::new(items)
-                .highlight_style(Style::default().bg(BLUE).fg(Color::White))
+                .highlight_style(crate::theme::selected())
                 .highlight_symbol("› "),
             rows[2],
             &mut state,
@@ -849,20 +1024,29 @@ impl Ui {
             );
         }
     }
-    pub(super) fn profiles_title(&self) -> String {
+    /// Tab-like title: the shown list is highlighted, the other one muted.
+    pub(super) fn profiles_title(&self) -> Line<'static> {
         let proxies = self.proxies_count();
         let rules = self.rows.len() - proxies;
-        match self.kind {
-            Kind::Proxy => tr!(
-                "[ Profiles {} ]   Rule cores {}   · Tab switch",
-                proxies,
-                rules
+        let tab = |label: String, on: bool| {
+            Span::styled(
+                format!(" {label} "),
+                if on {
+                    crate::theme::selected()
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            )
+        };
+        Line::from(vec![
+            Span::raw(" "),
+            tab(tr!("Profiles {}", proxies), self.kind == Kind::Proxy),
+            Span::raw(" "),
+            tab(tr!("Rule cores {}", rules), self.kind == Kind::Rule),
+            Span::styled(
+                format!("  {} ", t("Tab switch")),
+                Style::default().fg(MUTED),
             ),
-            Kind::Rule => tr!(
-                "Profiles {}   [ Rule cores {} ]   · Tab switch",
-                proxies,
-                rules
-            ),
-        }
+        ])
     }
 }

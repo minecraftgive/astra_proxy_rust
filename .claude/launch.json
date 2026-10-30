@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gui-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "prototype/gui", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}

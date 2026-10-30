@@ -8,8 +8,7 @@ use ratatui::{
     widgets::{BorderType, Sparkline},
 };
 
-pub(super) const BLUE: Color = Color::Rgb(79, 91, 213);
-pub(super) const MUTED: Color = Color::Rgb(140, 147, 161);
+pub(super) use crate::theme::{BLUE, MUTED};
 
 #[derive(Clone)]
 pub(super) enum Target {
@@ -28,6 +27,7 @@ pub(super) enum Target {
     Palette(usize),
     /// Make the n-th proxy instance the active profile.
     Activate(usize),
+    NetTools,
 }
 
 /// Panels use the terminal's own background so light and dark themes both read well.
@@ -308,30 +308,50 @@ impl Ui {
             );
             return;
         }
-        // Fixed columns: outbound (15) and both byte counters (25) plus padding.
-        let host_width = (inner.width as usize).saturating_sub(43).clamp(12, 48);
-        let lines: Vec<_> = connections
-            .iter()
+        let shown: Vec<_> = connections
+            .into_iter()
             .take(inner.height as usize)
+            .collect();
+        // Columns: target, outbound sized to the longest shown name, then 25 for both counters.
+        let fit = |text: String, width: usize| {
+            if Line::from(text.as_str()).width() > width {
+                text.chars()
+                    .take(width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…"
+            } else {
+                text
+            }
+        };
+        let outbound_width = shown
+            .iter()
+            .map(|c| Line::from(c.outbound.as_str()).width())
+            .max()
+            .unwrap_or(0)
+            .clamp(6, 24);
+        let host_width = (inner.width as usize)
+            .saturating_sub(outbound_width + 29)
+            .clamp(12, 48);
+        let lines: Vec<_> = shown
+            .iter()
             .map(|c| {
-                let mut target = format!("{}:{}", c.host, c.port);
-                if Line::from(target.as_str()).width() > host_width {
-                    target = target
-                        .chars()
-                        .take(host_width.saturating_sub(1))
-                        .collect::<String>()
-                        + "…";
-                }
+                let target = fit(format!("{}:{}", c.host, c.port), host_width);
+                let outbound = fit(c.outbound.clone(), outbound_width);
                 Line::from(vec![
                     Span::raw(format!(" {target:<host_width$} ")),
-                    Span::styled(format!("{:<14} ", c.outbound), Style::default().fg(BLUE)),
                     Span::styled(
-                        format!(
-                            "↓ {:>9}  ↑ {:>9}",
-                            live::bytes(c.download),
-                            live::bytes(c.upload)
-                        ),
-                        Style::default().fg(MUTED),
+                        format!("{outbound:<outbound_width$} "),
+                        Style::default().fg(crate::theme::exit_color(&c.outbound)),
+                    ),
+                    Span::styled("↓ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{:>9}", live::bytes(c.download)),
+                        crate::theme::volume_style(c.download),
+                    ),
+                    Span::styled("  ↑ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{:>9}", live::bytes(c.upload)),
+                        crate::theme::volume_style(c.upload),
                     ),
                 ])
             })
@@ -480,12 +500,23 @@ impl Ui {
                 "c Connect"
             };
             let width = Line::from(t(label)).width() as u16 + 2;
+            let x = area.right() - width - 2;
             self.button(
                 f,
-                Rect::new(area.right() - width - 2, area.y + 1, width, 1),
+                Rect::new(x, area.y + 1, width, 1),
                 label,
                 Target::Connect,
             );
+            let tools = "N Network tools";
+            let tools_width = Line::from(t(tools)).width() as u16 + 2;
+            if area.width >= 90 && x > area.x + tools_width + 40 {
+                self.button(
+                    f,
+                    Rect::new(x - tools_width - 1, area.y + 1, tools_width, 1),
+                    tools,
+                    Target::NetTools,
+                );
+            }
         }
     }
 
@@ -647,6 +678,9 @@ impl Ui {
             }
             Some(Target::Palette(index)) => self.palette_run(index),
             Some(Target::Connect) if self.can_switch_page() => self.toggle_active(),
+            Some(Target::NetTools) if self.can_switch_page() => {
+                self.active_operation(super::Operation::NetTools)
+            }
             Some(Target::Runtime(command)) => self.runtime_action(command),
             Some(Target::Group(index)) => {
                 if self.page != PROXIES {
@@ -858,5 +892,53 @@ mod tests {
                 .unwrap();
             }
         });
+    }
+    #[tokio::test]
+    async fn overview_opens_network_tools_and_esc_returns_to_overview() {
+        let mut ui = sample();
+        let press = |ui: &mut Ui, code| ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let Input::Run(action, _) = press(&mut ui, KeyCode::Char('N')) else {
+            panic!("N should open network tools")
+        };
+        assert!(matches!(&action, Action::Diagnostics(name) if name == "proxy-00"));
+        ui.execute(std::path::Path::new("unused-overview.sock"), action, None)
+            .await;
+        let view = ui.diagnostics.as_ref().expect("network tools open");
+        assert!(view.handles_escape(), "opens straight into the tools page");
+        assert!(!ui.open_nettools, "the request flag is consumed");
+        let text = crate::i18n::with_language(crate::i18n::Language::English, || {
+            screen(&render(&ui, 120, 30))
+        });
+        assert!(
+            text.contains("Network tools") && text.contains("Egress"),
+            "{text}"
+        );
+        press(&mut ui, KeyCode::Esc);
+        // The Overview card offers the same entry as a button.
+        render(&ui, 140, 40);
+        let button = ui
+            .hits
+            .borrow()
+            .iter()
+            .find(|(_, hit)| matches!(hit, Target::NetTools))
+            .map(|(rect, _)| *rect)
+            .expect("network tools button on Overview");
+        let click = ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(click, Input::Run(Action::Diagnostics(_), _)) && ui.open_nettools);
+        ui.open_nettools = false;
+        assert!(ui.diagnostics.is_none());
+        assert_eq!(ui.page, OVERVIEW);
+        // D still opens the node list, where n reaches the same tools.
+        let Input::Run(action, _) = press(&mut ui, KeyCode::Char('D')) else {
+            panic!()
+        };
+        ui.execute(std::path::Path::new("unused-overview.sock"), action, None)
+            .await;
+        assert!(!ui.diagnostics.as_ref().unwrap().handles_escape());
     }
 }

@@ -10,6 +10,7 @@ use astra_ipc::Target;
 pub(crate) use server::tcp;
 pub(crate) use server::{Guard, Prepared};
 use std::{future::Future, net::IpAddr, pin::Pin};
+pub(crate) use upstream::{framed, tls_connector};
 
 pub(super) struct Transport<'a>(pub &'a App);
 impl astra_dns::Transport for Transport<'_> {

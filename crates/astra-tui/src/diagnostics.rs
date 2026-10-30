@@ -38,6 +38,10 @@ pub struct View {
     tcp: BTreeMap<String, u64>,
     started: Option<Instant>,
     finished: Option<Instant>,
+    tools: Option<crate::nettools::View>,
+    /// Opened directly as network tools (Overview / palette): leaving tools leaves the page.
+    tools_only: bool,
+    closed: bool,
 }
 impl Drop for View {
     fn drop(&mut self) {
@@ -64,6 +68,9 @@ impl View {
             tcp: BTreeMap::new(),
             started: None,
             finished: None,
+            tools: None,
+            tools_only: false,
+            closed: false,
         };
         view.request(true);
         view
@@ -139,13 +146,39 @@ impl View {
         }));
         self.receiver = Some(receiver);
     }
+    /// Show network tools right away; outbound choices appear once the catalog loads.
+    pub fn open_tools(&mut self) {
+        self.tools_only = true;
+        self.open_tools_page();
+    }
+    fn open_tools_page(&mut self) {
+        self.tools = Some(crate::nettools::View::new(
+            &self.socket,
+            self.name.clone(),
+            &self.targets,
+        ));
+    }
+    /// True once the page asked to be closed (Esc from directly opened tools).
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+    /// Esc belongs to the network tools sub-page while it is open.
+    pub fn handles_escape(&self) -> bool {
+        self.tools.is_some()
+    }
     pub fn poll(&mut self) {
+        if let Some(tools) = &mut self.tools {
+            tools.poll();
+        }
         let Some(mut receiver) = self.receiver.take() else {
             return;
         };
         loop {
             match receiver.try_recv() {
                 Ok(Ok(Update::Targets(targets))) => {
+                    if let Some(tools) = &mut self.tools {
+                        tools.set_outbounds(&targets);
+                    }
                     self.checked = targets.iter().cloned().collect();
                     self.targets = targets;
                     self.cursor = 0;
@@ -220,7 +253,15 @@ impl View {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
+        if let Some(tools) = &mut self.tools {
+            if !tools.key(key) {
+                self.tools = None;
+                self.closed = self.tools_only;
+            }
+            return;
+        }
         match key.code {
+            KeyCode::Char('n') => self.open_tools_page(),
             KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor = (self.cursor + 1).min(self.targets.len().saturating_sub(1))
@@ -269,6 +310,11 @@ impl View {
         }
     }
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        if let Some(tools) = &self.tools {
+            frame.render_widget(ratatui::widgets::Clear, area);
+            tools.render(frame, area);
+            return;
+        }
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -343,7 +389,7 @@ impl View {
                 ])
                 .height(1)
                 .style(if index == self.cursor {
-                    Style::default().fg(Color::Cyan)
+                    crate::theme::selected()
                 } else {
                     Style::default()
                 })
@@ -422,7 +468,7 @@ impl View {
         );
         frame.render_widget(
             Paragraph::new(t(
-                "↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · x stop · Esc back",
+                "↑↓ select · Space toggle · a all/none · c clear\nEnter/t test selected · x stop · n network tools · Esc back",
             )),
             parts[3],
         );

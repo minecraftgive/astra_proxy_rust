@@ -2,7 +2,13 @@
 use std::io;
 
 pub fn names(exclude: Option<&str>) -> io::Result<Vec<String>> {
-    let mut names = platform_names(exclude)?;
+    finish(platform_names(exclude, false)?, exclude)
+}
+/// Operational adapters only, without NDIS filter pseudo-interfaces: egress choices for probes.
+pub fn connected() -> io::Result<Vec<String>> {
+    finish(platform_names(None, true)?, None)
+}
+fn finish(mut names: Vec<String>, exclude: Option<&str>) -> io::Result<Vec<String>> {
     names.retain(|name| !name.is_empty() && exclude != Some(name.as_str()));
     names.sort();
     names.dedup();
@@ -10,7 +16,7 @@ pub fn names(exclude: Option<&str>) -> io::Result<Vec<String>> {
 }
 
 #[cfg(windows)]
-fn platform_names(exclude: Option<&str>) -> io::Result<Vec<String>> {
+fn platform_names(exclude: Option<&str>, connected: bool) -> io::Result<Vec<String>> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
     };
@@ -34,6 +40,8 @@ fn platform_names(exclude: Option<&str>) -> io::Result<Vec<String>> {
         .iter()
         .filter(|row| {
             row.Type != 24 // Software loopback is not an egress adapter.
+            // OperStatus 1 is IfOperStatusUp; flag bit 1 marks filter-driver pseudo-interfaces.
+            && (!connected || (row.OperStatus == 1 && row.InterfaceAndOperStatusFlags._bitfield & 0x2 == 0))
             && !exclude.is_some_and(|name| name == row.InterfaceIndex.to_string())
         })
         .map(|row| {
@@ -48,7 +56,7 @@ fn platform_names(exclude: Option<&str>) -> io::Result<Vec<String>> {
 }
 
 #[cfg(unix)]
-fn platform_names(_exclude: Option<&str>) -> io::Result<Vec<String>> {
+fn platform_names(_exclude: Option<&str>, _connected: bool) -> io::Result<Vec<String>> {
     let pointer = unsafe { libc::if_nameindex() };
     if pointer.is_null() {
         return Err(io::Error::last_os_error());
@@ -86,5 +94,8 @@ mod tests {
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!super::names(Some(&names[0])).unwrap().contains(&names[0]));
         println!("Local adapters: {names:?}");
+        let connected = super::connected().unwrap();
+        assert!(connected.iter().all(|name| names.contains(name)));
+        println!("Connected adapters: {connected:?}");
     }
 }
