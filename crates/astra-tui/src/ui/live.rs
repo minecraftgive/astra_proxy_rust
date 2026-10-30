@@ -1,7 +1,13 @@
+//! Proxies and Connections pages, driven by the active profile's runtime snapshot.
 use super::dashboard::{card, Target, BLUE, MUTED};
+use super::shell::{CONNECTIONS, PROXIES};
 use super::*;
 use astra_ipc::runtime::{Command, Mode, Snapshot};
-use ratatui::{layout::Rect, widgets::Sparkline};
+use ratatui::{
+    layout::Rect,
+    style::Modifier,
+    widgets::{Cell, Row as TableRow, Table, TableState},
+};
 
 pub(super) fn bytes(value: u64) -> String {
     for (unit, scale) in [("GiB", 1u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
@@ -10,6 +16,53 @@ pub(super) fn bytes(value: u64) -> String {
         }
     }
     format!("{value} B")
+}
+
+/// Latency colored like the GUI: green < 150 ms, yellow < 400 ms, red otherwise.
+pub(super) fn delay_span(delay: Option<u64>, alive: Option<bool>) -> Span<'static> {
+    match (alive, delay) {
+        (Some(false), _) => Span::styled(t("Timeout").to_owned(), Style::default().fg(Color::Red)),
+        (_, Some(ms)) => Span::styled(
+            format!("{ms} ms"),
+            Style::default().fg(if ms < 150 {
+                Color::Green
+            } else if ms < 400 {
+                Color::Yellow
+            } else {
+                Color::Red
+            }),
+        ),
+        _ => Span::styled("—", Style::default().fg(Color::DarkGray)),
+    }
+}
+
+/// Follows group selections from the mode's entry group to the final outbound.
+pub(super) fn exit_chain(snapshot: &Snapshot) -> (Vec<String>, Option<u64>, Option<bool>) {
+    let mut chain = vec![match snapshot.mode {
+        Mode::Direct => "DIRECT".to_owned(),
+        _ => "PROXY".to_owned(),
+    }];
+    let (mut delay, mut alive) = (None, None);
+    for _ in 0..8 {
+        let Some(group) = snapshot
+            .groups
+            .iter()
+            .find(|g| Some(&g.name) == chain.last())
+        else {
+            break;
+        };
+        let Some(next) = group.selected.clone() else {
+            break;
+        };
+        if let Some(member) = group.members.iter().find(|m| m.name == next) {
+            (delay, alive) = (member.delay_ms, member.alive);
+        }
+        if chain.contains(&next) {
+            break;
+        }
+        chain.push(next);
+    }
+    (chain, delay, alive)
 }
 
 impl Ui {
@@ -24,8 +77,9 @@ impl Ui {
             && self.explanation.is_none()
             && self.help_scroll.is_none()
     }
+    /// Runtime data of the active profile; stale data from an older process is hidden.
     pub(super) fn live(&self) -> Option<&Snapshot> {
-        let row = self.selected()?;
+        let row = self.active_proxy()?;
         self.runtime_snapshot
             .as_ref()
             .filter(|s| self.runtime_instance == row.instance.name && Some(s.pid) == row.pid)
@@ -67,8 +121,8 @@ impl Ui {
         self.runtime_error.clear();
     }
     pub(super) fn runtime_action(&self, command: Command) -> Input {
-        match self.selected() {
-            Some(row) if row.pid.is_some() && row.instance.kind == Kind::Proxy => Input::Run(
+        match self.active_proxy() {
+            Some(row) if row.pid.is_some() => Input::Run(
                 Action::Runtime {
                     name: row.instance.name.clone(),
                     command,
@@ -90,25 +144,39 @@ impl Ui {
         }
     }
     pub(super) fn choose_runtime_member(&mut self, index: usize) -> Input {
+        if self.runtime_picker.is_none() {
+            self.open_runtime_group();
+        }
         let Some((name, _)) = &self.runtime_picker else {
             return Input::Idle;
         };
         let group = self
             .live()
             .and_then(|s| s.groups.iter().find(|g| &g.name == name));
-        if let Some(group) = group.filter(|g| g.mode == "select") {
-            if let Some(member) = group.members.get(index) {
-                let command = Command::Select {
-                    group: group.name.clone(),
-                    member: member.name.clone(),
-                };
-                self.runtime_picker = None;
-                return self.runtime_action(command);
+        let Some(group) = group else {
+            return Input::Idle;
+        };
+        let (select, count) = (group.mode == "select", group.members.len());
+        let command = group.members.get(index).map(|member| Command::Select {
+            group: group.name.clone(),
+            member: member.name.clone(),
+        });
+        if !select {
+            self.message = t("Automatic groups choose members by latency").into();
+            if let Some((_, cursor)) = self.runtime_picker.as_mut() {
+                *cursor = index.min(count.saturating_sub(1));
             }
+            return Input::Idle;
+        }
+        if let Some(command) = command {
+            if let Some((_, cursor)) = self.runtime_picker.as_mut() {
+                *cursor = index;
+            }
+            return self.runtime_action(command);
         }
         Input::Idle
     }
-    fn visible_connections(&self) -> Vec<&astra_ipc::runtime::Connection> {
+    pub(super) fn visible_connections(&self) -> Vec<&astra_ipc::runtime::Connection> {
         let filter = self.connection_filter.to_lowercase();
         self.live()
             .map(|s| {
@@ -148,7 +216,7 @@ impl Ui {
                 .map_or(0, |g| g.members.len());
             let mut next = index;
             match key.code {
-                KeyCode::Esc => self.runtime_picker = None,
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.runtime_picker = None,
                 KeyCode::Down | KeyCode::Char('j') => {
                     next = (index + 1).min(count.saturating_sub(1))
                 }
@@ -157,7 +225,9 @@ impl Ui {
                 KeyCode::PageUp => next = index.saturating_sub(10),
                 KeyCode::Home => next = 0,
                 KeyCode::End => next = count.saturating_sub(1),
-                KeyCode::Enter => return Some(self.choose_runtime_member(index)),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    return Some(self.choose_runtime_member(index))
+                }
                 KeyCode::Char('t') => return Some(self.runtime_action(Command::TestGroup(name))),
                 _ => return Some(Input::Idle),
             }
@@ -185,7 +255,9 @@ impl Ui {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            if matches!(self.page, 1 | 3) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(self.page, PROXIES | CONNECTIONS)
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
                 match key.code {
                     KeyCode::Char('d') => {
                         return self
@@ -200,8 +272,8 @@ impl Ui {
             }
             return None;
         }
-        // Connection navigation must not operate the hidden instance list.
-        if self.live().is_none() && self.page == 3 {
+        // List keys on runtime pages never fall through to other handlers.
+        if self.live().is_none() && matches!(self.page, PROXIES | CONNECTIONS) {
             return match key.code {
                 KeyCode::Up
                 | KeyCode::Down
@@ -210,7 +282,7 @@ impl Ui {
                 | KeyCode::PageUp
                 | KeyCode::PageDown
                 | KeyCode::Enter
-                | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'd' | 'D') => Some(Input::Idle),
+                | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'x' | 'X' | 't' | '/') => Some(Input::Idle),
                 _ => None,
             };
         }
@@ -233,7 +305,7 @@ impl Ui {
             KeyCode::Char('T') => return Some(self.runtime_action(Command::Tun(!snapshot.tun))),
             _ => {}
         }
-        if self.page == 1 {
+        if self.page == PROXIES {
             let count = snapshot.groups.len();
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -248,7 +320,7 @@ impl Ui {
                     self.group_selection = (self.group_selection + 10).min(count.saturating_sub(1))
                 }
                 KeyCode::PageUp => self.group_selection = self.group_selection.saturating_sub(10),
-                KeyCode::Enter => self.open_runtime_group(),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_runtime_group(),
                 KeyCode::Char('t') => {
                     return Some(self.runtime_action(Command::TestGroup(
                         snapshot.groups.get(self.group_selection)?.name.clone(),
@@ -258,7 +330,7 @@ impl Ui {
             }
             return Some(Input::Idle);
         }
-        if self.page == 3 {
+        if self.page == CONNECTIONS {
             let connections = self.visible_connections();
             match key.code {
                 KeyCode::Char('/') => self.connection_filtering = true,
@@ -282,12 +354,18 @@ impl Ui {
                     self.connection_selection = self.connection_selection.saturating_sub(10)
                 }
                 KeyCode::Enter => return Some(Input::Idle),
-                KeyCode::Char('d') => {
+                KeyCode::Char('x') => {
                     return Some(self.runtime_action(Command::Disconnect(Some(
                         connections.get(self.connection_selection)?.id,
                     ))))
                 }
-                KeyCode::Char('D') => return Some(self.runtime_action(Command::Disconnect(None))),
+                KeyCode::Char('X') => {
+                    if !connections.is_empty() {
+                        let row = self.active_proxy()?;
+                        let (name, pid) = (row.instance.name.clone(), row.pid);
+                        self.prompt(Prompt::CloseAll { name, pid });
+                    }
+                }
                 _ => return None,
             }
             return Some(Input::Idle);
@@ -295,39 +373,14 @@ impl Ui {
         None
     }
 
-    pub(super) fn render_transfer(&self, f: &mut Frame<'_>, area: Rect, index: usize) {
-        let total = self
-            .live()
-            .map_or(0, |s| if index == 0 { s.upload } else { s.download });
-        f.render_widget(
-            Paragraph::new(format!(
-                " {}/s\n {} {}",
-                bytes(self.rates[index]),
-                t("Total"),
-                bytes(total)
-            ))
-            .block(card(if index == 0 { "Upload" } else { "Download" })),
-            area,
-        );
-        if area.height >= 5 {
-            let data: Vec<_> = self.history[index].iter().copied().collect();
-            f.render_widget(
-                Sparkline::default()
-                    .data(&data)
-                    .style(Style::default().fg(BLUE)),
-                Rect::new(
-                    area.x + 1,
-                    area.bottom() - 2,
-                    area.width.saturating_sub(2),
-                    1,
-                ),
-            );
-        }
-    }
+    /// Mode segments and takeover switches, shared by Overview and the status bar.
     pub(super) fn render_runtime_modes(&self, f: &mut Frame<'_>, area: Rect) {
         let Some(snapshot) = self.live() else {
             return;
         };
+        if area.height < 3 {
+            return;
+        }
         let cells = Layout::horizontal([Constraint::Ratio(1, 6); 6]).split(area);
         for (index, mode) in [Mode::Rule, Mode::Global, Mode::Direct].iter().enumerate() {
             let label = t(match mode {
@@ -337,68 +390,122 @@ impl Ui {
             });
             let rect = cells[index].inner(ratatui::layout::Margin::new(1, 1));
             f.render_widget(
-                Paragraph::new(format!(" {} ", label)).style(Style::default().fg(Color::White).bg(
-                    if snapshot.mode == *mode {
-                        BLUE
-                    } else {
-                        Color::DarkGray
-                    },
-                )),
+                Paragraph::new(format!(" m {label} ")).style(if snapshot.mode == *mode {
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(BLUE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                }),
                 rect,
             );
             self.hit(rect, Target::Runtime(Command::SetMode(*mode)));
         }
-        for (index, label, enabled, command) in [
+        for (index, key, label, enabled, command) in [
             (
                 3,
+                'S',
                 t("System proxy"),
                 snapshot.system_proxy,
                 Command::SystemProxy(!snapshot.system_proxy),
             ),
-            (4, "TUN", snapshot.tun, Command::Tun(!snapshot.tun)),
+            (
+                4,
+                'T',
+                t("TUN · admin"),
+                snapshot.tun,
+                Command::Tun(!snapshot.tun),
+            ),
             (
                 5,
-                "LAN",
+                'A',
+                t("Allow LAN"),
                 snapshot.allow_lan,
                 Command::AllowLan(!snapshot.allow_lan),
             ),
         ] {
             let rect = cells[index].inner(ratatui::layout::Margin::new(1, 1));
             f.render_widget(
-                Paragraph::new(format!(" {} {} ", label, if enabled { "●" } else { "○" })).style(
-                    Style::default().fg(Color::White).bg(if enabled {
-                        BLUE
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!(" {key} {label} ")),
+                    Span::styled(
+                        if enabled { "●" } else { "○" },
+                        Style::default().fg(if enabled { Color::Green } else { MUTED }),
+                    ),
+                ]))
+                .style(if enabled {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                }),
                 rect,
             );
             self.hit(rect, Target::Runtime(command));
         }
     }
+
+    fn render_not_live(&self, f: &mut Frame<'_>, area: Rect, title: &str) {
+        let text = match self.active_proxy() {
+            None => t("No profile yet · 6 then n to create one").to_owned(),
+            Some(row) if row.pid.is_none() => {
+                tr!("{} is not connected · c connect", row.instance.name)
+            }
+            Some(_) => format!("{}\n{}", t("Waiting for runtime data…"), self.runtime_error),
+        };
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(MUTED))
+                .block(card(title)),
+            area,
+        );
+    }
+
+    /// Groups on the left, members of the focused group on the right.
     pub(super) fn render_live_groups(&self, f: &mut Frame<'_>, area: Rect) {
         let Some(snapshot) = self.live() else {
+            self.render_not_live(f, area, "Proxy groups");
             return;
         };
+        let wide = area.width >= 80;
+        let columns = if wide {
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area)
+        } else if self.runtime_picker.is_some() {
+            Layout::horizontal([Constraint::Length(0), Constraint::Min(0)]).split(area)
+        } else {
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(0)]).split(area)
+        };
+        let focus_members = self.runtime_picker.is_some();
         let items: Vec<_> = snapshot
             .groups
             .iter()
             .map(|group| {
                 ListItem::new(vec![
-                    Line::from(format!(
-                        " {}   [{}] {}",
-                        group.name,
-                        group.mode,
-                        if group.testing { t("Testing…") } else { "" }
-                    )),
-                    Line::styled(
-                        format!(
-                            "   → {}  ·  {} {}",
-                            group.selected.as_deref().unwrap_or("—"),
-                            group.members.len(),
-                            t("members")
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {}", group.name),
+                            Style::default().add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(
+                            format!(
+                                "  {}{}",
+                                t(if group.mode == "select" {
+                                    "manual"
+                                } else {
+                                    "auto"
+                                }),
+                                if group.testing {
+                                    format!(" · {}", t("Testing…"))
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            Style::default().fg(MUTED),
+                        ),
+                    ]),
+                    Line::styled(
+                        format!("   → {}", group.selected.as_deref().unwrap_or("—")),
                         Style::default().fg(MUTED),
                     ),
                 ])
@@ -407,228 +514,263 @@ impl Ui {
         let mut state = ListState::default().with_selected(
             (!items.is_empty()).then_some(self.group_selection.min(items.len().saturating_sub(1))),
         );
+        let groups_area = columns[0];
+        if groups_area.width > 0 {
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(card("Proxy groups").border_style(
+                        Style::default().fg(if focus_members { Color::DarkGray } else { BLUE }),
+                    ))
+                    .highlight_style(if focus_members {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(BLUE).fg(Color::White)
+                    })
+                    .highlight_symbol("› "),
+                groups_area,
+                &mut state,
+            );
+            for visible in 0..groups_area.height.saturating_sub(2) as usize / 2 {
+                let index = state.offset() + visible;
+                if index >= snapshot.groups.len() {
+                    break;
+                }
+                self.hit(
+                    Rect::new(
+                        groups_area.x + 1,
+                        groups_area.y + 1 + visible as u16 * 2,
+                        groups_area.width.saturating_sub(2),
+                        2,
+                    ),
+                    Target::Group(index),
+                );
+            }
+        }
+        let members_area = columns[1];
+        let Some(group) = snapshot.groups.get(self.group_selection) else {
+            return;
+        };
+        if members_area.width == 0 {
+            return;
+        }
+        let cursor = self
+            .runtime_picker
+            .as_ref()
+            .filter(|(name, _)| name == &group.name)
+            .map(|(_, index)| *index);
+        let items: Vec<_> = group
+            .members
+            .iter()
+            .map(|member| {
+                let chosen = group.selected.as_ref() == Some(&member.name);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if chosen { " ● " } else { " ○ " },
+                        Style::default().fg(if chosen { BLUE } else { Color::DarkGray }),
+                    ),
+                    Span::styled(
+                        format!("{:<28}", member.name),
+                        if chosen {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    delay_span(member.delay_ms, member.alive),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default()
+            .with_selected(cursor.map(|c| c.min(items.len().saturating_sub(1))));
+        let title = format!(
+            "{} · {}",
+            group.name,
+            t(if group.mode == "select" {
+                "Enter selects"
+            } else {
+                "chosen by latency"
+            })
+        );
         f.render_stateful_widget(
             List::new(items)
-                .block(card("Proxy groups").title_bottom(if self.page == 0 {
-                    format!("2 {}", t("Proxy groups"))
-                } else {
-                    t("Enter members · t test · m mode · S system proxy · T TUN").into()
-                }))
+                .block(
+                    card(&title).border_style(Style::default().fg(if focus_members {
+                        BLUE
+                    } else {
+                        Color::DarkGray
+                    })),
+                )
                 .highlight_style(Style::default().bg(BLUE).fg(Color::White))
-                .highlight_symbol("› "),
-            area,
+                .highlight_symbol("›"),
+            members_area,
             &mut state,
         );
-        for visible in 0..area.height.saturating_sub(2) as usize / 2 {
-            let index = state.offset() + visible;
-            if index >= snapshot.groups.len() {
+        if members_area.width >= 24 {
+            self.button(
+                f,
+                Rect::new(members_area.right() - 10, members_area.y, 8, 1),
+                "t Test",
+                Target::Runtime(Command::TestGroup(group.name.clone())),
+            );
+        }
+        for visible in 0..members_area.height.saturating_sub(2) as usize {
+            if visible + state.offset() >= group.members.len() {
                 break;
             }
             self.hit(
                 Rect::new(
-                    area.x + 1,
-                    area.y + 1 + visible as u16 * 2,
-                    area.width.saturating_sub(2),
-                    2,
+                    members_area.x + 1,
+                    members_area.y + 1 + visible as u16,
+                    members_area.width.saturating_sub(2),
+                    1,
                 ),
-                Target::Group(index),
+                Target::Member(visible + state.offset()),
             );
         }
     }
+
+    /// Connection table with a detail pane for the selected row.
     pub(super) fn render_connections(&self, f: &mut Frame<'_>, area: Rect) {
         let Some(snapshot) = self.live() else {
-            f.render_widget(
-                Paragraph::new(format!(
-                    "{}\n{}",
-                    t("Select a running proxy in Profiles"),
-                    self.runtime_error
-                ))
-                .wrap(Wrap { trim: false })
-                .block(card("Connections")),
-                area,
-            );
+            self.render_not_live(f, area, "Connections");
             return;
         };
         let connections = self.visible_connections();
-        let items: Vec<_> = connections
+        let selected = connections.get(self.connection_selection).copied();
+        let (table_area, detail_area) = if area.width >= 120 {
+            let split =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(38)]).split(area);
+            (split[0], Some(split[1]))
+        } else if area.height >= 20 {
+            let split = Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).split(area);
+            (split[0], Some(split[1]))
+        } else {
+            (area, None)
+        };
+        let header = TableRow::new(
+            [t("Target"), t("Network"), t("Exit"), "↑", "↓", t("Time")]
+                .map(|h| Cell::from(h).style(Style::default().fg(MUTED))),
+        );
+        let rows: Vec<_> = connections
             .iter()
             .map(|c| {
-                ListItem::new(vec![
-                    Line::from(format!(
-                        " {}:{}  {}  → {}",
-                        c.host, c.port, c.network, c.outbound
-                    )),
-                    Line::styled(
-                        format!(
-                            "   ↑ {}  ↓ {}  {:.1}s  {}",
-                            bytes(c.upload),
-                            bytes(c.download),
-                            c.elapsed_ms as f64 / 1000.0,
-                            c.source.as_deref().unwrap_or("—")
-                        ),
-                        Style::default().fg(MUTED),
-                    ),
+                TableRow::new(vec![
+                    Cell::from(format!("{}:{}", c.host, c.port)),
+                    Cell::from(format!("{} · {}", c.network, c.inbound))
+                        .style(Style::default().fg(MUTED)),
+                    Cell::from(c.outbound.clone()),
+                    Cell::from(bytes(c.upload)),
+                    Cell::from(bytes(c.download)),
+                    Cell::from(format!("{:.0}s", c.elapsed_ms as f64 / 1000.0)),
                 ])
             })
             .collect();
         let title = format!(
             "{} {} · {} {}{}",
-            t("Connections"),
+            t("Active"),
             snapshot.active,
             t("Total"),
             snapshot.total,
             if snapshot.truncated { " +" } else { "" }
         );
         let footer = if self.connection_filtering {
-            format!("/{}▏ · Enter", self.connection_filter)
+            format!(" /{}▏ · Enter ", self.connection_filter)
+        } else if self.connection_filter.is_empty() {
+            format!(" {} ", t("/ filter · x close · X close all"))
         } else {
             format!(
-                "{} {}",
-                t("/ filter · d close · D close all"),
-                self.connection_filter
+                " {} “{}” · Esc {} ",
+                t("Filter"),
+                self.connection_filter,
+                t("clear")
             )
         };
-        let mut state = ListState::default().with_selected(
-            (!items.is_empty())
-                .then_some(self.connection_selection.min(items.len().saturating_sub(1))),
+        let empty = rows.is_empty();
+        let mut state = TableState::default().with_selected(
+            (!empty).then_some(
+                self.connection_selection
+                    .min(connections.len().saturating_sub(1)),
+            ),
         );
         f.render_stateful_widget(
-            List::new(items)
-                .block(card(&title).title_bottom(footer))
-                .highlight_style(Style::default().bg(BLUE).fg(Color::White))
-                .highlight_symbol("›"),
-            area,
+            Table::new(
+                rows,
+                [
+                    Constraint::Min(18),
+                    Constraint::Length(14),
+                    Constraint::Min(10),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(7),
+                ],
+            )
+            .header(header)
+            .block(card(&title).title_bottom(footer))
+            .row_highlight_style(Style::default().bg(BLUE).fg(Color::White)),
+            table_area,
             &mut state,
         );
-        for visible in 0..area.height.saturating_sub(2) as usize / 2 {
+        if empty {
+            f.render_widget(
+                Paragraph::new(t("No matching connections")).style(Style::default().fg(MUTED)),
+                table_area.inner(ratatui::layout::Margin::new(2, 2)),
+            );
+        }
+        for visible in 0..table_area.height.saturating_sub(3) as usize {
             let index = state.offset() + visible;
             if index >= connections.len() {
                 break;
             }
             self.hit(
                 Rect::new(
-                    area.x + 1,
-                    area.y + 1 + visible as u16 * 2,
-                    area.width.saturating_sub(2),
-                    2,
+                    table_area.x + 1,
+                    table_area.y + 2 + visible as u16,
+                    table_area.width.saturating_sub(2),
+                    1,
                 ),
                 Target::Connection(index),
             );
         }
-        if area.width >= 60 {
-            if let Some(connection) = connections.get(self.connection_selection) {
-                self.button(
-                    f,
-                    Rect::new(area.right() - 34, area.y, 17, 1),
-                    "Close selected",
-                    Target::Runtime(Command::Disconnect(Some(connection.id))),
-                );
-            }
-        }
-        if area.width >= 36 {
-            let button = Rect::new(area.right() - 16, area.y, 14, 1);
+        if table_area.width >= 44 {
             self.button(
                 f,
-                button,
-                "Close all",
+                Rect::new(table_area.right() - 15, table_area.y, 13, 1),
+                "X Close all",
                 Target::Runtime(Command::Disconnect(None)),
             );
         }
-    }
-    pub(super) fn render_runtime_picker(&self, f: &mut Frame<'_>) {
-        let Some((name, index)) = &self.runtime_picker else {
-            return;
-        };
-        let Some(group) = self
-            .live()
-            .and_then(|s| s.groups.iter().find(|g| &g.name == name))
-        else {
-            return;
-        };
-        let area = f.area();
-        let width = area.width.saturating_sub(4).min(90).max(1).min(area.width);
-        let height = (group.members.len() as u16)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(2))
-            .max(1)
-            .min(area.height);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
-        self.hits.borrow_mut().clear();
-        f.render_widget(Clear, popup);
-        let items: Vec<_> = group
-            .members
-            .iter()
-            .map(|member| {
-                let delay = match member.alive {
-                    Some(true) => format!("{} ms", member.delay_ms.unwrap_or(0)),
-                    Some(false) => t("Timeout").into(),
-                    None => "—".into(),
-                };
-                ListItem::new(format!(
-                    "{} {}   {delay}",
-                    if group.selected.as_ref() == Some(&member.name) {
-                        "●"
-                    } else {
-                        "○"
-                    },
-                    member.name
-                ))
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(
-            (!items.is_empty()).then_some((*index).min(items.len().saturating_sub(1))),
-        );
-        let title = format!(
-            "{} [{}]{}",
-            group.name,
-            group.mode,
-            if group.testing {
-                format!(" · {}", t("Testing…"))
-            } else {
-                String::new()
-            }
-        );
-        f.render_stateful_widget(
-            List::new(items)
-                .block(card(&title).title_bottom(t("Enter select · t test · Esc back")))
-                .highlight_style(Style::default().bg(BLUE).fg(Color::White))
-                .highlight_symbol("›"),
-            popup,
-            &mut state,
-        );
-        if popup.width >= 24 {
-            self.button(
-                f,
-                Rect::new(popup.right() - 10, popup.y, 8, 1),
-                "Test",
-                Target::Runtime(Command::TestGroup(group.name.clone())),
-            );
-        }
-        if popup.width >= 28 && popup.height >= 2 {
-            self.button(
-                f,
-                Rect::new(popup.right() - 14, popup.bottom() - 1, 12, 1),
-                "Esc back",
-                Target::Back,
-            );
-        }
-        for visible in 0..popup.height.saturating_sub(2) as usize {
-            if visible + state.offset() >= group.members.len() {
-                break;
-            }
-            self.hit(
-                Rect::new(
-                    popup.x + 1,
-                    popup.y + 1 + visible as u16,
-                    popup.width.saturating_sub(2),
-                    1,
+        if let (Some(detail), Some(c)) = (detail_area, selected) {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{} ", t("Target")), Style::default().fg(MUTED)),
+                    Span::raw(format!("{}:{}", c.host, c.port)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("{} ", t("Exit")), Style::default().fg(MUTED)),
+                    Span::styled(c.outbound.clone(), Style::default().fg(BLUE)),
+                ]),
+                Line::raw(format!(
+                    "{} · {} · {}",
+                    c.network,
+                    c.inbound,
+                    c.source.as_deref().unwrap_or("—")
+                )),
+                Line::raw(format!(
+                    "↑ {}  ↓ {}  {:.1}s",
+                    bytes(c.upload),
+                    bytes(c.download),
+                    c.elapsed_ms as f64 / 1000.0
+                )),
+                Line::styled(
+                    t("x close · 4 then t explains a route"),
+                    Style::default().fg(MUTED),
                 ),
-                Target::Member(visible + state.offset()),
+            ];
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(card("Details")),
+                detail,
             );
         }
     }
@@ -636,6 +778,7 @@ impl Ui {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shell::{OVERVIEW, PROFILES};
     use super::*;
     use astra_ipc::runtime::{Connection, Group, Member};
     use ratatui::backend::TestBackend;
@@ -672,24 +815,37 @@ mod tests {
                     download: 8192,
                     elapsed_ms: 3000,
                 }],
-                groups: vec![Group {
-                    name: "PROXY".into(),
-                    mode: "select".into(),
-                    selected: Some("Tokyo".into()),
-                    testing: false,
-                    members: vec![
-                        Member {
+                groups: vec![
+                    Group {
+                        name: "PROXY".into(),
+                        mode: "select".into(),
+                        selected: Some("auto".into()),
+                        testing: false,
+                        members: vec![
+                            Member {
+                                name: "auto".into(),
+                                delay_ms: None,
+                                alive: None,
+                            },
+                            Member {
+                                name: "Singapore".into(),
+                                delay_ms: Some(110),
+                                alive: Some(true),
+                            },
+                        ],
+                    },
+                    Group {
+                        name: "auto".into(),
+                        mode: "auto".into(),
+                        selected: Some("Tokyo".into()),
+                        testing: false,
+                        members: vec![Member {
                             name: "Tokyo".into(),
                             delay_ms: Some(80),
                             alive: Some(true),
-                        },
-                        Member {
-                            name: "Singapore".into(),
-                            delay_ms: Some(110),
-                            alive: Some(true),
-                        },
-                    ],
-                }],
+                        }],
+                    },
+                ],
                 ..Default::default()
             },
         );
@@ -699,30 +855,59 @@ mod tests {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
     }
     #[test]
+    fn exit_chain_follows_group_selections_to_the_final_node() {
+        let ui = sample();
+        let (chain, delay, alive) = exit_chain(ui.live().unwrap());
+        assert_eq!(chain, ["PROXY", "auto", "Tokyo"]);
+        assert_eq!((delay, alive), (Some(80), Some(true)));
+    }
+    #[test]
     fn selecting_nodes_and_closing_filtered_connections_use_runtime_commands_with_pid() {
         let mut ui = sample();
         key(&mut ui, KeyCode::Char('2'));
         key(&mut ui, KeyCode::Enter);
         assert!(ui.runtime_picker.is_some());
-        // Editing shortcuts cannot act on the profile behind the member picker.
+        // Editing shortcuts cannot act on the profile behind the member list.
         assert!(matches!(key(&mut ui, KeyCode::Char('e')), Input::Idle));
         assert!(ui.editor.is_none());
         key(&mut ui, KeyCode::Down);
         assert!(
             matches!(key(&mut ui, KeyCode::Enter), Input::Run(Action::Runtime { command: Command::Select {group, member}, expected_pid: Some(42), .. }, _) if group == "PROXY" && member == "Singapore")
         );
-        key(&mut ui, KeyCode::Char('4'));
+        // Automatic groups stay read-only.
+        key(&mut ui, KeyCode::Esc);
+        key(&mut ui, KeyCode::Down);
+        key(&mut ui, KeyCode::Enter);
+        assert!(matches!(key(&mut ui, KeyCode::Enter), Input::Idle));
+        key(&mut ui, KeyCode::Esc);
+        key(&mut ui, KeyCode::Char('3'));
         key(&mut ui, KeyCode::Char('/'));
         for c in "example".chars() {
             key(&mut ui, KeyCode::Char(c));
         }
         key(&mut ui, KeyCode::Enter);
         assert_eq!(ui.visible_connections().len(), 1);
+        // d never closes connections; x does.
+        assert!(matches!(key(&mut ui, KeyCode::Char('d')), Input::Idle));
         assert!(matches!(
-            key(&mut ui, KeyCode::Char('d')),
+            key(&mut ui, KeyCode::Char('x')),
             Input::Run(
                 Action::Runtime {
                     command: Command::Disconnect(Some(7)),
+                    expected_pid: Some(42),
+                    ..
+                },
+                _
+            )
+        ));
+        // Closing everything asks first.
+        assert!(matches!(key(&mut ui, KeyCode::Char('X')), Input::Idle));
+        assert!(matches!(ui.prompt, Some(Prompt::CloseAll { .. })));
+        assert!(matches!(
+            key(&mut ui, KeyCode::Enter),
+            Input::Run(
+                Action::Runtime {
+                    command: Command::Disconnect(None),
                     expected_pid: Some(42),
                     ..
                 },
@@ -745,7 +930,7 @@ mod tests {
         let mut ui = sample();
         ui.rows.push(ui.rows[0].clone());
         ui.rows[1].instance.name = "other".into();
-        for page in [1, 3] {
+        for page in [PROXIES, CONNECTIONS] {
             ui.navigate(page);
             for code in [
                 KeyCode::End,
@@ -766,36 +951,77 @@ mod tests {
             ));
             assert_eq!(ui.selections[0], 0);
         }
-        ui.switch_core(Kind::Rule);
-        assert_eq!(ui.page, 2);
-        ui.navigate(3);
         ui.runtime_snapshot = None;
-        assert!(matches!(key(&mut ui, KeyCode::Char('d')), Input::Idle));
+        assert!(matches!(key(&mut ui, KeyCode::Char('x')), Input::Idle));
         assert!(ui.prompt.is_none());
         key(&mut ui, KeyCode::Down);
         assert_eq!(ui.selections[0], 0);
+        // Rule cores selected in Profiles never replace the active profile's runtime.
+        ui.navigate(PROFILES);
+        ui.switch_core(Kind::Rule);
+        assert_eq!(ui.active_proxy().unwrap().instance.name, "proxy");
     }
 
     #[test]
-    fn page_navigation_clears_search_capture_and_tools_exclude_profile_management() {
+    fn page_navigation_clears_search_capture() {
         let mut ui = sample();
-        ui.kind = Kind::Rule;
         ui.connection_filtering = true;
-        ui.navigate(3);
-        assert_eq!(ui.kind, Kind::Proxy);
+        ui.navigate(CONNECTIONS);
         assert!(!ui.connection_filtering);
-        ui.navigate(4);
-        assert!(ui.tool_operations().iter().all(|op| matches!(
-            op,
-            Operation::Logs
-                | Operation::Diagnostics
-                | Operation::UpdateSubscriptions
-                | Operation::Explain
-        )));
         key(&mut ui, KeyCode::BackTab);
-        assert_eq!(ui.page, 3);
+        assert_eq!(ui.page, PROXIES);
+        key(&mut ui, KeyCode::BackTab);
+        assert_eq!(ui.page, OVERVIEW);
     }
 
+    fn screen(ui: &Ui, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn proxies_show_members_beside_groups_and_connections_show_details() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = sample();
+            ui.navigate(PROXIES);
+            ui.open_runtime_group();
+            let proxies = screen(&ui, 120, 24);
+            for value in [
+                "Proxy groups",
+                "PROXY",
+                "Singapore",
+                "110 ms",
+                "Enter selects",
+            ] {
+                assert!(proxies.contains(value), "{value}\n{proxies}");
+            }
+            ui.navigate(CONNECTIONS);
+            let connections = screen(&ui, 130, 24);
+            for value in ["example.test:443", "Tokyo", "Details", "127.0.0.1:50000"] {
+                assert!(connections.contains(value), "{value}\n{connections}");
+            }
+            if std::env::var_os("ASTRA_TUI_PREVIEW").is_some() {
+                std::fs::write(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tui-pages-preview.txt"
+                    ),
+                    format!("{proxies}\n\n{connections}"),
+                )
+                .unwrap();
+            }
+        });
+    }
     #[test]
     fn live_cards_groups_and_connections_resize_and_old_process_data_is_hidden() {
         for language in [
@@ -805,7 +1031,7 @@ mod tests {
         ] {
             crate::i18n::with_language(language, || {
                 let mut ui = sample();
-                for page in [0, 1, 3] {
+                for page in [OVERVIEW, PROXIES, CONNECTIONS] {
                     ui.page = page;
                     for (width, height) in [(140, 40), (90, 24), (40, 12), (1, 1)] {
                         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -815,7 +1041,7 @@ mod tests {
                 if language == crate::i18n::Language::English
                     && std::env::var_os("ASTRA_TUI_PREVIEW").is_some()
                 {
-                    ui.page = 0;
+                    ui.page = OVERVIEW;
                     ui.rates = [1024, 8192];
                     ui.history = [
                         std::collections::VecDeque::from(vec![0, 100, 300, 800, 1024]),
@@ -833,7 +1059,7 @@ mod tests {
                     )
                     .unwrap();
                 }
-                ui.page = 1;
+                ui.page = PROXIES;
                 ui.open_runtime_group();
                 let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
                 terminal.draw(|f| ui.render(f)).unwrap();

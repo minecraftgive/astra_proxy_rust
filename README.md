@@ -126,7 +126,7 @@ cargo test --workspace
 ./target/release/astra-tui
 ```
 
-按 1–5 或点击侧栏切换仪表盘、代理、配置、实时连接和工具，鼠标滚轮/方向键导航，Tab 切换 core，n 添加实例，s/x/r 启动、停止、重启，e 编辑配置。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
+按 1–6 或点击页面栏切换概览、代理、连接、规则、日志和配置档，`:` / Ctrl-K 打开列出全部命令的命令面板，p 切换当前配置档，c 连接/断开，r 应用改动、R 完整重启，e 编辑配置；在配置档页按 n 添加实例，Tab 切换代理实例与路由引擎。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
 
 本地直连示例：
 

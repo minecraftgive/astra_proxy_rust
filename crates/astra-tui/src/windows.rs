@@ -13,22 +13,23 @@ use std::{
 pub enum View {
     Dashboard,
     Proxies,
-    Profiles,
     Connections,
-    Tools,
+    Rules,
     Logs,
+    Profiles,
     TuiLog,
     Diagnostics,
 }
 impl View {
     pub fn parse(value: &str) -> Result<Self> {
         Ok(match value {
-            "dashboard" => Self::Dashboard,
+            "overview" | "dashboard" => Self::Dashboard,
             "proxies" => Self::Proxies,
-            "profiles" => Self::Profiles,
             "connections" => Self::Connections,
-            "tools" => Self::Tools,
+            // Tools were split into Rules (route queries) and Proxies (diagnostics).
+            "rules" | "tools" => Self::Rules,
             "logs" => Self::Logs,
+            "profiles" => Self::Profiles,
             "tui-log" => Self::TuiLog,
             "diagnostics" => Self::Diagnostics,
             _ => anyhow::bail!("Unknown view: {value}"),
@@ -36,23 +37,25 @@ impl View {
     }
     pub fn name(self) -> &'static str {
         match self {
-            Self::Dashboard => "dashboard",
+            Self::Dashboard => "overview",
             Self::Proxies => "proxies",
-            Self::Profiles => "profiles",
             Self::Connections => "connections",
-            Self::Tools => "tools",
+            Self::Rules => "rules",
             Self::Logs => "logs",
+            Self::Profiles => "profiles",
             Self::TuiLog => "tui-log",
             Self::Diagnostics => "diagnostics",
         }
     }
+    /// Page index shared by the page bar, 1–6 and Alt+1–6.
     pub fn page(self) -> Option<usize> {
         match self {
             Self::Dashboard => Some(0),
             Self::Proxies => Some(1),
-            Self::Profiles => Some(2),
-            Self::Connections => Some(3),
-            Self::Tools => Some(4),
+            Self::Connections => Some(2),
+            Self::Rules => Some(3),
+            Self::Logs => Some(4),
+            Self::Profiles => Some(5),
             _ => None,
         }
     }
@@ -60,10 +63,11 @@ impl View {
         [
             Self::Dashboard,
             Self::Proxies,
-            Self::Profiles,
             Self::Connections,
-            Self::Tools,
-        ][index.min(4)]
+            Self::Rules,
+            Self::Logs,
+            Self::Profiles,
+        ][index.min(5)]
     }
 }
 #[derive(Debug, Clone, Default)]
@@ -331,13 +335,15 @@ mod tests {
             Launch::detached(View::Connections, None, Kind::Proxy).window_id
         );
         assert!(View::parse("bad").is_err());
+        assert_eq!(View::parse("tools").unwrap(), View::Rules);
+        assert_eq!(View::parse("dashboard").unwrap(), View::Dashboard);
         for view in [
             View::Dashboard,
             View::Proxies,
-            View::Profiles,
             View::Connections,
-            View::Tools,
+            View::Rules,
             View::Logs,
+            View::Profiles,
             View::TuiLog,
             View::Diagnostics,
         ] {

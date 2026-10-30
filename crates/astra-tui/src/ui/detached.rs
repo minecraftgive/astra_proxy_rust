@@ -4,7 +4,7 @@ use crate::windows::{Launch, View};
 impl Ui {
     pub(super) fn window_key(&mut self, key: event::KeyEvent) -> Option<Input> {
         let explicit = if key.modifiers.contains(KeyModifiers::ALT) {
-            if let KeyCode::Char(c @ '1'..='5') = key.code {
+            if let KeyCode::Char(c @ '1'..='6') = key.code {
                 Some(View::from_page(c as usize - '1' as usize))
             } else {
                 None
@@ -28,7 +28,7 @@ impl Ui {
                 || self.explanation.is_some()
                 || self.help_scroll.is_some()
             {
-                self.message = t("Use Alt+1–5 to open a page; the current draft stays here").into();
+                self.message = t("Use Alt+1–6 to open a page; the current draft stays here").into();
                 self.tasks.notice_message(&self.message);
                 return Some(Input::Idle);
             } else {
@@ -37,21 +37,22 @@ impl Ui {
         } else {
             return None;
         };
-        let kind = if matches!(view, View::Proxies | View::Connections) {
-            Kind::Proxy
-        } else {
+        // Every page except Profiles follows the active profile (the selected proxy).
+        let kind = if view == View::Profiles {
             self.kind
+        } else {
+            Kind::Proxy
         };
         let instance = if view == View::TuiLog {
             None
-        } else if view == View::Logs {
+        } else if view == View::Logs && self.viewer.is_some() {
             self.viewer.as_ref().map(|v| v.name.clone())
         } else if view == View::Diagnostics {
             self.diagnostics.as_ref().map(|v| v.name.clone())
+        } else if view == View::Profiles {
+            self.selected().map(|r| r.instance.name.clone())
         } else {
-            self.selected()
-                .filter(|r| r.instance.kind == kind)
-                .map(|r| r.instance.name.clone())
+            self.active_proxy().map(|r| r.instance.name.clone())
         };
         Some(Input::OpenWindow(Launch::detached(view, instance, kind)))
     }
@@ -122,7 +123,7 @@ mod tests {
     #[test]
     fn shortcuts_open_pages_and_selected_logs_without_editing_or_navigation() {
         let mut ui = setup();
-        ui.page = 3;
+        ui.page = 2;
         let Input::OpenWindow(launch) =
             ui.key(event::KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE))
         else {
@@ -140,15 +141,16 @@ mod tests {
         for (c, view) in [
             ('1', View::Dashboard),
             ('2', View::Proxies),
-            ('3', View::Profiles),
-            ('4', View::Connections),
-            ('5', View::Tools),
+            ('3', View::Connections),
+            ('4', View::Rules),
+            ('5', View::Logs),
+            ('6', View::Profiles),
         ] {
             assert!(
                 matches!(ui.key(event::KeyEvent::new(KeyCode::Char(c),KeyModifiers::ALT)),Input::OpenWindow(launch) if launch.view==Some(view))
             );
         }
-        assert_eq!(ui.page, 3);
+        assert_eq!(ui.page, 2);
         assert_eq!(ui.editor.as_ref().unwrap().text(), draft);
         ui.editor = None;
         ui.viewer = Some(logs::Viewer::new("edge".into(), Default::default()));
