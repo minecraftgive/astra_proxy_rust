@@ -52,7 +52,8 @@ fn plan(
     let Some(settings) = &config.system_proxy else {
         return Ok(vec![]);
     };
-    let address = super::mode_config::system_proxy_address(config)?;
+    super::mode_config::system_proxy_address(config)?;
+    let (http, socks) = super::mode_config::system_proxy_addresses(config)?;
     let mut changes = vec![];
     if cfg!(target_os = "macos") {
         let services = if settings.services.is_empty() {
@@ -71,8 +72,6 @@ fn plan(
         ensure!(!services.is_empty(), "no macOS network services found");
         for service in services {
             for (read, write) in [
-                ("-getwebproxy", "-setwebproxystate"),
-                ("-getsecurewebproxy", "-setsecurewebproxystate"),
                 ("-getautoproxyurl", "-setautoproxystate"),
                 ("-getproxyautodiscovery", "-setproxyautodiscovery"),
             ] {
@@ -90,77 +89,103 @@ fn plan(
                     ]),
                 });
             }
-            let old = query(&args(&[
-                "/usr/sbin/networksetup",
-                "-getsocksfirewallproxy",
-                &service,
-            ]))?;
-            let get = |key: &str| {
-                old.lines()
-                    .find_map(|line| line.strip_prefix(key))
-                    .map(str::trim)
-            };
-            ensure!(
-                get("Authenticated Proxy Enabled:") != Some("1"),
-                "cannot restore authenticated SOCKS proxy on {service}; disable it first"
-            );
-            let host = get("Server:").context("missing proxy Server")?;
-            let port = get("Port:").context("missing proxy Port")?;
-            let enabled = get("Enabled:") == Some("Yes");
-            // networksetup enables the proxy while setting host/port. Undo order
-            // restores the endpoint first, then its original on/off state.
-            changes.push(Change {
-                apply: args(&[
-                    "/usr/sbin/networksetup",
+            for (read, set, state, address) in [
+                ("-getwebproxy", "-setwebproxy", "-setwebproxystate", http),
+                (
+                    "-getsecurewebproxy",
+                    "-setsecurewebproxy",
+                    "-setsecurewebproxystate",
+                    http,
+                ),
+                (
+                    "-getsocksfirewallproxy",
                     "-setsocksfirewallproxy",
-                    &service,
-                    &address.ip().to_string(),
-                    &address.port().to_string(),
-                ]),
-                restore: args(&[
-                    "/usr/sbin/networksetup",
                     "-setsocksfirewallproxystate",
-                    &service,
-                    if enabled { "on" } else { "off" },
-                ]),
-            });
-            changes.push(Change {
-                apply: args(&[
-                    "/usr/sbin/networksetup",
-                    "-setsocksfirewallproxystate",
-                    &service,
-                    "on",
-                ]),
-                restore: args(&[
-                    "/usr/sbin/networksetup",
-                    "-setsocksfirewallproxy",
-                    &service,
-                    if host.is_empty() { "" } else { host },
-                    port,
-                ]),
-            });
+                    socks,
+                ),
+            ] {
+                let old = query(&args(&["/usr/sbin/networksetup", read, &service]))?;
+                let get = |key: &str| {
+                    old.lines()
+                        .find_map(|line| line.strip_prefix(key))
+                        .map(str::trim)
+                };
+                ensure!(
+                    get("Authenticated Proxy Enabled:") != Some("1"),
+                    "cannot restore authenticated proxy on {service}; disable it first"
+                );
+                let host = get("Server:").context("missing proxy Server")?;
+                let port = get("Port:").context("missing proxy Port")?;
+                let enabled = get("Enabled:") == Some("Yes");
+                let Some(address) = address else {
+                    changes.push(Change {
+                        apply: args(&["/usr/sbin/networksetup", state, &service, "off"]),
+                        restore: args(&[
+                            "/usr/sbin/networksetup",
+                            state,
+                            &service,
+                            if enabled { "on" } else { "off" },
+                        ]),
+                    });
+                    continue;
+                };
+                // networksetup enables the proxy while setting host/port. Undo order
+                // restores the endpoint first, then its original on/off state.
+                changes.push(Change {
+                    apply: args(&[
+                        "/usr/sbin/networksetup",
+                        set,
+                        &service,
+                        &address.ip().to_string(),
+                        &address.port().to_string(),
+                    ]),
+                    restore: args(&[
+                        "/usr/sbin/networksetup",
+                        state,
+                        &service,
+                        if enabled { "on" } else { "off" },
+                    ]),
+                });
+                changes.push(Change {
+                    apply: args(&["/usr/sbin/networksetup", state, &service, "on"]),
+                    restore: args(&[
+                        "/usr/sbin/networksetup",
+                        set,
+                        &service,
+                        if host.is_empty() { "" } else { host },
+                        port,
+                    ]),
+                });
+            }
         }
     } else if cfg!(target_os = "linux") {
         ensure!(
             settings.services.is_empty(),
             "system_proxy.services is macOS-only"
         );
-        for (schema, key, value) in [
-            ("org.gnome.system.proxy.http", "host", "''".to_owned()),
-            ("org.gnome.system.proxy.https", "host", "''".to_owned()),
-            ("org.gnome.system.proxy.ftp", "host", "''".to_owned()),
-            (
-                "org.gnome.system.proxy.socks",
-                "host",
-                format!("'{}'", address.ip()),
-            ),
-            (
-                "org.gnome.system.proxy.socks",
-                "port",
-                address.port().to_string(),
-            ),
-            ("org.gnome.system.proxy", "mode", "'manual'".to_owned()),
+        let mut values = vec![];
+        for (schema, address) in [
+            ("org.gnome.system.proxy.http", http),
+            ("org.gnome.system.proxy.https", http),
+            ("org.gnome.system.proxy.socks", socks),
         ] {
+            values.push((
+                schema,
+                "host",
+                address
+                    .map(|a| format!("'{}'", a.ip()))
+                    .unwrap_or_else(|| "''".into()),
+            ));
+            values.push((
+                schema,
+                "port",
+                address.map(|a| a.port()).unwrap_or(0).to_string(),
+            ));
+        }
+        values.push(("org.gnome.system.proxy.ftp", "host", "''".into()));
+        values.push(("org.gnome.system.proxy", "use-same-proxy", "false".into()));
+        values.push(("org.gnome.system.proxy", "mode", "'manual'".into()));
+        for (schema, key, value) in values {
             let old = query(&args(&["gsettings", "get", schema, key]))
                 .context("Linux system_proxy requires a GNOME user D-Bus session")?;
             changes.push(Change {
@@ -185,6 +210,11 @@ impl Guard {
         })?;
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(journal)
             .with_context(|| format!("system proxy recovery file exists or cannot be created: {}; restore it using --restore-system-proxy before starting", journal.display()))?;
+        if let Err(error) = astra_ipc::platform::adopt_owner(journal) {
+            let _ = std::fs::remove_file(journal);
+            return Err(anyhow::Error::new(error)
+                .context("hand the system proxy journal to the invoking user"));
+        }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         let guard = Self {
@@ -233,7 +263,9 @@ pub fn recover(path: &Path) -> Result<()> {
             && restore.get(1).is_some_and(|v| {
                 matches!(
                     v.as_str(),
-                    "-setsocksfirewallproxy"
+                    "-setwebproxy"
+                        | "-setsecurewebproxy"
+                        | "-setsocksfirewallproxy"
                         | "-setsocksfirewallproxystate"
                         | "-setwebproxystate"
                         | "-setsecurewebproxystate"
@@ -260,19 +292,21 @@ mod tests {
     use super::*;
     #[test]
     fn system_settings_plan_restores_original_endpoint_and_enable_states() {
-        let config: ProxyConfig = toml::from_str("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[system_proxy]\nservices=['Wi-Fi']\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:7890'\n").unwrap();
+        let config: ProxyConfig = toml::from_str("standalone=true\nmixed_listen='127.0.0.1:7891'\nsocks5_listen='127.0.0.1:1080'\n[system_proxy]\nservices=['Wi-Fi']\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:7890'\n").unwrap();
         if !cfg!(target_os = "macos") {
             return;
         }
         let plan = plan(&config, |args| {
-            if args[1] == "-getsocksfirewallproxy" {Ok("Enabled: No\nServer: original.example\nPort: 1234\nAuthenticated Proxy Enabled: 0".into())}
+            if args[1].ends_with("proxy") {Ok("Enabled: No\nServer: original.example\nPort: 1234\nAuthenticated Proxy Enabled: 0".into())}
             else {Ok("Enabled: Yes".into())}
         }).unwrap();
-        assert_eq!(plan.len(), 6);
-        assert_eq!(plan[4].apply.last().unwrap(), "1080");
-        assert_eq!(&plan[5].restore[3..], &["original.example", "1234"]);
-        assert_eq!(plan[4].restore.last().unwrap(), "off");
-        assert!(plan[..4]
+        assert_eq!(plan.len(), 8);
+        for pair in plan[2..].chunks_exact(2) {
+            assert_eq!(pair[0].apply.last().unwrap(), "7891");
+            assert_eq!(&pair[1].restore[3..], &["original.example", "1234"]);
+            assert_eq!(pair[0].restore.last().unwrap(), "off");
+        }
+        assert!(plan[..2]
             .iter()
             .all(|change| change.restore.last().unwrap() == "on"));
     }

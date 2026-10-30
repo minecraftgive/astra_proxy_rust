@@ -216,6 +216,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "futures-util",
+ "libc",
  "regex",
  "serde",
  "serde_json",

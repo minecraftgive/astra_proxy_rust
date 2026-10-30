@@ -1,4 +1,10 @@
 pub mod platform;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_elevated;
+/// Set by the sudo hand-off before the runtime starts; the elevated TUN mode
+/// lives only in this process and is never written back to the overrides file.
+pub(crate) static ELEVATED_TUN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 mod proxy;
 use platform::system_proxy;
 mod config;

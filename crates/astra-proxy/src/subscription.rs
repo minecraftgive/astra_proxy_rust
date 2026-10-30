@@ -326,6 +326,7 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
+    astra_ipc::platform::adopt_owner(&temporary)?;
     let result = (|| -> Result<()> {
         file.write_all(&data)?;
         file.sync_all()?;

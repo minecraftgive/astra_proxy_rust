@@ -16,6 +16,8 @@ pub mod progress;
 pub mod runtime;
 pub mod session;
 pub mod storage;
+#[cfg(unix)]
+pub mod unix_handoff;
 
 pub const API_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: u32 = 8192;
