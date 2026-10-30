@@ -49,6 +49,8 @@ struct Form {
     #[serde(skip)]
     vim_g: bool,
     #[serde(skip)]
+    marked_rules: Vec<usize>,
+    #[serde(skip)]
     vim_z: bool,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -943,6 +945,7 @@ impl Editor {
         Ok(doc)
     }
     fn update(&mut self, mut doc: DocumentMut) {
+        self.form.marked_rules.clear();
         position_tables(doc.as_table_mut(), &mut 0);
         let text = doc.to_string();
         let previous = self.text();
@@ -978,6 +981,7 @@ impl Editor {
         };
         to.push(self.lines.join("\n"));
         self.lines = text.split('\n').map(str::to_owned).collect();
+        self.form.marked_rules.clear();
         self.form.guide = None;
         let doc = self.document()?;
         let count = collection(&doc, &[Part::Key("outbounds".into())]).map_or(0, |a| a.len());
@@ -3525,10 +3529,37 @@ impl Editor {
                     result?;
                 }
             }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
+                if let Some(("rules", index)) = item_index(&path) {
+                    if key.code == KeyCode::Char('V') {
+                        let count = doc["rules"].as_array_of_tables().map_or(0, |a| a.len());
+                        if self.form.marked_rules.len() == count {
+                            self.form.marked_rules.clear();
+                        } else {
+                            self.form.marked_rules = (0..count).collect();
+                        }
+                    } else if self.form.marked_rules.contains(&index) {
+                        self.form.marked_rules.retain(|i| *i != index);
+                    } else {
+                        self.form.marked_rules.push(index);
+                    }
+                }
+            }
+            KeyCode::Char('m') if !self.form.marked_rules.is_empty() => {
+                let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
+                if let Some(("rules", target)) = item_index(&path) {
+                    self.move_marked_rules(Some(target), false)?;
+                }
+            }
             KeyCode::Char('K') | KeyCode::Char('J') => {
                 let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
                 let (kind, index) =
                     item_index(&path).context(t("请先选择要调整顺序的规则或节点"))?;
+                if kind == "rules" && !self.form.marked_rules.is_empty() {
+                    self.move_marked_rules(None, key.code == KeyCode::Char('J'))?;
+                    return Ok(());
+                }
                 let array_path = vec![Part::Key(kind.into())];
                 let mut doc = self.document()?;
                 let array = collection_mut(&mut doc, &array_path)?;
@@ -3557,6 +3588,56 @@ impl Editor {
         }
         Ok(())
     }
+    /// Reorder by original indices so non-adjacent selections keep their relative order.
+    fn move_marked_rules(&mut self, target: Option<usize>, down: bool) -> Result<()> {
+        let mut doc = self.document()?;
+        let array = collection_mut(&mut doc, &vec![Part::Key("rules".into())])?;
+        let marked = self.form.marked_rules.clone();
+        let mut order: Vec<usize> = (0..array.len()).collect();
+        if let Some(target) = target {
+            // Dropping on the selection itself is a no-op.
+            if marked.contains(&target) {
+                return Ok(());
+            }
+            let picked: Vec<_> = order
+                .iter()
+                .copied()
+                .filter(|i| marked.contains(i))
+                .collect();
+            order.retain(|i| !marked.contains(i));
+            let at = order
+                .iter()
+                .position(|i| *i == target)
+                .unwrap_or(order.len());
+            order.splice(at..at, picked);
+        } else if down {
+            for i in (0..order.len().saturating_sub(1)).rev() {
+                if marked.contains(&order[i]) && !marked.contains(&order[i + 1]) {
+                    order.swap(i, i + 1);
+                }
+            }
+        } else {
+            for i in 1..order.len() {
+                if marked.contains(&order[i]) && !marked.contains(&order[i - 1]) {
+                    order.swap(i, i - 1);
+                }
+            }
+        }
+        let tables: Vec<_> = array.iter().cloned().collect();
+        *array = order.iter().map(|i| tables[*i].clone()).collect();
+        let next: Vec<_> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, old)| marked.contains(old).then_some(i))
+            .collect();
+        self.update(doc);
+        self.form.marked_rules = next;
+        let doc = self.document()?;
+        if let Some(index) = self.form.marked_rules.first().copied() {
+            self.focus_item(&doc, "rules", index);
+        }
+        Ok(())
+    }
     /// Indentation level of a row; replaces the old "Rule 3 / " style label prefixes.
     fn depth(row: &FlatRow) -> usize {
         let depth = match row {
@@ -3582,6 +3663,13 @@ impl Editor {
         .any(|generic| t(generic) == help)
     }
     fn hint(&self, row: Option<&FlatRow>) -> String {
+        if !self.form.marked_rules.is_empty() {
+            return format!(
+                "{} · {}",
+                self.form.marked_rules.len(),
+                t("selected · v toggle · V all/clear · K/J move · m move before cursor")
+            );
+        }
         if self.form.guide.is_some() {
             return t("Filling new entry · Enter next field · Esc stop").into();
         }
@@ -3602,7 +3690,9 @@ impl Editor {
             Some(FlatRow::Node { .. }) => {
                 t("Enter fold · y duplicate · d delete · K/J move").into()
             }
-            Some(FlatRow::Rule { .. }) => t("y duplicate · d delete · K/J move").into(),
+            Some(FlatRow::Rule { .. }) => {
+                t("v select · V all/clear · K/J move · m move selection here").into()
+            }
             Some(FlatRow::Section { path, .. }) if last_key(path) == Some("tls") => {
                 t("Enter 启用/关闭 TLS；字段始终平铺；d 删除本分组参数").into()
             }
@@ -3892,6 +3982,11 @@ impl Editor {
                         Span::raw("  ")
                     },
                 );
+                if item_index(&row.path())
+                    .is_some_and(|(kind, i)| kind == "rules" && self.form.marked_rules.contains(&i))
+                {
+                    spans.insert(0, Span::styled("✓ ", Style::default().fg(Color::Cyan)));
+                }
                 ListItem::new(Line::from(spans))
             })
             .collect();
@@ -5057,6 +5152,67 @@ mod tests {
             Some(16)
         );
     }
+    #[test]
+    fn multi_rule_moves_preserve_order_and_undo() {
+        let mut e = Editor::new(
+            "rules".into(),
+            (0..5)
+                .map(|i| {
+                    format!("[[rules]]\nkind='domain'\nvalue='{i}.example'\naction='direct'\n")
+                })
+                .collect(),
+        );
+        let original = e.text();
+        e.form.marked_rules = vec![1, 3];
+        e.move_marked_rules(None, false).unwrap();
+        let values = |e: &Editor| {
+            e.document().unwrap()["rules"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .map(|r| r["value"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values(&e),
+            [
+                "1.example",
+                "0.example",
+                "3.example",
+                "2.example",
+                "4.example"
+            ]
+        );
+        assert_eq!(e.form.marked_rules, vec![0, 2]);
+        e.move_marked_rules(Some(4), false).unwrap();
+        assert_eq!(
+            values(&e),
+            [
+                "0.example",
+                "2.example",
+                "1.example",
+                "3.example",
+                "4.example"
+            ]
+        );
+        e.restore(false).unwrap();
+        e.restore(false).unwrap();
+        assert_eq!(e.text(), original);
+        assert!(e.form.marked_rules.is_empty());
+        e.form.marked_rules = vec![1, 2];
+        e.move_marked_rules(None, true).unwrap();
+        assert_eq!(
+            values(&e),
+            [
+                "0.example",
+                "3.example",
+                "1.example",
+                "2.example",
+                "4.example"
+            ]
+        );
+    }
+
     #[test]
     fn rule_add_edit_reorder_and_confirm_delete_keep_matching_order() {
         let mut e = rules();

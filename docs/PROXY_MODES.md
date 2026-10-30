@@ -40,7 +40,7 @@ http_listen = "127.0.0.1:8080"
 # Windows 不填 services；该字段仅用于 macOS。
 ```
 
-Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS 代理。普通 HTTP 请求由 Hyper 校验消息边界、移除逐跳头并流式转发，HTTPS 沿用 CONNECT 隧道；普通 HTTP 当前每条连接处理一个请求，`Upgrade` 需走独立 CONNECT（不支持明文 WebSocket 升级）。启用时记录手动代理地址、绕过列表、PAC URL 和自动检测标志，再设置 `http=回环地址;https=回环地址`、`<local>` 绕过并临时关闭 PAC/自动检测；正常关闭时恢复原值并通知应用。WinHTTP、VPN/RAS 连接、其他用户账户以及不遵循系统代理的应用不在该设置范围内。
+Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS 代理。普通 HTTP 请求由 Hyper 校验消息边界、移除逐跳头并流式转发，HTTPS 沿用 CONNECT 隧道；普通 HTTP 当前每条连接处理一个请求，`Upgrade` 需走独立 CONNECT（不支持明文 WebSocket 升级）。启用时记录手动代理地址、绕过列表、PAC URL 和自动检测标志，再设置 `回环地址:端口`（所有协议共用，与 Windows 设置界面写入的格式一致）、`<local>` 绕过并临时关闭 PAC/自动检测；正常关闭时恢复原值并通知应用。WinHTTP、VPN/RAS 连接、其他用户账户以及不遵循系统代理的应用不在该设置范围内。
 
 Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；发生崩溃时新实例会指出要恢复的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
 
