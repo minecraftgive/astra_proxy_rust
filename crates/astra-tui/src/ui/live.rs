@@ -203,6 +203,14 @@ impl Ui {
             return None;
         }
         if self.runtime_picker.is_some()
+            && (key.code == KeyCode::Char('/')
+                || (key.code == KeyCode::Char('f')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            self.prompt(Prompt::Find(PROXIES));
+            return Some(Input::Idle);
+        }
+        if self.runtime_picker.is_some()
             && key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -522,9 +530,9 @@ impl Ui {
                         Style::default().fg(if focus_members { Color::DarkGray } else { BLUE }),
                     ))
                     .highlight_style(if focus_members {
-                        Style::default().add_modifier(Modifier::BOLD)
+                        crate::theme::selected_inactive()
                     } else {
-                        Style::default().bg(BLUE).fg(Color::White)
+                        crate::theme::selected()
                     })
                     .highlight_symbol("› "),
                 groups_area,
@@ -600,7 +608,7 @@ impl Ui {
                         Color::DarkGray
                     })),
                 )
-                .highlight_style(Style::default().bg(BLUE).fg(Color::White))
+                .highlight_style(crate::theme::selected())
                 .highlight_symbol("›"),
             members_area,
             &mut state,
@@ -651,17 +659,31 @@ impl Ui {
             [t("Target"), t("Network"), t("Exit"), "↑", "↓", t("Time")]
                 .map(|h| Cell::from(h).style(Style::default().fg(MUTED))),
         );
+        let muted = Style::default().fg(MUTED);
         let rows: Vec<_> = connections
             .iter()
             .map(|c| {
+                // Host stands out, port recedes; the active filter is marked in place.
+                let mut target =
+                    crate::theme::mark_matches(&c.host, &self.connection_filter, Style::default());
+                target.push(Span::styled(format!(":{}", c.port), muted));
                 TableRow::new(vec![
-                    Cell::from(format!("{}:{}", c.host, c.port)),
-                    Cell::from(format!("{} · {}", c.network, c.inbound))
-                        .style(Style::default().fg(MUTED)),
-                    Cell::from(c.outbound.clone()),
-                    Cell::from(bytes(c.upload)),
-                    Cell::from(bytes(c.download)),
-                    Cell::from(format!("{:.0}s", c.elapsed_ms as f64 / 1000.0)),
+                    Cell::from(Line::from(target)),
+                    Cell::from(Line::from(vec![
+                        Span::styled(
+                            c.network.clone(),
+                            Style::default().fg(crate::theme::network_color(&c.network)),
+                        ),
+                        Span::styled(format!(" · {}", c.inbound), muted),
+                    ])),
+                    Cell::from(Line::from(crate::theme::mark_matches(
+                        &c.outbound,
+                        &self.connection_filter,
+                        Style::default().fg(crate::theme::exit_color(&c.outbound)),
+                    ))),
+                    Cell::from(bytes(c.upload)).style(crate::theme::volume_style(c.upload)),
+                    Cell::from(bytes(c.download)).style(crate::theme::volume_style(c.download)),
+                    Cell::from(format!("{:.0}s", c.elapsed_ms as f64 / 1000.0)).style(muted),
                 ])
             })
             .collect();
@@ -673,18 +695,29 @@ impl Ui {
             snapshot.total,
             if snapshot.truncated { " +" } else { "" }
         );
-        let footer = if self.connection_filtering {
-            format!(" /{}▏ · Enter ", self.connection_filter)
+        let footer = Line::from(if self.connection_filtering {
+            vec![
+                Span::styled(
+                    format!(" /{}▏", self.connection_filter),
+                    crate::theme::matched(),
+                ),
+                Span::styled(" · Enter ", muted),
+            ]
         } else if self.connection_filter.is_empty() {
-            format!(" {} ", t("/ filter · x close · X close all"))
+            let mut spans =
+                crate::theme::key_hints(&format!(" {}", t("/ filter · x close · X close all")));
+            spans.push(Span::raw(" "));
+            spans
         } else {
-            format!(
-                " {} “{}” · Esc {} ",
-                t("Filter"),
-                self.connection_filter,
-                t("clear")
-            )
-        };
+            vec![
+                Span::styled(format!(" {} ", t("Filter")), muted),
+                Span::styled(
+                    format!("“{}”", self.connection_filter),
+                    crate::theme::matched(),
+                ),
+                Span::styled(format!(" · Esc {} ", t("clear")), muted),
+            ]
+        });
         let empty = rows.is_empty();
         let mut state = TableState::default().with_selected(
             (!empty).then_some(
@@ -706,7 +739,7 @@ impl Ui {
             )
             .header(header)
             .block(card(&title).title_bottom(footer))
-            .row_highlight_style(Style::default().bg(BLUE).fg(Color::White)),
+            .row_highlight_style(crate::theme::selected()),
             table_area,
             &mut state,
         );
@@ -747,7 +780,10 @@ impl Ui {
                 ]),
                 Line::from(vec![
                     Span::styled(format!("{} ", t("Exit")), Style::default().fg(MUTED)),
-                    Span::styled(c.outbound.clone(), Style::default().fg(BLUE)),
+                    Span::styled(
+                        c.outbound.clone(),
+                        Style::default().fg(crate::theme::exit_color(&c.outbound)),
+                    ),
                 ]),
                 Line::raw(format!(
                     "{} · {} · {}",
@@ -853,6 +889,199 @@ mod tests {
     }
     fn key(ui: &mut Ui, code: KeyCode) -> Input {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn cursor_tabs_and_states_are_highlighted_on_every_list_page() {
+        let selected = crate::theme::selected();
+        let mut ui = sample();
+        ui.rows.push(Row {
+            instance: Instance {
+                name: "rules".into(),
+                kind: Kind::Rule,
+                config: "/r.toml".into(),
+            },
+            pid: None,
+            state: "Stopped".into(),
+            uptime: 0,
+            changed: false,
+        });
+        let draw = |ui: &Ui| {
+            let mut t = ratatui::Terminal::new(TestBackend::new(110, 30)).unwrap();
+            t.draw(|f| ui.render(f)).unwrap();
+            t.backend().buffer().clone()
+        };
+        // Styles of the cells spelling `text` on the first row that shows it.
+        let styles = |buffer: &ratatui::buffer::Buffer, text: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let line: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    let at = line.find(text)?;
+                    let column = line[..at].chars().count() as u16;
+                    Some(
+                        (column..column + text.chars().count() as u16)
+                            .map(|x| buffer[(x, y)].style())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            ui.navigate(PROFILES);
+            let buffer = draw(&ui);
+            assert!(styles(&buffer, "Profiles 1")
+                .iter()
+                .all(|s| s.bg == selected.bg));
+            assert!(styles(&buffer, "Rule cores 1")
+                .iter()
+                .all(|s| s.bg != selected.bg));
+            let state = styles(&buffer, "State: Running");
+            assert!(
+                state.iter().any(|s| s.fg == Some(Color::Green)),
+                "state is colored"
+            );
+            key(&mut ui, KeyCode::Tab);
+            let buffer = draw(&ui);
+            assert!(styles(&buffer, "Rule cores 1")
+                .iter()
+                .all(|s| s.bg == selected.bg));
+            // With focus on members, the group cursor stays visible without competing.
+            ui.navigate(PROXIES);
+            key(&mut ui, KeyCode::Enter);
+            let buffer = draw(&ui);
+            assert!(styles(&buffer, "● auto")
+                .iter()
+                .all(|s| s.bg == selected.bg));
+            // The selected group's second line, in the groups pane on the left.
+            let group = styles(&buffer, "→ auto");
+            assert!(!group.is_empty());
+            assert!(group
+                .iter()
+                .all(|s| s.add_modifier.contains(Modifier::UNDERLINED) && s.bg != selected.bg));
+            // Connections: exit, network and volume are colored on unselected rows.
+            let mut snapshot = ui.live().unwrap().clone();
+            snapshot.connections.push(Connection {
+                id: 8,
+                source: None,
+                host: "quiet.test".into(),
+                port: 53,
+                network: "Udp".into(),
+                inbound: "Tun".into(),
+                outbound: "DIRECT".into(),
+                upload: 100,
+                download: 3 * 1024 * 1024,
+                elapsed_ms: 1000,
+            });
+            ui.accept_runtime("proxy".into(), snapshot);
+            ui.navigate(CONNECTIONS);
+            let buffer = draw(&ui);
+            let fg = |text: &str| styles(&buffer, text).first().and_then(|s| s.fg);
+            assert_eq!(fg("DIRECT"), Some(Color::Green));
+            assert_eq!(fg("Udp"), Some(Color::Magenta));
+            assert_eq!(fg(":53"), Some(MUTED));
+            assert_eq!(fg("100 B"), Some(MUTED), "idle counters fade");
+            assert!(styles(&buffer, "3.0 MiB")[0]
+                .add_modifier
+                .contains(Modifier::BOLD));
+            // The page's key hints color keys apart from what they do.
+            assert_eq!(fg("x close"), Some(Color::Cyan));
+            assert_eq!(styles(&buffer, "x close")[2].fg, Some(MUTED));
+            // An active filter is marked in the footer and in unselected matching rows.
+            ui.connection_filter = "test".into();
+            let buffer = draw(&ui);
+            let matched = crate::theme::matched().bg;
+            assert_eq!(styles(&buffer, "“test”")[0].bg, matched);
+            let row = styles(&buffer, "quiet.test");
+            assert!(row[..6].iter().all(|s| s.bg != matched) && row[6].bg == matched);
+        });
+    }
+    #[test]
+    fn status_bar_colors_state_and_drops_detail_instead_of_cutting_words() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.tun = true;
+        ui.accept_runtime("proxy".into(), snapshot);
+        ui.rates = [0, 48_000];
+        let bar = |ui: &Ui, width: u16| {
+            let mut t = ratatui::Terminal::new(TestBackend::new(width, 12)).unwrap();
+            t.draw(|f| ui.render(f)).unwrap();
+            let buffer = t.backend().buffer().clone();
+            let cells: Vec<_> = (0..width).map(|x| buffer[(x, 0)].clone()).collect();
+            let text: String = cells.iter().map(|c| c.symbol()).collect();
+            (text, cells)
+        };
+        let color_of = |cells: &[ratatui::buffer::Cell], text: &str, word: &str| {
+            let at = text.find(word).unwrap();
+            cells[text[..at].chars().count()].fg
+        };
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let (text, cells) = bar(&ui, 120);
+            assert_eq!(color_of(&cells, &text, "TUN"), Color::Green);
+            assert_eq!(color_of(&cells, &text, "LAN"), MUTED);
+            assert_eq!(color_of(&cells, &text, "Rule"), Color::Cyan);
+            assert_eq!(
+                color_of(&cells, &text, "↑ 0 B/s"),
+                MUTED,
+                "idle rate is muted"
+            );
+            assert_eq!(color_of(&cells, &text, "↓"), Color::Cyan);
+            assert!(
+                text.trim_end().ends_with("KiB/s"),
+                "rates are right-aligned: {text}"
+            );
+            // Narrower bars lose whole parts in order, never half a word.
+            let (text, _) = bar(&ui, 70);
+            assert!(
+                !text.contains("B/s") && text.contains("TUN") && !text.contains("LAN"),
+                "{text}"
+            );
+            for width in [48, 36, 24] {
+                let (text, _) = bar(&ui, width);
+                let words: Vec<_> = text.split_whitespace().collect();
+                for word in words {
+                    assert!(
+                        ["Astra", "│", "●", "proxy", "Connected", "Rule", "TUN"].contains(&word)
+                            || word
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || "hms".contains(c)),
+                        "partial word {word:?} at {width}: {text}"
+                    );
+                }
+            }
+        });
+    }
+    #[test]
+    fn find_jumps_to_matching_groups_and_members() {
+        let mut ui = sample();
+        ui.navigate(PROXIES);
+        let find = |ui: &mut Ui, text: &str| {
+            key(ui, KeyCode::Char('/'));
+            assert!(matches!(ui.prompt, Some(Prompt::Find(PROXIES))));
+            ui.key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ));
+            for c in text.chars() {
+                key(ui, KeyCode::Char(c));
+            }
+            key(ui, KeyCode::Enter);
+        };
+        find(&mut ui, "sing");
+        assert_eq!(ui.group_selection, 0);
+        assert_eq!(ui.runtime_picker, Some(("PROXY".into(), 1)));
+        // Inside the member list, / searches again and finds members of other groups.
+        find(&mut ui, "tokyo");
+        assert_eq!(ui.group_selection, 1);
+        assert_eq!(ui.runtime_picker, Some(("auto".into(), 0)));
+        // "auto" is a member of PROXY and a group; after the last match the search wraps.
+        find(&mut ui, "auto");
+        assert_eq!(ui.runtime_picker, Some(("PROXY".into(), 0)));
+        find(&mut ui, "auto");
+        assert_eq!(ui.runtime_picker, None);
+        assert_eq!(ui.group_selection, 1);
+        find(&mut ui, "nothing");
+        assert!(ui.message.contains("nothing"));
     }
     #[test]
     fn exit_chain_follows_group_selections_to_the_final_node() {

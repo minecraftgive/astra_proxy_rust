@@ -151,13 +151,7 @@ struct DiagnosticPlan {
     control: Option<(PathBuf, Option<u32>)>,
 }
 impl DiagnosticPlan {
-    async fn stream(
-        mut self,
-        targets: Vec<String>,
-        output: &mut (impl tokio::io::AsyncWrite + Unpin),
-    ) -> Result<()> {
-        use astra_ipc::diagnostics::Event;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    async fn refresh(&mut self) -> Result<()> {
         if let Some((socket, pid)) = &self.control {
             let snapshot = control::config_snapshot(socket)
                 .await
@@ -173,58 +167,62 @@ impl DiagnosticPlan {
             self.config_path = snapshot.path;
             self.text = snapshot.text;
         }
+        Ok(())
+    }
+    async fn stream(
+        mut self,
+        targets: Vec<String>,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<()> {
+        use astra_ipc::diagnostics::Event;
+        self.refresh().await?;
         let payload = serde_json::to_vec(&astra_ipc::diagnostics::Request {
             config: self.text,
             targets: Some(targets),
             list_targets: false,
         })?;
-        let mut child = core_process(self.executable)
-            .arg("--diagnose-stream")
-            .arg(self.config_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let mut input = child.stdin.take().context("Missing diagnostic input")?;
-        input.write_all(&payload).await?;
-        drop(input);
-        let stderr = child.stderr.take().context("Missing diagnostic errors")?;
-        let errors = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let _ = stderr.take(4096).read_to_end(&mut bytes).await;
-            bytes
-        });
-        let mut reader = BufReader::new(child.stdout.take().context("Missing diagnostic output")?);
-        let mut done = false;
-        for _ in 0..20000 {
-            let mut line = String::new();
-            if (&mut reader).take(1024 * 1024).read_line(&mut line).await? == 0 {
-                break;
-            }
-            anyhow::ensure!(line.ends_with('\n'), "Diagnostic event exceeds limit");
-            let mut event: Event =
-                serde_json::from_str(&line).context("Update proxy core to use live node tests")?;
-            if let Event::Started { running_config, .. } = &mut event {
-                *running_config = self.running;
-            }
-            if matches!(event, Event::Done) {
-                done = true;
-                break;
-            }
-            timeout(
-                Duration::from_secs(2),
-                astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&event)?)),
-            )
-            .await??;
-        }
-        let status = child.wait().await?;
-        let errors = String::from_utf8_lossy(&errors.await?).into_owned();
-        anyhow::ensure!(status.success(), "Diagnostic core failed: {errors}");
-        anyhow::ensure!(done, "Diagnostic stream ended before completion");
-        astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&Event::Done)?))
-            .await?;
-        Ok(())
+        let running = self.running;
+        pipe_events(
+            self.executable,
+            "--diagnose-stream",
+            self.config_path,
+            payload,
+            output,
+            "Update proxy core to use live node tests",
+            |event: &mut Event| {
+                if let Event::Started { running_config, .. } = event {
+                    *running_config = running;
+                }
+                matches!(event, Event::Done)
+            },
+        )
+        .await
+    }
+    async fn nettool(
+        mut self,
+        mut request: astra_ipc::nettool::Request,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<()> {
+        use astra_ipc::nettool::Event;
+        self.refresh().await?;
+        request.config = self.text;
+        let payload = serde_json::to_vec(&request)?;
+        let running = self.running;
+        pipe_events(
+            self.executable,
+            "--nettool-stream",
+            self.config_path,
+            payload,
+            output,
+            "Update proxy core to use network tools",
+            |event: &mut Event| {
+                if let Event::Started { running_config, .. } = event {
+                    *running_config = running;
+                }
+                matches!(event, Event::Done)
+            },
+        )
+        .await
     }
     async fn run(self) -> Result<Reply> {
         self.run_selection(None, false).await
@@ -287,6 +285,65 @@ impl DiagnosticPlan {
         .await
         .context("Diagnostic core timed out")?
     }
+}
+
+/// Relay one JSON event per line from a short-lived core; `done` marks the final event.
+async fn pipe_events<E: serde::de::DeserializeOwned + Serialize>(
+    executable: PathBuf,
+    flag: &str,
+    config_path: PathBuf,
+    payload: Vec<u8>,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    outdated: &'static str,
+    mut done: impl FnMut(&mut E) -> bool,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let mut child = core_process(executable)
+        .arg(flag)
+        .arg(config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut input = child.stdin.take().context("Missing diagnostic input")?;
+    input.write_all(&payload).await?;
+    drop(input);
+    let stderr = child.stderr.take().context("Missing diagnostic errors")?;
+    let errors = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(4096).read_to_end(&mut bytes).await;
+        bytes
+    });
+    let mut reader = BufReader::new(child.stdout.take().context("Missing diagnostic output")?);
+    let mut last = None;
+    for _ in 0..20000 {
+        let mut line = String::new();
+        if (&mut reader).take(1024 * 1024).read_line(&mut line).await? == 0 {
+            break;
+        }
+        anyhow::ensure!(line.ends_with('\n'), "Diagnostic event exceeds limit");
+        let mut event: E = serde_json::from_str(&line).context(outdated)?;
+        if done(&mut event) {
+            last = Some(event);
+            break;
+        }
+        timeout(
+            Duration::from_secs(2),
+            astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&event)?)),
+        )
+        .await??;
+    }
+    let status = child.wait().await?;
+    let errors = String::from_utf8_lossy(&errors.await?).into_owned();
+    anyhow::ensure!(
+        status.success(),
+        "Diagnostic core failed: {}",
+        errors.trim()
+    );
+    let last = last.context("Diagnostic stream ended before completion")?;
+    astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&last)?)).await?;
+    Ok(())
 }
 
 fn core_process(path: PathBuf) -> Process {
@@ -996,27 +1053,76 @@ impl Manager {
         if let Err(error) = result {
             astra_ipc::storage::write_json(&path, &previous)
                 .context("Restore previous runtime switches after rejected TUN restart")?;
-            let _ = self.reap();
-            if self.running.contains_key(name)
-                && self
-                    .running
-                    .get(name)
-                    .and_then(|running| running.child.id())
-                    != previous_pid
-            {
-                self.stop(name).await.context(
-                    "Stop the replacement core before restoring previous runtime switches",
-                )?;
-            }
-            if !self.running.contains_key(name) {
-                self.start_one(name)
-                    .await
-                    .context("Restore previous proxy core after rejected TUN restart")?;
-            }
-            self.notify();
+            self.recover_handover(name, previous_pid)
+                .await
+                .context("Restore previous proxy core after rejected TUN restart")?;
             return Err(error);
         }
         result
+    }
+    /// After a failed handover, stop a replacement that came up and bring the
+    /// instance back if nothing is serving it.
+    #[cfg(windows)]
+    async fn recover_handover(&mut self, name: &str, previous_pid: Option<u32>) -> Result<()> {
+        let _ = self.reap();
+        if self.running.contains_key(name)
+            && self
+                .running
+                .get(name)
+                .and_then(|running| running.child.id())
+                != previous_pid
+        {
+            self.stop(name).await.context("Stop the replacement core")?;
+        }
+        if !self.running.contains_key(name) {
+            self.start_one(name).await?;
+        }
+        self.notify();
+        Ok(())
+    }
+    /// Restart an elevated TUN proxy with the UAC prompt answered while the
+    /// current core still serves, so its listeners close only for the drain
+    /// and handover rather than for as long as the prompt is open. Returns
+    /// false when the plain stop/start path applies.
+    #[cfg(windows)]
+    async fn restart_elevated(&mut self, name: &str) -> Result<bool> {
+        self.reap()?;
+        let instance = self.instance(name)?;
+        let Some(previous_pid) = self.running.get(name).and_then(|r| r.child.id()) else {
+            return Ok(false);
+        };
+        if instance.kind != Kind::Proxy
+            || astra_ipc::runtime::load_overrides(&instance.config)?.tun != Some(true)
+            || astra_ipc::elevation::is_elevated()?
+            // Missing dependencies need start()'s ordered startup and rollback.
+            || self
+                .start_plan(name)?
+                .iter()
+                .any(|item| item != name && !self.running.contains_key(item))
+        {
+            return Ok(false);
+        }
+        let replacement = self
+            .spawn_elevated(name, Some(previous_pid))
+            .await
+            .context("Restart was cancelled; the running core was left unchanged")?;
+        astra_ipc::progress::report(
+            "Restart with TUN",
+            "Approved; handing over to the administrator core",
+        );
+        let result: Result<()> = async {
+            // An early return drops (and so terminates) the replacement.
+            self.stop_core(name, false).await?;
+            self.start_with(name, Some(replacement)).await
+        }
+        .await;
+        if let Err(error) = result {
+            self.recover_handover(name, Some(previous_pid))
+                .await
+                .context("Restore proxy core after failed restart")?;
+            return Err(error);
+        }
+        Ok(true)
     }
     async fn stop_all(&mut self) {
         let _ = self.reap();
@@ -1243,7 +1349,9 @@ impl Manager {
             | Action::DiagnosticsSelected { .. } => {
                 bail!("Diagnostics require a dedicated connection")
             }
-            Action::DiagnosticsStream { .. } => bail!("Diagnostics require a dedicated connection"),
+            Action::DiagnosticsStream { .. } | Action::NetTool { .. } => {
+                bail!("Diagnostics require a dedicated connection")
+            }
             Action::Session | Action::WatchList | Action::WatchRuntime { .. } => {
                 bail!("Transport action requires a dedicated connection")
             }
@@ -1362,6 +1470,10 @@ impl Manager {
                 // start() checks the not-yet-running dependencies itself.
                 self.validate(i.kind, &i.config).await?;
                 self.start_plan(&name)?;
+                #[cfg(windows)]
+                if self.restart_elevated(&name).await? {
+                    return Ok(Reply::text("Restarted with current configuration"));
+                }
                 self.stop(&name).await?;
                 self.start(&name).await?;
                 Ok(Reply::text("Restarted with current configuration"))

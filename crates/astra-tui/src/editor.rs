@@ -66,6 +66,9 @@ enum Mode {
         options: Vec<String>,
         chosen: Vec<String>,
         cursor: usize,
+        /// `/` query while typing; Enter or Esc keeps the cursor on the match.
+        #[serde(default)]
+        find: Option<String>,
     },
     Delete {
         key: Option<String>,
@@ -963,7 +966,14 @@ impl Editor {
             (&mut self.history, &mut self.future)
         };
         let Some(text) = from.pop() else {
-            self.notice = Some(t(if redo { "Nothing to redo" } else { "Nothing to undo" }).into());
+            self.notice = Some(
+                t(if redo {
+                    "Nothing to redo"
+                } else {
+                    "Nothing to undo"
+                })
+                .into(),
+            );
             return Ok(());
         };
         to.push(self.lines.join("\n"));
@@ -1887,12 +1897,7 @@ impl Editor {
         self.flatten_table(doc, &[], &mut rows);
         rows
     }
-    fn flatten_table(
-        &self,
-        doc: &DocumentMut,
-        path: &[Part],
-        output: &mut Vec<FlatRow>,
-    ) {
+    fn flatten_table(&self, doc: &DocumentMut, path: &[Part], output: &mut Vec<FlatRow>) {
         if path.len() > 32 {
             return;
         }
@@ -2533,6 +2538,7 @@ impl Editor {
                         options,
                         chosen,
                         cursor: 0,
+                        find: None,
                     };
                     return Ok(());
                 }
@@ -2857,7 +2863,10 @@ impl Editor {
             }
         } else if let Some(field) = field {
             if self.form.path == vec![Part::Key("proxy_groups".into())] {
-                anyhow::ensure!(!proxy_references(&doc, field), t("Proxy target is referenced; change its groups or default before deleting"));
+                anyhow::ensure!(
+                    !proxy_references(&doc, field),
+                    t("Proxy target is referenced; change its groups or default before deleting")
+                );
             }
             if self.form.path == vec![Part::Key("rule_sets".into())] {
                 anyhow::ensure!(
@@ -3008,9 +3017,48 @@ impl Editor {
                 options,
                 chosen,
                 cursor,
+                find,
             } = &mut self.form.mode
             {
+                if let Some(query) = find {
+                    // Typing jumps to the first member containing the text; ↑↓ step between matches.
+                    let matches = |name: &String, query: &str| {
+                        name.to_lowercase().contains(&query.to_lowercase())
+                    };
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Esc => *find = None,
+                        KeyCode::Backspace => {
+                            query.pop();
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.push(c);
+                            if let Some(index) = options.iter().position(|o| matches(o, query)) {
+                                *cursor = index;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(index) =
+                                (*cursor + 1..options.len()).find(|&i| matches(&options[i], query))
+                            {
+                                *cursor = index;
+                            }
+                        }
+                        KeyCode::Up => {
+                            if let Some(index) =
+                                (0..*cursor).rev().find(|&i| matches(&options[i], query))
+                            {
+                                *cursor = index;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
                 match key.code {
+                    KeyCode::Char('/') => *find = Some(String::new()),
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        *find = Some(String::new())
+                    }
                     KeyCode::Esc => {
                         self.cancel_input();
                         return Ok(());
@@ -3430,7 +3478,9 @@ impl Editor {
                             index: Some(index),
                         };
                     }
-                    Some(FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. }) => {
+                    Some(
+                        FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. },
+                    ) => {
                         if let Some(name) = proxy_group_name(&path) {
                             anyhow::ensure!(
                                 !astra_ipc::groups::reserved(&name),
@@ -3549,7 +3599,9 @@ impl Editor {
                 t("Enter expand/collapse · r rename · e enable/disable · d delete").into()
             }
             Some(FlatRow::Field { spec, .. }) => spec.help.clone(),
-            Some(FlatRow::Node { .. }) => t("Enter fold · y duplicate · d delete · K/J move").into(),
+            Some(FlatRow::Node { .. }) => {
+                t("Enter fold · y duplicate · d delete · K/J move").into()
+            }
             Some(FlatRow::Rule { .. }) => t("y duplicate · d delete · K/J move").into(),
             Some(FlatRow::Section { path, .. }) if last_key(path) == Some("tls") => {
                 t("Enter 启用/关闭 TLS；字段始终平铺；d 删除本分组参数").into()
@@ -3562,6 +3614,11 @@ impl Editor {
             .into(),
             _ => t("Enter edit · n add").into(),
         }
+    }
+    /// Highlighting style for a field; rule values follow the rule's kind.
+    fn flavor(spec: &Spec, table: Option<&dyn TableLike>) -> crate::highlight::Flavor {
+        let kind = table.and_then(|t| t.get("kind")).and_then(Item::as_str);
+        crate::highlight::flavor(&spec.key, matches!(spec.kind, Type::Number(..)), kind)
     }
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let dirty = self.text() != self.original;
@@ -3637,32 +3694,42 @@ impl Editor {
                         let width = Span::raw(label.as_str()).width();
                         label.push_str(&" ".repeat(label_column.saturating_sub(width).max(2)));
                         let value = if tls_disabled {
-                            Span::styled(t("TLS off · filling any field enables it"), dim)
+                            vec![Span::styled(
+                                t("TLS off · filling any field enables it"),
+                                dim,
+                            )]
                         } else if matches!(spec.kind, Type::Boolean) {
                             let on = current.map(scalar).unwrap_or(spec.default.clone()) == "true";
                             let text = format!("{} {on}", if on { "[x]" } else { "[ ]" });
-                            if current.is_some() {
+                            vec![if current.is_some() {
                                 Span::styled(
                                     text,
-                                    Style::default().fg(if on { Color::Green } else { Color::Reset }),
+                                    Style::default().fg(if on {
+                                        Color::Green
+                                    } else {
+                                        Color::Reset
+                                    }),
                                 )
                             } else {
                                 Span::styled(tr!("{} · {}", text, t("default")), dim)
-                            }
+                            }]
                         } else if let Some(item) = current {
                             let text = scalar(item);
                             if spec.secret() && !text.is_empty() {
-                                Span::raw("••••••••")
+                                vec![Span::raw("••••••••")]
                             } else if PLACEHOLDERS.contains(&text.as_str()) {
-                                Span::styled(
+                                vec![Span::styled(
                                     tr!("{}  ← {}", text, t("template value")),
                                     Style::default().fg(Color::Yellow),
-                                )
+                                )]
                             } else {
-                                Span::raw(text.replace('\n', " ↵ "))
+                                crate::highlight::spans(
+                                    &text.replace('\n', " ↵ "),
+                                    Self::flavor(spec, table),
+                                )
                             }
                         } else if spec.required {
-                            Span::styled(
+                            vec![Span::styled(
                                 tr!(
                                     "{} · {}",
                                     t("required"),
@@ -3673,13 +3740,15 @@ impl Editor {
                                     }
                                 ),
                                 Style::default().fg(Color::Yellow),
-                            )
+                            )]
                         } else if spec.default.is_empty() {
-                            Span::styled("—", dim)
+                            vec![Span::styled("—", dim)]
                         } else {
-                            Span::styled(tr!("{} {}", t("default"), spec.default), dim)
+                            vec![Span::styled(tr!("{} {}", t("default"), spec.default), dim)]
                         };
-                        vec![Span::raw(label), value]
+                        let mut spans = vec![Span::raw(label)];
+                        spans.extend(value);
+                        spans
                     }
                     FlatRow::Collection { path, label } => {
                         let count = collection(&doc, path).map(|a| a.len()).unwrap_or(0);
@@ -3837,7 +3906,7 @@ impl Editor {
         }
         frame.render_stateful_widget(
             List::new(items)
-                .highlight_style(Style::default().bg(Color::Blue))
+                .highlight_style(crate::theme::selected_keep_colors())
                 .block(Block::default().title(title).borders(Borders::ALL)),
             sections[0],
             &mut state,
@@ -3892,9 +3961,8 @@ impl Editor {
             };
             // A field editor opens right under its row, so the label stays in sight.
             if matches!(self.form.mode, Mode::Field { .. }) && !items_empty {
-                let row = sections[0].y
-                    + 1
-                    + (self.form.selected.saturating_sub(state.offset())) as u16;
+                let row =
+                    sections[0].y + 1 + (self.form.selected.saturating_sub(state.offset())) as u16;
                 let left = area.x + 3 + label_column as u16;
                 let room = area.right().saturating_sub(left + 1);
                 if room >= 32 {
@@ -3911,17 +3979,30 @@ impl Editor {
             }
             frame.render_widget(Clear, popup);
             match &self.form.mode {
-                Mode::Members { options, chosen, cursor } => {
+                Mode::Members { options, chosen, cursor, find } => {
                     let mut state = ListState::default().with_selected(Some(*cursor));
-                    let items = options.iter().map(|name| ListItem::new(format!("[{}] {}", if chosen.contains(name) { "×" } else { " " }, name)));
-                    frame.render_stateful_widget(List::new(items).highlight_symbol("› ").highlight_style(Style::default().bg(Color::Blue))
-                        .block(Block::default().title(t("Group members")).title_bottom(t("j/k move · Space toggle · Enter confirm · Esc cancel")).borders(Borders::ALL)), popup, &mut state);
+                    let query = find.as_ref().map(|q| q.to_lowercase()).filter(|q| !q.is_empty());
+                    let items = options.iter().map(|name| {
+                        let item = ListItem::new(format!("[{}] {}", if chosen.contains(name) { "×" } else { " " }, name));
+                        // While searching, members that do not match are dimmed rather than hidden.
+                        if query.as_ref().is_some_and(|q| !name.to_lowercase().contains(q)) { item.style(Style::default().fg(Color::DarkGray)) } else { item }
+                    });
+                    let title = match find {
+                        Some(query) => format!("{} · /{}▏", t("Group members"), query),
+                        None => t("Group members").to_owned(),
+                    };
+                    let hint = if find.is_some() { t("Type to find · ↑↓ next match · Enter / Esc done") } else { t("j/k move · Space toggle · / find · Enter confirm · Esc cancel") };
+                    frame.render_stateful_widget(List::new(items).highlight_symbol("› ").highlight_style(crate::theme::selected())
+                        .block(Block::default().title(title).title_bottom(hint).borders(Borders::ALL)), popup, &mut state);
                 }
                 Mode::Field{key,input,reveal} => {
                     let spec = self.current_spec(&doc,key).ok();
                     let secret = spec.as_ref().is_some_and(Spec::secret) && !reveal;
                     let display = if secret { "•".repeat(input.text.chars().count()) } else { input.text.replace('\n'," ↵ ") };
-                    let mut display: Vec<char> = display.chars().collect(); display.insert(input.cursor.min(display.len()),'▏');
+                    let flavor = spec.as_ref().map(|spec| Self::flavor(spec, table_at(doc.as_table(), &self.form.path))).unwrap_or(crate::highlight::Flavor::Auto);
+                    let colored = if secret { vec![Span::raw(display.clone())] } else { crate::highlight::spans(&display, flavor) };
+                    let mut first = vec![Span::raw("> ")];
+                    first.extend(crate::highlight::with_cursor(colored, input.cursor.min(display.chars().count())));
                     let suggestions = self.suggestions(&doc, key, input);
                     let choices = suggestions.as_ref().map(|values| {
                         if values.is_empty() { return t("No matches").to_owned(); }
@@ -3932,9 +4013,9 @@ impl Editor {
                     }).unwrap_or_default();
                     let hint = if suggestions.is_some() { t("Type to filter · ↑↓ select · Tab complete · Enter confirm · Esc cancel") } else { t("Enter confirm · Esc cancel · Ctrl-U clear · F2 reveal") };
                     let help = spec.as_ref().map(|s| s.help.as_str()).filter(|help| !Self::generic_help(help)).unwrap_or("");
-                    let text = [format!("> {}", display.iter().collect::<String>()), choices, help.into(), hint.into()]
-                        .into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
-                    let paragraph = Paragraph::new(text).wrap(Wrap{trim:false});
+                    let mut lines = vec![Line::from(first)];
+                    lines.extend([choices, help.into(), hint.into()].into_iter().filter(|line| !line.is_empty()).flat_map(|text| text.lines().map(|line| Line::raw(line.to_owned())).collect::<Vec<_>>()));
+                    let paragraph = Paragraph::new(lines).wrap(Wrap{trim:false});
                     // Wrapped help lines on narrow screens must not push the key hints out.
                     let mut popup = popup;
                     popup.height = (paragraph.line_count(popup.width.saturating_sub(2).max(1)) as u16 + 2).min(area.height);
@@ -3944,7 +4025,7 @@ impl Editor {
                 }
                 Mode::NewOutbound(selected) => {
                     let mut state = ListState::default().with_selected(Some(*selected));
-                    frame.render_stateful_widget(List::new(OUTBOUND_KINDS.iter().map(|s|ListItem::new(*s))).highlight_symbol("› ").highlight_style(Style::default().bg(Color::Blue)).block(Block::default().title(t("新增出站节点 · ↑↓ 选择 · Enter 确认 · Esc 取消")).borders(Borders::ALL)),popup,&mut state);
+                    frame.render_stateful_widget(List::new(OUTBOUND_KINDS.iter().map(|s|ListItem::new(*s))).highlight_symbol("› ").highlight_style(crate::theme::selected()).block(Block::default().title(t("新增出站节点 · ↑↓ 选择 · Enter 确认 · Esc 取消")).borders(Borders::ALL)),popup,&mut state);
                 }
                 Mode::Header(input) => frame.render_widget(Paragraph::new(if last_key(&self.form.path)==Some("subscriptions") {tr!("Subscription name: {}▏\nEnter confirm · Esc cancel", input.text)} else if last_key(&self.form.path)==Some("proxy_groups") {tr!("Proxy group name: {}▏\nEnter confirm · Esc cancel", input.text)} else if self.form.rename_rule_set.is_some() {tr!("Rename rule set: {}▏\nEnter confirm · Esc cancel",input.text)}else if last_key(&self.form.path)==Some("rule_sets") {tr!("规则集名称：{}▏\nEnter 创建 · Esc 取消",input.text)}else{tr!("请求头名称：{}▏\nEnter 继续设置值 · Esc 取消",input.text)}).block(Block::default().title(if last_key(&self.form.path)==Some("subscriptions") {t("Subscriptions")} else if last_key(&self.form.path)==Some("proxy_groups") {t("Proxy groups")}else if last_key(&self.form.path)==Some("rule_sets"){t("规则集")}else{t("新增请求头")}).borders(Borders::ALL)),popup),
                 Mode::Delete{..} => frame.render_widget(Paragraph::new(t("删除所选条目/分组？\n只修改草稿，Ctrl-S 后写入配置。\ny 确认删除 · n / Esc 取消")).wrap(Wrap{trim:false}).block(Block::default().title(t("确认删除")).borders(Borders::ALL).style(Style::default().fg(Color::Yellow))),popup),
@@ -4203,7 +4284,9 @@ mod tests {
         assert!(
             matches!(editor.visible_rows(&doc).get(editor.form.selected), Some(FlatRow::Field{path:p,spec,..}) if p == &path && spec.key == key)
         );
-        if let Some(FlatRow::Field { spec, .. }) = editor.visible_rows(&doc).get(editor.form.selected) {
+        if let Some(FlatRow::Field { spec, .. }) =
+            editor.visible_rows(&doc).get(editor.form.selected)
+        {
             if matches!(spec.kind, Type::Boolean) {
                 let current = table_at(doc.as_table(), &path)
                     .and_then(|t| t.get(key))
@@ -4440,6 +4523,49 @@ mod tests {
         }
     }
     #[test]
+    fn member_picker_finds_members_without_toggling_them() {
+        let mut e = Editor::new("p".into(), "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='tokyo-1'\nserver='127.0.0.1:1081'\n[[outbounds]]\nkind='socks5'\ntag='osaka'\nserver='127.0.0.1:1082'\n[[outbounds]]\nkind='socks5'\ntag='tokyo-2'\nserver='127.0.0.1:1083'".into());
+        let path = vec![Part::Key("proxy_groups".into())];
+        e.form.selected = e
+            .visible_rows(&e.document().unwrap())
+            .iter()
+            .position(|r| r.path() == path)
+            .unwrap();
+        press(&mut e, KeyCode::Char('n'));
+        e.paste("jp");
+        press(&mut e, KeyCode::Enter);
+        let at = |e: &Editor| match &e.form.mode {
+            Mode::Members {
+                options, cursor, ..
+            } => options[*cursor].clone(),
+            _ => panic!("expected picker"),
+        };
+        press(&mut e, KeyCode::Char('/'));
+        // j, k and Space are query text while finding.
+        for c in "osaka".chars() {
+            press(&mut e, KeyCode::Char(c));
+        }
+        assert_eq!(at(&e), "osaka");
+        assert!(matches!(&e.form.mode, Mode::Members { find: Some(q), .. } if q == "osaka"));
+        for _ in 0.."osaka".len() {
+            press(&mut e, KeyCode::Backspace);
+        }
+        for c in "tokyo".chars() {
+            press(&mut e, KeyCode::Char(c));
+        }
+        assert_eq!(at(&e), "tokyo-1");
+        press(&mut e, KeyCode::Down);
+        assert_eq!(at(&e), "tokyo-2");
+        press(&mut e, KeyCode::Enter);
+        // The picker stays open; Space now toggles the found member.
+        press(&mut e, KeyCode::Char(' '));
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(
+            e.document().unwrap()["proxy_groups"]["jp"]["members"][0].as_str(),
+            Some("tokyo-2")
+        );
+    }
+    #[test]
     fn new_proxy_group_opens_member_picker_and_is_available_as_default() {
         let mut e=Editor::new("p".into(),"standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='a'\nserver='127.0.0.1:1081'".into());
         let path = vec![Part::Key("proxy_groups".into())];
@@ -4477,8 +4603,14 @@ mod tests {
         let mut e = Editor::new("p".into(), "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='a'\nserver='127.0.0.1:1081'".into())
             .with_kind(CoreKind::Proxy);
         let doc = e.document().unwrap();
-        assert_eq!(doc["proxy_groups"]["DIRECT"]["members"][0].as_str(), Some("DIRECT"));
-        assert_eq!(doc["proxy_groups"]["REJECT"]["members"][0].as_str(), Some("REJECT"));
+        assert_eq!(
+            doc["proxy_groups"]["DIRECT"]["members"][0].as_str(),
+            Some("DIRECT")
+        );
+        assert_eq!(
+            doc["proxy_groups"]["REJECT"]["members"][0].as_str(),
+            Some("REJECT")
+        );
         let direct = vec![Part::Key("proxy_groups".into()), Part::Key("DIRECT".into())];
         e.reveal(&doc, &direct, true);
         let header = e
@@ -4500,7 +4632,10 @@ mod tests {
         let doc = e.document().unwrap();
         e.focus_field(&doc, &direct, "members");
         press(&mut e, KeyCode::Enter);
-        let Mode::Members { options, cursor, .. } = &mut e.form.mode else {
+        let Mode::Members {
+            options, cursor, ..
+        } = &mut e.form.mode
+        else {
             panic!("expected picker");
         };
         assert!(options.contains(&"DIRECT".into()) && options.contains(&"a".into()));
@@ -4518,7 +4653,9 @@ mod tests {
         let mut r = rules();
         r.set_node_tags(vec!["DIRECT".into(), "edge".into()]);
         r.form.path = vec![Part::Key("rules".into()), Part::Index(0)];
-        let values = r.reference_values(&r.document().unwrap(), "action").unwrap();
+        let values = r
+            .reference_values(&r.document().unwrap(), "action")
+            .unwrap();
         assert!(values.contains(&"proxy:edge".into()) && !values.contains(&"proxy:DIRECT".into()));
     }
     #[test]
@@ -5533,7 +5670,9 @@ mod interaction_tests {
         // A blocked delete leaves no confirmation dialog behind.
         let doc = e.document().unwrap();
         e.focus_field(&doc, &[], "rule_socket");
-        assert!(e.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).is_err());
+        assert!(e
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .is_err());
         assert!(matches!(e.form.mode, Mode::Browse));
     }
     #[test]
@@ -5545,7 +5684,13 @@ mod interaction_tests {
         press(&mut e, KeyCode::Down);
         press(&mut e, KeyCode::Enter);
         let mut opened = Vec::new();
-        for value in ["hk-1", "hk.example.net", "8443", "11111111-2222-3333-4444-555555555555", "hk.example.net"] {
+        for value in [
+            "hk-1",
+            "hk.example.net",
+            "8443",
+            "11111111-2222-3333-4444-555555555555",
+            "hk.example.net",
+        ] {
             let Mode::Field { key, .. } = &e.form.mode else {
                 panic!("guided filling stopped early after {opened:?}");
             };
@@ -5560,7 +5705,10 @@ mod interaction_tests {
         let node = &doc["outbounds"][1];
         assert_eq!(node["tag"].as_str(), Some("hk-1"));
         assert_eq!(node["config"]["server"].as_str(), Some("hk.example.net"));
-        assert_eq!(node["config"]["tls"]["server_name"].as_str(), Some("hk.example.net"));
+        assert_eq!(
+            node["config"]["tls"]["server_name"].as_str(),
+            Some("hk.example.net")
+        );
         // Esc ends the walk and keeps what was entered so far.
         press(&mut e, KeyCode::Char('n'));
         press(&mut e, KeyCode::Enter);
@@ -5569,7 +5717,10 @@ mod interaction_tests {
         assert!(matches!(&e.form.mode, Mode::Field { key, .. } if key == "server"));
         press(&mut e, KeyCode::Esc);
         assert!(e.form.guide.is_none());
-        assert_eq!(e.document().unwrap()["outbounds"][2]["tag"].as_str(), Some("socks-a"));
+        assert_eq!(
+            e.document().unwrap()["outbounds"][2]["tag"].as_str(),
+            Some("socks-a")
+        );
     }
     #[test]
     fn new_rule_opens_kind_value_and_action_in_turn() {
@@ -5612,6 +5763,56 @@ mod interaction_tests {
             e.visible_rows(&doc).get(e.form.selected),
             Some(FlatRow::Node { index: 2, .. })
         ));
+    }
+    #[test]
+    fn field_values_and_the_input_line_are_highlighted() {
+        use ratatui::style::Color;
+        let mut e = Editor::new(
+            "rules".into(),
+            "socket='/tmp/r.sock'\ndefault_action='direct'\n[[rules]]\nkind='ip_cidr'\nvalue='10.0.0.0/8'\naction='proxy:PROXY'\n".into(),
+        )
+        .with_kind(CoreKind::Rule);
+        let line_colors = |e: &Editor, needle: &str| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| e.render(f, f.area())).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // The rule's heading repeats the value in one color; check the last match, the field.
+            (0..30u16)
+                .filter_map(|y| {
+                    let cells: Vec<_> = (0..100u16).map(|x| buffer[(x, y)].clone()).collect();
+                    let text: String = cells.iter().map(|c| c.symbol()).collect();
+                    let at = text.find(needle)?;
+                    // Byte offset to cell index: every cell holds one symbol here.
+                    let start = text[..at].chars().count();
+                    Some(
+                        cells[start..start + needle.chars().count()]
+                            .iter()
+                            .map(|c| c.fg)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .last()
+                .unwrap_or_else(|| panic!("{needle} not on screen"))
+        };
+        press(&mut e, KeyCode::Char('/'));
+        e.paste("10.0.0.0");
+        press(&mut e, KeyCode::Enter);
+        press(&mut e, KeyCode::Char('/'));
+        press(&mut e, KeyCode::Enter);
+        // Browsing: address, separator and prefix length use different colors.
+        let colors = line_colors(&e, "10.0.0.0/8");
+        assert_eq!(colors[0], Color::Cyan);
+        assert_eq!(colors[8], Color::Gray);
+        assert_eq!(colors[9], Color::Yellow);
+        let action = line_colors(&e, "proxy:PROXY");
+        assert_eq!(action[0], Color::Gray);
+        assert_eq!(action[6], Color::LightBlue);
+        // Editing: the typed text keeps its colors with the cursor at the end.
+        press(&mut e, KeyCode::Enter);
+        let colors = line_colors(&e, "> 10.0.0.0/8▏");
+        assert_eq!(colors[2 + 8], Color::Gray);
+        assert_eq!(colors[2 + 9], Color::Yellow);
     }
     #[test]
     fn search_reaches_fields_inside_collapsed_entries_and_wraps() {

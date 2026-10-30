@@ -57,9 +57,17 @@ enum Prompt {
     Shutdown,
     Discard,
     Import,
-    ImportConfirm { text: String, notices: String },
+    ImportConfirm {
+        text: String,
+        notices: String,
+    },
     Explain(String),
-    CloseAll { name: String, pid: Option<u32> },
+    CloseAll {
+        name: String,
+        pid: Option<u32>,
+    },
+    /// Find on a list page; Enter jumps to the next match.
+    Find(usize),
 }
 impl Prompt {
     fn confirmation(&self) -> bool {
@@ -75,6 +83,7 @@ impl Prompt {
     fn title(&self) -> &str {
         match self {
             Self::AddName => t("Name (1–24: a-z, 0-9, -_)"),
+            Self::Find(_) => t("Find (Enter jumps to the next match)"),
             Self::AddPath(_) => t("Configuration path"),
             Self::Config(_) => t("Configuration path"),
             Self::Clone(_) => t("Copy to path"),
@@ -105,6 +114,7 @@ enum Operation {
     Copy,
     Remove,
     Diagnostics,
+    NetTools,
     Explain,
 }
 impl Operation {
@@ -122,6 +132,7 @@ impl Operation {
             Self::Copy => "Copy configuration",
             Self::Remove => "Remove",
             Self::Diagnostics => "Connectivity / Exit IP",
+            Self::NetTools => "Network tools",
             Self::Explain => "Route explanation",
         })
     }
@@ -237,6 +248,8 @@ struct Ui {
     binding_picker: Option<BindingPicker>,
     prefilled_input: bool,
     diagnostics: Option<crate::diagnostics::View>,
+    /// The pending Diagnostics action was requested as network tools.
+    open_nettools: bool,
     explanation: Option<crate::explanation::View>,
     vim_g: bool,
     help_scroll: Option<u16>,
@@ -246,6 +259,9 @@ struct Ui {
     tui_viewer: Option<logs::Viewer>,
     operation_failed: bool,
     ready_editors: HashMap<String, Editor>,
+    last_find: String,
+    /// Open the editor's search as soon as a requested editor arrives.
+    search_on_open: bool,
 }
 impl std::ops::Deref for Ui {
     type Target = Session;
@@ -366,6 +382,7 @@ impl Ui {
             binding_picker: None,
             prefilled_input: false,
             diagnostics: None,
+            open_nettools: false,
             explanation: None,
             vim_g: false,
             help_scroll: None,
@@ -375,6 +392,8 @@ impl Ui {
             tui_viewer: None,
             operation_failed: false,
             ready_editors: HashMap::new(),
+            last_find: String::new(),
+            search_on_open: false,
         }
     }
     fn index(&self) -> usize {
@@ -411,6 +430,7 @@ impl Ui {
         ]);
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
+            operations.push(Operation::NetTools);
             operations.push(Operation::UpdateSubscriptions);
         }
         if row.instance.kind == Kind::Rule && row.pid.is_some() {
@@ -511,12 +531,13 @@ impl Ui {
             Operation::Edit => {
                 if let Some(editor) = self.ready_editors.remove(&name) {
                     self.editor = Some(editor);
+                    self.apply_pending_search();
                     return Input::Idle;
                 }
                 Some(Action::Read(name))
             }
             Operation::Logs => return self.open_logs(name),
-            Operation::Diagnostics => {
+            Operation::Diagnostics | Operation::NetTools => {
                 if row.instance.kind != Kind::Proxy {
                     return Input::Idle;
                 }
@@ -528,6 +549,7 @@ impl Ui {
                     self.message = "Restart manager to enable diagnostics".into();
                     None
                 } else {
+                    self.open_nettools = matches!(operation, Operation::NetTools);
                     Some(Action::Diagnostics(name))
                 }
             }
@@ -616,6 +638,7 @@ impl Ui {
                     target.to_string_lossy().into_owned()
                 })
                 .unwrap_or_default(),
+            Prompt::Find(_) => self.last_find.clone(),
             _ => String::new(),
         };
         self.prefilled_input = !self.input.is_empty();
@@ -789,6 +812,15 @@ impl Ui {
                 self.editor = None;
                 None
             }
+            Prompt::Find(page) => {
+                if !input.is_empty() {
+                    self.last_find = input.clone();
+                    if !self.find(page, &input) {
+                        self.message = tr!("No match for \"{}\"", input);
+                    }
+                }
+                None
+            }
             Prompt::CloseAll { name, pid } if input == "yes" => Some(Action::Runtime {
                 name,
                 command: astra_ipc::runtime::Command::Disconnect(None),
@@ -913,10 +945,13 @@ impl Ui {
             return Input::Idle;
         }
         if let Some(view) = &mut self.diagnostics {
-            if key.code == KeyCode::Esc {
+            if key.code == KeyCode::Esc && !view.handles_escape() {
                 self.diagnostics = None;
             } else {
                 view.key(key);
+                if view.closed() {
+                    self.diagnostics = None;
+                }
             }
             return Input::Idle;
         }
@@ -1085,6 +1120,16 @@ impl Ui {
                         )
                     }
                     Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+                }
+            } else if key.code == KeyCode::Char('f')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && editor.browsing()
+            {
+                // Ctrl-F matches the GUI; it opens the same search as `/`.
+                if let Err(error) =
+                    editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+                {
+                    self.fail(format!("{error:#}"), Resume::Editor);
                 }
             } else if key.code == KeyCode::Esc && editor.can_close() {
                 if editor.text() != editor.original {
@@ -1265,7 +1310,11 @@ impl Ui {
             return false;
         }
         if let Action::Diagnostics(name) = &action {
-            self.diagnostics = Some(crate::diagnostics::View::start(socket, name.clone()));
+            let mut view = crate::diagnostics::View::start(socket, name.clone());
+            if std::mem::take(&mut self.open_nettools) {
+                view.open_tools();
+            }
+            self.diagnostics = Some(view);
             self.message.clear();
             return false;
         }
@@ -1483,22 +1532,33 @@ impl Ui {
         terminal.draw(|frame| self.render(frame))?;
         Ok(())
     }
-    fn selection_status(&self) -> String {
+    /// Details of the selected instance: labels muted, state in its status color.
+    fn selection_status(&self) -> Text<'static> {
         let Some(row) = self.selected() else {
-            return String::new();
+            return Text::default();
         };
-        let mut lines = vec![
-            row.instance.config.display().to_string(),
-            format!("{}: {}", t("State"), t(&row.state)),
-            format!(
-                "PID {} · {} {}",
-                row.pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                t("Uptime"),
-                uptime(row.uptime)
-            ),
-        ];
+        let muted = Style::default().fg(dashboard::MUTED);
+        let mut text = Text::from(vec![
+            Line::styled(row.instance.config.display().to_string(), muted),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t("State")), muted),
+                Span::styled(
+                    t(&row.state).to_owned(),
+                    Style::default().fg(crate::theme::state_color(&row.state)),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("PID ", muted),
+                Span::raw(
+                    row.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Span::styled(format!(" · {} ", t("Uptime")), muted),
+                Span::raw(uptime(row.uptime)),
+            ]),
+        ]);
+        let mut lines: Vec<String> = Vec::new();
         if let Some(details) = self.details.get(&row.instance.name) {
             if !details.modes.is_empty() {
                 lines.push(
@@ -1533,7 +1593,8 @@ impl Ui {
                 )
             });
         }
-        lines.join("\n")
+        text.extend(lines.into_iter().map(Line::from));
+        text
     }
     fn help_page(&self) -> crate::help::Page {
         use crate::help::Page;
@@ -1622,16 +1683,16 @@ impl Ui {
                 _ => self.render_profiles(f, chunks[0]),
             }
         }
-        let detail = if let Some(prompt) = &self.prompt {
+        let detail: Text = if let Some(prompt) = &self.prompt {
             if prompt.confirmation() {
-                prompt.title().to_owned()
+                prompt.title().to_owned().into()
             } else {
-                format!("{}\n> {}▏", prompt.title(), self.input)
+                format!("{}\n> {}▏", prompt.title(), self.input).into()
             }
         } else if list_page {
             self.selection_status()
         } else {
-            String::new()
+            Text::default()
         };
         f.render_widget(
             Paragraph::new(detail)
@@ -1734,7 +1795,7 @@ impl Ui {
                             .title_bottom(help)
                             .borders(Borders::ALL),
                     )
-                    .highlight_style(Style::default().bg(Color::Blue))
+                    .highlight_style(crate::theme::selected())
                     .highlight_symbol("› "),
                 popup,
                 &mut state,
@@ -1768,6 +1829,7 @@ pub(crate) fn action_description(action: &Action) -> String {
         Action::Logs(name) if name == "@tui" => ("TUI log", ""),
         Action::Logs(name) => ("Logs", name.as_str()),
         Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
+        Action::NetTool { name, .. } => ("Network tools", name.as_str()),
         Action::Runtime { name, .. } => ("Applying runtime change", name.as_str()),
         Action::ExplainRoute { name, .. } => ("Route explanation", name.as_str()),
         Action::Create { name, .. } => ("Create", name.as_str()),
@@ -2325,6 +2387,70 @@ mod tests {
         );
         call(&socket, Action::Shutdown).await.unwrap();
         manager.await.unwrap().unwrap();
+    }
+    #[test]
+    fn profiles_and_rules_pages_search() {
+        let mut ui = sample_ui(true);
+        ui.key(key('/'));
+        for c in "rules".chars() {
+            ui.key(key(c));
+        }
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.kind, Kind::Rule);
+        assert_eq!(ui.selected().unwrap().instance.name, "rules");
+        // The previous query is prefilled; Enter wraps back through both lists.
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(ui.input, "rules");
+        ui.key(key('p'));
+        ui.key(key('r'));
+        ui.key(key('o'));
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.selected().unwrap().instance.name, "proxy");
+        // On Rules, / opens the profile's rule core in the editor with its search running.
+        ui.kind = Kind::Proxy;
+        ui.navigate(shell::RULES);
+        assert!(matches!(ui.key(key('/')), Input::Run(Action::Read(name), _) if name == "rules"));
+        ui.editor = Some(
+            Editor::new(
+                "rules".into(),
+                include_str!("../../../configs/rule.toml").into(),
+            )
+            .with_kind(Kind::Rule),
+        );
+        ui.apply_pending_search();
+        assert!(!ui.editor.as_ref().unwrap().browsing());
+        assert!(!ui.search_on_open);
+    }
+    #[test]
+    fn editor_search_takes_every_key_until_closed() {
+        let mut ui = sample_ui(false);
+        let draft = include_str!("../../../configs/rule.toml");
+        ui.editor = Some(Editor::new("rules".into(), draft.into()).with_kind(Kind::Rule));
+        for open in [
+            key('/'),
+            event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        ] {
+            ui.key(open);
+            assert!(!ui.editor.as_ref().unwrap().browsing());
+            // Page numbers, : and q are query text here, not shortcuts.
+            for c in "6:q".chars() {
+                assert!(matches!(ui.key(key(c)), Input::Idle));
+            }
+            assert_eq!(ui.page, PROFILES);
+            assert!(ui.palette.is_none());
+            press(&mut ui, KeyCode::Esc);
+            assert!(ui.editor.as_ref().unwrap().browsing());
+        }
+        ui.key(key('/'));
+        for c in "blocked.test".chars() {
+            ui.key(key(c));
+        }
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.editor.as_ref().unwrap().browsing());
+        assert_eq!(ui.editor.as_ref().unwrap().text(), draft);
     }
     #[test]
     fn dropped_config_and_import_shortcut_replace_only_draft_then_use_normal_save() {

@@ -17,8 +17,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
-pub(super) use tcp::exchange as framed;
-use tls::connector as tls_connector;
+pub(crate) use tcp::exchange as framed;
+pub(crate) use tls::connector as tls_connector;
 use udp::direct as udp_direct;
 
 async fn bootstrap(app: &App, host: &str) -> Result<IpAddr> {

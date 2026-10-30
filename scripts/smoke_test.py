@@ -27,10 +27,7 @@ class ThreadedServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+from protocol_matrix import free_port  # noqa: E402  (one port picker for every script)
 
 
 def wait_for_tcp(port, proc):

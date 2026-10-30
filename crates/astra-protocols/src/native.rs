@@ -152,14 +152,16 @@ pub fn compile(configs: &[OutboundConfig], base: &Path) -> Result<Registry> {
 }
 
 pub async fn connect(outbound: &NativeOutbound, target: &astra_ipc::Target) -> Result<Stream> {
+    use crate::stable_write::StableWrite;
+    // meow transports (gRPC, h2) require identical bytes when a pending write is retried.
     match outbound {
         NativeOutbound::Tuic(client) => client.connect(target).await,
-        NativeOutbound::Adapter(adapter) => {
-            Ok(Box::new(adapter.dial_tcp(&metadata(target)).await?))
-        }
-        NativeOutbound::Trojan { .. } => Ok(Box::new(
+        NativeOutbound::Adapter(adapter) => Ok(Box::new(StableWrite::new(
+            adapter.dial_tcp(&metadata(target)).await?,
+        ))),
+        NativeOutbound::Trojan { .. } => Ok(Box::new(StableWrite::new(
             crate::trojan::trojan_stream(outbound, target, 1).await?,
-        )),
+        ))),
     }
 }
 

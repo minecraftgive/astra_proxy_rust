@@ -146,6 +146,11 @@ pub enum Action {
         name: String,
         targets: Vec<String>,
     },
+    /// Streams `astra_ipc::nettool::Event`s; the manager fills the request's configuration.
+    NetTool {
+        name: String,
+        request: astra_ipc::nettool::Request,
+    },
     StoragePaths,
     Runtime {
         name: String,

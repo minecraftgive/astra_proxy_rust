@@ -8,7 +8,8 @@ pub(super) struct Tasks {
     records: std::collections::VecDeque<Record>,
     details: Option<u16>,
     notice: Option<(String, u64)>,
-    toast: Option<(String, u64, Instant)>,
+    /// How the last background task ended, keyed by the message it left behind.
+    verdict: Option<(String, bool)>,
 }
 struct Record {
     id: u64,
@@ -45,28 +46,6 @@ impl Tasks {
                 record.events.pop_front();
             }
         }
-    }
-    fn line(&self) -> String {
-        let record = self
-            .records
-            .iter()
-            .rev()
-            .find(|r| r.finished.is_none())
-            .or_else(|| self.records.back());
-        record
-            .map(|r| {
-                format!(
-                    "{} · {} · {:.1}s · {}",
-                    r.events.back().cloned().unwrap_or_default(),
-                    r.title,
-                    r.finished
-                        .unwrap_or_else(Instant::now)
-                        .duration_since(r.started)
-                        .as_secs_f64(),
-                    t("F6 tasks · F7 TUI log")
-                )
-            })
-            .unwrap_or_else(|| t("F6 tasks · F7 TUI log").into())
     }
 }
 struct Job {
@@ -192,6 +171,10 @@ impl Jobs {
             match job.handle.await {
                 Ok((mut worker, exit)) => {
                     let failed = worker.operation_failed;
+                    if failed {
+                        // A failed open must not start a search in a later, unrelated editor.
+                        ui.search_on_open = false;
+                    }
                     let detail = worker
                         .recovery
                         .as_ref()
@@ -218,6 +201,14 @@ impl Jobs {
                     if let Some(record) = ui.tasks.records.iter_mut().find(|r| r.id == job.id) {
                         record.finished = Some(Instant::now());
                     }
+                    ui.tasks.verdict = Some((
+                        worker
+                            .recovery
+                            .as_ref()
+                            .map(|r| r.message.clone())
+                            .unwrap_or_else(|| worker.message.clone()),
+                        failed,
+                    ));
                     let selected = ui.selected().map(|r| r.instance.name.clone());
                     let same = job.selected == selected
                         || match &job.action {
@@ -249,9 +240,13 @@ impl Jobs {
                                 ui.selections = worker.selections;
                             }
                             ui.editor = worker.editor.take();
+                            ui.apply_pending_search();
                         }
-                        if worker.diagnostics.is_some() {
-                            ui.diagnostics = worker.diagnostics.take();
+                        if let Some(mut view) = worker.diagnostics.take() {
+                            if std::mem::take(&mut ui.open_nettools) {
+                                view.open_tools();
+                            }
+                            ui.diagnostics = Some(view);
                         }
                         if worker.explanation.is_some() {
                             ui.explanation = worker.explanation.take();
@@ -282,6 +277,7 @@ impl Jobs {
                     quit |= exit;
                 }
                 Err(error) => {
+                    ui.tasks.verdict = Some((error.to_string(), true));
                     ui.tasks
                         .event(job.id, Progress::new("Failed", error.to_string()));
                     if let Some(r) = ui.tasks.records.iter_mut().find(|r| r.id == job.id) {
@@ -396,36 +392,109 @@ impl Ui {
             if self.menu.is_none() && self.binding_picker.is_none() && self.prompt.is_none() {
                 self.hit(status, dashboard::Target::TaskDetails);
             }
-            f.render_widget(
-                Paragraph::new(
-                    if let Some((message, ms, _)) = self
-                        .tasks
-                        .toast
-                        .as_ref()
-                        .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(4))
-                    {
-                        format!("{} {}", crate::tui_log::stamp(*ms), message)
-                    } else if self.tasks.records.is_empty() {
-                        self.tasks
-                            .notice
-                            .as_ref()
-                            .filter(|(message, _)| !message.is_empty())
-                            .map(|(message, ms)| {
-                                format!(
-                                    "{} {} · F6 / F7",
-                                    crate::tui_log::stamp(*ms),
-                                    t(message).replace(['\n', '\r'], " ")
-                                )
-                            })
-                            .unwrap_or_else(|| self.tasks.line())
-                    } else {
-                        self.tasks.line()
-                    },
-                )
-                .style(Style::default().fg(Color::Cyan)),
-                status,
-            );
+            f.render_widget(Paragraph::new(self.status_line(status.width)), status);
         }
+    }
+}
+
+impl Ui {
+    /// One line for what just happened: a running task, else the latest result.
+    /// Fresh results are bright, older ones fade; time and F6 sit on the right.
+    fn status_line(&self, width: u16) -> Line<'static> {
+        use crate::theme::MUTED;
+        let running = self
+            .tasks
+            .records
+            .iter()
+            .rev()
+            .find(|r| r.finished.is_none());
+        let (icon, text, color, stamp) = if let Some(record) = running {
+            // Events read "HH:MM:SS.mmm phase · detail"; the clock is shown on the right.
+            let event = record.events.back().map(String::as_str).unwrap_or_default();
+            let event = event.split_once(' ').map_or(event, |(_, rest)| rest);
+            (
+                "⟳",
+                format!(
+                    "{} · {} · {:.1}s",
+                    record.title,
+                    event,
+                    record.started.elapsed().as_secs_f64()
+                ),
+                Color::Yellow,
+                None,
+            )
+        } else {
+            let message = self.operation_text().replace(['\n', '\r'], " ");
+            let notice = self
+                .tasks
+                .notice
+                .as_ref()
+                .filter(|(m, _)| t(m) == message || m == &message);
+            let age = notice.map(|(_, ms)| progress::now_ms().saturating_sub(*ms));
+            let failed = match &self.tasks.verdict {
+                Some((verdict, failed)) if verdict == &message || t(verdict) == message => {
+                    Some(*failed)
+                }
+                _ => None,
+            };
+            let color = match failed {
+                Some(true) => Color::Red,
+                Some(false) => Color::Green,
+                None => crate::theme::outcome_color(&message),
+            };
+            let icon = match color {
+                Color::Red => "✗",
+                Color::Green => "✓",
+                Color::Yellow => "⟳",
+                _ => "•",
+            };
+            // Results older than a few seconds recede so a new one draws the eye.
+            let color = if age.is_some_and(|age| age > 6000) && color != Color::Red {
+                MUTED
+            } else {
+                color
+            };
+            (icon, message, color, notice.map(|(_, ms)| *ms))
+        };
+        let mut right = String::new();
+        if let Some(ms) = stamp {
+            // Seconds are enough here; F6 keeps the full timestamps.
+            right.push_str(
+                &crate::tui_log::stamp(ms)
+                    .chars()
+                    .take(8)
+                    .collect::<String>(),
+            );
+            right.push_str(" · ");
+        }
+        right.push_str(t("F6 details"));
+        let right = format!(" {right} ");
+        let room = (width as usize).saturating_sub(Line::from(right.as_str()).width());
+        if text.is_empty() {
+            let mut spans = vec![Span::raw(" ".repeat(room))];
+            spans.extend(crate::theme::key_hints(&right));
+            return Line::from(spans);
+        }
+        let mut left = format!(" {icon} {text}");
+        if Line::from(left.as_str()).width() > room {
+            let mut cut = String::new();
+            for c in left.chars() {
+                if Line::from(cut.as_str()).width() + 2 > room {
+                    break;
+                }
+                cut.push(c);
+            }
+            left = cut + "…";
+        }
+        let pad = room.saturating_sub(Line::from(left.as_str()).width());
+        let mut spans = vec![
+            Span::styled(left, Style::default().fg(color)),
+            Span::raw(" ".repeat(pad)),
+        ];
+        if room > 0 {
+            spans.push(Span::styled(right, Style::default().fg(MUTED)));
+        }
+        Line::from(spans)
     }
 }
 
@@ -657,8 +726,11 @@ mod tests {
             }).await.unwrap();
             assert!(ui.editor.as_ref().unwrap().text().contains("standalone=false"));
             assert_eq!(ui.editor.as_ref().unwrap().original,"standalone=true\n");
-            assert_eq!(ui.tasks.line().lines().count(),1);
-            assert!(ui.tasks.line().contains(t("Completed")));
+            // The finished task's result is the status line, marked as a success.
+            assert!(matches!(&ui.tasks.verdict, Some((_, false))));
+            let status: String = ui.status_line(100).spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(status.starts_with(" ✓ ") && status.lines().count() == 1, "{status}");
+            assert!(ui.tasks.records[0].events.back().unwrap().contains(t("Completed")));
             assert!(ui.tasks.records[0].events.back().unwrap().chars().nth(2)==Some(':'));
             let draft=ui.editor.as_ref().unwrap().text();
             assert!(matches!(ui.key(event::KeyEvent::new(KeyCode::F(7),KeyModifiers::NONE)),Input::Run(Action::Logs(name),_)if name=="@tui"));

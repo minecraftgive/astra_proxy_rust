@@ -10,6 +10,7 @@ pub mod diagnostics;
 pub mod elevation;
 pub mod groups;
 pub mod logging;
+pub mod nettool;
 pub mod platform;
 pub mod progress;
 pub mod runtime;

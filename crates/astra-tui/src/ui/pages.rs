@@ -95,6 +95,13 @@ impl Ui {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
+                    Span::styled(" / ", Style::default().fg(Color::White).bg(BLUE)),
+                    Span::raw(format!(
+                        " {}",
+                        t("Search rules: opens the rule editor with search; Enter jumps to the next match")
+                    )),
+                ]));
+                lines.push(Line::from(vec![
                     Span::styled(" e ", Style::default().fg(Color::White).bg(BLUE)),
                     Span::raw(format!(
                         " {}",
@@ -188,13 +195,7 @@ impl Ui {
             .rows()
             .iter()
             .map(|row| {
-                let color = if row.state == "Running" {
-                    Color::Green
-                } else if row.state == "Unresponsive" || row.state.starts_with("Exited") {
-                    Color::Red
-                } else {
-                    MUTED
-                };
+                let color = crate::theme::state_color(&row.state);
                 let details = self.details.get(&row.instance.name);
                 let modes = details
                     .map(|details| {
@@ -270,10 +271,9 @@ impl Ui {
         if !empty {
             state.select(Some(self.selections[self.index()]));
         }
-        let title = self.profiles_title();
         let list = List::new(items)
-            .block(card(&title))
-            .highlight_style(Style::default().bg(BLUE).fg(Color::White))
+            .block(card("").title(self.profiles_title()))
+            .highlight_style(crate::theme::selected())
             .highlight_symbol("› ");
         f.render_stateful_widget(list, area, &mut state);
         self.list_hits(area, state.offset());

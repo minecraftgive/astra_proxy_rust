@@ -349,6 +349,19 @@ async fn serve(
                 }
                 return Ok(());
             }
+            Action::NetTool { name, request } => {
+                let _permit = diagnostics
+                    .try_acquire()
+                    .context("Diagnostics are busy; retry shortly")?;
+                let plan = hub.plan(name)?;
+                let request = request.clone();
+                let (mut input, mut output) = tokio::io::split(stream);
+                let result = tokio::select! {result=plan.nettool(request,&mut output)=>result,_=input.read_u8()=>return Ok(())};
+                if let Err(error) = result {
+                    let _ = astra_ipc::send_management(&mut output, &reply(Err(error))).await;
+                }
+                return Ok(());
+            }
             _ => {}
         }
         let shutdown = matches!(request.action, Action::Shutdown);

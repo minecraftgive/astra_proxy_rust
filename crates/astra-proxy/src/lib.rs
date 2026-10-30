@@ -17,6 +17,7 @@ use proxy::runtime;
 mod diagnostics;
 mod dns;
 mod http_forward;
+mod nettool;
 mod subscription;
 pub use astra_protocols::xhttp;
 use proxy::udp;
@@ -585,6 +586,44 @@ pub async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let first = args.next();
     let first = elevated_config.or(first);
+    if first.as_deref() == Some("--nettool") {
+        return nettool::cli(args).await;
+    }
+    if first.as_deref() == Some("--nettool-stream") {
+        use std::io::{Read, Write};
+        let path = std::path::absolute(args.next().context("expected config path")?)?;
+        let mut input = String::new();
+        std::io::stdin()
+            .take(512 * 1024 + 1)
+            .read_to_string(&mut input)?;
+        anyhow::ensure!(
+            input.len() <= 512 * 1024,
+            "Network tool request exceeds limit"
+        );
+        let request: astra_ipc::nettool::Request = serde_json::from_str(&input)?;
+        // Interface and system probes work without a loadable profile.
+        let app = if request.config.is_empty() {
+            None
+        } else {
+            anyhow::ensure!(
+                request.config.len() <= 480 * 1024,
+                "Configuration exceeds 480 KiB"
+            );
+            Some(subscription::cached_app(
+                &path,
+                App::from_text(&path, request.config.clone())?,
+            ))
+        };
+        nettool::run(app.as_ref(), &request, false, |event| {
+            let mut stdout = std::io::stdout().lock();
+            serde_json::to_writer(&mut stdout, &event)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            Ok(())
+        })
+        .await?;
+        return Ok(());
+    }
     if matches!(
         first.as_deref(),
         Some(

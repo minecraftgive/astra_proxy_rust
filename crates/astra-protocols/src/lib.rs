@@ -9,6 +9,7 @@ pub mod native;
 pub mod outbound;
 pub mod shadowsocks;
 pub mod sniff;
+pub mod stable_write;
 pub mod socks5;
 pub mod trojan;
 pub mod tuic;

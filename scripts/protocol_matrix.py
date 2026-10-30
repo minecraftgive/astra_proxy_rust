@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import pathlib
+import random
 import signal
 import socket
 import socketserver
@@ -110,9 +111,20 @@ class EchoServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 def free_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+    # Servers often listen on TCP and UDP with one port; Windows reserves different
+    # ranges per protocol (netsh int ipv4 show excludedportrange), so check both.
+    # Ports are drawn at random: the OS hands out ephemeral TCP ports in sequence and
+    # can sit inside a hundreds-wide UDP exclusion for many consecutive picks.
+    for _ in range(500):
+        port = random.randint(20000, 60999)
+        with socket.socket() as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            try:
+                tcp.bind(('127.0.0.1', port))
+                udp.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no port is free for both TCP and UDP')
 
 def exact(sock, count):
     data = b''
