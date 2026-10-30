@@ -21,6 +21,21 @@ pub(super) fn snapshot(current: &Current) -> Snapshot {
 }
 
 impl State {
+    /// The overrides file must never record the TUN switch of an elevated
+    /// core: that process holds CAP_NET_ADMIN, while the next launch of the
+    /// same profile runs without it and would fail to create the device.
+    fn persist_overrides(
+        &self,
+        path: &std::path::Path,
+        overrides: &Overrides,
+    ) -> Result<()> {
+        let mut value = overrides.clone();
+        if self.elevated_tun {
+            value.tun = None;
+        }
+        Ok(astra_ipc::storage::write_json(path, &value)?)
+    }
+
     pub(super) fn runtime_snapshot(&self) -> Snapshot {
         snapshot(&self.current)
     }
@@ -102,13 +117,13 @@ impl State {
             None
         };
         let path = astra_ipc::storage::runtime_path(&self.path, "overrides")?;
-        astra_ipc::storage::write_json(&path, &next)?;
+        self.persist_overrides(&path, &next)?;
         app.groups
             .commit_overrides(&app, next, disconnect.as_deref());
         if let Some(candidate) = candidate {
             if let Err(error) = self.apply(self.path.clone(), candidate).await {
                 app.groups.commit_overrides(&app, previous.clone(), None);
-                astra_ipc::storage::write_json(&path, &previous)
+                self.persist_overrides(&path, &previous)
                     .context("restore runtime overrides after rejected change")?;
                 return Err(error);
             }

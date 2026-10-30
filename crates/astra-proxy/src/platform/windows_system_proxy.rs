@@ -181,7 +181,15 @@ impl Guard {
             settings.services.is_empty(),
             "system_proxy.services is macOS-only"
         );
-        let address = super::mode_config::system_proxy_address(config)?;
+        super::mode_config::system_proxy_address(config)?;
+        let (http, socks) = super::mode_config::system_proxy_addresses(config)?;
+        let mut endpoints = Vec::new();
+        if let Some(address) = http {
+            endpoints.extend([format!("http={address}"), format!("https={address}")]);
+        }
+        if let Some(address) = socks {
+            endpoints.push(format!("socks={address}"));
+        }
         let mut lock = lock(None)?;
         let original =
             query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;
@@ -226,13 +234,9 @@ impl Guard {
         lock.sync_all()?;
         guard.lock = Some(lock);
         // Only DIRECT + PROXY: temporarily suppress PAC and auto-detection.
-        // A bare host:port (the form Windows Settings writes) sends every
-        // scheme to the local HTTP proxy; HTTPS uses CONNECT. Per-scheme
-        // `http=…;https=…` lists are misread by clients that parse the value
-        // as a single address.
         write(&Settings {
             flags: PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
-            server: Some(address.to_string()),
+            server: Some(endpoints.join(";")),
             bypass: Some("<local>".into()),
             auto_config_url: Some(String::new()),
         })?;

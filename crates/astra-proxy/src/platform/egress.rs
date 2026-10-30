@@ -84,6 +84,7 @@ pub(crate) fn cache_interface(path: &std::path::Path, tun: &crate::mode_config::
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
+        astra_ipc::platform::adopt_owner(&temporary)?;
         file.write_all(&text)?;
         file.sync_all()?;
         drop(file);

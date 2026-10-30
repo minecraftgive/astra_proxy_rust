@@ -14,5 +14,8 @@ bincode.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Registry"] }

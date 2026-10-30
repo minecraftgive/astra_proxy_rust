@@ -103,13 +103,42 @@ pub fn set_private(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        adopt_owner(path.as_ref())?;
+        Ok(())
     }
     #[cfg(windows)]
     {
         let _ = mode;
         windows::set_private(path.as_ref())
     }
+}
+
+/// The macOS elevated core runs as root but creates files (the control socket,
+/// logs, caches) inside the unprivileged user's state directory. Hand those
+/// files back to the invoking user so the next normal launch can read, rotate
+/// and replace them. No-op unless the sudo hand-off set `ASTRA_ELEVATED_OWNER`
+/// and this process is actually root.
+pub fn adopt_owner(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(());
+        }
+        let Some((uid, gid)) = std::env::var("ASTRA_ELEVATED_OWNER")
+            .ok()
+            .and_then(|value| {
+                let (uid, gid) = value.split_once(':')?;
+                Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?))
+            })
+        else {
+            return Ok(());
+        };
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Legacy example /tmp endpoints map into the current user's temporary folder.

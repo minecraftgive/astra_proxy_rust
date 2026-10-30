@@ -120,7 +120,22 @@ impl Ui {
             .min(self.visible_connections().len().saturating_sub(1));
         self.runtime_error.clear();
     }
-    pub(super) fn runtime_action(&self, command: Command) -> Input {
+    pub(super) fn runtime_action(&mut self, command: Command) -> Input {
+        if matches!(command, Command::Tun(true)) {
+            let elevation = self.active_proxy().and_then(|row| {
+                let name = row.instance.name.clone();
+                let pid = row.pid;
+                let supported = self
+                    .details
+                    .get(&name)
+                    .is_some_and(|details| details.elevation_supported);
+                (pid.is_some() && supported).then_some((name, pid))
+            });
+            if let Some((name, pid)) = elevation {
+                self.prompt(Prompt::ElevateTun { name, pid });
+                return Input::Idle;
+            }
+        }
         match self.active_proxy() {
             Some(row) if row.pid.is_some() => Input::Run(
                 Action::Runtime {
@@ -1312,6 +1327,45 @@ mod tests {
             }
         });
     }
+    #[test]
+    fn tun_toggle_asks_for_elevation_only_when_supported() {
+        let mut ui = sample();
+        ui.page = OVERVIEW;
+        let mut details = crate::protocol::InstanceDetails::default();
+        details.elevation_supported = true;
+        ui.details.insert("proxy".into(), details);
+
+        assert!(matches!(
+            ui.runtime_action(Command::Tun(true)),
+            Input::Idle
+        ));
+        assert!(matches!(
+            &ui.prompt,
+            Some(Prompt::ElevateTun { name, pid }) if name == "proxy" && *pid == Some(42)
+        ));
+        let enter = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            ui.key(enter),
+            Input::Run(Action::PrepareElevation { name, expected_pid: Some(42) }, _) if name == "proxy"
+        ));
+
+        // Turning TUN off never needs sudo; the running core handles it.
+        assert!(matches!(
+            ui.runtime_action(Command::Tun(false)),
+            Input::Run(Action::Runtime { .. }, _)
+        ));
+
+        let mut ui = sample();
+        ui.page = OVERVIEW;
+        ui.details
+            .insert("proxy".into(), crate::protocol::InstanceDetails::default());
+        assert!(matches!(
+            ui.runtime_action(Command::Tun(true)),
+            Input::Run(Action::Runtime { .. }, _)
+        ));
+        assert!(ui.prompt.is_none());
+    }
+
     #[test]
     fn live_cards_groups_and_connections_resize_and_old_process_data_is_hidden() {
         for language in [

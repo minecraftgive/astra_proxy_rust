@@ -66,6 +66,11 @@ enum Prompt {
         name: String,
         pid: Option<u32>,
     },
+    /// Linux only: a sudo-launched core takes over the TUN listener.
+    ElevateTun {
+        name: String,
+        pid: Option<u32>,
+    },
     /// Find on a list page; Enter jumps to the next match.
     Find(usize),
 }
@@ -78,6 +83,7 @@ impl Prompt {
                 | Self::Discard
                 | Self::ImportConfirm { .. }
                 | Self::CloseAll { .. }
+                | Self::ElevateTun { .. }
         )
     }
     fn title(&self) -> &str {
@@ -95,6 +101,9 @@ impl Prompt {
             Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
             Self::CloseAll { .. } => {
                 t("Close all connections? Applications reconnect on their own.")
+            }
+            Self::ElevateTun { .. } => {
+                t("Enable TUN? sudo asks for your password; the current core keeps running until the replacement is ready.")
             }
         }
     }
@@ -836,6 +845,12 @@ impl Ui {
                 command: astra_ipc::runtime::Command::Disconnect(None),
                 expected_pid: pid,
             }),
+            Prompt::ElevateTun { name, pid } if input == "yes" => {
+                Some(Action::PrepareElevation {
+                    name,
+                    expected_pid: pid,
+                })
+            }
             Prompt::Explain(name) => Some(Action::ExplainRoute {
                 name,
                 request: crate::explanation::request(&input)?,
@@ -1311,6 +1326,24 @@ impl Ui {
                         },
                     )
                     .into();
+                }
+                Err(error) => {
+                    self.operation_failed = true;
+                    self.message = format!("{error:#}");
+                }
+            }
+            return false;
+        }
+        if let Action::WaitElevation { name, .. } = &action {
+            self.progress(t("Waiting for the elevated core").into(), &mut terminal);
+            match call(socket, action.clone()).await.and_then(|reply| {
+                Ok(serde_json::from_str::<astra_ipc::runtime::Snapshot>(
+                    &reply.text,
+                )?)
+            }) {
+                Ok(snapshot) => {
+                    self.accept_runtime(name.clone(), snapshot);
+                    self.message = t("TUN enabled by the elevated core").into();
                 }
                 Err(error) => {
                     self.operation_failed = true;
@@ -1841,6 +1874,9 @@ pub(crate) fn action_description(action: &Action) -> String {
         Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
         Action::NetTool { name, .. } => ("Network tools", name.as_str()),
         Action::Runtime { name, .. } => ("Applying runtime change", name.as_str()),
+        Action::PrepareElevation { name, .. } => ("Enable TUN with administrator permission", name.as_str()),
+        Action::CancelElevation { name, .. } => ("Cancel TUN elevation", name.as_str()),
+        Action::WaitElevation { name, .. } => ("Wait for the elevated core", name.as_str()),
         Action::ExplainRoute { name, .. } => ("Route explanation", name.as_str()),
         Action::Create { name, .. } => ("Create", name.as_str()),
         Action::Add(instance) => ("Add", instance.name.as_str()),
@@ -1998,7 +2034,13 @@ async fn run_local(
         let quit = match input {
             Input::Quit => true,
             Input::Run(action, origin) => {
-                jobs.start(&mut ui, action, origin);
+                if let Action::PrepareElevation { name, expected_pid } = action {
+                    // sudo needs the real terminal, so this step cannot run as a
+                    // background job; the wait for the new core can.
+                    elevate(&mut ui, &mut jobs, &socket, name, expected_pid, &mut terminal).await;
+                } else {
+                    jobs.start(&mut ui, action, origin);
+                }
                 false
             }
             Input::Idle => false,
@@ -2055,6 +2097,142 @@ async fn run_local(
         }
     }
     Ok(())
+}
+
+/// Ctrl-C is normally a raw-mode key event, but sudo needs a real terminal.
+/// Ignore the signal in this process while sudo runs so it reaches sudo only.
+#[cfg(unix)]
+struct IgnoreInterrupt(libc::sighandler_t);
+#[cfg(unix)]
+impl IgnoreInterrupt {
+    fn install() -> Self {
+        Self(unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) })
+    }
+}
+#[cfg(unix)]
+impl Drop for IgnoreInterrupt {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.0);
+        }
+    }
+}
+
+/// Ask the manager for a hand-off, run sudo on the real terminal, and wait for
+/// the elevated core as a background job so the UI stays responsive.
+#[cfg(unix)]
+async fn elevate(
+    ui: &mut Ui,
+    jobs: &mut background::Jobs,
+    socket: &std::path::Path,
+    name: String,
+    expected_pid: Option<u32>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) {
+    let reply = match call(
+        socket,
+        Action::PrepareElevation {
+            name: name.clone(),
+            expected_pid,
+        },
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => {
+            ui.message = format!("{error:#}");
+            return;
+        }
+    };
+    let offer: astra_ipc::unix_handoff::Offer = match serde_json::from_str(&reply.text) {
+        Ok(offer) => offer,
+        Err(error) => {
+            ui.message = format!("{error:#}");
+            return;
+        }
+    };
+    let launched = (|| -> Result<std::process::ExitStatus> {
+        disable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            crossterm::cursor::Show,
+            LeaveAlternateScreen
+        )?;
+        #[cfg(unix)]
+        let _interrupt = IgnoreInterrupt::install();
+        std::process::Command::new(&offer.sudo)
+            .arg(&offer.binary)
+            .args(["--unix-elevated"])
+            .arg(&offer.socket)
+            .arg(&offer.ticket)
+            .status()
+            .map_err(Into::into)
+    })();
+    // Always restore the TUI, including when sudo or the terminal setup fails.
+    let restored = (|| -> Result<()> {
+        enable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
+        terminal.clear()?;
+        Ok(())
+    })();
+    if let Err(error) = restored {
+        ui.message = format!("{error:#}");
+        return;
+    }
+    match launched {
+        Ok(status) if status.success() => {
+            ui.message = t("Administrator permission granted; waiting for the elevated core").into();
+            jobs.start(
+                ui,
+                Action::WaitElevation {
+                    name,
+                    ticket: offer.ticket,
+                },
+                None,
+            );
+        }
+        Ok(_) => {
+            let _ = call(
+                socket,
+                Action::CancelElevation {
+                    name: name.clone(),
+                    ticket: offer.ticket,
+                },
+            )
+            .await;
+            ui.message = t("Administrator permission was not granted").into();
+        }
+        Err(error) => {
+            let _ = call(
+                socket,
+                Action::CancelElevation {
+                    name,
+                    ticket: offer.ticket,
+                },
+            )
+            .await;
+            ui.message = format!("{error:#}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn elevate(
+    ui: &mut Ui,
+    _jobs: &mut background::Jobs,
+    _socket: &std::path::Path,
+    _name: String,
+    _expected_pid: Option<u32>,
+    _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) {
+    ui.message = t("TUN elevation is only available on Linux").into();
 }
 
 #[cfg(test)]

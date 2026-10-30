@@ -4,7 +4,12 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use astra_ipc::Inbound;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpListener,
+    sync::Mutex,
+    task::JoinHandle,
+};
 
 pub type Current = Arc<ArcSwap<App>>;
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -37,6 +42,7 @@ pub struct State {
     system_journal: PathBuf,
     group_worker: Option<GroupWorker>,
     outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
+    elevated_tun: bool,
 }
 impl State {
     async fn refresh_egress(
@@ -315,6 +321,41 @@ impl State {
     }
 }
 pub async fn run(path: PathBuf, app: App) -> Result<()> {
+    run_inner(path, app, None).await
+}
+
+/// An elevated core keeps its lifeline to the unprivileged manager. EOF means
+/// the manager is gone, so the core must remove its routes and listeners
+/// instead of lingering with administrator-granted capabilities.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) async fn run_with_lifeline(
+    path: PathBuf,
+    app: App,
+    lifeline: tokio::net::UnixStream,
+) -> Result<()> {
+    run_inner(path, app, Some(lifeline)).await
+}
+
+async fn lifeline_closed(lifeline: &mut Option<tokio::net::UnixStream>) {
+    match lifeline {
+        Some(lifeline) => {
+            let mut probe = [0u8; 1];
+            loop {
+                match lifeline.read(&mut probe).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn run_inner(
+    path: PathBuf,
+    app: App,
+    mut lifeline: Option<tokio::net::UnixStream>,
+) -> Result<()> {
     let system_journal = if let Some(socket) = std::env::var_os("ASTRA_CONTROL_SOCKET") {
         PathBuf::from(socket).with_extension("system-proxy-state.toml")
     } else {
@@ -322,6 +363,12 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     };
     astra_ipc::storage::prepare_parent(&system_journal)?;
     *app.overrides.write().unwrap() = controls::load(&path)?;
+    let elevated_tun = crate::ELEVATED_TUN.swap(false, std::sync::atomic::Ordering::SeqCst);
+    if elevated_tun {
+        if let Ok(mut overrides) = app.overrides.write() {
+            overrides.tun = Some(true);
+        }
+    }
     let current = Arc::new(ArcSwap::from_pointee(app));
     let mut state = State {
         generation: 0,
@@ -332,6 +379,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         listeners: HashMap::new(),
         group_worker: None,
         outbound_interface: None,
+        elevated_tun,
         tunnel: None,
         tproxy_udp: None,
         dns: None,
@@ -619,6 +667,10 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let result = tokio::select! {
         result = service => result,
         _ = fatal.recv() => Err(std::io::Error::other("packet inbound stopped unexpectedly; see core log")),
+        _ = lifeline_closed(&mut lifeline) => {
+            tracing::warn!("manager exited; stopping the elevated core");
+            Ok(())
+        }
     };
     watch.abort();
     subscription_worker.abort();

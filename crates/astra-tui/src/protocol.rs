@@ -78,6 +78,8 @@ pub struct InstanceDetails {
     pub explanation_supported: bool,
     pub subscription_nodes_supported: bool,
     pub runtime_supported: bool,
+    /// Enabling TUN needs the sudo hand-off on this platform and account.
+    pub elevation_supported: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionNodes {
@@ -165,6 +167,22 @@ pub enum Action {
         expected_pid: u32,
         interval_ms: u64,
     },
+    /// Unix only: reserve a private hand-off endpoint for a sudo-launched core.
+    /// The reply carries `astra_ipc::unix_handoff::Offer` as JSON.
+    PrepareElevation {
+        name: String,
+        expected_pid: Option<u32>,
+    },
+    CancelElevation {
+        name: String,
+        ticket: String,
+    },
+    /// Blocks until the prepared core is serving, then returns its runtime
+    /// snapshot as JSON.
+    WaitElevation {
+        name: String,
+        ticket: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -219,7 +237,11 @@ pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Re
     } else {
         180
     };
-    let lane = if matches!(
+    let lane = if matches!(action, Action::WaitElevation { .. }) {
+        // A hand-off can legitimately wait for minutes; keep it off the lane
+        // used by quick mutations so the UI stays responsive.
+        2
+    } else if matches!(
         action,
         Action::List
             | Action::StoragePaths
