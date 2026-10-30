@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
             "--shutdown" => shutdown = true,
             "--help" | "-h" => {
                 println!("astra-tui [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
-                println!("--view dashboard|proxies|profiles|connections|tools|logs|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–5: page in a new window");
+                println!("--view overview|proxies|connections|rules|logs|profiles|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–6: page in a new window");
                 return Ok(());
             }
             _ => anyhow::bail!("Unknown argument: {arg}"),

@@ -545,9 +545,9 @@ impl Feeds {
                 Err(error) => ui.runtime_error = error,
             }
         }
+        // Runtime data always follows the active profile, whatever Profiles shows.
         let key = ui
-            .selected()
-            .filter(|r| r.instance.kind == Kind::Proxy)
+            .active_proxy()
             .and_then(|r| r.pid.map(|pid| (r.instance.name.clone(), pid)));
         if key.as_ref() != self.runtime.as_ref().map(|(key, _)| key) {
             self.runtime = key.map(|(name, pid)| {

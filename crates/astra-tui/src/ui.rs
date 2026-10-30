@@ -2,6 +2,8 @@ mod background;
 mod dashboard;
 mod detached;
 mod live;
+mod pages;
+mod shell;
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
@@ -24,6 +26,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
+use shell::{LOGS, PROFILES};
 use std::{
     collections::HashMap,
     io::{self, Stdout},
@@ -56,12 +59,17 @@ enum Prompt {
     Import,
     ImportConfirm { text: String, notices: String },
     Explain(String),
+    CloseAll { name: String, pid: Option<u32> },
 }
 impl Prompt {
     fn confirmation(&self) -> bool {
         matches!(
             self,
-            Self::Remove(_) | Self::Shutdown | Self::Discard | Self::ImportConfirm { .. }
+            Self::Remove(_)
+                | Self::Shutdown
+                | Self::Discard
+                | Self::ImportConfirm { .. }
+                | Self::CloseAll { .. }
         )
     }
     fn title(&self) -> &str {
@@ -76,6 +84,9 @@ impl Prompt {
             Self::Import => t("Import config or proxy share links"),
             Self::ImportConfirm { .. } => t("Replace editor draft?"),
             Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
+            Self::CloseAll { .. } => {
+                t("Close all connections? Applications reconnect on their own.")
+            }
         }
     }
 }
@@ -201,7 +212,7 @@ impl Session {
 struct Ui {
     session: Session,
     page: usize,
-    tool_selection: usize,
+    palette: Option<shell::Palette>,
     runtime_snapshot: Option<astra_ipc::runtime::Snapshot>,
     runtime_instance: String,
     runtime_error: String,
@@ -330,7 +341,7 @@ impl Ui {
         Self {
             session,
             page: 0,
-            tool_selection: 0,
+            palette: None,
             runtime_snapshot: None,
             runtime_instance: String::new(),
             runtime_error: String::new(),
@@ -410,26 +421,9 @@ impl Ui {
         }
         operations
     }
+    /// Switches the Profiles list between proxy instances and rule cores.
     fn switch_core(&mut self, kind: Kind) {
         self.kind = kind;
-        self.tool_selection = 0;
-        if kind == Kind::Rule && matches!(self.page, 1 | 3) {
-            self.navigate(2);
-        }
-    }
-    fn tool_operations(&self) -> Vec<Operation> {
-        self.operations()
-            .into_iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    Operation::Logs
-                        | Operation::Diagnostics
-                        | Operation::UpdateSubscriptions
-                        | Operation::Explain
-                )
-            })
-            .collect()
     }
     fn open_bindings(&mut self, name: String, targets: Option<Vec<String>>) {
         let Some(kind) = self
@@ -521,7 +515,7 @@ impl Ui {
                 }
                 Some(Action::Read(name))
             }
-            Operation::Logs => Some(Action::Logs(name)),
+            Operation::Logs => return self.open_logs(name),
             Operation::Diagnostics => {
                 if row.instance.kind != Kind::Proxy {
                     return Input::Idle;
@@ -795,6 +789,11 @@ impl Ui {
                 self.editor = None;
                 None
             }
+            Prompt::CloseAll { name, pid } if input == "yes" => Some(Action::Runtime {
+                name,
+                command: astra_ipc::runtime::Command::Disconnect(None),
+                expected_pid: pid,
+            }),
             Prompt::Explain(name) => Some(Action::ExplainRoute {
                 name,
                 request: crate::explanation::request(&input)?,
@@ -849,45 +848,20 @@ impl Ui {
         if let Some(input) = self.background_key(key) {
             return input;
         }
+        if self.palette.is_some() {
+            return self.palette_key(key);
+        }
+        if let Some(input) = self.viewer_page_key(key) {
+            return input;
+        }
         if self.live_input() {
             if let Some(input) = self.live_key(key) {
                 return input;
             }
         }
         if self.overview_input() {
-            if self.page == 4 {
-                match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.tool_selection = (self.tool_selection + 1)
-                            .min(self.tool_operations().len().saturating_sub(1));
-                        return Input::Idle;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.tool_selection = self.tool_selection.saturating_sub(1);
-                        return Input::Idle;
-                    }
-                    KeyCode::Enter => {
-                        if let Some(op) = self
-                            .tool_operations()
-                            .get(
-                                self.tool_selection
-                                    .min(self.tool_operations().len().saturating_sub(1)),
-                            )
-                            .copied()
-                        {
-                            return self.operation(op);
-                        }
-                        return Input::Idle;
-                    }
-                    _ => {}
-                }
-            }
-            if let KeyCode::Char(c @ '1'..='5') = key.code {
-                return self.navigate((c as u8 - b'1') as usize);
-            }
-            if key.code == KeyCode::BackTab {
-                return self
-                    .navigate((self.page + dashboard::PAGES.len() - 1) % dashboard::PAGES.len());
+            if let Some(input) = self.page_key(key) {
+                return input;
             }
         }
         if self.help_scroll.is_some()
@@ -1136,9 +1110,10 @@ impl Ui {
                 }
                 logs::Command::None => {}
             }
-        } else {
+        } else if self.page == PROFILES {
             let index = self.index();
             let name = self.selected().map(|r| r.instance.name.clone());
+            let running = self.selected().is_some_and(|r| r.pid.is_some());
             if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
                 if self.vim_g {
                     self.selections[index] = 0;
@@ -1194,11 +1169,14 @@ impl Ui {
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
+                    // Same verbs as every other page: c/Space connect, r apply, R restart.
                     let operation = match c {
+                        'c' | ' ' if running => Operation::Stop,
+                        'c' | ' ' => Operation::Start,
                         's' => Operation::Start,
                         'x' => Operation::Stop,
-                        'r' => Operation::Restart,
-                        'R' => Operation::Reload,
+                        'r' => Operation::Reload,
+                        'R' => Operation::Restart,
                         'e' => Operation::Edit,
                         'L' => Operation::Logs,
                         't' => {
@@ -1210,7 +1188,6 @@ impl Ui {
                         }
                         'b' => Operation::Bind,
                         'd' => Operation::Remove,
-                        'c' => Operation::Config,
                         'y' => Operation::Copy,
                         'v' => return Input::Run(Action::Validate(name.unwrap()), None),
                         _ => return Input::Idle,
@@ -1580,13 +1557,14 @@ impl Ui {
             } else {
                 Page::ProxyEditor
             }
-        } else {
+        } else if self.page == PROFILES {
             Page::Instances
+        } else {
+            Page::General
         }
     }
     fn render(&self, f: &mut Frame<'_>) {
         self.hits.borrow_mut().clear();
-        let content_area = self.render_navigation(f);
         if let Some(view) = &self.diagnostics {
             view.render(f, f.area());
             if let Some(scroll) = self.help_scroll {
@@ -1601,51 +1579,25 @@ impl Ui {
             self.render_background(f);
             return;
         }
-        let overview = self.editor.is_none() && self.viewer.is_none() && self.recovery.is_none();
-        let operation_text = self.operation_text();
-        let operation_height = 0;
+        let content_area = self.render_frame(f);
+        let list_page = self.page == PROFILES
+            && self.editor.is_none()
+            && self.viewer.is_none()
+            && self.recovery.is_none();
         let detail_height = if self.prompt.is_some() {
             3
-        } else if overview && self.page == 2 {
+        } else if list_page {
             (Paragraph::new(self.selection_status())
                 .wrap(Wrap { trim: false })
-                .line_count(f.area().width.max(1)) as u16)
-                .min(
-                    (f.area().height / 2)
-                        .min(f.area().height.saturating_sub(operation_height + 8))
-                        .max(1),
-                )
+                .line_count(content_area.width.max(1)) as u16)
+                .min((content_area.height / 2).max(1))
         } else {
             0
         };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(3),
-                Constraint::Length(detail_height),
-                Constraint::Length(operation_height),
-                Constraint::Length(2),
-            ])
+            .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
             .split(content_area);
-        let tabs = match self.kind {
-            Kind::Proxy => tr!("[ {} ]  {}", t("Proxy"), t("Rules")),
-            Kind::Rule => tr!("{}  [ {} ]", t("Proxy"), t("Rules")),
-        };
-        f.render_widget(
-            Paragraph::new(format!(
-                "{}  ·  {tabs}",
-                if overview {
-                    t(dashboard::PAGES[self.page])
-                } else {
-                    "Astra"
-                }
-            ))
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::Cyan)),
-            chunks[0],
-        );
-        self.header_hits(f, chunks[0]);
         if let Some(recovery) = &self.recovery {
             f.render_widget(
                 Paragraph::new(&*recovery.message)
@@ -1653,109 +1605,21 @@ impl Ui {
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(Color::Yellow))
                     .block(Block::default().title(t("Paused")).borders(Borders::ALL)),
-                chunks[1],
+                chunks[0],
             );
         } else if let Some(editor) = &self.editor {
-            editor.render(f, chunks[1]);
+            editor.render(f, chunks[0]);
+        } else if self.page == LOGS {
+            self.render_logs_page(f, chunks[0]);
         } else if let Some(viewer) = &self.viewer {
-            viewer.render(f, chunks[1]);
-        } else if self.page == 1 && self.live().is_some() {
-            self.render_live_groups(f, chunks[1]);
-        } else if self.page == 3 {
-            self.render_connections(f, chunks[1]);
-        } else if self.page == 0 || self.page == 4 {
-            self.render_dashboard(f, chunks[1]);
+            viewer.render(f, chunks[0]);
         } else {
-            let items: Vec<ListItem> = self
-                .rows()
-                .iter()
-                .map(|row| {
-                    let color = if row.state == "Running" {
-                        Color::Green
-                    } else if row.state == "Unresponsive" || row.state.starts_with("Exited") {
-                        Color::Red
-                    } else {
-                        Color::Gray
-                    };
-                    let details = self.details.get(&row.instance.name);
-                    let modes = details
-                        .map(|details| {
-                            details
-                                .modes
-                                .iter()
-                                .map(|mode| t(mode))
-                                .collect::<Vec<_>>()
-                                .join(" + ")
-                        })
-                        .unwrap_or_default();
-                    let first = Line::from(vec![
-                        Span::styled(
-                            if row.pid.is_some() { "● " } else { "○ " },
-                            Style::default().fg(color),
-                        ),
-                        Span::raw(format!("{}  ", row.instance.name)),
-                        Span::styled(t(&row.state).to_owned(), Style::default().fg(color)),
-                        Span::raw(if chunks[1].width >= 48 {
-                            format!("  {modes}")
-                        } else {
-                            String::new()
-                        }),
-                        Span::styled(
-                            if row.changed {
-                                t(" · reload pending")
-                            } else {
-                                ""
-                            },
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]);
-                    let summary = if let Some(details) = details {
-                        let mut summary = if details.config_unavailable {
-                            t("Configuration unavailable").to_owned()
-                        } else {
-                            details.listeners.join(" · ")
-                        };
-                        if !details.bindings.is_empty() {
-                            summary.push_str(&format!("  → {}", details.bindings.join(", ")));
-                        }
-                        if summary.is_empty() {
-                            summary = t("No listeners").into();
-                        }
-                        summary
-                    } else {
-                        row.instance
-                            .config
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    ListItem::new(Text::from(vec![
-                        first,
-                        Line::styled(format!("  {summary}"), Style::default().fg(Color::Gray)),
-                    ]))
-                })
-                .collect();
-            let empty = items.is_empty();
-            let mut state = ListState::default();
-            if !empty {
-                state.select(Some(self.selections[self.index()]));
-            }
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .title(tr!("Instances ({})", self.rows().len()))
-                        .borders(Borders::ALL),
-                )
-                .highlight_style(Style::default().bg(Color::Blue))
-                .highlight_symbol("› ");
-            f.render_stateful_widget(list, chunks[1], &mut state);
-            self.list_hits(chunks[1], state.offset());
-            if empty {
-                f.render_widget(
-                    Paragraph::new(t("n to add an instance")),
-                    chunks[1].inner(ratatui::layout::Margin::new(2, 1)),
-                );
+            match self.page {
+                shell::OVERVIEW => self.render_overview(f, chunks[0]),
+                shell::PROXIES => self.render_live_groups(f, chunks[0]),
+                shell::CONNECTIONS => self.render_connections(f, chunks[0]),
+                shell::RULES => self.render_rules(f, chunks[0]),
+                _ => self.render_profiles(f, chunks[0]),
             }
         }
         let detail = if let Some(prompt) = &self.prompt {
@@ -1764,30 +1628,20 @@ impl Ui {
             } else {
                 format!("{}\n> {}▏", prompt.title(), self.input)
             }
-        } else if overview {
+        } else if list_page {
             self.selection_status()
         } else {
             String::new()
         };
-        f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[2]);
-        f.render_widget(Paragraph::new(operation_text), chunks[3]);
-        let help = if self.recovery.is_some() {
-            t("c retry · b cancel · ↑↓ scroll")
-        } else if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
-            t("Enter confirm · Esc cancel")
-        } else if self.prompt.is_some() {
-            t("Enter confirm · Esc cancel · Ctrl-U clear")
-        } else if self.viewer.is_some() {
-            t("↑↓ scroll · Space pause · w wrap · Esc back · ? all operations")
-        } else if self.editor.is_some() {
-            // Editing keys sit in the editor's own hint bar; list the file-level ones here.
-            t("Ctrl-O import · F4 external editor · F5 read draft · Ctrl-C leave, keep draft")
-        } else {
-            t("1–5 pages · Shift-Tab previous · Tab core · ↑↓ select · Enter actions · q quit · ? help")
-        };
         f.render_widget(
-            Paragraph::new(help).style(Style::default().fg(Color::Gray)),
-            chunks[4],
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: false })
+                .style(if self.prompt.is_some() {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+            chunks[1],
         );
         if let Some(Prompt::ImportConfirm { notices, .. }) = &self.prompt {
             let popup = crate::help::popup(f.area(), notices);
@@ -1887,7 +1741,7 @@ impl Ui {
             );
             self.menu_hits(popup, state.offset());
         }
-        self.render_runtime_picker(f);
+        self.render_palette(f);
         if let Some(scroll) = self.help_scroll {
             let text = crate::help::text(self.help_page());
             let popup = crate::help::popup(f.area(), &text);
@@ -2139,6 +1993,8 @@ mod tests {
     }
     fn sample_ui(running: bool) -> Ui {
         let mut ui = Ui::new(Session::default());
+        // Instance-level shortcuts live on the Profiles page.
+        ui.page = PROFILES;
         ui.rows = vec![
             Row {
                 instance: Instance {
@@ -2314,6 +2170,7 @@ mod tests {
         call(&socket, Action::Start("rules".into())).await.unwrap();
         let mut ui = Ui::new(Session::default());
         ui.kind = Kind::Rule;
+        ui.page = PROFILES;
         ui.execute(&socket, Action::List, None).await;
         ui.key(key('t'));
         assert!(matches!(ui.prompt, Some(Prompt::Explain(_))));
@@ -2683,10 +2540,14 @@ mod tests {
             operation,
             Operation::Stop | Operation::Restart | Operation::Reload
         )));
+        // r applies (hot reload) and needs a running core; R restarts or starts.
+        assert!(matches!(ui.key(key('r')), Input::Idle));
         assert!(
-            matches!(ui.key(key('r')), Input::Run(Action::Start(name), None) if name == "proxy")
+            matches!(ui.key(key('R')), Input::Run(Action::Start(name), None) if name == "proxy")
         );
-        assert!(matches!(ui.key(key('R')), Input::Idle));
+        assert!(
+            matches!(ui.key(key('c')), Input::Run(Action::Start(name), None) if name == "proxy")
+        );
     }
     #[test]
     fn bindings_are_selected_without_typing_and_cancel_does_not_save() {
@@ -2768,7 +2629,8 @@ mod tests {
     #[test]
     fn configuration_paths_are_prefilled_and_paste_replaces_the_default() {
         let mut ui = sample_ui(false);
-        ui.key(key('c'));
+        // The path dialog moved to the action menu and command palette; c connects.
+        ui.operation(Operation::Config);
         assert!(ui.input.ends_with("proxy.toml"));
         ui.paste_prompt("new path.toml");
         assert_eq!(ui.input, "new path.toml");
