@@ -17,11 +17,11 @@ TUI：`s` 启动，`x` 停止，`r` 重启，`l` 重载，`e` 编辑配置，`v`
 直接运行核心：
 
 ```powershell
-./target/release/astra-server-core --config server.toml
-./target/release/astra-server-core --config server.toml --check
-./target/release/astra-server-core --status
-./target/release/astra-server-core --reload
-./target/release/astra-server-core --stop
+./target/<本机 Rust target>/release/astra-server-core --config server.toml
+./target/<本机 Rust target>/release/astra-server-core --config server.toml --check
+./target/<本机 Rust target>/release/astra-server-core --status
+./target/<本机 Rust target>/release/astra-server-core --reload
+./target/<本机 Rust target>/release/astra-server-core --stop
 ```
 
 核心在前台运行时支持 Ctrl+C。TUI 启动核心时在控制目录写入 `server.log`。默认控制目录：Windows `%LOCALAPPDATA%/.astra-server`，Unix `$HOME/.astra-server`。所有命令和 TUI 可用 `--control PATH` 管理其他实例，每个实例必须使用独立路径和监听端口。控制接口使用当前用户可访问的本地 IPC，不监听公网管理端口。不要在核心运行时删除控制文件；异常退出后的残留文件应在确认旧进程已经结束后手动清理。
@@ -52,7 +52,7 @@ Trojan、Hysteria2、TUIC 强制 TLS。REALITY 使用自己的入站认证配置
 开发用自签名证书：
 
 ```powershell
-./target/release/astra-server-core --generate-cert local-tls localhost
+./target/<本机 Rust target>/release/astra-server-core --generate-cert local-tls localhost
 ```
 
 该命令要求目录尚不存在。客户端 TLS 的 `server_name` 必须与证书一致；VLESS/VMess/Trojan/TUIC 可配置 `ca_file`，Hysteria2 使用 `pin_sha256`。生产环境使用实际域名和可信证书。

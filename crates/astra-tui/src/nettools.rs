@@ -741,4 +741,118 @@ mod tests {
         assert_eq!(host_part("2001:db8::1"), "2001:db8::1");
         assert_eq!(host_part("1.1.1.1"), "1.1.1.1");
     }
+    struct Home(PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires freshly built core binaries"]
+    async fn live_network_tools_probe_through_manager_and_profile_outbound() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A SOCKS5 outbound that accepts every CONNECT and reports the requested target.
+        let socks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = socks.local_addr().unwrap();
+        let (seen, mut targets) = mpsc::channel(4);
+        let stub = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = socks.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut greeting = [0; 2];
+                    stream.read_exact(&mut greeting).await?;
+                    stream
+                        .read_exact(&mut vec![0; greeting[1] as usize])
+                        .await?;
+                    stream.write_all(&[5, 0]).await?;
+                    let mut header = [0; 4];
+                    stream.read_exact(&mut header).await?;
+                    anyhow::ensure!(header == [5, 1, 0, 3], "domain CONNECT expected");
+                    let mut host = vec![0; stream.read_u8().await? as usize];
+                    stream.read_exact(&mut host).await?;
+                    let port = stream.read_u16().await?;
+                    stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                    seen.send((String::from_utf8(host)?, port)).await?;
+                    Ok::<_, anyhow::Error>(())
+                });
+            }
+        });
+        let home = Home(std::env::temp_dir().join(format!("astra-nettool-{}", std::process::id())));
+        let state = home.0.join("state");
+        let socket = state.join("manager.sock");
+        let config = home.0.join("proxy.toml");
+        std::fs::create_dir_all(&home.0).unwrap();
+        std::fs::write(&config, format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='edge'\nserver='{server}'\n")).unwrap();
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let manager = tokio::spawn(crate::manager::serve(state, bin));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        protocol::call(
+            &socket,
+            Action::Add(protocol::Instance {
+                name: "proxy".into(),
+                kind: protocol::Kind::Proxy,
+                config,
+            }),
+        )
+        .await
+        .unwrap();
+        // Drive the page itself: TUI → manager → short-lived core → streamed events.
+        let mut view = View::new(&socket, "proxy".into(), &["DIRECT".into(), "edge".into()]);
+        view.egress = view
+            .egresses
+            .iter()
+            .position(|egress| *egress == Egress::Outbound("edge".into()))
+            .unwrap();
+        view.target = "nettool.example:443".into();
+        view.count = 2;
+        view.key(key(KeyCode::Enter));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while view.running() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                view.poll();
+            }
+        })
+        .await
+        .expect("the probe stream must finish");
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert!(
+            view.note
+                .as_deref()
+                .is_some_and(|note| note.contains("outbound edge")),
+            "{:?}",
+            view.note
+        );
+        assert!(
+            view.attempts.len() == 2
+                && view
+                    .attempts
+                    .iter()
+                    .all(|a| a.error.is_none() && a.rtt_ms.is_some()),
+            "{:?}",
+            view.attempts
+        );
+        let summary = view.summary.clone().unwrap();
+        assert_eq!((summary.sent, summary.received), (2, 2));
+        for _ in 0..2 {
+            assert_eq!(
+                targets.recv().await.unwrap(),
+                ("nettool.example".to_owned(), 443)
+            );
+        }
+        stub.abort();
+        protocol::call(&socket, Action::Shutdown).await.unwrap();
+        manager.await.unwrap().unwrap();
+    }
 }

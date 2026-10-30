@@ -1,0 +1,163 @@
+Astra TUI Overview · ASCII layout demo
+======================================
+
+目的
+----
+把 Overview 从“多个同等权重的卡片”改成“运行状态 → 控制 → 实时连接”的阅读顺序。
+本文件用于 review 布局；对应 Rust/UI 实现已完成。
+
+标记说明
+--------
+●G / ●Y / ●R  当前实例状态色（大写）：绿=Running，黄=Starting/Stopping，红=Failed/Exited
+P / R          当前实例核心类型：P=Proxy core，R=Rule core
+例：●G m1 · P 表示正在运行的 Proxy core m1；●G p2 · R 表示正在运行的 Rule core p2。
+
+
+[宽屏：>= 120 columns]
+
+┌─ Astra ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ● m1  Connected 4h22m  │ Rule  ·  Exit PROXY ▸ AJP-80-Direct-Vision  ·  38 ms                 ↑ 2.3 KiB/s  ↓ 762.9 KiB/s │
+│ SOCKS5 0.0.0.0:1080 · HTTP 0.0.0.0:8080 · Mixed 0.0.0.0:7890 · 10 outbounds            [N Network tools]  [c Disconnect] │
+├─ 1 Overview   2 Proxies   3 Connections   4 Rules   5 Logs   6 Profiles ─────────────────────────────────────────────────┤
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ATTENTION ──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ▌ Error: create native TUN device (Unix requires root/CAP_NET_ADMIN): Operation not permitted · persists                 │
+│ ▌ Warning: Configuration changed but not applied · r apply · hides after 15s                                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CONTROLS ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ [m Rule]   m Global   m Direct        [S System proxy ●]   T TUN ○   A Allow LAN ○   r Apply                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ LIVE CONNECTIONS · 20 active · sorted by traffic ───────────── ▁▂▃▅▃▆▇▅▃▂▁▃▅▃▆▇▅▃▂▁ ┐ ┌─ SNAPSHOT ──────────────────────┐
+│ z j-cn-live-comet.chat.bilibili.com:2245   DIRECT             ↓18.9 MiB    ↑18.8 KiB │ │ ●G m1 · P   ●G p2 · R           │
+│ d1--cn-gotcha209.bilivideo.com:443         DIRECT              ↓8.9 MiB    ↑36.3 KiB │ │                                 │
+│ claude.ai:443                              AJP-80-Direct…     ↓44.9 KiB     ↑1.4 MiB │ │ PROXY GROUPS · 2                │
+│ data.bilibili.com:443                      DIRECT             ↓87.6 KiB   ↑353.5 KiB │ │ DIRECT  → DIRECT                │
+│ downloads.claude.ai:443                    AJP-80-Direct…    ↓165.3 KiB     ↑2.8 KiB │ │ PROXY   → AJP-80-Direct…        │
+│ api.openai.com:443                         AJP-80-Direct…     ↓88.5 KiB    ↑28.4 KiB │ │ REJECT  → REJECT                │
+│ www.bing.com:443                           AJP-80-Direct…      ↓7.1 KiB    ↑18.5 KiB │ │ no      → —                     │
+│ aks-prod-japaneast...                      AJP-80-Direct…     ↓12.2 KiB     ↑9.3 KiB │ │                                 │
+│ www.bing.com:443                           AJP-80-Direct…      ↓6.1 KiB    ↑13.7 KiB │ │ p switch profiles               │
+│ ...                                                                                  │ │                                 │
+│ Enter open · z chart                                                                 │ │                                 │
+│                                                                                      │ │                                 │
+└──────────────────────────────────────────────────────────────────────────────────────┘ └─────────────────────────────────┘
+
+ （存在问题时才插入 ATTENTION；正常状态整块消失，不占固定高度。）
+ （TRAFFIC 迷你趋势图默认嵌入 LIVE CONNECTIONS 上边框；按 z 展开完整详情卡，再按 z 收起。）
+
+│ e edit · L logs · ? help                                                                                                 │
+
+
+[中等宽度：80–119 columns]
+
+┌─ Astra ──────────────────────────────────────────────────────────────────────────────────┐
+│ ● m1  Connected 4h22m  │ Rule  ·  Exit PROXY ▸ AJP-80-Direct-Vision    ↑2.3K/s ↓762.9K/s │
+│ SOCKS5 :1080 · HTTP :8080 · Mixed :7890                [N Network tools]  [c Disconnect] │
+├─ 1 Overview   2 Proxies   3 Connections   4 Rules   5 Logs   6 Profiles ─────────────────┤
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CONTROLS ───────────────────────────────────────────────────────────────────────────────┐
+│ [m Rule]  m Global  m Direct   [S System proxy ●]  T TUN ○  A LAN ○  r Apply             │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ LIVE CONNECTIONS · 20 active · sorted by traffic ───────────────── ▁▂▃▅▃▆▇▅▃▂▁▃▅▃▆▇▅▃▂▁ ┐
+│ z j-cn-live-comet.chat.bilibili.com:2245   DIRECT             ↓18.9 MiB    ↑18.8 KiB     │
+│ d1--cn-gotcha209.bilivideo.com:443         DIRECT              ↓8.9 MiB    ↑36.3 KiB     │
+│ claude.ai:443                              AJP-80-Direct…     ↓44.9 KiB     ↑1.4 MiB     │
+│ data.bilibili.com:443                      DIRECT             ↓87.6 KiB   ↑353.5 KiB     │
+│ downloads.claude.ai:443                    AJP-80-Direct…    ↓165.3 KiB     ↑2.8 KiB     │
+│ ...                                                                                      │
+│ Enter open · z chart                                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ PROXY GROUPS · 2 ───────────────────────────────────────────────────────────────────────┐
+│ ●G m1 · P   ●G p2 · R                                                                    │
+│ DIRECT  → DIRECT                                                                         │
+│ PROXY   → AJP-80-Direct-Vision                                                           │
+│ REJECT  → REJECT                                                                         │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+[窄屏：< 80 columns]
+
+┌─ Astra · m1 · ● Connected · Up 4h22m ──────────────────────────────────────┐
+│ Exit PROXY ▸ AJP-80-Direct-Vision                        ↑2.3K/s ↓762.9K/s │
+│ SOCKS5 :1080 · HTTP :8080 · Mixed :7890                                    │
+│ [N Network tools]  [c Disconnect]                                          │
+├─ [1] Overview  [2] Proxies  [3] Connections  [6] Profiles ─────────────────┤
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CONTROLS ─────────────────────────────────────────────────────────────────┐
+│ [m Rule]  m Global  m Direct  S proxy ●  T TUN ○  A LAN ○                  │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CONNECTIONS · 20 active · sorted by traffic ──────── ▁▂▃▅▃▆▇▅▃▂▁▃▅▃▆▇▅▃▂▁ ┐
+│ z j-cn-live-comet.chat.bilibili.com:2245                                   │
+│ DIRECT · TCP                                        ↓18.9 MiB    ↑18.8 KiB │
+│ claude.ai:443                                                              │
+│ AJP-80-Direct-Vision · TCP                          ↓44.9 KiB     ↑1.4 MiB │
+│ data.bilibili.com:443                                                      │
+│ DIRECT · TCP                                        ↓87.6 KiB   ↑353.5 KiB │
+│ ...                                                                        │
+│ ↑↓ scroll · PgUp/PgDn · Enter open                                          │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ PROXY GROUPS · 2 ─────────────────────────────────────────────────────────┐
+│ ●G m1 · P   ●G p2 · R                                                      │
+│ DIRECT  → DIRECT                                                           │
+│ PROXY   → AJP-80-Direct-Vision                                             │
+│ REJECT  → REJECT                                                           │
+└────────────────────────────────────────────────────────────────────────────┘
+
+│ ↑↓/jk scroll · PgUp/PgDn page · e edit · L logs · ? help                   │
+
+ 窄屏内容区统一滚动；Proxy groups 位于连接之后，可通过滚动访问。
+
+
+设计决策（已按确认结果更新）
+------------------------------
+1. 顶部 Astra 面板合并状态栏与 ACTIVE PROFILE：当前实例状态、出口、地址端口、页签栏在同一面板内，信息只出现一次。
+2. CONTROLS 独立成一行，明确 m/S/T/A/r 都是当前实例的即时操作，而不是普通统计信息。
+3. LIVE CONNECTIONS 获得最大面积；这是代理工具最常用、最需要扫描的实时信息。
+4. TRAFFIC 的迷你趋势图合并到 LIVE CONNECTIONS 上边框，不再单独占用卡片；宽屏和中等宽度可按 z 展开完整 TRAFFIC 详情。
+5. 宽屏右侧只保留 PROXY GROUPS，并显示当前实例指示器；Profile 切换仍由顶部合并面板和 p switch 完成。
+6. 当前实例指示器同时显示 Proxy core（P）与绑定的 Rule core（R），格式为 名称 + P/R + 大写颜色标志 ●G/●Y/●R。
+7. ATTENTION 只在存在问题时插入到合并后的 Astra 面板与 CONTROLS 之间；所有错误和警告都进入这里，警告 15s 后自动隐藏，错误持续显示。成功提示不进入 ATTENTION，也不受该超时影响。
+8. 80–119 列时 LIVE CONNECTIONS 占满宽度；TRAFFIC 已合并到上边框，底部只保留占满宽度的 PROXY GROUPS。
+9. 窄屏连接采用两行一项：第一行 host:port；第二行 route · network 与上下行流量。
+10. 窄屏内容区统一滚动，使用 ↑↓ / j k 与 PgUp/PgDn；Proxy groups 排在连接之后。
+11. LIVE CONNECTIONS 在活跃连接内按总流量（download + upload）降序排列，延续现有 Busiest connections 语义。
+12. 保留现有项目术语和操作：Overview、Proxies、Connections、Profiles、Rule/Global/Direct、System proxy、TUN、LAN。
+13. 宽屏和中等宽度默认只在 LIVE CONNECTIONS 上边框显示迷你趋势图；按 z 展开完整 TRAFFIC 详情卡（速率、总量、更长趋势图），再按 z 收起。窄屏仅保留内嵌迷你图，不提供展开。
+14. 展开的 TRAFFIC 详情卡高度按内容区比例自适应，约占 35%–45%，最少 6 行、最多 14 行；连接列表仍然优先获得剩余高度。
+15. 顶部合并面板、CONTROLS 与列表内已经展示的快捷键，不在底部 hint 重复；底部只保留未展示的操作（e edit · L logs · ? help）。
+16. 该 demo 不代表最终像素尺寸；实际实现仍应以 ratatui 的 Rect、Line::width() 和现有 key_hints_fit 为准。
+
+已确认的选择
+--------------
+- Overview 主视觉区域：LIVE CONNECTIONS。
+- 宽屏右侧：只保留 Proxy groups，并保留当前实例指示器。
+- 实时速率：顶部摘要 + LIVE CONNECTIONS 上边框的迷你趋势图；展开时显示完整 TRAFFIC 详情。
+- 窄屏连接：两行一项，第二行保留路由、网络类型、上下行。
+- 中等宽度：连接列表占满宽度；TRAFFIC 合并后 PROXY GROUPS 在下方占满宽度。
+- 窄屏 Proxy groups：放在连接之后，页面统一滚动。
+- 提醒：所有错误和警告进入 ATTENTION；警告 15s 后隐藏，错误持续显示。
+- 连接排序：活跃连接内按总流量降序。
+- 实例指示器：同时显示 P 与 R，颜色代码使用大写 ●G/●Y/●R。
+- TRAFFIC 图表：默认合并到 LIVE CONNECTIONS 上边框，不占独立卡片。
+- 宽屏 TRAFFIC：按 z 展开完整详情，再按 z 收起。
+- TRAFFIC 展开高度：按内容区比例自适应（约 35%–45%，最少 6 行、最多 14 行）。
+- TRAFFIC 展开适用范围：宽屏和中等宽度；窄屏仅保留内嵌迷你图。
+- ATTENTION 超时：仅警告 15s 后隐藏；错误持续显示；成功提示不进入 ATTENTION。
+- 顶部布局：状态栏与 ACTIVE PROFILE 合并为单个 Astra 面板，页签栏也在其中。
+- 快捷键提示：面板内已展示的键（c/N/m/S/T/A/r/z/Enter/3//x/X/p）不在底部 hint 重复。
+
+实现状态
+--------
+- dashboard.rs：Overview 已按宽/中/窄三档重排；迷你趋势图渲染在 LIVE CONNECTIONS 上边框，z 展开/收起完整 TRAFFIC 详情；窄屏两行连接并在滚动到底后继续滚动代理组。
+- live.rs：Overview 支持 z、↑↓ / j k、PgUp/PgDn、gg/G；模式与接管开关改为自适应单行控制面板。
+- shell.rs：Overview 使用合并的 Astra 面板，其他页面保留独立状态栏与页面栏；底部只保留未在面板中展示的按键。
+- 测试覆盖三种宽度、连接按流量排序、趋势图内嵌、z 展开和小窗口渲染。

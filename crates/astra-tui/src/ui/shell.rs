@@ -740,20 +740,40 @@ impl Ui {
     /// Status bar, page bar and hint line; returns the page content area.
     pub(super) fn render_frame(&self, f: &mut Frame<'_>) -> Rect {
         let area = f.area();
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        self.render_status_bar(f, rows[0]);
-        self.render_page_bar(f, rows[1]);
+        let header_height = self.overview_header_height(area.width);
+        let merged = self.page == OVERVIEW
+            && self.active_proxy().is_some()
+            && area.height >= header_height.saturating_add(4);
+        let rows = if merged {
+            Layout::vertical([
+                Constraint::Length(header_height),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area)
+        };
+        let (content, hint) = if merged {
+            self.render_overview_header(f, rows[0]);
+            (rows[1], rows[2])
+        } else {
+            self.render_status_bar(f, rows[0]);
+            self.render_page_bar(f, rows[1]);
+            (rows[2], rows[3])
+        };
         // This page's keys, whole entries only; results live in the status line below.
-        let spans = crate::theme::key_hints_fit(&self.hint(), rows[3].width as usize, t("? more"));
-        f.render_widget(Paragraph::new(Line::from(spans)), rows[3]);
-        rows[2]
+        let spans = crate::theme::key_hints_fit(&self.hint(), hint.width as usize, t("? more"));
+        f.render_widget(Paragraph::new(Line::from(spans)), hint);
+        content
     }
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -926,7 +946,7 @@ impl Ui {
             "↑↓ member · Enter select · / find · t test · Esc groups"
         } else {
             match self.page {
-                OVERVIEW => "c connect/disconnect · m mode · S system proxy · T TUN · A LAN · r apply · e edit · L logs · N network tools",
+                OVERVIEW => "e edit · L logs · ? help",
                 PROXIES => "↑↓ group · Enter members · / find · t test · D node tests · U update subscriptions",
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
                 RULES => "t test a route · / search rules · e edit rules",
