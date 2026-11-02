@@ -6,6 +6,14 @@ use std::{
     time::Duration,
 };
 
+fn workers() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
+    static WORKERS: OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    WORKERS.get_or_init(Default::default)
+}
+pub(crate) fn register_worker(pid: u32) { workers().lock().unwrap().insert(pid); }
+pub(crate) fn unregister_worker(pid: u32) { workers().lock().unwrap().remove(&pid); }
+pub(crate) fn own_process(pid: u32) -> bool { pid == std::process::id() || workers().lock().unwrap().contains(&pid) }
+
 pub(crate) async fn lookup(
     network: Network,
     source: SocketAddr,
@@ -29,7 +37,7 @@ pub(crate) async fn is_self(network: Network, source: SocketAddr, destination: S
             let pid = windows::owner_pid_snapshot(network, source, destination);
             #[cfg(not(windows))]
             let pid = resolve(network, source, destination).map(|process| process.pid);
-            pid.map(|pid| pid == std::process::id())
+            pid.map(own_process)
         },
     )
     .await

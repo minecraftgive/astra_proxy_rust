@@ -23,6 +23,7 @@ use proxy::packet;
 use proxy::rule_client;
 use proxy::runtime;
 mod diagnostics;
+pub mod hosted;
 #[path = "dns/shared_mod.rs"]
 mod dns;
 mod http_forward;
@@ -50,12 +51,17 @@ struct CacheKey {
 }
 
 pub struct App {
+    hosted: Option<Arc<hosted::Host>>,
+    worker_host: Option<hosted::WorkerHost>,
     metrics: Arc<proxy::traffic::Metrics>,
     overrides: Arc<std::sync::RwLock<astra_ipc::runtime::Overrides>>,
     egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
     dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
     source_text: String,
+    // Preserve the validated subscription expansion independently of the
+    // editable source. Immutable workers must not reread a mutable cache.
+    effective_text: String,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
     outbounds: HashMap<String, OutboundConfig>,
     groups: proxy::groups::Groups,
@@ -164,7 +170,9 @@ impl App {
             return Ok(RouteAction::Block);
         }
         // Transparent self-capture is unsafe even in standalone mode.
-        let process = if self.standalone_action.is_none() || inbound == Inbound::Tun {
+        let process = if let Ok(process) = hosted::INGRESS_PROCESS.try_with(Clone::clone) {
+            process
+        } else if self.standalone_action.is_none() || inbound == Inbound::Tun {
             match (source, destination) {
                 (Some(source), Some(destination)) => {
                     platform::process::lookup(network, source, destination).await
@@ -210,7 +218,7 @@ impl App {
         if inbound == Inbound::Tun
             && process
                 .as_ref()
-                .is_some_and(|process| process.pid == std::process::id())
+                .is_some_and(|process| platform::process::own_process(process.pid))
         {
             bail!("TUN recaptured a proxy-core connection; check tun.interface and outbound bypass routes");
         }
@@ -564,6 +572,8 @@ impl App {
             }
         }
         Ok(Self {
+            hosted: None,
+            worker_host: None,
             metrics: Arc::default(),
             overrides: Arc::default(),
             egress_signal: Arc::new(tokio::sync::watch::channel(false).0),
@@ -583,6 +593,7 @@ impl App {
             permits: Arc::new(limit::Limit::new(config.max_connections)),
             cache: builder.build(),
             route_leases: vec![],
+            effective_text: source_text.clone(),
             source_text,
             config,
             outbounds,
@@ -593,6 +604,10 @@ impl App {
 }
 
 pub async fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--host-worker") {
+        let _log = astra_ipc::logging::init()?;
+        return hosted::worker().await;
+    }
     let elevated_config = platform::privilege::bootstrap()?;
     let mut args = std::env::args().skip(1);
     let first = args.next();

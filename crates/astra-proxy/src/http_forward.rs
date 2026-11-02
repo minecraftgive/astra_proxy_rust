@@ -213,9 +213,17 @@ async fn forward(
     }
 }
 
-pub async fn handle(client: tokio::net::TcpStream, app: Arc<App>) -> anyhow::Result<()> {
-    let source = client.peer_addr().ok();
-    let destination = client.local_addr().ok();
+pub async fn handle_stream<S>(
+    client: S,
+    app: Arc<App>,
+    source: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let source = Some(source);
+    let destination = Some(local);
     hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
         .half_close(true)

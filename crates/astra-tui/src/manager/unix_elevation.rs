@@ -214,6 +214,7 @@ pub(super) async fn prepare(
         digest,
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
+        hosted: std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some(),
     };
     tokio::spawn(async move {
         let result = tokio::select! {

@@ -1,35 +1,40 @@
 use crate::App;
 use anyhow::{Context, Result};
 use astra_ipc::{Inbound, RouteAction};
-use std::{sync::Arc, time::Duration};
-use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
+pub async fn handle_http(client: TcpStream, app: Arc<App>) -> Result<()> {
+    let source = client.peer_addr()?;
+    let local = client.local_addr()?;
+    super::handle_stream(client, app, Inbound::HttpConnect, source, local).await
+}
+
+pub(super) async fn handle_stream<S>(
+    mut client: super::BufferedStream<S>,
+    app: Arc<App>,
+    source: SocketAddr,
+    local: SocketAddr,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     {
-        // Peek preserves bytes for either HTTP parser. Fragmented request lines
-        // share the same bounded handshake deadline as CONNECT.
-        let connect = timeout(HANDSHAKE_TIMEOUT, async {
-            let mut prefix = [0u8; 8];
-            loop {
-                let size = client.peek(&mut prefix).await?;
-                if size == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-                }
-                if size >= prefix.len() {
-                    return Ok(prefix == *b"CONNECT ");
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .context("HTTP handshake timeout")??;
-        if !connect {
-            return crate::http_forward::handle(client, app).await;
+        // Lookahead is replayed to either parser, even on non-socket streams.
+        timeout(HANDSHAKE_TIMEOUT, client.prefetch(8))
+            .await
+            .context("HTTP handshake timeout")??;
+        if client.buffer[..8] != *b"CONNECT " {
+            return crate::http_forward::handle_stream(client, app, source, local).await;
         }
     }
-    let users = app.authentication(client.peer_addr().ok().map(|s| s.ip()));
+    let users = app.authentication(Some(source.ip()));
     if !super::authorize_connect(&mut client, users).await? {
         return Ok(());
     }
@@ -51,8 +56,8 @@ pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
             &target,
             Inbound::HttpConnect,
             astra_ipc::Network::Tcp,
-            client.peer_addr().ok(),
-            client.local_addr().ok(),
+            Some(source),
+            Some(local),
         )
         .await
     {
@@ -71,12 +76,7 @@ pub async fn handle_http(mut client: TcpStream, app: Arc<App>) -> Result<()> {
         return Ok(());
     }
     let mut upstream = match app
-        .connect_tracked(
-            &target,
-            &action,
-            Inbound::HttpConnect,
-            client.peer_addr().ok(),
-        )
+        .connect_tracked(&target, &action, Inbound::HttpConnect, Some(source))
         .await
     {
         Ok(s) => s,

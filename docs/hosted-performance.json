@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-11-02T10:40:12.934338+00:00",
+  "platform": "Windows-11-10.0.26340-SP0",
+  "machine": "AMD64",
+  "logical_cpus": 32,
+  "python": "3.13.7",
+  "binary": "target\\debug\\astra-proxy.exe",
+  "binary_sha256": {
+    "astra-proxy.exe": "fb238cf42f1a5ea1f341511c7abae33217f1f4f77c9f32f90633e08c49ab4ed7",
+    "astra-rule.exe": "fb95a5249b16b91b0298a68fe8d5558767bd82cc590cc987f4dd01fd519b2255"
+  },
+  "build_profile_hint": "debug",
+  "connections_per_round": 30,
+  "concurrency": 1,
+  "warmup_connections": 5,
+  "rounds": 2,
+  "settle_seconds_after_warmup": 2,
+  "throughput_seconds_requested": 1.0,
+  "scope": "Same proxy/rule binaries, direct-only IPv4 SOCKS5 over loopback. Each trial has one Rule Core with an empty rules table and default direct action. CPU/RSS include the rule process and proxy plus all worker descendants. Python asyncio client and echo server are excluded from CPU/RSS but limit measured throughput. No TUN, system proxy, DNS listener or external traffic. Setup latency excludes the client concurrency gate. Throughput counts acknowledged echo payload once, not upload plus download. RSS is sampled aggregate working set, not an OS lifetime peak.",
+  "results": [
+    {
+      "mode": "ordinary",
+      "round": 1,
+      "samples": 30,
+      "setup_ms": {
+        "p50": 3.019,
+        "p95": 14.238,
+        "p99": 66.29
+      },
+      "throughput": {
+        "streams": 1,
+        "payload_chunk_bytes": 65536,
+        "echoed_payload_bytes": 13565952,
+        "elapsed_seconds": 1.023074,
+        "echo_payload_mib_per_second": 12.646,
+        "resources": {
+          "collector": "psutil proxy tree plus rule process",
+          "cpu_seconds_during_throughput": 0.453125,
+          "cpu_percent_one_core_100": 44.29,
+          "sampled_peak_aggregate_rss_bytes": 33378304,
+          "peak_process_count": 2,
+          "process_names": [
+            "astra-proxy.exe",
+            "astra-rule.exe"
+          ],
+          "sample_interval_ms": 100,
+          "samples": 11,
+          "collection_errors": []
+        }
+      }
+    },
+    {
+      "mode": "hosted",
+      "round": 1,
+      "samples": 30,
+      "setup_ms": {
+        "p50": 4.079,
+        "p95": 59.519,
+        "p99": 64.94
+      },
+      "throughput": {
+        "streams": 1,
+        "payload_chunk_bytes": 65536,
+        "echoed_payload_bytes": 8716288,
+        "elapsed_seconds": 1.003695,
+        "echo_payload_mib_per_second": 8.282,
+        "resources": {
+          "collector": "psutil proxy tree plus rule process",
+          "cpu_seconds_during_throughput": 0.640625,
+          "cpu_percent_one_core_100": 63.83,
+          "sampled_peak_aggregate_rss_bytes": 65368064,
+          "peak_process_count": 4,
+          "process_names": [
+            "astra-proxy.exe",
+            "astra-rule.exe",
+            "conhost.exe"
+          ],
+          "sample_interval_ms": 100,
+          "samples": 11,
+          "collection_errors": []
+        }
+      }
+    },
+    {
+      "mode": "hosted",
+      "round": 2,
+      "samples": 30,
+      "setup_ms": {
+        "p50": 4.957,
+        "p95": 37.705,
+        "p99": 63.939
+      },
+      "throughput": {
+        "streams": 1,
+        "payload_chunk_bytes": 65536,
+        "echoed_payload_bytes": 6946816,
+        "elapsed_seconds": 1.125198,
+        "echo_payload_mib_per_second": 5.888,
+        "resources": {
+          "collector": "psutil proxy tree plus rule process",
+          "cpu_seconds_during_throughput": 0.59375,
+          "cpu_percent_one_core_100": 52.77,
+          "sampled_peak_aggregate_rss_bytes": 65241088,
+          "peak_process_count": 4,
+          "process_names": [
+            "astra-proxy.exe",
+            "astra-rule.exe",
+            "conhost.exe"
+          ],
+          "sample_interval_ms": 100,
+          "samples": 12,
+          "collection_errors": []
+        }
+      }
+    },
+    {
+      "mode": "ordinary",
+      "round": 2,
+      "samples": 30,
+      "setup_ms": {
+        "p50": 3.531,
+        "p95": 70.417,
+        "p99": 82.837
+      },
+      "throughput": {
+        "streams": 1,
+        "payload_chunk_bytes": 65536,
+        "echoed_payload_bytes": 15335424,
+        "elapsed_seconds": 1.001883,
+        "echo_payload_mib_per_second": 14.598,
+        "resources": {
+          "collector": "psutil proxy tree plus rule process",
+          "cpu_seconds_during_throughput": 0.359375,
+          "cpu_percent_one_core_100": 35.87,
+          "sampled_peak_aggregate_rss_bytes": 33419264,
+          "peak_process_count": 2,
+          "process_names": [
+            "astra-proxy.exe",
+            "astra-rule.exe"
+          ],
+          "sample_interval_ms": 100,
+          "samples": 11,
+          "collection_errors": []
+        }
+      }
+    }
+  ],
+  "summary": {
+    "ordinary": {
+      "median_round_setup_p50_ms": 3.275,
+      "median_round_setup_p95_ms": 42.328,
+      "median_echo_payload_mib_per_second": 13.622
+    },
+    "hosted": {
+      "median_round_setup_p50_ms": 4.518,
+      "median_round_setup_p95_ms": 48.612,
+      "median_echo_payload_mib_per_second": 7.085
+    }
+  }
+}

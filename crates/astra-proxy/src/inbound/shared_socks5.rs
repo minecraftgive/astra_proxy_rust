@@ -1,13 +1,31 @@
 use crate::App;
 use anyhow::{Context, Result};
 use astra_ipc::{Inbound, RouteAction};
-use std::{sync::Arc, time::Duration};
-use tokio::{net::TcpStream, time::timeout};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    time::timeout,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
-    let users = app.authentication(client.peer_addr().ok().map(|s| s.ip()));
+pub async fn handle_socks5(client: TcpStream, app: Arc<App>) -> Result<()> {
+    let source = client.peer_addr()?;
+    let local = client.local_addr()?;
+    super::handle_stream(client, app, Inbound::Socks5, source, local).await
+}
+
+pub(super) async fn handle_stream<S>(
+    mut client: S,
+    app: Arc<App>,
+    source: SocketAddr,
+    local: SocketAddr,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let users = app.authentication(Some(source.ip()));
     let (command, target) = timeout(
         HANDSHAKE_TIMEOUT,
         read_socks_request_with_auth(&mut client, users),
@@ -15,15 +33,15 @@ pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
     .await
     .context("SOCKS5 handshake timeout")??;
     if command == 3 {
-        return crate::udp::associate(client, target, app).await;
+        return crate::udp::associate_stream(client, target, app, source, local).await;
     }
     let action = match app
         .route_connection(
             &target,
             Inbound::Socks5,
             astra_ipc::Network::Tcp,
-            client.peer_addr().ok(),
-            client.local_addr().ok(),
+            Some(source),
+            Some(local),
         )
         .await
     {
@@ -38,7 +56,7 @@ pub async fn handle_socks5(mut client: TcpStream, app: Arc<App>) -> Result<()> {
         return Ok(());
     }
     let mut upstream = match app
-        .connect_tracked(&target, &action, Inbound::Socks5, client.peer_addr().ok())
+        .connect_tracked(&target, &action, Inbound::Socks5, Some(source))
         .await
     {
         Ok(s) => s,

@@ -408,6 +408,10 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                         if app.intercept_dns(destination) {
                             return crate::dns::tcp(stream, app.clone()).await;
                         }
+                        if let Some(host) = &app.hosted {
+                            let process = super::process::lookup(astra_ipc::Network::Tcp,source,destination).await;
+                            return host.relay(stream,crate::hosted::Metadata { flow_id:None,inbound: Inbound::Tun, source, local:destination, destination:Some(destination), process }).await;
+                        }
                         let sniff=app.config.tun.as_ref().is_none_or(|tun|tun.sniff) && matches!(destination.port(),80|443|8080|8443);
                         let (prefix,hostname)=if sniff {crate::proxy::target::preface(&mut stream).await?}else{(vec![],None)};
                         let (route,dial)=crate::proxy::target::select(&app,&target,hostname)?;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use astra_dns::{wire, Config, Resolver, Transport, Upstream};
+use astra_dns::{wire, Config, LocalMappingStore, MappingStore, Resolver, Transport, Upstream};
 use hickory_proto::{
     op::{Message, ResponseCode},
     rr::{rdata::A, RData, Record, RecordType},
@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -21,6 +21,217 @@ struct Mock {
     wrong_id: bool,
     ttl: u32,
     negative: bool,
+}
+
+#[tokio::test]
+async fn shared_mapping_store_preserves_ownership_and_reservations_across_generations() {
+    let config = Config {
+        fake_ip: true,
+        fake_ip_range6: Some("fdab::/64".into()),
+        mapping_capacity: 4,
+        ..Config::default()
+    };
+    let host = Arc::new(LocalMappingStore::default());
+    let mut old = Resolver::with_mapping_store(config.clone(), host.clone()).unwrap();
+    // Probe through more reservations than the old capacity+3 loop allowed.
+    for offset in 2..=10 {
+        old.try_reserve_address(format!("198.18.0.{offset}").parse().unwrap())
+            .unwrap();
+    }
+    let mut new = Resolver::with_mapping_store(config.clone(), host.clone()).unwrap();
+    new.try_reserve_address("198.18.0.11".parse().unwrap())
+        .unwrap();
+    let mock = Mock::default();
+    let first = address(&answer(&old, &mock, "old.example", RecordType::A).await);
+    assert_eq!(first, "198.18.0.12".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(new.restore(first).unwrap().as_deref(), Some("old.example"));
+    assert_eq!(
+        first,
+        address(&answer(&new, &mock, "old.example", RecordType::A).await)
+    );
+    let second = address(&answer(&new, &mock, "new.example", RecordType::A).await);
+    assert_ne!(first, second);
+    assert_eq!(old.restore(second).unwrap().as_deref(), Some("new.example"));
+    let ipv6 = address(&answer(&old, &mock, "old.example", RecordType::AAAA).await);
+    assert_eq!(new.restore(ipv6).unwrap().as_deref(), Some("old.example"));
+    assert!(new.try_reserve_address(first).is_err());
+    let changed = Config {
+        fake_ip_range: "198.19.0.0/16".into(),
+        ..config.clone()
+    };
+    assert!(Resolver::with_mapping_store(changed, host.clone()).is_err());
+    // A resolver created before Fake-IP was enabled may still observe real
+    // answers, but an inactive configuration cannot allocate fake addresses.
+    let inactive = Config {
+        fake_ip: false,
+        ..config
+    };
+    assert!(Resolver::with_mapping_store(inactive.clone(), host.clone()).is_ok());
+    assert!(host
+        .allocate(&inactive, "disabled.example", false, &Default::default())
+        .is_err());
+    // Failed registration did not change existing address ownership.
+    assert_eq!(new.restore(first).unwrap().as_deref(), Some("old.example"));
+}
+
+#[tokio::test]
+async fn shared_real_observations_retain_ambiguity() {
+    let host = Arc::new(LocalMappingStore::default());
+    let old = Resolver::with_mapping_store(Config::default(), host.clone()).unwrap();
+    let new = Resolver::with_mapping_store(Config::default(), host).unwrap();
+    let mock = Mock {
+        ttl: 30,
+        ..Default::default()
+    };
+    let ip = address(&answer(&old, &mock, "one.example", RecordType::A).await);
+    assert_eq!(new.restore(ip).unwrap().as_deref(), Some("one.example"));
+    answer(&new, &mock, "two.example", RecordType::A).await;
+    assert_eq!(old.restore(ip).unwrap(), None);
+}
+
+#[tokio::test]
+async fn enabling_fake_ip_does_not_break_the_previous_real_only_resolver() {
+    let old = Resolver::new(Config::default()).unwrap();
+    let mut new = Resolver::new(Config {
+        fake_ip: true,
+        ..Config::default()
+    })
+    .unwrap();
+    new.inherit(&old).unwrap();
+    let mock = Mock {
+        ttl: 30,
+        ..Default::default()
+    };
+    let real = address(&answer(&old, &mock, "existing.example", RecordType::A).await);
+    assert_eq!(
+        old.restore(real).unwrap().as_deref(),
+        Some("existing.example")
+    );
+    assert_eq!(
+        new.restore(real).unwrap().as_deref(),
+        Some("existing.example")
+    );
+    let fake = address(&answer(&new, &mock, "new.example", RecordType::A).await);
+    assert!(new.is_fake(fake));
+    let mut disabled = Resolver::new(Config::default()).unwrap();
+    assert!(disabled.inherit(&new).is_err());
+}
+
+#[derive(Default)]
+struct RemoteMappings {
+    host: LocalMappingStore,
+    calls: [AtomicUsize; 4],
+    fail: std::sync::atomic::AtomicBool,
+}
+impl RemoteMappings {
+    fn called(&self, operation: usize) -> Result<()> {
+        self.calls[operation].fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(
+            !self.fail.load(Ordering::SeqCst),
+            "simulated host RPC failure"
+        );
+        Ok(())
+    }
+}
+impl MappingStore for RemoteMappings {
+    fn configure(
+        &self,
+        config: &Config,
+        reserved: &std::collections::HashSet<std::net::IpAddr>,
+    ) -> Result<()> {
+        self.called(0)?;
+        self.host.configure(config, reserved)
+    }
+    fn allocate(
+        &self,
+        config: &Config,
+        domain: &str,
+        ipv6: bool,
+        reserved: &std::collections::HashSet<std::net::IpAddr>,
+    ) -> Result<Option<std::net::IpAddr>> {
+        self.called(1)?;
+        self.host.allocate(config, domain, ipv6, reserved)
+    }
+    fn restore(&self, config: &Config, ip: std::net::IpAddr) -> Result<Option<String>> {
+        self.called(2)?;
+        self.host.restore(config, ip)
+    }
+    fn observe(&self, config: &Config, domain: &str, ip: std::net::IpAddr, ttl: u32) -> Result<()> {
+        self.called(3)?;
+        self.host.observe(config, domain, ip, ttl)
+    }
+}
+
+#[tokio::test]
+async fn injected_store_receives_every_mapping_operation_and_fails_closed() {
+    let config = Config {
+        fake_ip: true,
+        ..Config::default()
+    };
+    let remote = Arc::new(RemoteMappings::default());
+    let mut resolver = Resolver::new(config.clone()).unwrap();
+    resolver.reserve_address("198.18.0.2".parse().unwrap());
+    resolver.set_mapping_store(remote.clone()).unwrap();
+    let mock = Mock {
+        ttl: 30,
+        ..Default::default()
+    };
+    let fake = address(&answer(&resolver, &mock, "one.example", RecordType::A).await);
+    assert_eq!(fake, "198.18.0.3".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(
+        resolver.restore(fake).unwrap().as_deref(),
+        Some("one.example")
+    );
+    let real = address(&answer(&resolver, &mock, "printer.lan", RecordType::A).await);
+    assert_eq!(
+        resolver.restore(real).unwrap().as_deref(),
+        Some("printer.lan")
+    );
+    assert!(remote
+        .calls
+        .iter()
+        .all(|count| count.load(Ordering::SeqCst) > 0));
+    remote.fail.store(true, Ordering::SeqCst);
+    assert!(resolver.restore(fake).is_err());
+    for name in ["other.example", "another.lan"] {
+        assert!(resolver
+            .answer(
+                &wire::query(name, RecordType::A).unwrap().to_vec().unwrap(),
+                &mock
+            )
+            .await
+            .is_err());
+    }
+    let mut replacement = Resolver::new(config).unwrap();
+    assert!(replacement.inherit(&resolver).is_err());
+    remote.fail.store(false, Ordering::SeqCst);
+    replacement.inherit(&resolver).unwrap();
+    assert!(Arc::ptr_eq(
+        &resolver.mapping_store(),
+        &replacement.mapping_store()
+    ));
+    assert_eq!(
+        replacement.restore(fake).unwrap().as_deref(),
+        Some("one.example")
+    );
+}
+
+#[tokio::test]
+async fn changing_backend_invalidates_cached_real_answers() {
+    let mut resolver = Resolver::new(Config::default()).unwrap();
+    let mock = Mock {
+        ttl: 30,
+        ..Default::default()
+    };
+    answer(&resolver, &mock, "cached.example", RecordType::A).await;
+    let remote = Arc::new(RemoteMappings::default());
+    resolver.set_mapping_store(remote.clone()).unwrap();
+    let ip = address(&answer(&resolver, &mock, "cached.example", RecordType::A).await);
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        remote.restore(&Config::default(), ip).unwrap().as_deref(),
+        Some("cached.example")
+    );
 }
 impl Transport for Mock {
     fn exchange<'a>(

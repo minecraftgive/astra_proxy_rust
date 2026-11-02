@@ -35,11 +35,25 @@ def main():
                 assert member.isfile() or member.isdir()
             tar.extractall(directory, filter="data")
         root, = directory.iterdir()
-        expected_files = {executable(n) for n in ('astra-rule','astra-proxy','astra-tui','astra-convert')} | {'client.example.toml'}
+        expected_files = {executable(n) for n in ('astra-rule','astra-proxy','astra-tui','astra-host','astra-convert')} | {'client.example.toml', 'manifest.json'}
         if os.name == 'nt' and (root/'wintun.dll').exists():expected_files.add('wintun.dll')
         actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
         assert root.name == 'client' and actual == expected_files and {p.name for p in root.iterdir()} == expected_files, actual
+        manifest = json.loads((root/'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['schema_version'] == 1 and manifest['release_id']
+        assert manifest['host_protocol']['min'] <= 1 <= manifest['host_protocol']['max']
+        assert {'astra-rule', 'astra-proxy', 'astra-tui', 'astra-host'} <= manifest['components'].keys()
+        listed = {entry['path'] for entry in manifest['files']}
+        assert len(listed) == len(manifest['files']) and listed == actual - {'manifest.json'}
+        for entry in manifest['files']:
+            path = root/entry['path']
+            assert path.stat().st_size == entry['size'], entry['path']
+            digest = hashlib.sha256()
+            with path.open('rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''):digest.update(block)
+            assert digest.hexdigest() == entry['sha256'], entry['path']
         subprocess.run([str(root/executable('astra-tui')), '--help'],check=True,capture_output=True,timeout=10)
+        subprocess.run([str(root/executable('astra-host')), '--help'],check=True,capture_output=True,timeout=10)
         subprocess.run([str(root/executable('astra-proxy')), '--check', str(root/'client.example.toml')],check=True,timeout=15)
         # The single client example contains a commented complete Rule Core template.
         text = (root/'client.example.toml').read_text(encoding='utf-8')
@@ -81,7 +95,7 @@ def main():
         assert not sock.exists(), 'packaged shutdown left a stale rule socket'
         echo.shutdown()
     if args.report:
-        args.report.write_text(json.dumps({'archive':archive.name,'archive_sha256':expected,'passed':True,'checks':['archive checksum','four executable binaries','strict minimal client file list','TUI help and manager IPC shutdown','full proxy example and embedded full rule template checks','native cores from a separate directory','65536-byte SOCKS echo and EOF','graceful exit and UDS cleanup']},indent=2)+'\n')
+        args.report.write_text(json.dumps({'archive':archive.name,'archive_sha256':expected,'passed':True,'checks':['archive checksum','release manifest and per-file checksums','client executable binaries','strict client file list','TUI help and manager IPC shutdown','full proxy example and embedded full rule template checks','native cores from a separate directory','65536-byte SOCKS echo and EOF','graceful exit and UDS cleanup']},indent=2)+'\n')
     print('PASS minimal client archive, native executables, TUI IPC, full configuration, 64 KiB SOCKS echo and cleanup')
 
 

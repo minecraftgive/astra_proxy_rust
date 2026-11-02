@@ -13,7 +13,8 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+// v2 explicitly carries resident-host mode across sudo's environment cleanup.
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,8 @@ pub struct Handoff {
     pub digest: u64,
     pub uid: u32,
     pub gid: u32,
+    #[serde(default)]
+    pub hosted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +276,29 @@ mod tests {
         let value = ticket().unwrap();
         assert_eq!(value.len(), 32);
         assert_ne!(value, ticket().unwrap());
+    }
+
+    #[test]
+    fn handoff_preserves_explicit_resident_mode() {
+        for hosted in [false, true] {
+            let handoff = Handoff {
+                version: PROTOCOL_VERSION,
+                config: "/private/config.toml".into(),
+                control: "/private/control.sock".into(),
+                log: "/private/core.log".into(),
+                log_level: "info".into(),
+                runtime_dir: "/private/runtime".into(),
+                cwd: "/private".into(),
+                digest: 7,
+                uid: 1000,
+                gid: 1000,
+                hosted,
+            };
+            let bytes = frame(&handoff).unwrap();
+            let decoded: Handoff = decode(&bytes[4..]).unwrap();
+            assert_eq!(decoded.version, PROTOCOL_VERSION);
+            assert_eq!(decoded.hosted, hosted);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

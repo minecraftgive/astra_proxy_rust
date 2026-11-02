@@ -124,7 +124,7 @@ impl Ui {
                     tr!("{} has no rule core bound.", proxy.instance.name)
                 }));
                 lines.push(Line::styled(
-                    t("6 Profiles → select the profile → b bind a rule core, or n to create one (Tab lists rule cores)."),
+                    t("Ctrl-P opens configuration selection. Tab to type, choose Proxy or Rules, then Enter to the list and Enter to select. Rule selection keeps the active proxy. In Profiles, select the proxy and press b to bind a rule core. To create a rule core: 6 → Right → Insert."),
                     Style::default().fg(MUTED),
                 ));
             }

@@ -227,13 +227,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let check = first.as_deref() == Some("--check");
+    let hosted_worker = first.as_deref() == Some("--host-worker");
     let path =
-        if check { args.next() } else { first }.unwrap_or_else(|| "configs/rule.toml".into());
+        if check || hosted_worker { args.next() } else { first }.unwrap_or_else(|| "configs/rule.toml".into());
     let path = std::fs::canonicalize(path)?;
     // Cold start serves expired caches immediately; the watcher refreshes
     // them in the background right after the core is listening.
     astra_rule_data::serve_stale_cache(true);
-    let (text, config, rules) = load(&path)?;
+    astra_rule_data::read_only_cache(hosted_worker);
+    let (text, config, rules) = if hosted_worker {
+        use std::io::Read;
+        let mut text = String::new();
+        std::io::stdin().take(480 * 1024 + 1).read_to_string(&mut text)?;
+        anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+        load_text(&path,text)?
+    } else { load(&path)? };
     astra_rule_data::serve_stale_cache(false);
     if check {
         return Ok(());
@@ -265,6 +273,7 @@ async fn main() -> Result<()> {
         |path| {
             let state = state.clone();
             async move {
+                if hosted_worker { return Err("generation configuration is immutable".into()); }
                 state
                     .lock()
                     .await
@@ -320,6 +329,7 @@ async fn main() -> Result<()> {
             let mut failure = String::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if hosted_worker { continue; }
                 let mut state = state.lock().await;
                 let resource_due = state.resources.due(state.watch_file);
                 if !state.watch_file && !resource_due {
@@ -385,6 +395,18 @@ async fn serve(
         if req.api_version != API_VERSION {
             tracing::debug!(target: "astra_route", core="rule", phase="rejected", peer_id, request_id=req.id, reason="unsupported IPC version", "rule request rejected");
             anyhow::bail!("unsupported IPC version");
+        }
+        if req.id == u64::MAX && req.target.host == astra_ipc::CORE_INFO_HOST && req.target.port == 0 {
+            let process = req.process.as_ref().context("missing core metadata")?;
+            let peer: astra_ipc::CoreInfo = serde_json::from_str(&process.path)?;
+            anyhow::ensure!(peer.wire_version == API_VERSION, "incompatible core wire protocol");
+            let local = astra_ipc::CoreInfo::local(env!("CARGO_PKG_VERSION"));
+            tracing::info!(?peer, features = ?local.common_features(&peer), "core capabilities exchanged");
+            astra_ipc::send(&mut stream, &RouteResponse {
+                revision: 0, api_version: API_VERSION, id: req.id,
+                action: RouteAction::Proxy(format!("astra-core-info:{}", serde_json::to_string(&local)?)),
+            }).await?;
+            continue;
         }
         if req.id == 0 && req.target.host.is_empty() && req.target.port == 0 {
             loop {

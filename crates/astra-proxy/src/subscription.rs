@@ -535,6 +535,11 @@ mod tests {
         );
         assert_eq!(app.config.proxy_groups["PROXY"].members, ["subscription"]);
         assert_eq!(app.source_text, base);
+        // This is the immutable document handed to a worker, even if the
+        // shared cache changes or disappears after candidate preparation.
+        let worker = App::from_text(&config, app.effective_text.clone()).unwrap();
+        assert!(worker.outbounds.contains_key("cached-node"));
+        assert_eq!(worker.config.proxy_groups["subscription"].members, ["cached-node"]);
         assert!(read(&config, &format!("{base}\n# changed")).is_none());
         std::fs::write(path(&config).unwrap(), b"invalid").unwrap();
         let app = cached_app(&config, App::from_text(&config, base.into()).unwrap());

@@ -10,6 +10,9 @@ pub(super) struct Tasks {
     notice: Option<(String, u64)>,
     /// How the last background task ended, keyed by the message it left behind.
     verdict: Option<(String, bool)>,
+    update_error: Option<String>,
+    viewport_height: std::cell::Cell<u16>,
+    content_height: std::cell::Cell<u16>,
 }
 struct Record {
     id: u64,
@@ -19,6 +22,14 @@ struct Record {
     events: std::collections::VecDeque<String>,
 }
 impl Tasks {
+    pub(super) fn running(&self) -> bool {
+        self.records.iter().any(|r| r.finished.is_none())
+    }
+    pub(super) fn notice_is_old(&self) -> bool {
+        self.notice
+            .as_ref()
+            .is_some_and(|(_, ms)| progress::now_ms().saturating_sub(*ms) > 6000)
+    }
     pub(super) fn showing_details(&self) -> bool {
         self.details.is_some()
     }
@@ -54,6 +65,35 @@ struct Job {
     selected: Option<String>,
     progress: watch::Receiver<Option<Progress>>,
     handle: JoinHandle<(Ui, bool)>,
+    progress_wake: JoinHandle<()>,
+    view_context: (usize, Kind, Option<String>),
+    overlay_epoch: u64,
+}
+/// A background read may discover a disk conflict while the foreground continues
+/// editing. Merge its observation without replacing a newer draft or save baseline.
+fn merge_draft_metadata(ui: &mut Ui, worker: &Ui) {
+    let Some(editor) = &worker.editor else {
+        return;
+    };
+    for (key, observed) in worker
+        .drafts
+        .iter()
+        .filter(|(_, draft)| draft.editor.name == editor.name)
+    {
+        if ui.editor.as_ref().is_some_and(|current| {
+            current.name == editor.name && current.original != observed.editor.original
+        }) {
+            continue;
+        }
+        if let Some(current) = ui.drafts.get_mut(key) {
+            if current.editor.original == observed.editor.original {
+                current.conflict = observed.conflict;
+                current.observed_disk = observed.observed_disk.clone();
+            }
+        } else {
+            ui.drafts.insert(key.clone(), observed.clone());
+        }
+    }
 }
 pub(super) struct Jobs {
     socket: PathBuf,
@@ -94,6 +134,14 @@ impl Jobs {
             }
         }
         self.next += 1;
+        if matches!(&action,Action::Logs(name) if name=="@tui") && ui.tui_viewer.is_none() {
+            let mut viewer = logs::Viewer::new(
+                "@tui".into(),
+                ui.log_settings.get("@tui").cloned().unwrap_or_default(),
+            );
+            viewer.set_vim_navigation(ui.vim_keys);
+            ui.tui_viewer = Some(viewer);
+        }
         let id = self.next;
         let title = action_description(&action);
         if let Some(log) = &self.log {
@@ -114,6 +162,12 @@ impl Jobs {
         ui.tasks
             .event(id, Progress::new("Queued", "等待执行；界面可继续操作"));
         let (sender, receiver) = watch::channel(None);
+        let mut signals = receiver.clone();
+        let progress_wake = tokio::spawn(async move {
+            while signals.changed().await.is_ok() {
+                super::wake();
+            }
+        });
         let mut worker = Ui::new(ui.session.clone());
         if !matches!(
             &action,
@@ -131,6 +185,7 @@ impl Jobs {
         let request = action.clone();
         let handle = tokio::task::spawn_local(async move {
             let quit = progress::scope(sender, worker.execute(&socket, request, origin)).await;
+            super::wake();
             (worker, quit)
         });
         self.jobs.push(Job {
@@ -139,6 +194,13 @@ impl Jobs {
             selected,
             progress: receiver,
             handle,
+            progress_wake,
+            view_context: (
+                ui.page,
+                ui.kind,
+                ui.active_proxy().map(|row| row.instance.name.clone()),
+            ),
+            overlay_epoch: ui.overlay_epoch,
         });
     }
     pub(super) async fn poll(&mut self, ui: &mut Ui) -> bool {
@@ -149,6 +211,7 @@ impl Jobs {
             .is_none_or(|(message, _)| message != &ui.message)
         {
             ui.tasks.notice = Some((ui.message.clone(), progress::now_ms()));
+            self.changed = true;
         }
         let mut quit = false;
         let mut index = 0;
@@ -156,6 +219,7 @@ impl Jobs {
             let job = &mut self.jobs[index];
             if job.progress.has_changed().unwrap_or(false) {
                 if let Some(event) = job.progress.borrow_and_update().clone() {
+                    self.changed = true;
                     if let Some(log) = &self.log {
                         log.write("UI progress", &format!("#{} {}", job.id, event.phase));
                     }
@@ -167,10 +231,18 @@ impl Jobs {
                 continue;
             }
             let job = self.jobs.remove(index);
+            job.progress_wake.abort();
             self.changed = true;
             match job.handle.await {
                 Ok((mut worker, exit)) => {
                     let failed = worker.operation_failed;
+                    if let Some(status) = worker.update_status.take() {
+                        ui.update_status = Some(status);
+                    }
+                    if let Some(view) = worker.update_view.take() {
+                        ui.update_view = Some(view);
+                        ui.tasks.details = Some(0);
+                    }
                     if failed {
                         // A failed open must not start a search in a later, unrelated editor.
                         ui.search_on_open = false;
@@ -210,20 +282,56 @@ impl Jobs {
                         failed,
                     ));
                     let selected = ui.selected().map(|r| r.instance.name.clone());
-                    let same = job.selected == selected
+                    let context = (
+                        ui.page,
+                        ui.kind,
+                        ui.active_proxy().map(|row| row.instance.name.clone()),
+                    );
+                    let same = job.selected == selected && job.view_context == context
                         || match &job.action {
                             Action::Create { name, .. } => selected.as_ref() == Some(name),
                             Action::Add(instance) => selected.as_ref() == Some(&instance.name),
                             _ => false,
                         };
-                    if let Action::Save { name, text, .. } = &job.action {
+                    let tui_log = matches!(&job.action,Action::Logs(name) if name=="@tui");
+                    let log_target_current = !tui_log
+                        || (job.overlay_epoch == ui.overlay_epoch && ui.tui_viewer.is_some());
+                    // Failed saves may have read the current disk content to expose
+                    // a conflict. Merge that observation without replacing a newer
+                    // foreground draft or treating the write as successful.
+                    let is_save = matches!(&job.action, Action::Save { .. });
+                    if (!failed && !is_save) || (failed && is_save) {
+                        merge_draft_metadata(ui, &worker);
+                    }
+                    if let Action::Save {
+                        name,
+                        original,
+                        text,
+                    } = &job.action
+                    {
                         if !failed {
+                            for draft in ui.drafts.values_mut().filter(|d| {
+                                d.editor.name == *name && d.editor.original == *original
+                            }) {
+                                draft.editor.original = text.clone();
+                                draft.conflict = false;
+                                draft.observed_disk = None;
+                            }
                             if let Some(editor) = ui.editor.as_mut().filter(|e| e.name == *name) {
                                 editor.original = text.clone();
                             }
                         }
                     } else if matches!(&job.action,Action::Logs(name) if name=="@tui") {
-                        ui.tui_viewer = worker.viewer.take();
+                        if log_target_current {
+                            if failed {
+                                ui.tui_viewer = None;
+                                if let Some(recovery) = &worker.recovery {
+                                    worker.message = recovery.message.clone();
+                                }
+                            } else {
+                                ui.tui_viewer = worker.viewer.take();
+                            }
+                        }
                     } else if let Action::Logs(_) = &job.action {
                         if same {
                             ui.viewer = worker.viewer.take();
@@ -262,7 +370,7 @@ impl Jobs {
                             }
                         }
                     }
-                    if same && ui.prompt.is_none() && ui.recovery.is_none() {
+                    if same && log_target_current && ui.prompt.is_none() && ui.recovery.is_none() {
                         ui.recovery = worker.recovery.take();
                     }
                     if let Some(editor) = worker.editor.take() {
@@ -277,6 +385,13 @@ impl Jobs {
                     quit |= exit;
                 }
                 Err(error) => {
+                    if matches!(&job.action,Action::Logs(name) if name=="@tui")
+                        && job.overlay_epoch == ui.overlay_epoch
+                        && ui.tui_viewer.is_some()
+                    {
+                        ui.tui_viewer = None;
+                        ui.message = error.to_string();
+                    }
                     ui.tasks.verdict = Some((error.to_string(), true));
                     ui.tasks
                         .event(job.id, Progress::new("Failed", error.to_string()));
@@ -290,6 +405,34 @@ impl Jobs {
     }
 }
 impl Ui {
+    pub(super) fn notice_host_restart(&mut self) {
+        self.message =
+            t("Host restarted; previous connection targets and paused data were cleared").into();
+        self.tasks.notice_message(&self.message);
+    }
+
+    /// Remote update outcomes stay visible even when this interface did not start
+    /// the operation, or its connection/log data is explicitly paused.
+    fn update_alert(&self) -> Option<String> {
+        use crate::protocol::updates::UpdatePhase;
+        if let Some(error) = &self.tasks.update_error {
+            return Some(tr!("Update status unavailable: {}", error));
+        }
+        let operation = self.update_status.as_ref()?.operation.as_ref()?;
+        if !matches!(
+            operation.phase,
+            UpdatePhase::Failed | UpdatePhase::NeedsRecovery | UpdatePhase::Uncertain
+        ) {
+            return None;
+        }
+        Some(tr!(
+            "Update {} · {} · {}",
+            operation.request.operation_id,
+            t(operation.phase.label()),
+            operation.error.as_deref().unwrap_or("")
+        ))
+    }
+
     pub(super) fn background_paste(&mut self, text: &str) -> bool {
         if self.tasks.details.is_some() {
             return true;
@@ -321,13 +464,26 @@ impl Ui {
             });
         }
         if let Some(scroll) = &mut self.tasks.details {
+            let max_scroll = self
+                .tasks
+                .content_height
+                .get()
+                .saturating_sub(self.tasks.viewport_height.get());
             match key.code {
                 KeyCode::Esc => self.tasks.details = None,
                 KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-                KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                KeyCode::Down => *scroll = scroll.saturating_add(1).min(max_scroll),
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(self.tasks.viewport_height.get().max(1))
+                }
+                KeyCode::PageDown => {
+                    *scroll = scroll
+                        .saturating_add(self.tasks.viewport_height.get().max(1))
+                        .min(max_scroll)
+                }
                 KeyCode::Home => *scroll = 0,
+                KeyCode::End => *scroll = max_scroll,
+                KeyCode::F(5) => return Some(Input::Run(Action::UpdateStatus, None)),
                 _ => {}
             }
             return Some(Input::Idle);
@@ -351,7 +507,22 @@ impl Ui {
             self.hits.borrow_mut().clear();
         }
         if let Some(scroll) = self.tasks.details {
-            let mut lines = vec![];
+            let before = f.buffer_mut().clone();
+            let mut lines = if let Some(status) = &self.update_status {
+                update::View::new(status.clone()).lines()
+            } else {
+                vec![Line::from(t("Update status unavailable; F5 refresh"))]
+            };
+            if let Some(error) = &self.tasks.update_error {
+                lines.push(Line::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            lines.push(Line::from(""));
+            self.tasks
+                .viewport_height
+                .set(area.height.saturating_sub(2));
             for record in self.tasks.records.iter().rev() {
                 lines.push(
                     Line::from(format!(
@@ -370,15 +541,19 @@ impl Ui {
                 lines.push(Line::from(""));
             }
             f.render_widget(Clear, area);
+            let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+            let content_height = content
+                .line_count(area.width.saturating_sub(2).max(1))
+                .min(u16::MAX as usize) as u16;
+            self.tasks.content_height.set(content_height);
+            let scroll =
+                scroll.min(content_height.saturating_sub(self.tasks.viewport_height.get()));
             f.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(t("Task details · F6 / Esc back · ↑↓ scroll")),
-                    ),
+                content.scroll((scroll, 0)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(t("Task details · F6 / Esc back · ↑↓ scroll")),
+                ),
                 area,
             );
             self.hits.borrow_mut().clear();
@@ -386,6 +561,8 @@ impl Ui {
                 ratatui::layout::Rect::new(area.x, area.y, area.width, 1),
                 dashboard::Target::Back,
             );
+            self.animations
+                .surface(f, animation::Kind::Drawer, area, &before);
         } else if area.height > 0 {
             let status =
                 ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1);
@@ -408,12 +585,14 @@ impl Ui {
             .iter()
             .rev()
             .find(|r| r.finished.is_none());
-        let (icon, text, color, stamp) = if let Some(record) = running {
+        let (icon, text, color, stamp) = if let Some(alert) = self.update_alert() {
+            ("✗", alert.replace(['\n', '\r'], " "), Color::Red, None)
+        } else if let Some(record) = running {
             // Events read "HH:MM:SS.mmm phase · detail"; the clock is shown on the right.
             let event = record.events.back().map(String::as_str).unwrap_or_default();
             let event = event.split_once(' ').map_or(event, |(_, rest)| rest);
             (
-                "⟳",
+                self.animations.spinner(),
                 format!(
                     "{} · {} · {:.1}s",
                     record.title,
@@ -502,6 +681,17 @@ struct Feed {
     receiver: watch::Receiver<Option<Result<Reply, String>>>,
     handle: JoinHandle<()>,
 }
+fn feed_signature(reply: &Reply, action: &Action) -> Result<String> {
+    if matches!(action, Action::WatchUpdates) {
+        let mut value: serde_json::Value = serde_json::from_str(&reply.text)?;
+        // Observing unchanged hosts is a heartbeat, not a visual change.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("observed_at_ms");
+        }
+        return Ok(serde_json::to_string(&value)?);
+    }
+    Ok(serde_json::to_string(reply)?)
+}
 impl Drop for Feed {
     fn drop(&mut self) {
         self.handle.abort();
@@ -512,6 +702,7 @@ impl Feed {
         let (sender, receiver) = watch::channel(None);
         let handle = tokio::spawn(async move {
             let mut delay = 250;
+            let mut previous = String::new();
             let log = socket
                 .parent()
                 .and_then(|p| crate::tui_log::Log::open(&p.join("tui.log")).ok());
@@ -550,12 +741,18 @@ impl Feed {
                             }
                             online = true;
                         }
-                        sender.send_replace(Some(Ok(reply)));
+                        let encoded = feed_signature(&reply, &action)?;
+                        if encoded != previous {
+                            previous = encoded;
+                            sender.send_replace(Some(Ok(reply)));
+                            super::wake();
+                        }
                         delay = 250;
                     }
                 }
                 .await;
                 if let Err(error) = result {
+                    previous.clear();
                     if online {
                         if let Some(log) = &log {
                             log.write("connection", &format!("disconnected {label}; reconnecting"));
@@ -563,6 +760,7 @@ impl Feed {
                         online = false;
                     }
                     sender.send_replace(Some(Err(format!("连接中断，自动重连：{error:#}"))));
+                    super::wake();
                 }
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 delay = (delay * 2).min(5000);
@@ -585,16 +783,41 @@ pub(super) struct Feeds {
     runtime: Option<((String, u32), Feed)>,
     metadata: Option<(String, JoinHandle<Ui>)>,
     metadata_time: Instant,
+    updates: Option<Feed>,
+    update_probe: Option<JoinHandle<Option<crate::protocol::updates::UpdateStatus>>>,
 }
 impl Drop for Feeds {
     fn drop(&mut self) {
         if let Some((_, task)) = &self.metadata {
             task.abort();
         }
+        if let Some(task) = &self.update_probe {
+            task.abort();
+        }
     }
 }
 impl Feeds {
     pub(super) fn new(socket: &std::path::Path) -> Self {
+        let probe_socket = socket.to_owned();
+        let update_probe = tokio::spawn(async move {
+            let status = async {
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    call(&probe_socket, Action::UpdateStatus),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                let value: serde_json::Value = serde_json::from_str(&reply.text).ok()?;
+                if value.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+                    return None;
+                }
+                serde_json::from_value(value).ok()
+            }
+            .await;
+            super::wake();
+            status
+        });
         Self {
             socket: socket.into(),
             list: Feed::start(socket.into(), Action::WatchList),
@@ -602,10 +825,39 @@ impl Feeds {
             runtime: None,
             metadata: None,
             metadata_time: Instant::now() - Duration::from_secs(3),
+            updates: None,
+            update_probe: Some(update_probe),
         }
     }
-    pub(super) async fn poll(&mut self, ui: &mut Ui) {
+    pub(super) async fn poll(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        if self
+            .update_probe
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            if let Ok(Some(status)) = self.update_probe.take().unwrap().await {
+                ui.update_status = Some(status);
+                self.updates = Some(Feed::start(self.socket.clone(), Action::WatchUpdates));
+                changed = true;
+            }
+        }
+        if let Some(feed) = &mut self.updates {
+            if let Some(result) = feed.take() {
+                changed = true;
+                match result
+                    .and_then(|reply| serde_json::from_str(&reply.text).map_err(|e| e.to_string()))
+                {
+                    Ok(status) => {
+                        ui.update_status = Some(status);
+                        ui.tasks.update_error = None;
+                    }
+                    Err(error) => ui.tasks.update_error = Some(error),
+                }
+            }
+        }
         if let Some(result) = self.list.take() {
+            changed = true;
             match result {
                 Ok(reply) => {
                     self.ready = true;
@@ -619,6 +871,13 @@ impl Feeds {
             .active_proxy()
             .and_then(|r| r.pid.map(|pid| (r.instance.name.clone(), pid)));
         if key.as_ref() != self.runtime.as_ref().map(|(key, _)| key) {
+            if self.runtime.as_ref().zip(key.as_ref()).is_some_and(
+                |(((old_name, old_pid), _), (new_name, new_pid))| {
+                    old_name == new_name && old_pid != new_pid
+                },
+            ) {
+                ui.notice_host_restart();
+            }
             self.runtime = key.map(|(name, pid)| {
                 let feed = Feed::start(
                     self.socket.clone(),
@@ -630,21 +889,23 @@ impl Feeds {
                 );
                 ((name, pid), feed)
             });
-            ui.runtime_snapshot = None;
+            // This is a profile/host PID transition, not a reconnect of the same Feed.
+            // Clear identity before the old Snapshot is lost, including legacy peers.
+            ui.reset_live_identity();
         }
         if let Some(((name, pid), feed)) = &mut self.runtime {
             if let Some(result) = feed.take() {
-                match result.and_then(|r| {
-                    serde_json::from_str::<astra_ipc::runtime::Snapshot>(&r.text)
+                changed = true;
+                match result.and_then(|reply| {
+                    serde_json::from_str::<astra_ipc::host::RuntimeView>(&reply.text)
                         .map_err(|e| e.to_string())
                 }) {
-                    Ok(snapshot) if snapshot.pid == *pid => {
-                        ui.accept_runtime(name.clone(), snapshot)
+                    Ok(view) if view.snapshot.pid == *pid => {
+                        ui.accept_runtime_view(name.clone(), view)
                     }
-                    Ok(_) => {}
+                    Ok(_) => ui.runtime_disconnected(t("Runtime identity changed").into()),
                     Err(error) => {
-                        ui.runtime_snapshot = None;
-                        ui.runtime_error = error;
+                        ui.runtime_disconnected(error);
                     }
                 }
             }
@@ -655,6 +916,7 @@ impl Feeds {
             .is_some_and(|(_, task)| task.is_finished())
         {
             let (name, task) = self.metadata.take().unwrap();
+            changed = true;
             if let Ok(mut worker) = task.await {
                 if ui.editor.as_ref().is_some_and(|e| e.name == name) {
                     // Metadata setters are copied without replacing the current draft.
@@ -677,18 +939,99 @@ impl Feeds {
                     name,
                     tokio::task::spawn_local(async move {
                         worker.refresh_node_tags(&socket).await;
+                        super::wake();
                         worker
                     }),
                 ));
                 self.metadata_time = Instant::now();
             }
         }
+        changed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_update_failure_is_visible_without_a_local_job() {
+        use crate::protocol::updates::UpdatePhase;
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = Ui::new(Session::default());
+            let status = serde_json::from_value(serde_json::json!({
+                "operation": {
+                    "request": {"operation_id":"remote-op", "intent":{"kind":"activate", "release_id":"v2"}},
+                    "phase":"needs_recovery", "before_directory":"old", "target_directory":"new",
+                    "release_id":"v2", "runtime_committed":true, "next_launch_saved":false,
+                    "pending_record_saved":true, "participants":[], "error":"save failed", "updated_at_ms":1
+                }
+            })).unwrap();
+            ui.update_status = Some(status);
+            let line = ui.status_line(180).to_string();
+            assert!(line.contains("remote-op") && line.contains("save failed"));
+            assert!(ui.tasks.records.is_empty());
+            ui.update_status
+                .as_mut()
+                .unwrap()
+                .operation
+                .as_mut()
+                .unwrap()
+                .phase = UpdatePhase::Complete;
+            assert!(ui.update_alert().is_none());
+            ui.tasks.update_error = Some("disconnected".into());
+            assert!(ui.status_line(180).to_string().contains("disconnected"));
+        });
+    }
+
+    #[test]
+    fn background_disk_observation_preserves_newer_foreground_draft_and_conflict_diff() {
+        let mut ui = Ui::new(Session::default());
+        ui.open_draft("proxy".into(), "standalone=true\n".into());
+        ui.editor
+            .as_mut()
+            .unwrap()
+            .import("standalone=false\n# local\n".into())
+            .unwrap();
+        ui.remember_draft();
+        let mut worker = Ui::new(ui.session.clone());
+        worker.open_draft("proxy".into(), "standalone=true\n# external\n".into());
+        ui.editor
+            .as_mut()
+            .unwrap()
+            .import("standalone=false\n# newer local\n".into())
+            .unwrap();
+        merge_draft_metadata(&mut ui, &worker);
+        assert!(ui.editor.as_ref().unwrap().text().contains("newer local"));
+        ui.remember_draft();
+        let draft = ui.drafts.values().next().unwrap();
+        assert!(draft.conflict);
+        assert!(draft.observed_disk.as_ref().unwrap().contains("external"));
+        ui.compare_draft();
+        assert!(ui
+            .help_override
+            .as_ref()
+            .is_some_and(|text| text.contains("external") && text.contains("newer local")));
+    }
+    #[test]
+    fn unchanged_update_heartbeat_does_not_request_another_frame() {
+        let a = Reply::text(
+            r#"{"schema_version":1,"observed_at_ms":10,"operation":{"phase":"preparing"}}"#,
+        );
+        let b = Reply::text(
+            r#"{"schema_version":1,"observed_at_ms":20,"operation":{"phase":"preparing"}}"#,
+        );
+        let c = Reply::text(
+            r#"{"schema_version":1,"observed_at_ms":20,"operation":{"phase":"complete"}}"#,
+        );
+        assert_eq!(
+            feed_signature(&a, &Action::WatchUpdates).unwrap(),
+            feed_signature(&b, &Action::WatchUpdates).unwrap()
+        );
+        assert_ne!(
+            feed_signature(&b, &Action::WatchUpdates).unwrap(),
+            feed_signature(&c, &Action::WatchUpdates).unwrap()
+        );
+    }
     #[tokio::test]
     async fn slow_save_keeps_navigation_live_and_preserves_newer_draft() {
         tokio::task::LocalSet::new().run_until(async {
@@ -773,6 +1116,112 @@ mod tests {
 #[cfg(test)]
 mod view_tests {
     use super::*;
+    #[tokio::test]
+    async fn late_tui_log_failure_does_not_reopen_a_replaced_overlay_and_current_failure_is_visible(
+    ) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for switch_to_palette in [true, false] {
+                    let fixture = crate::import::tests::Fixture::new();
+                    let socket = fixture.0.join("overlay-log.sock");
+                    let listener = astra_ipc::platform::LocalListener::bind(&socket).unwrap();
+                    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+                    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+                    let (entered, finish) = (started.clone(), release.clone());
+                    let server = tokio::spawn(async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let hello: Request =
+                            astra_ipc::receive_management(&mut stream).await.unwrap();
+                        assert!(matches!(hello.action, Action::Session));
+                        astra_ipc::send_management(
+                            &mut stream,
+                            &astra_ipc::session::Event::<Reply>::Ready(astra_ipc::API_VERSION),
+                        )
+                        .await
+                        .unwrap();
+                        let request: Request =
+                            astra_ipc::receive_management(&mut stream).await.unwrap();
+                        assert!(matches!(request.action,Action::GetLogLevel(name) if name=="@tui"));
+                        entered.notify_one();
+                        finish.notified().await;
+                        let mut reply = Reply::text("");
+                        reply.error = Some("TUI log unavailable in test".into());
+                        astra_ipc::send_management(
+                            &mut stream,
+                            &astra_ipc::session::Event::Reply(reply),
+                        )
+                        .await
+                        .unwrap();
+                    });
+                    let mut ui = Ui::new(Session::default());
+                    ui.editor = Some(Editor::new("draft".into(), "standalone=true\n".into()));
+                    let draft = serde_json::to_value(ui.editor.as_ref().unwrap()).unwrap();
+                    let mut jobs = Jobs::new(&socket);
+                    let Input::Run(action, origin) =
+                        ui.key(event::KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE))
+                    else {
+                        panic!("log request");
+                    };
+                    jobs.start(&mut ui, action, origin);
+                    assert!(ui.tui_viewer.is_some());
+                    tokio::time::timeout(Duration::from_secs(3), started.notified())
+                        .await
+                        .unwrap();
+                    if switch_to_palette {
+                        ui.key(event::KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                    }
+                    release.notify_one();
+                    server.await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while !jobs.jobs.is_empty() {
+                            jobs.poll(&mut ui).await;
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(ui.tui_viewer.is_none());
+                    assert_eq!(
+                        serde_json::to_value(ui.editor.as_ref().unwrap()).unwrap(),
+                        draft
+                    );
+                    if switch_to_palette {
+                        assert!(ui.palette.is_some());
+                        assert!(ui.recovery.is_none());
+                    } else {
+                        assert!(ui
+                            .recovery
+                            .as_ref()
+                            .unwrap()
+                            .message
+                            .contains("TUI log unavailable in test"));
+                    }
+                    crate::i18n::with_language(crate::i18n::Language::English, || {
+                        let mut terminal =
+                            Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
+                        terminal.draw(|frame| ui.render(frame)).unwrap();
+                        let text: String = terminal
+                            .backend()
+                            .buffer()
+                            .content
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect();
+                        assert!(
+                            text.contains(if switch_to_palette {
+                                "Commands"
+                            } else {
+                                "TUI log unavailable in test"
+                            }),
+                            "{text}"
+                        );
+                    });
+                    drop(jobs);
+                    astra_ipc::platform::remove_socket(&socket);
+                }
+            })
+            .await;
+    }
     #[test]
     fn details_and_tui_log_capture_input_without_touching_editor() {
         let mut ui = Ui::new(Session::default());

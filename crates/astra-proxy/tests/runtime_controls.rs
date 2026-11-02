@@ -23,9 +23,38 @@ struct Core {
 }
 impl Drop for Core {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            // A separate CLI runtime can request Stop even when this guard is
+            // dropped while the test's current-thread runtime is unwinding.
+            let mut stop = std::process::Command::new(env!("CARGO_BIN_EXE_astra-proxy"));
+            stop.arg("--stop")
+                .arg(&self.socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            astra_ipc::platform::background_command(&mut stop, false);
+            let _ = stop.status();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.child.try_wait().ok().flatten().is_none()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+        }
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.root);
+        // Never destroy the only recovery snapshot after a failed shutdown.
+        let journal = self.socket.with_extension("system-proxy-state.toml");
+        if journal.exists() {
+            eprintln!(
+                "system proxy recovery snapshot retained at {}",
+                journal.display()
+            );
+        } else {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }
 impl Core {
@@ -452,14 +481,20 @@ async fn missing_system_proxy_listener_rejects_runtime_change_without_touching_p
     let a = server(b'a', true).await;
     let b = server(b'b', true).await;
     let mut core = Core::start(a.address, b.address, false).await;
-    core.source = core.source.replace(
-        "mixed_listen",
-        if cfg!(windows) {
-            "socks5_listen"
-        } else {
-            "http_listen"
-        },
-    );
+    // Every supported platform now accepts both HTTP and SOCKS endpoints.
+    // DNS-only is a valid runtime with no eligible system-proxy listener, so
+    // validation must reject the request before touching desktop settings.
+    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns_address = reserved.local_addr().unwrap();
+    drop(reserved);
+    core.source = core
+        .source
+        .lines()
+        .filter(|line| !line.starts_with("mixed_listen="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    core.source
+        .push_str(&format!("\n[dns]\nlisten=['{dns_address}']\n"));
     std::fs::write(core.root.join("config/proxy.toml"), &core.source).unwrap();
     control::request(&core.socket, control::Command::Reload { path: None })
         .await

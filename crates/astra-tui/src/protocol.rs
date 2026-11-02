@@ -1,4 +1,6 @@
 pub use astra_ipc::logging::LogLevel;
+#[path = "update_state.rs"]
+pub mod updates;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -183,6 +185,21 @@ pub enum Action {
         name: String,
         ticket: String,
     },
+    /// Append-only: keep existing bincode discriminants stable for older UIs.
+    UpdatePackage(PathBuf),
+    UpdateStatus,
+    Rollback,
+    UpdateTransaction {
+        #[serde(with = "json_text")]
+        request: updates::UpdateRequest,
+    },
+    RecoverUpdate {
+        operation_id: String,
+    },
+    WatchUpdates,
+    UpdateOperationStatus {
+        operation_id: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -232,7 +249,13 @@ pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Re
     };
     type Peer = astra_ipc::session::Peer<Request, Reply>;
     static POOL: OnceLock<Mutex<HashMap<(PathBuf, u8), Peer>>> = OnceLock::new();
-    let seconds = if matches!(action, Action::Shutdown) {
+    let seconds = if matches!(
+        action,
+        Action::Shutdown
+            | Action::UpdatePackage(_)
+            | Action::UpdateTransaction { .. }
+            | Action::RecoverUpdate { .. }
+    ) {
         2400
     } else {
         180
@@ -244,6 +267,8 @@ pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Re
     } else if matches!(
         action,
         Action::List
+            | Action::UpdateStatus
+            | Action::UpdateOperationStatus { .. }
             | Action::StoragePaths
             | Action::GetLogLevel(_)
             | Action::NodeTags(_)
@@ -312,6 +337,37 @@ pub async fn subscribe(
 mod tests {
     use super::*;
     use astra_ipc::nettool::{Egress, Probe};
+
+    #[tokio::test]
+    async fn update_actions_preserve_existing_discriminants_and_json_request_identity() {
+        use tokio::io::AsyncReadExt;
+        let (mut client, mut server) = astra_ipc::platform::stream_pair().await.unwrap();
+        for (action, expected) in [
+            (Action::List, 0),
+            (Action::UpdateStatus, 38),
+            (Action::Rollback, 39),
+            (Action::WatchUpdates, 42),
+        ] {
+            astra_ipc::send_management(&mut client, &action)
+                .await
+                .unwrap();
+            assert_eq!(server.read_u32().await.unwrap(), 4);
+            assert_eq!(server.read_u32_le().await.unwrap(), expected);
+        }
+        let request = updates::UpdateRequest::new(updates::UpdateIntent::Rollback {
+            target_directory: PathBuf::from("fixed-release"),
+        });
+        astra_ipc::send_management(
+            &mut client,
+            &Action::UpdateTransaction {
+                request: request.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let received: Action = astra_ipc::receive_management(&mut server).await.unwrap();
+        assert!(matches!(received,Action::UpdateTransaction {request:actual} if actual == request));
+    }
 
     #[tokio::test]
     async fn network_tool_requests_survive_management_frames() {

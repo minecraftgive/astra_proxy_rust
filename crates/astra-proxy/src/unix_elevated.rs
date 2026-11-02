@@ -208,6 +208,11 @@ fn child_main(
     std::env::set_var("ASTRA_CONTROL_SOCKET", &handoff.control);
     std::env::set_var("ASTRA_LOG_LEVEL", &handoff.log_level);
     std::env::set_var("ASTRA_RUNTIME_DIR", &runtime_dir);
+    if handoff.hosted {
+        std::env::set_var("ASTRA_HOSTED_EXPERIMENTAL", "1");
+    } else {
+        std::env::remove_var("ASTRA_HOSTED_EXPERIMENTAL");
+    }
     // The elevated core turns TUN on for this process only; the switch is not
     // persisted, so a later unprivileged restart does not fail trying to
     // create a TUN device it cannot own.

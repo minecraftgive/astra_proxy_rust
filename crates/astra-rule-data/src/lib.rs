@@ -336,6 +336,10 @@ pub fn validate_redirect(from: &str, to: &str) -> Result<()> {
 
 static SERVE_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SERVED_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Immutable rule generations consume the resident owner's validated cache;
+/// preparing an update must never download or overwrite shared resources.
+pub fn read_only_cache(enabled: bool) { READ_ONLY.store(enabled,std::sync::atomic::Ordering::Relaxed); }
 /// While enabled, an expired but valid cache is used immediately instead of
 /// blocking on a download. Cores enable it for cold start and validation, then
 /// refresh expired resources in the background.
@@ -390,6 +394,9 @@ pub fn load_resource_with<T>(
     };
     validate_url(url)?;
     let cached = read().ok();
+    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return cached.context("rule generation requires a validated cached resource; refresh it through the resident rule owner first");
+    }
     let fresh = fs::metadata(&path)
         .and_then(|m| m.modified())
         .ok()
@@ -460,6 +467,39 @@ pub fn load_resource_with<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn immutable_generation_never_downloads_or_rewrites_shared_cache() {
+        // The policy is process-wide, just as it is in a real Rule worker.
+        // Isolate it from ordinary loader tests running in parallel.
+        const CHILD: &str = "ASTRA_TEST_READ_ONLY_RULE_CACHE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::immutable_generation_never_downloads_or_rewrites_shared_cache", "--nocapture"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("astra-read-only-rule-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("resource");
+        fs::write(&source, b"42").unwrap();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/resource", server.local_addr().unwrap());
+        let decode = |bytes: &[u8]| -> Result<u32> { Ok(std::str::from_utf8(bytes)?.parse()?) };
+        read_only_cache(true);
+        let (_, number) = load_resource_with(&dir, "resource", Some(&url), 0, 100, decode).unwrap();
+        assert_eq!(number, 42);
+        assert_eq!(fs::read(&source).unwrap(), b"42");
+        assert!(load_resource_with(&dir, "missing", Some(&url), 0, 100, decode).is_err());
+        fs::write(&source, b"invalid").unwrap();
+        assert!(load_resource_with(&dir, "resource", Some(&url), 0, 100, decode).is_err());
+        assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&source).unwrap(), b"invalid");
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     #[test]
     fn parsed_resource_reuses_validation_and_keeps_cached_value_on_invalid_update() {
         use std::{cell::Cell, net::TcpListener};

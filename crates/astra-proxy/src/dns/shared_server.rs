@@ -111,6 +111,7 @@ pub(crate) async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     app: Arc<App>,
 ) -> Result<()> {
+    if let Some(host) = &app.hosted { return host.dns_tcp(stream).await; }
     for _ in 0..256 {
         let size =
             tokio::time::timeout(Duration::from_secs(10), stream.read_u16()).await?? as usize;

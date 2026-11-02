@@ -110,6 +110,7 @@ impl View {
                     sender
                         .send(Ok(Update::Targets(serde_json::from_str(&reply.text)?)))
                         .await?;
+                    crate::ui::wake();
                 } else {
                     let mut stream = astra_ipc::platform::connect_trusted(&socket).await?;
                     astra_ipc::send_management(
@@ -132,6 +133,7 @@ impl View {
                         let event: Event = serde_json::from_str(&reply.text)?;
                         let done = matches!(event, Event::Done);
                         sender.send(Ok(Update::Event(event))).await?;
+                        crate::ui::wake();
                         if done {
                             break;
                         }
@@ -142,6 +144,7 @@ impl View {
             .await;
             if let Err(error) = result {
                 let _ = sender.send(Err(error)).await;
+                crate::ui::wake();
             }
         }));
         self.receiver = Some(receiver);
@@ -166,15 +169,18 @@ impl View {
     pub fn handles_escape(&self) -> bool {
         self.tools.is_some()
     }
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
         if let Some(tools) = &mut self.tools {
-            tools.poll();
+            changed |= tools.poll();
         }
         let Some(mut receiver) = self.receiver.take() else {
-            return;
+            return changed;
         };
         loop {
-            match receiver.try_recv() {
+            let event = receiver.try_recv();
+            changed |= !matches!(&event, Err(mpsc::error::TryRecvError::Empty));
+            match event {
                 Ok(Ok(Update::Targets(targets))) => {
                     if let Some(tools) = &mut self.tools {
                         tools.set_outbounds(&targets);
@@ -184,13 +190,13 @@ impl View {
                     self.cursor = 0;
                     self.loading = false;
                     self.task = None;
-                    return;
+                    return changed;
                 }
                 Ok(Ok(Update::Event(Event::Done))) => {
                     self.finished = Some(Instant::now());
                     self.active.clear();
                     self.task = None;
-                    return;
+                    return changed;
                 }
                 Ok(Ok(Update::Event(event))) => self.apply(event),
                 Ok(Err(error)) => {
@@ -199,11 +205,11 @@ impl View {
                     self.active.clear();
                     self.loading = false;
                     self.task = None;
-                    return;
+                    return changed;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     self.receiver = Some(receiver);
-                    return;
+                    return changed;
                 }
                 Err(_) => {
                     self.finished = Some(Instant::now());
@@ -211,7 +217,7 @@ impl View {
                     self.active.clear();
                     self.loading = false;
                     self.task = None;
-                    return;
+                    return changed;
                 }
             }
         }

@@ -4,6 +4,7 @@ pub mod egress;
 pub mod mode_config;
 #[path = "shared_privilege.rs"]
 pub(crate) mod privilege;
+pub(crate) mod worker;
 #[path = "shared_process.rs"]
 pub(crate) mod process;
 #[cfg(not(windows))]

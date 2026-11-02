@@ -2,12 +2,38 @@
 use super::dashboard::{card, Target, BLUE, MUTED};
 use super::shell::{CONNECTIONS, OVERVIEW, PROXIES};
 use super::*;
+use astra_ipc::host::{Coverage, RuntimeTelemetry, RuntimeView};
 use astra_ipc::runtime::{Command, Mode, Snapshot};
 use ratatui::{
     layout::Rect,
     style::Modifier,
     widgets::{Cell, Row as TableRow, Table, TableState},
 };
+
+#[derive(Default)]
+pub(super) struct LiveState {
+    telemetry: Option<RuntimeTelemetry>,
+    baseline: Option<(Snapshot, RuntimeTelemetry)>,
+    received: Option<Instant>,
+    selected: Option<u64>,
+    frozen: Option<Snapshot>,
+    frozen_telemetry: Option<RuntimeTelemetry>,
+    frozen_at: Option<String>,
+    disconnected: bool,
+    rates_valid: bool,
+    detail_open: bool,
+    detail_scroll: u16,
+    viewports: [std::cell::Cell<usize>; 5],
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Viewport {
+    Overview,
+    Groups,
+    Members,
+    Connections,
+    Details,
+}
 
 pub(super) fn bytes(value: u64) -> String {
     for (unit, scale) in [("GiB", 1u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
@@ -66,6 +92,19 @@ pub(super) fn exit_chain(snapshot: &Snapshot) -> (Vec<String>, Option<u64>, Opti
 }
 
 impl Ui {
+    pub(super) fn record_live_viewport(&self, view: Viewport, rows: usize) {
+        self.live_state.viewports[view as usize].set(rows);
+    }
+    fn live_page_size(&self, view: Viewport) -> usize {
+        self.live_state.viewports[view as usize].get().max(1)
+    }
+    fn disabled_live_alias(&self, key: event::KeyEvent) -> bool {
+        !self.vim_keys
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'l' | 'g' | 'G'))
+    }
     pub(super) fn live_input(&self) -> bool {
         self.editor.is_none()
             && self.viewer.is_none()
@@ -84,17 +123,192 @@ impl Ui {
             .as_ref()
             .filter(|s| self.runtime_instance == row.instance.name && Some(s.pid) == row.pid)
     }
+    pub(super) fn accept_runtime_json(&mut self, name: String, text: &str) -> Result<()> {
+        let view: RuntimeView = serde_json::from_str(text)?;
+        self.accept_runtime_view(name, view);
+        Ok(())
+    }
     pub(super) fn accept_runtime(&mut self, name: String, snapshot: Snapshot) {
+        self.accept_runtime_view(
+            name,
+            RuntimeView {
+                snapshot,
+                telemetry: None,
+            },
+        );
+    }
+    /// A transport reconnect preserves the view; a different profile or host PID does not.
+    pub(super) fn reset_live_identity(&mut self) {
+        self.live_state = LiveState::default();
+        self.runtime_instance.clear();
+        self.runtime_snapshot = None;
+        self.runtime_sample = Instant::now();
+        self.runtime_error.clear();
+        self.history = Default::default();
+        self.rates = [0, 0];
+        self.direct_rates = [0, 0];
+        self.connection_selection = 0;
+        self.overview_scroll = 0;
+    }
+    pub(super) fn accept_runtime_view(&mut self, name: String, view: RuntimeView) {
+        let RuntimeView {
+            snapshot,
+            telemetry,
+        } = view;
+        let identity_changed = self.runtime_instance != name
+            || self
+                .runtime_snapshot
+                .as_ref()
+                .is_some_and(|old| old.pid != snapshot.pid)
+            || telemetry
+                .as_ref()
+                .zip(self.live_state.telemetry.as_ref())
+                .is_some_and(|(new, old)| new.host_boot_id != old.host_boot_id);
+        if identity_changed {
+            if self.runtime_snapshot.is_some() && self.runtime_instance == name {
+                self.notice_host_restart();
+            }
+            self.reset_live_identity();
+        }
+        // Command replies without source metadata must not replace a hosted source clock.
+        if telemetry.is_none() && self.live_state.telemetry.is_some() && !identity_changed {
+            self.runtime_instance = name;
+            self.runtime_snapshot = Some(snapshot);
+            return;
+        }
+        if let Some(meta) = telemetry {
+            if self
+                .live_state
+                .baseline
+                .as_ref()
+                .is_some_and(|(_, old)| meta.sample_sequence < old.sample_sequence)
+            {
+                return;
+            }
+            let valid = meta.coverage == Coverage::Complete && meta.sample_age_ms <= 3000;
+            let fresh = self
+                .live_state
+                .baseline
+                .as_ref()
+                .is_none_or(|(_, old)| old.sample_sequence != meta.sample_sequence);
+            if fresh {
+                self.live_state.rates_valid = false;
+                let previous = self
+                    .live_state
+                    .baseline
+                    .as_ref()
+                    .filter(|(_, old)| {
+                        old.host_boot_id == meta.host_boot_id && old.coverage == Coverage::Complete
+                    })
+                    .cloned();
+                if let Some((old, old_meta)) = previous.filter(|_| valid) {
+                    let elapsed = meta
+                        .sample_elapsed_ms
+                        .saturating_sub(old_meta.sample_elapsed_ms)
+                        as f64
+                        / 1000.0;
+                    if elapsed > 0.0 {
+                        self.set_runtime_rates(&old, &snapshot, elapsed);
+                        self.live_state.rates_valid = true;
+                        self.record_runtime_rates();
+                        if !self.connections_paused() {
+                            self.animations.trigger(animation::Kind::Sample);
+                        }
+                    }
+                } else {
+                    self.live_state.rates_valid = false;
+                }
+                self.live_state.baseline = Some((snapshot.clone(), meta.clone()));
+            }
+            if !valid {
+                self.live_state.rates_valid = false;
+            }
+            self.live_state.telemetry = Some(meta);
+        } else {
+            self.accept_legacy_rates(&name, &snapshot);
+        }
+        self.live_state.received = Some(Instant::now());
+        self.live_state.disconnected = false;
+        self.runtime_sample = Instant::now();
+        self.runtime_instance = name;
+        self.runtime_snapshot = Some(snapshot);
+        self.group_selection = self
+            .group_selection
+            .min(self.live().map_or(0, |s| s.groups.len().saturating_sub(1)));
+        let ids: Vec<_> = self.visible_connections().iter().map(|c| c.id).collect();
+        if let Some(id) = self.live_state.selected {
+            if let Some(index) = ids.iter().position(|value| *value == id) {
+                self.connection_selection = index;
+            }
+        } else if let Some(id) = ids.first() {
+            self.live_state.selected = Some(*id);
+            self.select_connection(0);
+        }
+        self.runtime_error.clear();
+    }
+    fn set_runtime_rates(&mut self, old: &Snapshot, snapshot: &Snapshot, elapsed: f64) {
+        self.rates = [
+            (snapshot.proxy_upload.saturating_sub(old.proxy_upload) as f64 / elapsed) as u64,
+            (snapshot.proxy_download.saturating_sub(old.proxy_download) as f64 / elapsed) as u64,
+        ];
+        self.direct_rates = [
+            (snapshot
+                .upload
+                .saturating_sub(snapshot.proxy_upload)
+                .saturating_sub(old.upload.saturating_sub(old.proxy_upload)) as f64
+                / elapsed) as u64,
+            (snapshot
+                .download
+                .saturating_sub(snapshot.proxy_download)
+                .saturating_sub(old.download.saturating_sub(old.proxy_download))
+                as f64
+                / elapsed) as u64,
+        ];
+    }
+    fn record_runtime_rates(&mut self) {
+        for index in 0..2 {
+            self.history[index].push_back(self.rates[index]);
+            if self.history[index].len() > 64 {
+                self.history[index].pop_front();
+            }
+        }
+    }
+    fn accept_legacy_rates(&mut self, name: &str, snapshot: &Snapshot) {
         let previous = self
             .runtime_snapshot
             .as_ref()
             .filter(|old| name == self.runtime_instance && old.pid == snapshot.pid);
         let elapsed = self.runtime_sample.elapsed().as_secs_f64();
+        self.direct_rates = if let Some(old) = previous {
+            if elapsed > 0.1 {
+                [
+                    (snapshot
+                        .upload
+                        .saturating_sub(snapshot.proxy_upload)
+                        .saturating_sub(old.upload.saturating_sub(old.proxy_upload))
+                        as f64
+                        / elapsed) as u64,
+                    (snapshot
+                        .download
+                        .saturating_sub(snapshot.proxy_download)
+                        .saturating_sub(old.download.saturating_sub(old.proxy_download))
+                        as f64
+                        / elapsed) as u64,
+                ]
+            } else {
+                self.direct_rates
+            }
+        } else {
+            self.history = Default::default();
+            [0, 0]
+        };
         self.rates = if let Some(old) = previous {
             if elapsed > 0.1 {
                 [
-                    (snapshot.upload.saturating_sub(old.upload) as f64 / elapsed) as u64,
-                    (snapshot.download.saturating_sub(old.download) as f64 / elapsed) as u64,
+                    (snapshot.proxy_upload.saturating_sub(old.proxy_upload) as f64 / elapsed)
+                        as u64,
+                    (snapshot.proxy_download.saturating_sub(old.proxy_download) as f64 / elapsed)
+                        as u64,
                 ]
             } else {
                 self.rates
@@ -110,15 +324,170 @@ impl Ui {
             }
         }
         self.runtime_sample = Instant::now();
-        self.runtime_instance = name;
-        self.runtime_snapshot = Some(snapshot);
-        self.group_selection = self
-            .group_selection
-            .min(self.live().map_or(0, |s| s.groups.len().saturating_sub(1)));
-        self.connection_selection = self
-            .connection_selection
-            .min(self.visible_connections().len().saturating_sub(1));
-        self.runtime_error.clear();
+        self.live_state.rates_valid = previous.is_some();
+    }
+    pub(super) fn runtime_disconnected(&mut self, error: String) {
+        self.live_state.disconnected = true;
+        self.live_state.rates_valid = false;
+        self.live_state.baseline = None;
+        self.runtime_error = error;
+    }
+    pub(super) fn runtime_rates_available(&self) -> bool {
+        self.live().is_some()
+            && self.live_state.rates_valid
+            && !self.live_state.disconnected
+            && self
+                .live_state
+                .received
+                .is_some_and(|at| at.elapsed() <= Duration::from_secs(3))
+            && self.live_state.telemetry.as_ref().is_none_or(|meta| {
+                meta.sample_age_ms.saturating_add(
+                    self.live_state
+                        .received
+                        .map_or(0, |at| at.elapsed().as_millis() as u64),
+                ) <= 3000
+            })
+    }
+    pub(super) fn runtime_health(&self) -> String {
+        if self.live_state.disconnected {
+            return t("Reconnecting · last received data").into();
+        }
+        if self
+            .live_state
+            .received
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+        {
+            return t("Runtime data stale").into();
+        }
+        match &self.live_state.telemetry {
+            Some(meta) if meta.ingress_paused => t("Update: new connections paused").into(),
+            Some(meta) if meta.coverage == Coverage::Partial => {
+                t("Partial worker telemetry").into()
+            }
+            Some(meta)
+                if matches!(meta.coverage, Coverage::Stale | Coverage::Unknown)
+                    || meta.sample_age_ms.saturating_add(
+                        self.live_state
+                            .received
+                            .map_or(0, |at| at.elapsed().as_millis() as u64),
+                    ) > 3000 =>
+            {
+                t("Worker telemetry stale").into()
+            }
+            Some(meta) => tr!("Generation {} · live", meta.active_generation.unwrap_or(0)),
+            None if self.live().is_some() => t("Legacy telemetry · source age unknown").into(),
+            None => t("Waiting for runtime data…").into(),
+        }
+    }
+    pub(super) fn connections_paused(&self) -> bool {
+        self.live_state.frozen.is_some()
+    }
+    pub(super) fn live_detail_open(&self) -> bool {
+        self.live_state.detail_open
+    }
+    pub(super) fn connection_badges(&self) -> String {
+        let mut badges = Vec::new();
+        let paused = tr!(
+            "PAUSED {}",
+            self.live_state.frozen_at.as_deref().unwrap_or("—")
+        );
+        if self.connections_paused() {
+            badges.push(paused.as_str());
+        }
+        if self.live_state.disconnected {
+            badges.push(t("RECONNECTING"));
+        } else if self
+            .live_state
+            .received
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+        {
+            badges.push(t("STALE"));
+        } else if let Some(meta) = &self.live_state.telemetry {
+            if meta.ingress_paused {
+                badges.push(t("INGRESS PAUSED"));
+            }
+            if matches!(meta.coverage, Coverage::Stale | Coverage::Unknown)
+                || meta.sample_age_ms.saturating_add(
+                    self.live_state
+                        .received
+                        .map_or(0, |at| at.elapsed().as_millis() as u64),
+                ) > 3000
+            {
+                badges.push(t("STALE"));
+            } else if meta.coverage == Coverage::Partial {
+                badges.push(t("PARTIAL"));
+            }
+        }
+        if badges.is_empty() {
+            String::new()
+        } else {
+            format!("{} · ", badges.join(" · "))
+        }
+    }
+    pub(super) fn connection_pause_hint(&self) -> Option<String> {
+        self.connections_paused().then(|| {
+            tr!(
+                "Paused {} · background updates continue · Space resume",
+                self.live_state.frozen_at.as_deref().unwrap_or("—")
+            )
+        })
+    }
+    pub(super) fn toggle_live_pause(&mut self) -> Input {
+        if self.live_state.frozen.take().is_none() {
+            self.live_state.frozen = self.live().cloned();
+            self.live_state.frozen_telemetry = self.live_state.telemetry.clone();
+            self.live_state.frozen_at = self
+                .live_state
+                .frozen
+                .as_ref()
+                .map(|_| chrono::Local::now().format("%H:%M:%S").to_string());
+            self.animations.finish(animation::Kind::Sample);
+        } else {
+            self.live_state.frozen_telemetry = None;
+            self.live_state.frozen_at = None;
+        }
+        if let Some(id) = self.live_state.selected {
+            if let Some(index) = self.visible_connections().iter().position(|c| c.id == id) {
+                self.connection_selection = index;
+            }
+        }
+        Input::Idle
+    }
+    pub(super) fn connection_snapshot(&self) -> Option<&Snapshot> {
+        self.live()?;
+        self.live_state.frozen.as_ref().or_else(|| self.live())
+    }
+    pub(super) fn select_connection(&mut self, index: usize) {
+        let id = self.visible_connections().get(index).map(|c| c.id);
+        if self.live_state.selected != id {
+            self.live_state.detail_scroll = 0;
+        }
+        self.connection_selection = index;
+        self.live_state.selected = id;
+    }
+    pub(super) fn select_connection_id(&mut self, id: u64) {
+        if !self.visible_connections().iter().any(|c| c.id == id)
+            && self
+                .connection_snapshot()
+                .is_some_and(|s| s.connections.iter().any(|c| c.id == id))
+        {
+            self.connection_filter.clear();
+        }
+        if let Some(index) = self.visible_connections().iter().position(|c| c.id == id) {
+            self.select_connection(index);
+        }
+    }
+    pub(super) fn reveal_selected_connection(&mut self) {
+        if let Some(id) = self.live_state.selected {
+            self.select_connection_id(id);
+        }
+    }
+    pub(super) fn connection_is_selected(&self, id: u64) -> bool {
+        self.live_state.selected == Some(id)
+    }
+    fn selected_connection(&self) -> Option<&astra_ipc::runtime::Connection> {
+        let id = self.live_state.selected?;
+        self.visible_connections().into_iter().find(|c| c.id == id)
     }
     pub(super) fn runtime_action(&mut self, command: Command) -> Input {
         if matches!(command, Command::Tun(true)) {
@@ -156,6 +525,7 @@ impl Ui {
                 .position(|m| Some(&m.name) == group.selected.as_ref())
                 .unwrap_or(0);
             self.runtime_picker = Some((group.name.clone(), selected));
+            self.focus.region = focus::Region::Secondary;
         }
     }
     pub(super) fn choose_runtime_member(&mut self, index: usize) -> Input {
@@ -192,8 +562,13 @@ impl Ui {
         Input::Idle
     }
     pub(super) fn visible_connections(&self) -> Vec<&astra_ipc::runtime::Connection> {
-        let filter = self.connection_filter.to_lowercase();
-        self.live()
+        let filter = if self.page == CONNECTIONS {
+            self.connection_filter.to_lowercase()
+        } else {
+            String::new()
+        };
+        let mut connections: Vec<_> = self
+            .connection_snapshot()
             .map(|s| {
                 s.connections
                     .iter()
@@ -211,9 +586,93 @@ impl Ui {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        connections.sort_by_key(|c| (std::cmp::Reverse(c.upload.saturating_add(c.download)), c.id));
+        connections
+    }
+    pub(super) fn live_secondary_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        if self.disabled_live_alias(key) {
+            return Some(Input::Idle);
+        }
+        if self.page == OVERVIEW {
+            let count = self.live()?.groups.len();
+            let page = self.live_page_size(Viewport::Groups);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.group_selection = (self.group_selection + 1).min(count.saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.group_selection = self.group_selection.saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.group_selection =
+                        (self.group_selection + page).min(count.saturating_sub(1))
+                }
+                KeyCode::PageUp => self.group_selection = self.group_selection.saturating_sub(page),
+                KeyCode::Home => self.group_selection = 0,
+                KeyCode::End => self.group_selection = count.saturating_sub(1),
+                KeyCode::Enter => {
+                    self.navigate(PROXIES);
+                    self.open_runtime_group();
+                }
+                _ => return None,
+            }
+        } else if self.page == CONNECTIONS {
+            let page = self
+                .live_page_size(Viewport::Details)
+                .min(u16::MAX as usize) as u16;
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.live_state.detail_scroll = self.live_state.detail_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.live_state.detail_scroll = self.live_state.detail_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.live_state.detail_scroll =
+                        self.live_state.detail_scroll.saturating_add(page)
+                }
+                KeyCode::PageUp => {
+                    self.live_state.detail_scroll =
+                        self.live_state.detail_scroll.saturating_sub(page)
+                }
+                KeyCode::Home => self.live_state.detail_scroll = 0,
+                KeyCode::Enter => {
+                    self.live_state.detail_open = true;
+                    self.animations.open(animation::Kind::Detail);
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+        Some(Input::Idle)
     }
     pub(super) fn live_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        if !self.connection_filtering && self.disabled_live_alias(key) {
+            return Some(Input::Idle);
+        }
+        if self.live_state.detail_open && self.page == CONNECTIONS {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.live_state.detail_open = false;
+                    self.animations.close(animation::Kind::Detail);
+                    return Some(Input::Idle);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.live_state.detail_scroll = self.live_state.detail_scroll.saturating_add(1);
+                    return Some(Input::Idle);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.live_state.detail_scroll = self.live_state.detail_scroll.saturating_sub(1);
+                    return Some(Input::Idle);
+                }
+                KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home => {
+                    return self.live_secondary_key(key)
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return None;
         }
@@ -233,6 +692,7 @@ impl Ui {
             return Some(Input::Idle);
         }
         if let Some((name, index)) = self.runtime_picker.clone() {
+            let page = self.live_page_size(Viewport::Members);
             let count = self
                 .live()
                 .and_then(|s| s.groups.iter().find(|g| g.name == name))
@@ -244,8 +704,8 @@ impl Ui {
                     next = (index + 1).min(count.saturating_sub(1))
                 }
                 KeyCode::Up | KeyCode::Char('k') => next = index.saturating_sub(1),
-                KeyCode::PageDown => next = (index + 10).min(count.saturating_sub(1)),
-                KeyCode::PageUp => next = index.saturating_sub(10),
+                KeyCode::PageDown => next = (index + page).min(count.saturating_sub(1)),
+                KeyCode::PageUp => next = index.saturating_sub(page),
                 KeyCode::Home => next = 0,
                 KeyCode::End => next = count.saturating_sub(1),
                 KeyCode::Enter | KeyCode::Char(' ') => {
@@ -270,7 +730,7 @@ impl Ui {
                 }
                 _ => return Some(Input::Idle),
             }
-            self.connection_selection = 0;
+            self.select_connection(0);
             return Some(Input::Idle);
         }
         // Modified shortcuts must never become unmodified network mutations.
@@ -305,12 +765,14 @@ impl Ui {
                 | KeyCode::PageUp
                 | KeyCode::PageDown
                 | KeyCode::Enter
+                | KeyCode::Delete
                 | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'x' | 'X' | 't' | '/') => Some(Input::Idle),
                 _ => None,
             };
         }
-        let snapshot = self.live()?;
+        let snapshot = self.live()?.clone();
         if self.page == OVERVIEW {
+            let page = self.live_page_size(Viewport::Overview);
             let count = self
                 .overview_scroll_limit
                 .get()
@@ -322,34 +784,47 @@ impl Ui {
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.overview_scroll = (self.overview_scroll + 1).min(count.saturating_sub(1));
+                    self.select_connection(
+                        self.overview_scroll
+                            .min(snapshot.connections.len().saturating_sub(1)),
+                    );
                     return Some(Input::Idle);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                    self.select_connection(self.overview_scroll);
                     return Some(Input::Idle);
                 }
                 KeyCode::PageDown => {
-                    self.overview_scroll = (self.overview_scroll + 5).min(count.saturating_sub(1));
+                    self.overview_scroll =
+                        (self.overview_scroll + page).min(count.saturating_sub(1));
+                    self.select_connection(
+                        self.overview_scroll
+                            .min(snapshot.connections.len().saturating_sub(1)),
+                    );
                     return Some(Input::Idle);
                 }
                 KeyCode::PageUp => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(5);
+                    self.overview_scroll = self.overview_scroll.saturating_sub(page);
+                    self.select_connection(self.overview_scroll);
                     return Some(Input::Idle);
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.overview_scroll = 0;
+                    self.select_connection(0);
                     return Some(Input::Idle);
                 }
                 KeyCode::End | KeyCode::Char('G') => {
                     self.overview_scroll = count.saturating_sub(1);
+                    self.select_connection(snapshot.connections.len().saturating_sub(1));
                     return Some(Input::Idle);
                 }
                 KeyCode::Enter => return Some(self.navigate(CONNECTIONS)),
+                KeyCode::Char(' ') => return Some(self.toggle_live_pause()),
                 _ => {}
             }
         }
         match key.code {
-            KeyCode::Char('0') => return Some(self.runtime_action(Command::Reset)),
             KeyCode::Char('m') => {
                 return Some(self.runtime_action(Command::SetMode(match snapshot.mode {
                     Mode::Rule => Mode::Global,
@@ -368,6 +843,7 @@ impl Ui {
         }
         if self.page == PROXIES {
             let count = snapshot.groups.len();
+            let page = self.live_page_size(Viewport::Groups);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.group_selection = (self.group_selection + 1).min(count.saturating_sub(1))
@@ -378,9 +854,10 @@ impl Ui {
                 KeyCode::Home | KeyCode::Char('g') => self.group_selection = 0,
                 KeyCode::End | KeyCode::Char('G') => self.group_selection = count.saturating_sub(1),
                 KeyCode::PageDown => {
-                    self.group_selection = (self.group_selection + 10).min(count.saturating_sub(1))
+                    self.group_selection =
+                        (self.group_selection + page).min(count.saturating_sub(1))
                 }
-                KeyCode::PageUp => self.group_selection = self.group_selection.saturating_sub(10),
+                KeyCode::PageUp => self.group_selection = self.group_selection.saturating_sub(page),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_runtime_group(),
                 KeyCode::Char('t') => {
                     return Some(self.runtime_action(Command::TestGroup(
@@ -392,34 +869,50 @@ impl Ui {
             return Some(Input::Idle);
         }
         if self.page == CONNECTIONS {
+            let page = self.live_page_size(Viewport::Connections);
             let connections = self.visible_connections();
+            let count = connections.len();
             match key.code {
                 KeyCode::Char('/') => self.connection_filtering = true,
                 KeyCode::Esc => self.connection_filter.clear(),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.connection_selection =
-                        (self.connection_selection + 1).min(connections.len().saturating_sub(1))
-                }
+                KeyCode::Down | KeyCode::Char('j') => self.select_connection(
+                    (self.connection_selection + 1).min(count.saturating_sub(1)),
+                ),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.connection_selection = self.connection_selection.saturating_sub(1)
+                    self.select_connection(self.connection_selection.saturating_sub(1))
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.connection_selection = 0,
+                KeyCode::Home | KeyCode::Char('g') => self.select_connection(0),
                 KeyCode::End | KeyCode::Char('G') => {
-                    self.connection_selection = connections.len().saturating_sub(1)
+                    self.select_connection(count.saturating_sub(1))
                 }
-                KeyCode::PageDown => {
-                    self.connection_selection =
-                        (self.connection_selection + 10).min(connections.len().saturating_sub(1))
-                }
+                KeyCode::PageDown => self.select_connection(
+                    (self.connection_selection + page).min(count.saturating_sub(1)),
+                ),
                 KeyCode::PageUp => {
-                    self.connection_selection = self.connection_selection.saturating_sub(10)
+                    self.select_connection(self.connection_selection.saturating_sub(page))
                 }
-                KeyCode::Enter => return Some(Input::Idle),
-                KeyCode::Char('x') => {
-                    return Some(self.runtime_action(Command::Disconnect(Some(
-                        connections.get(self.connection_selection)?.id,
-                    ))))
+                KeyCode::Enter => {
+                    self.live_state.detail_open = true;
+                    self.live_state.detail_scroll = 0;
+                    self.animations.open(animation::Kind::Detail);
+                    return Some(Input::Idle);
                 }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    let Some(id) = self.selected_connection().map(|c| c.id) else {
+                        self.message = "Selected connection is not present in this sample".into();
+                        return Some(Input::Idle);
+                    };
+                    if self.live_state.disconnected
+                        || !self
+                            .live()
+                            .is_some_and(|s| s.connections.iter().any(|c| c.id == id))
+                    {
+                        self.message = "Connection cannot be verified in the latest sample".into();
+                        return Some(Input::Idle);
+                    }
+                    return Some(self.runtime_action(Command::Disconnect(Some(id))));
+                }
+                KeyCode::Char(' ') => return Some(self.toggle_live_pause()),
                 KeyCode::Char('X') => {
                     if !connections.is_empty() {
                         let row = self.active_proxy()?;
@@ -545,6 +1038,8 @@ impl Ui {
 
     /// Groups on the left, members of the focused group on the right.
     pub(super) fn render_live_groups(&self, f: &mut Frame<'_>, area: Rect) {
+        self.record_live_viewport(Viewport::Groups, 0);
+        self.record_live_viewport(Viewport::Members, 0);
         let Some(snapshot) = self.live() else {
             self.render_not_live(f, area, "Proxy groups");
             return;
@@ -596,6 +1091,14 @@ impl Ui {
             (!items.is_empty()).then_some(self.group_selection.min(items.len().saturating_sub(1))),
         );
         let groups_area = columns[0];
+        self.record_live_viewport(
+            Viewport::Groups,
+            if groups_area.width > 0 {
+                groups_area.height.saturating_sub(2) as usize / 2
+            } else {
+                0
+            },
+        );
         if groups_area.width > 0 {
             f.render_stateful_widget(
                 List::new(items)
@@ -628,6 +1131,14 @@ impl Ui {
             }
         }
         let members_area = columns[1];
+        self.record_live_viewport(
+            Viewport::Members,
+            if members_area.width > 0 {
+                members_area.height.saturating_sub(2) as usize
+            } else {
+                0
+            },
+        );
         let Some(group) = snapshot.groups.get(self.group_selection) else {
             return;
         };
@@ -708,16 +1219,92 @@ impl Ui {
                 Target::Member(visible + state.offset()),
             );
         }
+        self.focus_region(f, groups_area, focus::Region::Main);
+        self.focus_region(f, members_area, focus::Region::Secondary);
     }
 
     /// Connection table with a detail pane for the selected row.
     pub(super) fn render_connections(&self, f: &mut Frame<'_>, area: Rect) {
-        let Some(snapshot) = self.live() else {
+        self.record_live_viewport(Viewport::Connections, 0);
+        self.record_live_viewport(Viewport::Details, 0);
+        let Some(snapshot) = self.connection_snapshot() else {
             self.render_not_live(f, area, "Connections");
             return;
         };
         let connections = self.visible_connections();
-        let selected = connections.get(self.connection_selection).copied();
+        let selected = self.selected_connection();
+        if self.live_state.detail_open {
+            self.record_live_viewport(Viewport::Details, area.height.saturating_sub(2) as usize);
+            let before = f.buffer_mut().clone();
+            let mut text = selected.map(|c| format!("Target: {}:{}\nExit: {}\nNetwork: {} · {}\nSource: {}\nUpload: {}\nDownload: {}\nElapsed: {:.1}s\n{}",
+                c.host,c.port,c.outbound,c.network,c.inbound,c.source.as_deref().unwrap_or("—"),bytes(c.upload),bytes(c.download),c.elapsed_ms as f64/1000.0,
+                self.live_state.frozen_telemetry.as_ref().or(self.live_state.telemetry.as_ref()).and_then(|m| m.connection_generations.get(&c.id)).map_or(String::new(),|generation|format!("Worker generation: {generation}"))))
+                .unwrap_or_else(|| "Selected connection is not present in this sample".into());
+            if let Some(hint) = self.connection_pause_hint() {
+                text.push_str(&format!("\n{hint}"));
+            }
+            text.push_str(&format!("\n{}", self.runtime_health()));
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.live_state.detail_scroll, 0))
+                    .block(card("Connection details · ↑↓ scroll · Esc back")),
+                area,
+            );
+            self.animations
+                .surface(f, animation::Kind::Detail, area, &before);
+            return;
+        }
+        if area.width < 80 {
+            self.record_live_viewport(
+                Viewport::Connections,
+                area.height.saturating_sub(2) as usize / 2,
+            );
+            let items: Vec<_> = connections
+                .iter()
+                .map(|c| {
+                    ListItem::new(vec![
+                        Line::raw(format!("{}:{}", c.host, c.port)),
+                        Line::raw(format!(
+                            "{} · {} · ↑{} ↓{}",
+                            c.outbound,
+                            c.network,
+                            bytes(c.upload),
+                            bytes(c.download)
+                        )),
+                    ])
+                })
+                .collect();
+            let title = format!(
+                "{}Connections {}/{}{}",
+                self.connection_badges(),
+                connections.len(),
+                snapshot.active,
+                if snapshot.truncated {
+                    " · partial"
+                } else {
+                    ""
+                }
+            );
+            let mut state =
+                ListState::default().with_selected(selected.map(|_| self.connection_selection));
+            let hint = if selected.is_none() && self.live_state.selected.is_some() {
+                "Selection not in sample · ↑↓ choose another".into()
+            } else {
+                self.connection_pause_hint()
+                    .unwrap_or_else(|| " Enter details · Space pause ".into())
+            };
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(crate::theme::selected())
+                    .highlight_symbol("› ")
+                    .block(card(&title).title_bottom(hint)),
+                area,
+                &mut state,
+            );
+            self.focus_region(f, area, focus::Region::Main);
+            return;
+        }
         let (table_area, detail_area) = if area.width >= 120 {
             let split =
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(38)]).split(area);
@@ -728,6 +1315,14 @@ impl Ui {
         } else {
             (area, None)
         };
+        self.record_live_viewport(
+            Viewport::Connections,
+            table_area.height.saturating_sub(3) as usize,
+        );
+        self.record_live_viewport(
+            Viewport::Details,
+            detail_area.map_or(0, |area| area.height.saturating_sub(2) as usize),
+        );
         let header = TableRow::new(
             [t("Target"), t("Network"), t("Exit"), "↑", "↓", t("Time")]
                 .map(|h| Cell::from(h).style(Style::default().fg(MUTED))),
@@ -761,39 +1356,52 @@ impl Ui {
             })
             .collect();
         let title = format!(
-            "{} {} · {} {}{}",
+            "{}{} {}/{} · {} {}{}",
+            self.connection_badges(),
             t("Active"),
+            snapshot.connections.len(),
             snapshot.active,
             t("Total"),
             snapshot.total,
-            if snapshot.truncated { " +" } else { "" }
+            if snapshot.truncated {
+                " · partial sample"
+            } else {
+                ""
+            }
         );
-        let footer = Line::from(if self.connection_filtering {
-            vec![
-                Span::styled(
-                    format!(" /{}▏", self.connection_filter),
-                    crate::theme::matched(),
-                ),
-                Span::styled(" · Enter ", muted),
-            ]
-        } else if self.connection_filter.is_empty() {
-            let mut spans =
-                crate::theme::key_hints(&format!(" {}", t("/ filter · x close · X close all")));
-            spans.push(Span::raw(" "));
-            spans
-        } else {
-            vec![
-                Span::styled(format!(" {} ", t("Filter")), muted),
-                Span::styled(
-                    format!("“{}”", self.connection_filter),
-                    crate::theme::matched(),
-                ),
-                Span::styled(format!(" · Esc {} ", t("clear")), muted),
-            ]
-        });
+        let footer = Line::from(
+            if let Some(hint) = self
+                .connection_pause_hint()
+                .filter(|_| !self.connection_filtering)
+            {
+                crate::theme::key_hints(&hint)
+            } else if self.connection_filtering {
+                vec![
+                    Span::styled(
+                        format!(" /{}▏", self.connection_filter),
+                        crate::theme::matched(),
+                    ),
+                    Span::styled(" · Enter ", muted),
+                ]
+            } else if self.connection_filter.is_empty() {
+                let mut spans =
+                    crate::theme::key_hints(&format!(" {}", t("/ filter · x close · X close all")));
+                spans.push(Span::raw(" "));
+                spans
+            } else {
+                vec![
+                    Span::styled(format!(" {} ", t("Filter")), muted),
+                    Span::styled(
+                        format!("“{}”", self.connection_filter),
+                        crate::theme::matched(),
+                    ),
+                    Span::styled(format!(" · Esc {} ", t("clear")), muted),
+                ]
+            },
+        );
         let empty = rows.is_empty();
         let mut state = TableState::default().with_selected(
-            (!empty).then_some(
+            selected.is_some().then_some(
                 self.connection_selection
                     .min(connections.len().saturating_sub(1)),
             ),
@@ -818,7 +1426,12 @@ impl Ui {
         );
         if empty {
             f.render_widget(
-                Paragraph::new(t("No matching connections")).style(Style::default().fg(MUTED)),
+                Paragraph::new(if snapshot.truncated {
+                    "No matches in the loaded sample"
+                } else {
+                    t("No matching connections")
+                })
+                .style(Style::default().fg(MUTED)),
                 table_area.inner(ratatui::layout::Margin::new(2, 2)),
             );
         }
@@ -834,7 +1447,7 @@ impl Ui {
                     table_area.width.saturating_sub(2),
                     1,
                 ),
-                Target::Connection(index),
+                Target::Connection(connections[index].id),
             );
         }
         if table_area.width >= 44 {
@@ -878,9 +1491,26 @@ impl Ui {
             f.render_widget(
                 Paragraph::new(lines)
                     .wrap(Wrap { trim: false })
+                    .scroll((self.live_state.detail_scroll, 0))
                     .block(card("Details")),
                 detail,
             );
+        }
+        if selected.is_none() && self.live_state.selected.is_some() {
+            f.render_widget(
+                Paragraph::new("Selected connection is not present in this sample")
+                    .style(Style::default().fg(Color::Yellow)),
+                Rect::new(
+                    table_area.x + 1,
+                    table_area.y,
+                    table_area.width.saturating_sub(2),
+                    1,
+                ),
+            );
+        }
+        self.focus_region(f, table_area, focus::Region::Main);
+        if let Some(area) = detail_area {
+            self.focus_region(f, area, focus::Region::Secondary);
         }
     }
 }
@@ -963,6 +1593,303 @@ mod tests {
     fn key(ui: &mut Ui, code: KeyCode) -> Input {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
     }
+    fn telemetry(snapshot: Snapshot, boot: &str, sequence: u64, time: u64) -> RuntimeView {
+        RuntimeView {
+            snapshot,
+            telemetry: Some(RuntimeTelemetry {
+                host_boot_id: boot.into(),
+                active_generation: Some(1),
+                sample_sequence: sequence,
+                sample_elapsed_ms: time,
+                coverage: Coverage::Complete,
+                ..Default::default()
+            }),
+        }
+    }
+    #[test]
+    fn live_paging_tracks_rendered_viewports_and_two_line_rows() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        let connection = snapshot.connections[0].clone();
+        snapshot.connections = (0..80)
+            .map(|id| {
+                let mut row = connection.clone();
+                row.id = id;
+                row.host = format!("host-{id}.test");
+                row
+            })
+            .collect();
+        snapshot.active = 80;
+        let mut group = snapshot.groups[0].clone();
+        group.members = (0..60)
+            .map(|id| Member {
+                name: format!("member-{id}"),
+                delay_ms: None,
+                alive: None,
+            })
+            .collect();
+        group.selected = Some("member-0".into());
+        snapshot.groups = (0..50)
+            .map(|id| {
+                let mut row = group.clone();
+                row.name = format!("group-{id}");
+                row
+            })
+            .collect();
+        ui.accept_runtime("proxy".into(), snapshot);
+        ui.navigate(CONNECTIONS);
+        for (width, step) in [(120, 17), (70, 9)] {
+            ui.select_connection(0);
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal
+                .draw(|f| ui.render_connections(f, f.area()))
+                .unwrap();
+            key(&mut ui, KeyCode::PageDown);
+            assert_eq!(ui.connection_selection, step);
+            key(&mut ui, KeyCode::PageUp);
+            assert_eq!(ui.connection_selection, 0);
+        }
+        ui.navigate(PROXIES);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|f| ui.render_live_groups(f, f.area()))
+            .unwrap();
+        key(&mut ui, KeyCode::PageDown);
+        assert_eq!(ui.group_selection, 9);
+        key(&mut ui, KeyCode::PageUp);
+        key(&mut ui, KeyCode::Enter);
+        terminal
+            .draw(|f| ui.render_live_groups(f, f.area()))
+            .unwrap();
+        key(&mut ui, KeyCode::PageDown);
+        assert_eq!(ui.runtime_picker.as_ref().unwrap().1, 18);
+        key(&mut ui, KeyCode::PageUp);
+        assert_eq!(ui.runtime_picker.as_ref().unwrap().1, 0);
+        ui.navigate(OVERVIEW);
+        for (width, step) in [(140, 18), (70, 6)] {
+            ui.overview_scroll = 0;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| ui.render_overview(f, f.area())).unwrap();
+            key(&mut ui, KeyCode::PageDown);
+            assert_eq!(ui.overview_scroll, step);
+            key(&mut ui, KeyCode::PageUp);
+            assert_eq!(ui.overview_scroll, 0);
+        }
+        ui.focus.region = focus::Region::Secondary;
+        key(&mut ui, KeyCode::PageDown);
+        assert_eq!(ui.group_selection, 3);
+    }
+    #[test]
+    fn live_aliases_respect_opt_in_and_delete_never_repeats_or_edits_filters() {
+        let mut ui = sample();
+        ui.navigate(PROXIES);
+        ui.live_key(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.group_selection, 0);
+        ui.live_secondary_key(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.group_selection, 0);
+        ui.vim_keys = true;
+        ui.live_key(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.group_selection, 1);
+        assert!(ui
+            .live_key(event::KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
+            .is_none());
+        ui.navigate(CONNECTIONS);
+        assert!(matches!(
+            key(&mut ui, KeyCode::Delete),
+            Input::Run(
+                Action::Runtime {
+                    command: Command::Disconnect(Some(7)),
+                    ..
+                },
+                _
+            )
+        ));
+        let mut repeated = event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+        repeated.kind = KeyEventKind::Repeat;
+        assert!(matches!(ui.key(repeated), Input::Idle));
+        ui.vim_keys = false;
+        ui.connection_filtering = true;
+        ui.live_key(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.connection_filter, "j");
+        assert!(matches!(key(&mut ui, KeyCode::Delete), Input::Idle));
+    }
+    #[test]
+    fn hosted_source_clock_deduplicates_cached_responses_and_resets_on_boot() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.proxy_upload = 100;
+        ui.accept_runtime_view(
+            "proxy".into(),
+            telemetry(snapshot.clone(), "first", 1, 1000),
+        );
+        let count = ui.history[0].len();
+        ui.accept_runtime_view(
+            "proxy".into(),
+            telemetry(snapshot.clone(), "first", 1, 1000),
+        );
+        assert_eq!(ui.history[0].len(), count);
+        snapshot.proxy_upload = 1100;
+        ui.accept_runtime_view(
+            "proxy".into(),
+            telemetry(snapshot.clone(), "first", 2, 2000),
+        );
+        assert_eq!(ui.rates[0], 1000);
+        assert!(ui.runtime_rates_available());
+        let count = ui.history[0].len();
+        ui.accept_runtime_view(
+            "proxy".into(),
+            telemetry(snapshot.clone(), "first", 2, 2000),
+        );
+        assert_eq!(ui.history[0].len(), count);
+        ui.accept_runtime_view("proxy".into(), telemetry(snapshot, "restarted", 1, 10));
+        assert!(ui.history[0].is_empty());
+        assert!(!ui.runtime_rates_available());
+    }
+    #[test]
+    fn feed_identity_change_clears_frozen_targets_before_legacy_snapshot_arrives() {
+        for enhanced in [false, true] {
+            let mut ui = sample();
+            let mut next = ui.live().unwrap().clone();
+            if enhanced {
+                ui.accept_runtime_view(
+                    "proxy".into(),
+                    telemetry(next.clone(), "old-boot", 1, 1000),
+                );
+            }
+            ui.toggle_live_pause();
+            assert_eq!(ui.selected_connection().unwrap().id, 7);
+            // Feeds calls this exactly when its (profile, host PID) key changes.
+            ui.reset_live_identity();
+            assert!(ui.live_state.selected.is_none());
+            assert!(ui.live_state.telemetry.is_none());
+            assert!(!ui.connections_paused());
+            assert!(ui.history.iter().all(|lane| lane.is_empty()));
+            ui.rows[0].pid = Some(84);
+            next.pid = 84;
+            next.connections[0].host = "replacement.test".into();
+            ui.accept_runtime("proxy".into(), next);
+            assert_eq!(ui.connection_snapshot().unwrap().pid, 84);
+            assert_eq!(ui.selected_connection().unwrap().host, "replacement.test");
+            assert!(!ui.runtime_rates_available());
+        }
+    }
+    #[test]
+    fn same_host_reconnect_and_worker_generation_change_preserve_frozen_view() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        ui.accept_runtime_view("proxy".into(), telemetry(snapshot.clone(), "boot", 1, 1000));
+        ui.toggle_live_pause();
+        let frozen_at = ui.live_state.frozen_at.clone();
+        ui.runtime_disconnected("reconnecting".into());
+        snapshot.connections[0].host = "latest.test".into();
+        let mut changed_worker = telemetry(snapshot, "boot", 2, 2000);
+        changed_worker.telemetry.as_mut().unwrap().active_generation = Some(2);
+        ui.accept_runtime_view("proxy".into(), changed_worker);
+        assert!(ui.connections_paused());
+        assert_eq!(ui.live_state.frozen_at, frozen_at);
+        assert_eq!(ui.selected_connection().unwrap().host, "example.test");
+        assert_eq!(ui.live().unwrap().connections[0].host, "latest.test");
+        assert_eq!(
+            ui.live_state.telemetry.as_ref().unwrap().active_generation,
+            Some(2)
+        );
+    }
+    #[test]
+    fn selection_survives_reorder_and_missing_sample_never_closes_another_flow() {
+        let mut ui = sample();
+        ui.page = CONNECTIONS;
+        let mut snapshot = ui.live().unwrap().clone();
+        let mut newer = snapshot.connections[0].clone();
+        newer.id = 99;
+        newer.download = u64::MAX / 2;
+        snapshot.connections.insert(0, newer);
+        ui.accept_runtime("proxy".into(), snapshot.clone());
+        assert_eq!(ui.selected_connection().unwrap().id, 7);
+        assert_eq!(ui.connection_selection, 1);
+        snapshot.connections.retain(|c| c.id != 7);
+        snapshot.truncated = true;
+        ui.accept_runtime("proxy".into(), snapshot);
+        assert!(ui.selected_connection().is_none());
+        assert!(matches!(
+            ui.live_key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(Input::Idle)
+        ));
+        assert!(ui.message.contains("not present"));
+    }
+    #[test]
+    fn overview_selection_is_revealed_on_connections_despite_an_old_filter() {
+        let mut ui = sample();
+        ui.connection_filter = "unrelated.test".into();
+        ui.navigate(OVERVIEW);
+        assert_eq!(ui.visible_connections().len(), 1);
+        ui.select_connection_id(7);
+        ui.navigate(CONNECTIONS);
+        assert_eq!(ui.selected_connection().unwrap().id, 7);
+        assert!(ui.connection_filter.is_empty());
+        key(&mut ui, KeyCode::Enter);
+        assert!(ui.live_detail_open());
+        key(&mut ui, KeyCode::Esc);
+        assert!(!ui.live_detail_open());
+        assert_eq!(ui.page, CONNECTIONS);
+    }
+    #[test]
+    fn explicit_pause_freezes_rows_while_health_and_latest_data_continue() {
+        let mut ui = sample();
+        ui.toggle_live_pause();
+        let frozen_at = ui.live_state.frozen_at.clone();
+        assert!(frozen_at.is_some());
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.connections[0].host = "updated.example".into();
+        ui.accept_runtime("proxy".into(), snapshot);
+        assert_eq!(ui.live_state.frozen_at, frozen_at);
+        assert_eq!(ui.visible_connections()[0].host, "example.test");
+        assert_eq!(ui.live().unwrap().connections[0].host, "updated.example");
+        ui.runtime_disconnected("lost transport".into());
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            assert!(ui.runtime_health().contains("Reconnecting"));
+        });
+        assert!(!ui.runtime_rates_available());
+        ui.toggle_live_pause();
+        assert_eq!(ui.visible_connections()[0].host, "updated.example");
+    }
+    #[test]
+    fn partial_samples_do_not_fabricate_rates_and_late_samples_do_not_rewind() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        ui.accept_runtime_view("proxy".into(), telemetry(snapshot.clone(), "boot", 1, 1000));
+        snapshot.proxy_download = 2000;
+        ui.accept_runtime_view("proxy".into(), telemetry(snapshot.clone(), "boot", 2, 2000));
+        let count = ui.history[1].len();
+        let mut partial = telemetry(snapshot.clone(), "boot", 3, 3000);
+        partial.telemetry.as_mut().unwrap().coverage = Coverage::Partial;
+        ui.accept_runtime_view("proxy".into(), partial);
+        assert!(!ui.runtime_rates_available());
+        assert_eq!(ui.history[1].len(), count);
+        snapshot.proxy_download = 1;
+        ui.accept_runtime_view("proxy".into(), telemetry(snapshot, "boot", 2, 2000));
+        assert_eq!(ui.live().unwrap().proxy_download, 2000);
+        assert_eq!(ui.live_state.telemetry.as_ref().unwrap().sample_sequence, 3);
+    }
+    #[test]
+    fn narrow_views_keep_pause_and_transport_health_visible() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = sample();
+            ui.toggle_live_pause();
+            ui.runtime_disconnected("transport lost".into());
+            for page in [OVERVIEW, CONNECTIONS] {
+                ui.navigate(page);
+                let text = screen(&ui, 70, 24);
+                assert!(
+                    text.contains("PAUSED") && text.contains("RECONNECTING"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("example.test"),
+                    "last received rows remain visible"
+                );
+            }
+        });
+    }
     #[test]
     fn cursor_tabs_and_states_are_highlighted_on_every_list_page() {
         let selected = crate::theme::selected();
@@ -1015,6 +1942,8 @@ mod tests {
                 "state is colored"
             );
             key(&mut ui, KeyCode::Tab);
+            key(&mut ui, KeyCode::Right);
+            key(&mut ui, KeyCode::Enter);
             let buffer = draw(&ui);
             assert!(styles(&buffer, "Rule cores 1")
                 .iter()
@@ -1092,7 +2021,7 @@ mod tests {
             cells[text[..at].chars().count()].fg
         };
         crate::i18n::with_language(crate::i18n::Language::English, || {
-            let (text, cells) = bar(&ui, 120);
+            let (text, cells) = bar(&ui, 220);
             assert_eq!(color_of(&cells, &text, "TUN"), Color::Green);
             assert_eq!(color_of(&cells, &text, "LAN"), MUTED);
             assert_eq!(color_of(&cells, &text, "Rule"), Color::Cyan);
@@ -1103,7 +2032,9 @@ mod tests {
             );
             assert_eq!(color_of(&cells, &text, "↓"), Color::Cyan);
             assert!(
-                text.trim_end().ends_with("KiB/s"),
+                text.contains("Proxy")
+                    && text.contains("Direct")
+                    && text.trim_end().ends_with("B/s"),
                 "rates are right-aligned: {text}"
             );
             // Narrower bars lose whole parts in order, never half a word.
@@ -1117,7 +2048,18 @@ mod tests {
                 let words: Vec<_> = text.split_whitespace().collect();
                 for word in words {
                     assert!(
-                        ["Astra", "│", "●", "proxy", "Connected", "Rule", "TUN"].contains(&word)
+                        [
+                            "Astra",
+                            "│",
+                            "●",
+                            "proxy",
+                            "Connected",
+                            "Profile",
+                            "connected",
+                            "Rule",
+                            "TUN"
+                        ]
+                        .contains(&word)
                             || word
                                 .chars()
                                 .all(|c| c.is_ascii_digit() || "hms".contains(c)),
@@ -1208,6 +2150,10 @@ mod tests {
         // Closing everything asks first.
         assert!(matches!(key(&mut ui, KeyCode::Char('X')), Input::Idle));
         assert!(matches!(ui.prompt, Some(Prompt::CloseAll { .. })));
+        assert!(matches!(key(&mut ui, KeyCode::Enter), Input::Idle));
+        assert!(ui.prompt.is_none(), "confirmation defaults to cancel");
+        key(&mut ui, KeyCode::Char('X'));
+        key(&mut ui, KeyCode::Tab);
         assert!(matches!(
             key(&mut ui, KeyCode::Enter),
             Input::Run(
@@ -1273,9 +2219,9 @@ mod tests {
         ui.connection_filtering = true;
         ui.navigate(CONNECTIONS);
         assert!(!ui.connection_filtering);
-        key(&mut ui, KeyCode::BackTab);
+        key(&mut ui, KeyCode::Char('2'));
         assert_eq!(ui.page, PROXIES);
-        key(&mut ui, KeyCode::BackTab);
+        key(&mut ui, KeyCode::Char('1'));
         assert_eq!(ui.page, OVERVIEW);
     }
 
@@ -1341,6 +2287,10 @@ mod tests {
             Some(Prompt::ElevateTun { name, pid }) if name == "proxy" && *pid == Some(42)
         ));
         let enter = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ui.key(enter), Input::Idle));
+        assert!(ui.prompt.is_none(), "elevation also defaults to cancel");
+        ui.runtime_action(Command::Tun(true));
+        key(&mut ui, KeyCode::Tab);
         assert!(matches!(
             ui.key(enter),
             Input::Run(Action::PrepareElevation { name, expected_pid: Some(42) }, _) if name == "proxy"

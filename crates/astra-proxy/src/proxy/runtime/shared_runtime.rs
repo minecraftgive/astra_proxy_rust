@@ -27,6 +27,7 @@ impl Drop for Listener {
     }
 }
 pub struct State {
+    hosted: Option<Arc<crate::hosted::Host>>,
     generation: u64,
     path: PathBuf,
     text: String,
@@ -77,6 +78,7 @@ impl State {
         Ok(true)
     }
     async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
+        if let Some(host) = &self.hosted { anyhow::ensure!(!host.busy().await, "an update is prepared; retry configuration changes after activation"); }
         astra_ipc::progress::report("Prepare runtime", path.display().to_string());
         let old = self.current.load_full();
         candidate.metrics = old.metrics.clone();
@@ -117,6 +119,12 @@ impl State {
             crate::egress::prepare_interface(tun)?;
         }
         crate::mode_config::validate(&candidate.config)?;
+        let worker_generation = if let Some(host) = &self.hosted {
+            candidate.hosted = Some(host.clone());
+            candidate.route_leases = old.route_leases.clone();
+            if let Some(dns) = &mut candidate.dns { dns.set_mapping_store(host.mappings.clone())?; }
+            Some(host.prepare_runtime(&candidate).await?)
+        } else { None };
         let mut keys = vec![];
         if let Some(addr) = &candidate.config.socks5_listen {
             keys.push(Key(Inbound::Socks5, addr.clone()));
@@ -254,7 +262,12 @@ impl State {
         } else {
             old.egress_signal.send_replace(true);
         }
-        self.current.store(Arc::new(candidate));
+        let candidate = Arc::new(candidate);
+        if let Some(generation) = worker_generation {
+            generation.commit(candidate.route_leases.clone(),|| self.current.store(candidate)).await;
+        } else {
+            self.current.store(candidate);
+        }
         if replace_dns {
             self.dns = dns_prepared.map(|prepared| prepared.start(self.current.clone()));
         }
@@ -364,7 +377,11 @@ async fn run_inner(
         }
     }
     let current = Arc::new(ArcSwap::from_pointee(app));
+    let hosted = if std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some() {
+        Some(crate::hosted::Host::start(path.clone(), &current).await?)
+    } else { None };
     let mut state = State {
+        hosted,
         generation: 0,
         system_journal,
         text: String::new(),
@@ -719,6 +736,15 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
             let _permit = permit;
             let cancellation = app.clone();
             let session = async {
+                if let Some(host) = &app.hosted {
+                    let local = stream.local_addr()?;
+                    let destination = match inbound {
+                        Inbound::Tproxy | Inbound::Redirect => Some(transparent::destination(&stream,inbound)?),
+                        _ => None,
+                    };
+                    let process = crate::platform::process::lookup(astra_ipc::Network::Tcp,peer,destination.unwrap_or(local)).await;
+                    return host.relay(stream,crate::hosted::Metadata { flow_id:None,inbound,source:peer,local,destination,process }).await;
+                }
                 match inbound {
                     Inbound::Socks5 => inbound::handle_socks5(stream, app).await,
                     Inbound::HttpConnect => inbound::handle_http(stream, app).await,

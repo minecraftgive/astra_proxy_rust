@@ -1,4 +1,5 @@
-//! Control plane only. No packet payload ever crosses this interface.
+//! Rule and management IPC carry metadata only. The separate `host` module
+//! provides authenticated-by-caller data channels for resident ingress workers.
 use crate::platform::LocalStream as UnixStream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
@@ -9,6 +10,7 @@ pub mod diagnostics;
 #[cfg(windows)]
 pub mod elevation;
 pub mod groups;
+pub mod host;
 pub mod logging;
 pub mod nettool;
 pub mod platform;
@@ -135,3 +137,50 @@ async fn receive_bounded<T: DeserializeOwned>(
 }
 
 pub use platform::shutdown_signal;
+
+/// Extensible metadata carried inside the existing v4 route envelope.
+/// Release versions are informational; wire compatibility is independent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreInfo {
+    pub version: String,
+    pub wire_version: u16,
+    pub features: Vec<String>,
+}
+impl CoreInfo {
+    pub fn local(version: &str) -> Self {
+        Self { version: version.into(), wire_version: API_VERSION,
+            features: vec!["route".into(), "destination-ip".into(), "revision-subscription".into()] }
+    }
+    pub fn common_features(&self, peer: &Self) -> Vec<String> {
+        self.features.iter().filter(|f| peer.features.contains(f)).cloned().collect()
+    }
+}
+pub const CORE_INFO_HOST: &str = "astra-core-info.invalid";
+
+pub async fn exchange_core_info(stream: &mut UnixStream, version: &str) -> io::Result<Option<CoreInfo>> {
+    let local = CoreInfo::local(version);
+    let request = RouteRequest {
+        destination_ip: None, api_version: API_VERSION, id: u64::MAX,
+        target: Target { host: CORE_INFO_HOST.into(), port: 0 },
+        network: Network::Tcp, inbound: Inbound::Socks5,
+        process: Some(ProcessInfo { pid: 0, name: CORE_INFO_HOST.into(),
+            path: serde_json::to_string(&local)? }),
+    };
+    send(stream, &request).await?;
+    let response: RouteResponse = receive(stream).await?;
+    if response.id != request.id || response.api_version != API_VERSION {
+        return Err(io::Error::other("incompatible core wire protocol"));
+    }
+    // Older v4 cores treat the probe as an ordinary route request.
+    if let RouteAction::Proxy(value) = response.action {
+        if let Some(json) = value.strip_prefix("astra-core-info:") {
+            let peer: CoreInfo = serde_json::from_str(json)?;
+            if peer.wire_version != API_VERSION {
+                return Err(io::Error::other("incompatible core wire protocol"));
+            }
+            tracing::info!(?peer, features = ?local.common_features(&peer), "core capabilities exchanged");
+            return Ok(Some(peer));
+        }
+    }
+    Ok(None)
+}

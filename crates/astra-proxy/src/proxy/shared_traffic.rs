@@ -22,6 +22,8 @@ pub(crate) struct Metrics {
     total: AtomicU64,
     upload: AtomicU64,
     download: AtomicU64,
+    proxy_upload: AtomicU64,
+    proxy_download: AtomicU64,
     flows: Mutex<BTreeMap<u64, Weak<Flow>>>,
 }
 impl Metrics {
@@ -31,6 +33,8 @@ impl Metrics {
             pid: std::process::id(),
             upload: self.upload.load(Ordering::Relaxed),
             download: self.download.load(Ordering::Relaxed),
+            proxy_upload: self.proxy_upload.load(Ordering::Relaxed),
+            proxy_download: self.proxy_download.load(Ordering::Relaxed),
             active: flows.len(),
             total: self.total.load(Ordering::Relaxed),
             truncated: flows.len() > 128,
@@ -155,6 +159,9 @@ impl Traffic {
         tracing::debug!(target: "astra_route", flow = self.id, phase = "forward", source = ?self.source, host = ?self.target.host, port = self.target.port, inbound = ?self.inbound, network = ?self.network, action = ?self.action, "forwarding started");
     }
     pub(crate) fn upload(&self, bytes: usize) {
+        if matches!(self.action, RouteAction::Proxy(_)) {
+            self.metrics.proxy_upload.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         self.up.fetch_add(bytes as u64, Ordering::Relaxed);
         self.metrics
             .upload
@@ -164,6 +171,9 @@ impl Traffic {
         }
     }
     pub(crate) fn download(&self, bytes: usize) {
+        if matches!(self.action, RouteAction::Proxy(_)) {
+            self.metrics.proxy_download.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         self.down.fetch_add(bytes as u64, Ordering::Relaxed);
         self.metrics
             .download

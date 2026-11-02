@@ -72,6 +72,13 @@ async fn flow(
     output: mpsc::Sender<Datagram>,
     inbound: Inbound,
 ) -> Result<()> {
+    if let Some(host) = &app.hosted {
+        let process = crate::platform::process::lookup(astra_ipc::Network::Udp, source, destination).await;
+        return host.relay_udp(crate::hosted::Metadata {
+            flow_id:None,
+            inbound, source, local: destination, destination: Some(destination), process,
+        }, requests, output).await;
+    }
     let original = Target {
         host: destination.ip().to_string(),
         port: destination.port(),

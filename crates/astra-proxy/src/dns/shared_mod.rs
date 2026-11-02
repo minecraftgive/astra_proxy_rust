@@ -75,6 +75,7 @@ impl App {
         Ok(tokio::net::lookup_host((host, port)).await?.collect())
     }
     pub(crate) async fn dns_answer(&self, raw: &[u8]) -> Result<Vec<u8>> {
+        if let Some(host) = &self.hosted { return host.dns_answer(raw).await; }
         let dns = self
             .dns
             .as_ref()

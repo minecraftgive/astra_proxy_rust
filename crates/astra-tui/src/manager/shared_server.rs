@@ -28,6 +28,7 @@ pub(super) struct Hub {
     bin: PathBuf,
     base: watch::Sender<Base>,
     list: watch::Sender<Reply>,
+    updates: watch::Sender<crate::protocol::updates::UpdateStatus>,
     generation: AtomicU64,
     log: Arc<crate::tui_log::Log>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -55,6 +56,7 @@ impl Hub {
             bin: manager.bin.clone(),
             base: watch::channel(initial).0,
             list: watch::channel(Reply::text("")).0,
+            updates: watch::channel(manager.cached_update_status()).0,
             generation: AtomicU64::new(0),
             log: Arc::new(crate::tui_log::Log::open(&manager.home.join("tui.log"))?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -112,10 +114,43 @@ impl Hub {
             levels: manager.runtime.log_levels.clone(),
         });
         self.list.send_replace(reply);
+        self.publish_updates(manager.cached_update_status());
+    }
+    pub(super) fn publish_updates(&self, mut status: crate::protocol::updates::UpdateStatus) {
+        // Runtime observations are published independently of the mutation actor.
+        let routes = self.base.borrow().routes.clone();
+        self.updates.send_modify(|current| {
+            status.instances = routes
+                .iter()
+                .filter(|(_, route)| route.instance.kind == Kind::Proxy && route.pid.is_some())
+                .map(|(name, route)| {
+                    (
+                        name.clone(),
+                        current
+                            .instances
+                            .get(name)
+                            .filter(|instance| instance.pid == route.pid)
+                            .cloned()
+                            .unwrap_or_else(|| crate::protocol::updates::UpdateInstance {
+                                pid: route.pid,
+                                error: Some("Waiting for network host status".into()),
+                                ..Default::default()
+                            }),
+                    )
+                })
+                .collect();
+            status.observed_at_ms = current.observed_at_ms;
+            apply_instance_gate(&mut status);
+            *current = status.clone();
+        });
+    }
+    pub(super) fn update_status_snapshot(&self) -> crate::protocol::updates::UpdateStatus {
+        self.updates.borrow().clone()
     }
     fn reader(&self) -> Manager {
         let base = self.base.borrow();
         Manager {
+            updates: Default::default(),
             home: self.home.clone(),
             config_home: self.config.clone(),
             bin: self.bin.clone(),
@@ -215,6 +250,49 @@ struct Work {
     progress: progress::Sender,
 }
 
+fn apply_instance_gate(status: &mut crate::protocol::updates::UpdateStatus) {
+    let capabilities = &mut status.capabilities;
+    let reason = if !capabilities.experimental_enabled {
+        Some("Online activation is disabled in this host session")
+    } else if !capabilities.ordinary_user {
+        Some("Online activation requires an ordinary-user manager")
+    } else if capabilities.operation_running || capabilities.recovery_operation_id.is_some() {
+        Some("An update is running or requires recovery")
+    } else if status
+        .instances
+        .values()
+        .any(|instance| !instance.reachable)
+    {
+        Some("A running instance is legacy or unavailable")
+    } else if status.instances.values().any(|instance| {
+        instance.status.as_ref().is_none_or(|s| {
+            s.get("boot_id")
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty)
+        })
+    }) {
+        Some("A network host does not support recoverable update identities")
+    } else if status.instances.values().any(|instance| {
+        instance.status.as_ref().is_some_and(|s| {
+            s.get("paused").and_then(|v| v.as_bool()) == Some(true)
+                || s.get("busy").and_then(|v| v.as_bool()) == Some(true)
+                || s.get("generations")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|g| g.get("prepared").and_then(|v| v.as_bool()) == Some(true))
+                    })
+        })
+    }) {
+        Some("A network host is paused or preparing a generation")
+    } else {
+        None
+    };
+    capabilities.activation_allowed = reason.is_none();
+    capabilities.activation_blocked_reason = reason.map(str::to_owned);
+}
+
 pub(super) async fn run(mut manager: Manager, listener: UnixListener) -> Result<()> {
     let hub = Hub::new(&manager)?;
     manager.publisher = Some(hub.clone());
@@ -242,7 +320,16 @@ pub(super) async fn run(mut manager: Manager, listener: UnixListener) -> Result<
                     actor_hub.publish(&manager);
                     let _=work.reply.send(reply);
                 }
-                _=tick.tick()=>{let _=manager.reap();actor_hub.publish(&manager);}
+                _=tick.tick()=>{
+                    let _=manager.reap();
+                    if manager.updates.status.operation.as_ref().is_none_or(|operation|operation.phase.terminal()) {
+                        manager.updates.status.rule_sync_error = match manager.refresh_rule_generations().await {
+                            Ok(()) => None,
+                            Err(error) => { let message=format!("rule generation refresh deferred: {error:#}"); actor_hub.log.write("manager",&message); Some(message) }
+                        };
+                    }
+                    actor_hub.publish(&manager);
+                }
             }
         }
         manager.stop_all().await;
@@ -282,6 +369,68 @@ pub(super) async fn run(mut manager: Manager, listener: UnixListener) -> Result<
         }
     });
     let permits = Arc::new(Semaphore::new(64));
+    let update_hub = hub.clone();
+    let update_polling = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let routes: Vec<_> = update_hub
+                .base
+                .borrow()
+                .routes
+                .iter()
+                .filter(|(_, route)| route.instance.kind == Kind::Proxy && route.pid.is_some())
+                .map(|(name, route)| (name.clone(), route.clone()))
+                .collect();
+            let observed: Vec<_> = stream::iter(routes)
+                .map(|(name, route)| async move {
+                    let endpoint = astra_proxy::hosted::endpoint(&route.socket);
+                    let result = timeout(
+                        Duration::from_millis(750),
+                        astra_proxy::hosted::request(
+                            &endpoint,
+                            astra_proxy::hosted::Command::Status,
+                        ),
+                    )
+                    .await;
+                    let instance = match result {
+                        Ok(Ok(value)) => crate::protocol::updates::UpdateInstance {
+                            pid: route.pid,
+                            reachable: true,
+                            status: Some(value),
+                            error: None,
+                        },
+                        Ok(Err(error)) => crate::protocol::updates::UpdateInstance {
+                            pid: route.pid,
+                            error: Some(format!("Legacy host or unavailable: {error:#}")),
+                            ..Default::default()
+                        },
+                        Err(_) => crate::protocol::updates::UpdateInstance {
+                            pid: route.pid,
+                            error: Some("Host status timed out".into()),
+                            ..Default::default()
+                        },
+                    };
+                    (name, route.pid, instance)
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            let instances = observed
+                .into_iter()
+                .filter(|(name, pid, _)| {
+                    update_hub.route(name).is_ok_and(|route| route.pid == *pid)
+                })
+                .map(|(name, _, instance)| (name, instance))
+                .collect();
+            update_hub.updates.send_modify(|status| {
+                status.instances = instances;
+                status.observed_at_ms = progress::now_ms();
+                apply_instance_gate(status);
+            });
+        }
+    });
     let diagnostics = Arc::new(Semaphore::new(2));
     let followers = Arc::new(Semaphore::new(16));
     let mut clients = tokio::task::JoinSet::new();
@@ -300,6 +449,7 @@ pub(super) async fn run(mut manager: Manager, listener: UnixListener) -> Result<
         }
     }
     polling.abort();
+    update_polling.abort();
     clients.abort_all();
     while clients.join_next().await.is_some() {}
     drop(sender);
@@ -323,6 +473,32 @@ async fn send(
     )
     .await??;
     Ok(())
+}
+
+/// Closing a subscription can race with its next pushed snapshot. A closed
+/// peer is a normal end of subscription, including Windows ERROR_NO_DATA.
+async fn send_subscription(
+    stream: &mut astra_ipc::platform::LocalStream,
+    value: &(impl Serialize + Sync),
+) -> Result<bool> {
+    match send(stream, value).await {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            }) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 async fn serve(
     mut stream: astra_ipc::platform::LocalStream,
@@ -362,12 +538,36 @@ async fn serve(
             "Unsupported manager version"
         );
         match &request.action {
+            Action::WatchUpdates => {
+                let mut updates = hub.updates.subscribe();
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(5),
+                );
+                loop {
+                    let status = updates.borrow_and_update().clone();
+                    if !send_subscription(
+                        &mut stream,
+                        &Reply::text(serde_json::to_string(&status)?),
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    tokio::select! {result=updates.changed()=>{result?;},_=heartbeat.tick()=>{},_=stream.read_u8()=>return Ok(())}
+                }
+            }
             Action::WatchList => {
                 let mut updates = hub.list.subscribe();
-                let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(5),
+                );
                 loop {
                     let snapshot = updates.borrow_and_update().clone();
-                    send(&mut stream, &snapshot).await?;
+                    if !send_subscription(&mut stream, &snapshot).await? {
+                        return Ok(());
+                    }
                     tokio::select! {_=updates.changed()=>{},_=heartbeat.tick()=>{},_=stream.read_u8()=>return Ok(())}
                 }
             }
@@ -378,6 +578,48 @@ async fn serve(
             } => {
                 let route = hub.route(name)?;
                 anyhow::ensure!(route.pid == Some(*expected_pid), "Core PID changed");
+                let endpoint = astra_proxy::hosted::endpoint(&route.socket);
+                let enhanced = timeout(
+                    Duration::from_millis(750),
+                    astra_proxy::hosted::request(&endpoint, astra_proxy::hosted::Command::Status),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|status| {
+                    status
+                        .get("capabilities")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|items| {
+                            items
+                                .iter()
+                                .any(|v| v.as_str() == Some("runtime_telemetry_v1"))
+                        })
+                });
+                if enhanced {
+                    let mut tick = tokio::time::interval(Duration::from_millis(
+                        (*interval_ms).clamp(100, 5000),
+                    ));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! { _=tick.tick()=>{}, _=stream.read_u8()=>return Ok(()) }
+                        let value = timeout(
+                            Duration::from_secs(2),
+                            astra_proxy::hosted::request(
+                                &endpoint,
+                                astra_proxy::hosted::Command::Telemetry,
+                            ),
+                        )
+                        .await??;
+                        anyhow::ensure!(
+                            value.get("pid").and_then(|v| v.as_u64()) == Some(*expected_pid as u64)
+                                && hub.route(name)?.pid == Some(*expected_pid),
+                            "Core PID changed"
+                        );
+                        // One atomic host sample: never splice metadata onto a separately sampled Snapshot.
+                        send(&mut stream, &Reply::text(serde_json::to_string(&value)?)).await?;
+                    }
+                }
                 let mut core = control::watch_runtime(&route.socket, *interval_ms).await?;
                 loop {
                     let snapshot: std::result::Result<astra_ipc::runtime::Snapshot, String> = tokio::select! {
@@ -549,6 +791,19 @@ async fn serve(
 async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
     Some(match action {
         Action::List => Ok(hub.list.borrow().clone()),
+        Action::UpdateStatus => serde_json::to_string(&*hub.updates.borrow())
+            .map(Reply::text)
+            .map_err(Into::into),
+        Action::UpdateOperationStatus { operation_id } => {
+            let home = hub.home.clone();
+            let status = hub.updates.borrow().clone();
+            let id = operation_id.clone();
+            tokio::task::spawn_blocking(move || {
+                Manager::lookup_update_operation(&home, status, &id)
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.into()))
+        }
         Action::StoragePaths => serde_json::to_string(&StoragePaths {
             config: hub.config.clone(),
             state: hub.home.clone(),
@@ -685,5 +940,132 @@ async fn fast_progress(
                 if let Some(event)=event{hub.log.write("progress",&format!("{} {}",event.phase,event.detail));if send(stream,&Event::<Reply>::Progress(event)).await.is_err(){return Some(Err(anyhow::anyhow!("UI disconnected; the core operation may continue")));}}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_status_tests {
+    use super::*;
+    use crate::protocol::updates::{UpdateIntent, UpdateRequest, UpdateStatus};
+
+    #[tokio::test]
+    async fn a_subscriber_close_before_the_next_push_is_a_normal_disconnect() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut server) = astra_ipc::platform::stream_pair().await.unwrap();
+        drop(client);
+        // Observe the close first, then exercise a write that raced with it.
+        assert!(timeout(Duration::from_millis(500), server.read_u8())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(
+            !send_subscription(&mut server, &Reply::text("next snapshot"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_and_watch_update_status_do_not_enter_the_mutation_queue() {
+        let id = UpdateRequest::new(UpdateIntent::Stage {
+            package: PathBuf::new(),
+        })
+        .operation_id;
+        let root = std::env::temp_dir().join(format!("astra-update-watch-{id}"));
+        let manager = Manager::load(root.join("state"), root.join("bundle")).unwrap();
+        let hub = Hub::new(&manager).unwrap();
+        // Keep the receiver alive but deliberately never service it, as during a long update.
+        let (sender, mut queued) = mpsc::channel(1);
+        let (stopped, _stop) = mpsc::channel(1);
+        for action in [Action::UpdateStatus, Action::WatchUpdates] {
+            let watching = matches!(action, Action::WatchUpdates);
+            let (mut client, server) = astra_ipc::platform::stream_pair().await.unwrap();
+            let task = tokio::spawn(serve(
+                server,
+                hub.clone(),
+                sender.clone(),
+                stopped.clone(),
+                Arc::new(Semaphore::new(1)),
+                Arc::new(Semaphore::new(1)),
+            ));
+            astra_ipc::send_management(
+                &mut client,
+                &Request {
+                    version: astra_ipc::API_VERSION,
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+            let first: Reply = timeout(
+                Duration::from_millis(500),
+                astra_ipc::receive_management(&mut client),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<UpdateStatus>(&first.text)
+                    .unwrap()
+                    .schema_version,
+                1
+            );
+            if watching {
+                let mut changed = manager.cached_update_status();
+                changed.staged_release_id = Some("observed-during-work".into());
+                hub.publish_updates(changed);
+                timeout(Duration::from_millis(500), async {
+                    loop {
+                        let next: Reply = astra_ipc::receive_management(&mut client).await.unwrap();
+                        let status: UpdateStatus = serde_json::from_str(&next.text).unwrap();
+                        if status.staged_release_id.as_deref() == Some("observed-during-work") {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            drop(client);
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(queued.try_recv().is_err());
+        assert!(
+            !manager.home.join("updates").exists(),
+            "reads and watches must not open/recover release-store journals"
+        );
+        drop(hub);
+        drop(manager);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gate_requires_observed_identity_and_idle_host() {
+        let mut status = UpdateStatus::default();
+        status.capabilities.experimental_enabled = true;
+        status.capabilities.ordinary_user = true;
+        status.instances.insert(
+            "legacy".into(),
+            crate::protocol::updates::UpdateInstance {
+                reachable: true,
+                status: Some(serde_json::json!({"active":1})),
+                error: None,
+                ..Default::default()
+            },
+        );
+        apply_instance_gate(&mut status);
+        assert!(!status.capabilities.activation_allowed);
+        status.instances.get_mut("legacy").unwrap().status =
+            Some(serde_json::json!({"boot_id":"one","paused":true}));
+        apply_instance_gate(&mut status);
+        assert!(!status.capabilities.activation_allowed);
+        status.instances.get_mut("legacy").unwrap().status =
+            Some(serde_json::json!({"boot_id":"one","paused":false,"busy":false}));
+        apply_instance_gate(&mut status);
+        assert!(status.capabilities.activation_allowed);
     }
 }

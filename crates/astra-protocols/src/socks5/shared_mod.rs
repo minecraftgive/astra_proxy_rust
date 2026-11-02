@@ -1,10 +1,7 @@
 use crate::outbound::{append_socks_address, Stream};
 use anyhow::{bail, Result};
 use astra_ipc::Target;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub async fn socks5(
     server: &str,
     username: Option<&str>,
@@ -105,11 +102,15 @@ pub async fn accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
 use anyhow::Context;
 use std::net::{Ipv4Addr, Ipv6Addr};
-pub async fn read_socks_request(client: &mut TcpStream) -> Result<(u8, Target)> {
+pub async fn read_socks_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    client: &mut S,
+) -> Result<(u8, Target)> {
     read_socks_request_with_auth(client, &[]).await
 }
-pub async fn read_socks_request_with_auth(
-    client: &mut TcpStream,
+pub async fn read_socks_request_with_auth<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
+    client: &mut S,
     users: &[String],
 ) -> Result<(u8, Target)> {
     if client.read_u8().await? != 5 {
@@ -185,7 +186,10 @@ pub async fn read_socks_request_with_auth(
     Ok((request[1], Target { host, port }))
 }
 
-pub async fn reply_socks5(client: &mut TcpStream, reply: u8) -> Result<()> {
+pub async fn reply_socks5<S: tokio::io::AsyncWrite + Unpin>(
+    client: &mut S,
+    reply: u8,
+) -> Result<()> {
     client
         .write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0])
         .await?;

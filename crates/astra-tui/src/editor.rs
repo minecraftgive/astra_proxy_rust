@@ -85,6 +85,10 @@ struct TextInput {
     replace: bool,
     #[serde(default)]
     candidate: Option<String>,
+    #[serde(default)]
+    undo: Vec<(String, usize)>,
+    #[serde(default)]
+    redo: Vec<(String, usize)>,
 }
 impl TextInput {
     fn new(text: String) -> Self {
@@ -94,6 +98,8 @@ impl TextInput {
             cursor,
             replace: true,
             candidate: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
     fn byte(&self) -> usize {
@@ -104,6 +110,7 @@ impl TextInput {
             .unwrap_or(self.text.len())
     }
     fn insert(&mut self, text: &str) {
+        self.remember();
         self.candidate = None;
         if self.replace {
             self.text.clear();
@@ -116,10 +123,36 @@ impl TextInput {
             self.cursor += 1;
         }
     }
+    fn remember(&mut self) {
+        self.undo.push((self.text.clone(), self.cursor));
+        if self.undo.len() > 64 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
     fn key(&mut self, key: KeyEvent) {
         self.candidate = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if key.code == KeyCode::Char('u') {
+            if matches!(key.code, KeyCode::Char('z' | 'y')) {
+                let redo = key.code == KeyCode::Char('y');
+                let previous = if redo {
+                    self.redo.pop()
+                } else {
+                    self.undo.pop()
+                };
+                if let Some((text, cursor)) = previous {
+                    let current = (self.text.clone(), self.cursor);
+                    if redo {
+                        self.undo.push(current);
+                    } else {
+                        self.redo.push(current);
+                    }
+                    self.text = text;
+                    self.cursor = cursor;
+                    self.replace = false;
+                }
+            } else if key.code == KeyCode::Char('u') {
+                self.remember();
                 self.text.clear();
                 self.cursor = 0;
                 self.replace = false;
@@ -145,16 +178,19 @@ impl TextInput {
                 self.cursor = self.text.chars().count();
             }
             KeyCode::Backspace | KeyCode::Delete if self.replace => {
+                self.remember();
                 self.text.clear();
                 self.cursor = 0;
                 self.replace = false;
             }
             KeyCode::Backspace if self.cursor > 0 => {
+                self.remember();
                 self.cursor -= 1;
                 let byte = self.byte();
                 self.text.remove(byte);
             }
             KeyCode::Delete if self.cursor < self.text.chars().count() => {
+                self.remember();
                 let byte = self.byte();
                 self.text.remove(byte);
             }
@@ -1105,6 +1141,16 @@ impl Editor {
     pub fn browsing(&self) -> bool {
         matches!(self.form.mode, Mode::Browse)
     }
+    /// A member picker or delete confirmation is not a text field.
+    pub fn accepts_text_input(&self) -> bool {
+        matches!(
+            self.form.mode,
+            Mode::Field { .. }
+                | Mode::Header(_)
+                | Mode::Search(_)
+                | Mode::Members { find: Some(_), .. }
+        )
+    }
     pub fn import(&mut self, text: String) -> Result<()> {
         let mut candidate = Self::new(self.name.clone(), text);
         candidate.kind = self.kind;
@@ -1124,18 +1170,38 @@ impl Editor {
         self.form.rename_proxy_group = None;
     }
     pub fn can_close(&self) -> bool {
-        if !matches!(self.form.mode, Mode::Browse) {
+        if !self.browsing() {
             return false;
         }
-        !self
-            .document()
-            .ok()
-            .and_then(|doc| {
-                self.visible_rows(&doc)
-                    .get(self.form.selected)
-                    .and_then(FlatRow::node)
-            })
-            .is_some_and(|index| self.form.expanded_nodes.contains(&index))
+        let Ok(doc) = self.document() else {
+            return true;
+        };
+        let rows = self.visible_rows(&doc);
+        let Some(row) = rows.get(self.form.selected) else {
+            return true;
+        };
+        let path = row.path();
+        !row.node().is_some_and(|i| self.form.expanded_nodes.contains(&i))
+            && !proxy_group_name(&path).is_some_and(|name| self.form.expanded_proxy_groups.iter().any(|v| v==name))
+            && !rule_set_name(&path).is_some_and(|name| self.form.expanded_rule_sets.iter().any(|v|v==name))
+            && !path.first().is_some_and(|part| matches!(part,Part::Key(key) if self.form.expanded_collections.contains(key)))
+    }
+    pub fn fold_signature(&self) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.form.expanded_nodes,
+            self.form.expanded_rule_sets,
+            self.form.expanded_collections,
+            self.form.expanded_rule_groups,
+            self.form.expanded_proxy_groups
+        )
+    }
+    pub fn find_again(&mut self, backwards: bool) -> Result<()> {
+        let query = self.form.last_search.clone();
+        if query.is_empty() {
+            return Ok(());
+        }
+        self.search_direction(&query, backwards)
     }
     pub fn prepare_save(&mut self) -> Result<String> {
         match self.form.mode {
@@ -1198,7 +1264,8 @@ impl Editor {
             bail!(t("Select a rule to export"));
         };
         anyhow::ensure!(
-            collection(&doc, &[Part::Key("rules".into())]).is_some_and(|rules| *index < rules.len()),
+            collection(&doc, &[Part::Key("rules".into())])
+                .is_some_and(|rules| *index < rules.len()),
             t("Select a rule to export")
         );
         Ok(*index)
@@ -2771,6 +2838,9 @@ impl Editor {
     }
     /// Jumps to the next row containing `query`, opening folds on the way when needed.
     fn search(&mut self, query: &str) -> Result<()> {
+        self.search_direction(query, false)
+    }
+    fn search_direction(&mut self, query: &str, backwards: bool) -> Result<()> {
         let doc = self.document()?;
         let query = query.to_lowercase();
         let current = self
@@ -2782,9 +2852,19 @@ impl Editor {
         let rows = all.visible_rows(&doc);
         let start = current
             .and_then(|id| rows.iter().position(|row| Self::row_id(row) == id))
-            .map_or(0, |at| at + 1);
-        let Some(target) = (0..rows.len())
-            .map(|offset| &rows[(start + offset) % rows.len()])
+            .unwrap_or(if backwards {
+                0
+            } else {
+                rows.len().saturating_sub(1)
+            });
+        let Some(target) = (1..=rows.len())
+            .map(|offset| {
+                &rows[if backwards {
+                    (start + rows.len() - offset) % rows.len()
+                } else {
+                    (start + offset) % rows.len()
+                }]
+            })
             .find(|row| Self::search_text(&doc, row).contains(&query))
         else {
             self.notice = Some(tr!("No match for \"{}\"", query));
@@ -3038,7 +3118,14 @@ impl Editor {
                     self.form.mode = Mode::Search(input);
                     return Ok(());
                 }
-                KeyCode::Char(' ') => key.code = KeyCode::Enter,
+                KeyCode::Char(' ') => {
+                    let doc = self.document()?;
+                    let boolean = matches!(self.visible_rows(&doc).get(self.form.selected), Some(FlatRow::Field { spec, .. }) if matches!(spec.kind, Type::Boolean));
+                    if boolean {
+                        return self.enter(false);
+                    }
+                    return Ok(());
+                }
                 _ => {}
             }
             if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
@@ -3484,10 +3571,14 @@ impl Editor {
             }
             KeyCode::Esc => {
                 if let Some(row) = &selected {
-                    if row.node().is_some()
-                        || rule_set_name(&row.path()).is_some()
-                        || proxy_group_name(&row.path()).is_some()
+                    // Back leaves a rule's fields before its group; Left/h remains
+                    // the explicit collapse command and folds the group immediately.
+                    let path = row.path();
+                    if let Some(("rules", index)) =
+                        item_index(&path).filter(|_| !matches!(row, FlatRow::Rule { .. }))
                     {
+                        self.focus_item(&doc, "rules", index);
+                    } else {
                         self.collapse_selection(&doc, row);
                     }
                 }
@@ -4347,14 +4438,17 @@ mod tests {
     fn selected_export_rejects_child_rows() {
         let mut node_editor = Editor::new(
             "proxy".into(),
-            "standalone=true\n[[outbounds]]\ntag='node'\nkind='http'\nserver='127.0.0.1:1234'\n".into(),
+            "standalone=true\n[[outbounds]]\ntag='node'\nkind='http'\nserver='127.0.0.1:1234'\n"
+                .into(),
         );
         node_editor.form.expanded_nodes.push(0);
         let doc = node_editor.document().unwrap();
         node_editor.form.selected = node_editor
             .visible_rows(&doc)
             .iter()
-            .position(|row| matches!(row, FlatRow::Field { path, .. } if node_index(path).is_some()))
+            .position(
+                |row| matches!(row, FlatRow::Field { path, .. } if node_index(path).is_some()),
+            )
             .unwrap();
         assert!(node_editor.selected_node_tag().is_err());
 
@@ -5425,6 +5519,10 @@ mod tests {
         field(&mut e, "value", "new.example");
         field(&mut e, "action", "proxy:edge");
         press(&mut e, KeyCode::Esc);
+        assert!(matches!(
+            e.visible_rows(&e.document().unwrap()).get(e.form.selected),
+            Some(FlatRow::Rule { index: 2, .. })
+        ));
         press(&mut e, KeyCode::Char('K'));
         let doc = e.document().unwrap();
         let a = doc["rules"].as_array_of_tables().unwrap();
@@ -5774,6 +5872,34 @@ mod tests {
             Some(FlatRow::Collection { .. })
         ));
         assert_eq!(e.text(), original);
+    }
+    #[test]
+    fn escape_leaves_rule_fields_then_group_without_changing_rule_order() {
+        let mut editor = Editor::new("rules".into(), "socket='r'\ndefault_action='direct'\nrules=[{kind='domain_exact',value='first.test',action='block'},{kind='ip_cidr',value='10.0.0.0/8',action='direct'}]".into());
+        let original = editor.text();
+        let doc = editor.document().unwrap();
+        editor.focus_field(
+            &doc,
+            &vec![Part::Key("rules".into()), Part::Index(1)],
+            "value",
+        );
+        press(&mut editor, KeyCode::Esc);
+        assert!(matches!(
+            editor.visible_rows(&doc).get(editor.form.selected),
+            Some(FlatRow::Rule { index: 1, .. })
+        ));
+        press(&mut editor, KeyCode::Esc);
+        assert!(matches!(
+            editor.visible_rows(&doc).get(editor.form.selected),
+            Some(FlatRow::RuleGroup { start: 1, .. })
+        ));
+        press(&mut editor, KeyCode::Esc);
+        assert!(matches!(
+            editor.visible_rows(&doc).get(editor.form.selected),
+            Some(FlatRow::Collection { .. })
+        ));
+        assert!(editor.can_close());
+        assert_eq!(editor.text(), original);
     }
     #[test]
     fn only_nodes_fold_and_their_nested_fields_share_the_same_page() {
@@ -6224,5 +6350,27 @@ mod interaction_tests {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod text_input_history_tests {
+    use super::*;
+    #[test]
+    fn unicode_field_editing_undo_redo_preserves_cursor_and_legacy_serialization() {
+        let mut input = TextInput::new("a界c".into());
+        input.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        input.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(input.text, "ac");
+        input.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(input.text, "a界c");
+        assert_eq!(input.cursor, 2);
+        input.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(input.text, "ac");
+        assert_eq!(input.cursor, 1);
+        let old: TextInput =
+            serde_json::from_str(r#"{"text":"legacy","cursor":6,"replace":false}"#).unwrap();
+        assert!(old.undo.is_empty());
+        assert!(old.redo.is_empty());
     }
 }

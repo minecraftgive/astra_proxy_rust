@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
     sync::mpsc,
     task::JoinSet,
     time::timeout,
@@ -33,8 +33,16 @@ async fn idle(activity: Activity, duration: Duration) {
     }
 }
 
-pub async fn associate(mut control: TcpStream, requested: Target, app: Arc<App>) -> Result<()> {
-    let peer = control.peer_addr()?;
+pub async fn associate_stream<S>(
+    mut control: S,
+    requested: Target,
+    app: Arc<App>,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Never accept a UDP source from an IP other than the TCP control peer.
     if let Ok(ip) = requested.host.parse::<IpAddr>() {
         if !ip.is_unspecified() && ip != peer.ip() {
@@ -45,7 +53,7 @@ pub async fn associate(mut control: TcpStream, requested: Target, app: Arc<App>)
         control.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         bail!("UDP association source must be an IP address");
     }
-    let socket = Arc::new(UdpSocket::bind(SocketAddr::new(control.local_addr()?.ip(), 0)).await?);
+    let socket = Arc::new(UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?);
     let local = socket.local_addr()?;
     let mut reply = vec![5, 0, 0];
     crate::outbound::append_socks_address(
@@ -88,9 +96,24 @@ pub async fn associate(mut control: TcpStream, requested: Target, app: Arc<App>)
                     let (send, receive) = mpsc::channel(QUEUE_PACKETS);
                     flows.insert(target.clone(), send);
                     let (app, socket, activity, target) = (app.clone(), socket.clone(), activity.clone(), target.clone());
+                    let process = crate::hosted::INGRESS_PROCESS.try_with(Clone::clone).ok();
                     workers.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = flow(app, socket, from, &target, receive, activity).await {
+                        // A hosted association can outlive several core versions.
+                        // Keep one resident-host lease per destination so all
+                        // workers share the same global UDP limit.
+                        let _host_permit = if let Some(host) = &app.worker_host {
+                            match host.udp_permit().await {
+                                Ok(permit) => Some(permit),
+                                Err(error) => {
+                                    tracing::debug!(%error, host=%target.host, port=target.port, "host UDP admission rejected");
+                                    return;
+                                }
+                            }
+                        } else { None };
+                        let session = flow(app, socket, from, &target, receive, activity);
+                        let result = if let Some(process) = process { crate::hosted::INGRESS_PROCESS.scope(process,session).await } else { session.await };
+                        if let Err(error) = result {
                             tracing::debug!(%error, host=%target.host, port=target.port, "UDP flow ended");
                         }
                     });

@@ -84,9 +84,12 @@ impl RuleClient {
                 // Cancellation, partial I/O and timeouts therefore always close it.
                 let mut stream = match lease.stream.take() {
                     Some(stream) => stream,
-                    None => astra_ipc::platform::connect_trusted(&self.socket_path)
-                        .await
-                        .context("Rule Core connect failed")?,
+                    None => {
+                        let mut stream = astra_ipc::platform::connect_trusted(&self.socket_path)
+                            .await.context("Rule Core connect failed")?;
+                        astra_ipc::exchange_core_info(&mut stream, env!("CARGO_PKG_VERSION")).await?;
+                        stream
+                    },
                 };
                 let result = async {
                     astra_ipc::send(&mut stream, &req).await?;

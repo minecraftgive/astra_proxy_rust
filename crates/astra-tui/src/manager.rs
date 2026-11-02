@@ -3,6 +3,8 @@
 mod elevation;
 #[path = "manager/shared_server.rs"]
 mod server;
+#[path = "manager/updates.rs"]
+mod updates;
 use crate::protocol::*;
 use anyhow::{bail, Context, Result};
 use astra_ipc::control::{self, Command};
@@ -96,6 +98,7 @@ impl ManagedChild {
     }
 }
 pub struct Manager {
+    updates: updates::Updates,
     publisher: Option<std::sync::Arc<server::Hub>>,
     home: PathBuf,
     config_home: PathBuf,
@@ -559,6 +562,7 @@ impl Manager {
             }
         };
         let manager = Self {
+            updates: updates::Updates::load(&home, &bin)?,
             publisher: None,
             home,
             config_home,
@@ -1287,6 +1291,17 @@ impl Manager {
     async fn action(&mut self, action: Action) -> Result<Reply> {
         self.reap()?;
         match action {
+            Action::UpdateTransaction { request } => self.update_transaction(request).await,
+            Action::RecoverUpdate { operation_id } => self.recover_update(&operation_id).await,
+            Action::WatchUpdates => bail!("Update subscriptions require a dedicated connection"),
+            Action::UpdatePackage(path) => self.update_package(path).await,
+            Action::UpdateStatus => self.update_status().await,
+            Action::UpdateOperationStatus { operation_id } => Self::lookup_update_operation(
+                &self.home,
+                self.cached_update_status(),
+                &operation_id,
+            ),
+            Action::Rollback => self.rollback_update().await,
             Action::StoragePaths => Ok(Reply::text(serde_json::to_string(&StoragePaths {
                 config: self.config_home.clone(),
                 state: self.home.clone(),
@@ -1604,16 +1619,21 @@ impl Manager {
                 let backup = backups.join(format!("{name}.toml.bak"));
                 atomic_write(&backup, original.as_bytes())?;
                 atomic_write(&i.config, text.as_bytes())?;
-                if self.running.contains_key(&name) {
+                let running = self.running.contains_key(&name);
+                if running {
                     if let Err(error) = self.reload(&name, &i.config).await {
                         atomic_write(&i.config, original.as_bytes())
                             .context("restore file after rejected reload")?;
                         return Err(error).context("hot reload rejected; original file restored");
                     }
                 }
-                Ok(Reply::text(
-                    "Validated and saved; hot applied when running; previous file in state directory backups/",
-                ))
+                Ok(Reply::text(if !running {
+                    "Validated and saved; instance stopped; configuration applies on next start. Previous file: state directory backups/"
+                } else if i.kind == Kind::Rule {
+                    "Validated and saved; rule source loaded. F6 shows synchronization for new connections. Previous file: state directory backups/"
+                } else {
+                    "Validated and saved; new connections use the reloaded configuration. Previous file: state directory backups/"
+                }))
             }
             Action::CloneConfig(name, destination) => {
                 let i = self.instance(&name)?;
@@ -2083,7 +2103,9 @@ mod tests {
                 .unwrap();
         });
         let source = temp.0.join("proxy.toml");
-        let text = format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[subscriptions.remote]\nurl='http://{address}/sub'\n");
+        // This fixture has no proxy nodes. Use DIRECT so the delayed server is
+        // reached and the assertions actually exercise an in-flight refresh.
+        let text = format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[subscriptions.remote]\nurl='http://{address}/sub'\nproxy='DIRECT'\n");
         fs::write(&source, &text).unwrap();
         let manager = tokio::spawn(serve(home, bin));
         for _ in 0..100 {

@@ -1,4 +1,4 @@
-use super::{mapping::Mappings, wire, Config, Upstream};
+use super::{mapping::Mappings, wire, Config, LocalMappingStore, MappingStore, Upstream};
 use anyhow::{bail, Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
@@ -34,14 +34,18 @@ pub struct Resolver {
     excluded: std::collections::HashSet<String>,
     reserved: std::collections::HashSet<IpAddr>,
     pub config: Config,
-    mappings: Arc<Mutex<Mappings>>,
+    mappings: Arc<dyn MappingStore>,
     cache: Mutex<HashMap<Vec<u8>, Cached>>,
     permits: Arc<Semaphore>,
     requests: Arc<Semaphore>,
 }
 impl Resolver {
     pub fn new(config: Config) -> Result<Self> {
+        Self::with_mapping_store(config, Arc::new(LocalMappingStore::default()))
+    }
+    pub fn with_mapping_store(config: Config, mappings: Arc<dyn MappingStore>) -> Result<Self> {
         config.validate()?;
+        mappings.configure(&config, &Default::default())?;
         let excluded = config
             .nameserver
             .iter()
@@ -59,18 +63,12 @@ impl Resolver {
             excluded,
             permits: Arc::new(Semaphore::new(config.max_concurrent)),
             config,
-            mappings: Arc::new(Mutex::new(Mappings::default())),
+            mappings,
             cache: Mutex::new(HashMap::new()),
         })
     }
     /// A reload keeps address ownership; changing fake ranges requires restart.
     pub fn inherit(&mut self, previous: &Self) -> Result<()> {
-        for ip in &self.reserved {
-            anyhow::ensure!(
-                !(previous.is_fake(*ip) && previous.restore(*ip).ok().flatten().is_some()),
-                "TUN address/subnet endpoint overlaps an active Fake IP mapping; restart proxy"
-            );
-        }
         if previous.config.enable && previous.config.fake_ip {
             anyhow::ensure!(
                 self.config.enable
@@ -80,11 +78,29 @@ impl Resolver {
                 "changing/disabling active Fake IP ranges requires a proxy restart"
             );
         }
-        self.mappings = previous.mappings.clone();
+        let mut reserved = previous.reserved.clone();
+        reserved.extend(&self.reserved);
+        previous.mappings.configure(&self.config, &reserved)?;
+        self.reserved = reserved;
+        self.set_mapping_store(previous.mappings.clone())
+    }
+    /// Install a host-backed store before this resolver is shared with request
+    /// handlers. Existing cached answers are discarded so observations cannot
+    /// bypass the newly installed backend.
+    pub fn set_mapping_store(&mut self, mappings: Arc<dyn MappingStore>) -> Result<()> {
+        mappings.configure(&self.config, &self.reserved)?;
+        self.mappings = mappings;
+        self.cache
+            .get_mut()
+            .map_err(|_| anyhow::anyhow!("DNS cache is unavailable"))?
+            .clear();
         Ok(())
     }
+    pub fn mapping_store(&self) -> Arc<dyn MappingStore> {
+        self.mappings.clone()
+    }
     pub fn restore(&self, ip: IpAddr) -> Result<Option<String>> {
-        self.mappings.lock().unwrap().reverse(&self.config, ip)
+        self.mappings.restore(&self.config, ip)
     }
     pub fn exclude_domain(&mut self, domain: &str) {
         self.excluded
@@ -92,6 +108,15 @@ impl Resolver {
     }
     pub fn reserve_address(&mut self, address: IpAddr) {
         self.reserved.insert(address);
+    }
+    /// Reserve immediately in a shared store. The legacy reserve_address
+    /// collects addresses validated by set_mapping_store/inherit/allocation.
+    pub fn try_reserve_address(&mut self, address: IpAddr) -> Result<()> {
+        let mut reserved = self.reserved.clone();
+        reserved.insert(address);
+        self.mappings.configure(&self.config, &reserved)?;
+        self.reserved = reserved;
+        Ok(())
     }
     pub fn is_fake(&self, ip: IpAddr) -> bool {
         self.config.fake_ip && Mappings::contains_fake(&self.config, ip)
@@ -120,7 +145,7 @@ impl Resolver {
             }
             if matches!(q.query_type(), RecordType::A | RecordType::AAAA) {
                 let mut reply = wire::response(&query, ResponseCode::NoError);
-                if let Some(ip) = self.mappings.lock().unwrap().allocate(
+                if let Some(ip) = self.mappings.allocate(
                     &self.config,
                     &domain,
                     q.query_type() == RecordType::AAAA,
@@ -278,7 +303,6 @@ impl Resolver {
             .map(|record| record.ttl)
             .min()
             .unwrap_or(0);
-        let mut mappings = self.mappings.lock().unwrap();
         for record in &message.answers {
             let ip = match record.data {
                 RData::A(A(ip)) => IpAddr::V4(ip),
@@ -286,10 +310,10 @@ impl Resolver {
                 _ => continue,
             };
             if names.contains(&record.name) {
-                mappings.observe(&self.config, &domain, ip, record.ttl.min(chain_ttl));
+                self.mappings
+                    .observe(&self.config, &domain, ip, record.ttl.min(chain_ttl))?;
             }
         }
-        drop(mappings);
         let ttl = if message.answers.is_empty()
             || message.metadata.response_code == ResponseCode::NXDomain
         {

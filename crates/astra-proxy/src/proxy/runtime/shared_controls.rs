@@ -12,6 +12,7 @@ pub(super) fn snapshot(current: &Current) -> Snapshot {
     snapshot.tun = app.config.tun.is_some();
     snapshot.allow_lan = app.lan_enabled();
     snapshot.groups = app.groups.snapshot(&app);
+    if let Some(host) = &app.hosted { host.merge_snapshot(&mut snapshot); }
     snapshot.truncated |= snapshot.groups.len() < app.config.proxy_groups.len()
         || snapshot
             .groups
@@ -37,6 +38,9 @@ impl State {
     }
 
     pub(super) async fn runtime_control(&mut self, command: Command) -> Result<Snapshot> {
+        if !matches!(command,Command::Snapshot | Command::Disconnect(_) | Command::TestGroup(_)) {
+            if let Some(host) = &self.hosted { anyhow::ensure!(!host.busy().await,"an update is prepared; retry changes after activation"); }
+        }
         let app = self.current.load_full();
         let previous = app.overrides.read().unwrap().clone();
         let mut next = previous.clone();
@@ -45,10 +49,12 @@ impl State {
         match command {
             Command::Snapshot => return Ok(self.runtime_snapshot()),
             Command::Disconnect(id) => {
+                if let Some(host) = &app.hosted { anyhow::ensure!(host.disconnect(id).await?,"connection no longer exists"); return Ok(self.runtime_snapshot()); }
                 anyhow::ensure!(app.metrics.disconnect(id), "connection no longer exists");
                 return Ok(self.runtime_snapshot());
             }
             Command::TestGroup(name) => {
+                if let Some(host) = &app.hosted { host.test_group(name).await?; return Ok(self.runtime_snapshot()); }
                 crate::proxy::groups::Groups::request_test(app, name)?;
                 return Ok(self.runtime_snapshot());
             }
@@ -115,7 +121,16 @@ impl State {
         let path = astra_ipc::storage::runtime_path(&self.path, "overrides")?;
         self.persist_overrides(&path, &next)?;
         app.groups
-            .commit_overrides(&app, next, disconnect.as_deref());
+            .commit_overrides(&app, next.clone(), disconnect.as_deref());
+        if candidate.is_none() {
+            if let Some(host) = &app.hosted {
+                if let Err(error) = host.overrides(next, disconnect.clone()).await {
+                    app.groups.commit_overrides(&app,previous.clone(),None);
+                    self.persist_overrides(&path,&previous)?;
+                    return Err(error);
+                }
+            }
+        }
         if let Some(candidate) = candidate {
             if let Err(error) = self.apply(self.path.clone(), candidate).await {
                 app.groups.commit_overrides(&app, previous.clone(), None);

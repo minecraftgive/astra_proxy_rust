@@ -252,11 +252,8 @@ const ADMIN_SIDS: &[&str] = &[
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
 
-/// A program UAC runs elevated must not be replaceable by the unelevated user
-/// (or anything running as them) while the prompt is open: the file, its
-/// folder (where a planted DLL would load first) and every folder above must
-/// be owned by an administrator principal and grant no one else rights that
-/// replace, rename or re-permission them. Returns the resolved path.
+/// Resolve the executable path and warn if non-administrators can modify it.
+/// Ownership and ACL findings are advisory and do not block TUN elevation.
 pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
     let path = std::fs::canonicalize(path)?;
     if !std::fs::metadata(&path)?.is_file() {
@@ -273,13 +270,11 @@ pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
             _ => control | DELETE | FILE_DELETE_CHILD,
         };
         if let Some(principal) = foreign_writer(item, dangerous)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} can be changed by {principal}; install the core in a folder only administrators can modify (for example under Program Files) before enabling TUN",
-                    item.display()
-                ),
-            ));
+            tracing::warn!(
+                "{} can be changed by {principal}; consider installing the core in a folder only administrators can modify (for example under Program Files); continuing TUN elevation",
+                item.display()
+            );
+            break;
         }
     }
     Ok(strip_verbatim(path))
@@ -472,6 +467,7 @@ pub fn core_arguments(
             .map(|pid| pid.to_string())
             .unwrap_or_default()
             .into(),
+        if std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some() { "1" } else { "0" }.into(),
     ])
 }
 /// Created here, unelevated, so the elevated core never creates folders on a
@@ -575,12 +571,13 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     if args.first().is_none_or(|arg| arg != "--windows-elevated") {
         return Ok(None);
     }
-    if args.len() != 10 || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
+    if !matches!(args.len(), 10 | 11) || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "TUN elevation requires the original Windows account and an elevated token",
         ));
     }
+    let hosted = hosted_argument(args.get(10))?;
     // This core is driven by its non-elevated launcher (manager/TUI).
     crate::platform::allow_unelevated_clients();
     std::env::set_current_dir(&args[6])?;
@@ -605,6 +602,11 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
         std::env::remove_var("ASTRA_CONTROL_SOCKET");
     }
     std::env::set_var("ASTRA_LOG_LEVEL", &args[4]);
+    if hosted {
+        std::env::set_var("ASTRA_HOSTED_EXPERIMENTAL", "1");
+    } else {
+        std::env::remove_var("ASTRA_HOSTED_EXPERIMENTAL");
+    }
     if !args[5].is_empty() {
         std::env::set_var("ASTRA_WINTUN_DLL", &args[5]);
     } else {
@@ -634,10 +636,27 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     Ok(Some(args[1].clone()))
 }
 
+fn hosted_argument(value: Option<&OsString>) -> io::Result<bool> {
+    match value.map(OsString::as_os_str) {
+        None => Ok(false),
+        Some(value) if value == "0" => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid resident-host elevation flag")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+
+    #[test]
+    fn resident_mode_is_explicit_and_legacy_elevation_defaults_off() {
+        assert!(!hosted_argument(None).unwrap());
+        assert!(!hosted_argument(Some(&OsString::from("0"))).unwrap());
+        assert!(hosted_argument(Some(&OsString::from("1"))).unwrap());
+        assert!(hosted_argument(Some(&OsString::from("unexpected"))).is_err());
+    }
 
     fn owned_process(command: &mut std::process::Command) -> (std::process::Child, ElevatedChild) {
         let child = command.spawn().unwrap();
@@ -755,10 +774,10 @@ mod tests {
         wait_for_exit(u32::MAX - 3).unwrap();
     }
     #[test]
-    fn user_writable_program_is_not_elevated() {
+    fn user_writable_program_is_allowed_with_warning() {
         let exe = std::env::temp_dir().join(format!("astra-elevation-{}.exe", std::process::id()));
         std::fs::write(&exe, b"").unwrap();
-        assert!(ensure_admin_controlled(&exe).is_err());
+        assert_eq!(ensure_admin_controlled(&exe).unwrap(), strip_verbatim(std::fs::canonicalize(&exe).unwrap()));
         std::fs::remove_file(exe).unwrap();
     }
     #[test]

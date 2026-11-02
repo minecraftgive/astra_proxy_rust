@@ -78,6 +78,8 @@ pub struct Snapshot {
     pub allow_lan: bool,
     pub upload: u64,
     pub download: u64,
+    pub proxy_upload: u64,
+    pub proxy_download: u64,
     pub active: usize,
     pub total: u64,
     pub truncated: bool,

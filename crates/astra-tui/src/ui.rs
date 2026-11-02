@@ -1,3 +1,16 @@
+#[path = "ui/animation.rs"]
+mod animation;
+#[path = "ui/commands.rs"]
+mod commands;
+#[path = "ui/drafts.rs"]
+mod drafts;
+#[path = "ui/event_loop.rs"]
+mod event_loop;
+#[path = "ui/focus.rs"]
+mod focus;
+pub(crate) fn wake() {
+    animation::wake();
+}
 #[path = "ui/shared_background.rs"]
 mod background;
 #[path = "ui/shared_dashboard.rs"]
@@ -10,6 +23,8 @@ mod live;
 mod pages;
 #[path = "ui/shared_shell.rs"]
 mod shell;
+#[path = "update.rs"]
+mod update;
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
@@ -63,6 +78,8 @@ enum Prompt {
     Shutdown,
     Discard,
     Import,
+    UpdatePackage,
+    UpdateConfirm(crate::protocol::updates::UpdateRequest),
     ImportNode(crate::import::MergeMode),
     ImportRule(crate::import::MergeMode),
     ExportConfig {
@@ -105,6 +122,7 @@ impl Prompt {
                 | Self::ImportConfirm { .. }
                 | Self::CloseAll { .. }
                 | Self::ElevateTun { .. }
+                | Self::UpdateConfirm(_)
         )
     }
     fn title(&self) -> &str {
@@ -118,6 +136,8 @@ impl Prompt {
             Self::Shutdown => t("Stop all instances?"),
             Self::Discard => t("Discard changes?"),
             Self::Import => t("Import config or proxy share links"),
+            Self::UpdatePackage => t("Local update package path (.zip, .tar.gz or directory)"),
+            Self::UpdateConfirm(_) => t("Apply this exact update target?"),
             Self::ImportNode(_) => t("Import node TOML or share link"),
             Self::ImportRule(_) => t("Import rules TOML"),
             Self::ExportConfig { .. } => t("Export configuration to path"),
@@ -199,6 +219,24 @@ struct Recovery {
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
+    #[serde(default)]
+    session_version: u32,
+    #[serde(default)]
+    keymap_version: u32,
+    #[serde(default)]
+    keymap_notice_pending: bool,
+    #[serde(default)]
+    drafts: HashMap<String, drafts::Draft>,
+    #[serde(default)]
+    active_profile: Option<String>,
+    #[serde(default)]
+    searches: HashMap<usize, String>,
+    #[serde(default)]
+    input_cursor: usize,
+    #[serde(default)]
+    motion: animation::MotionMode,
+    #[serde(default)]
+    vim_keys: bool,
     kind: Kind,
     selections: [usize; 2],
     editor: Option<Editor>,
@@ -220,6 +258,15 @@ fn launch_directory() -> PathBuf {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            session_version: 1,
+            keymap_version: drafts::KEYMAP_VERSION,
+            keymap_notice_pending: false,
+            drafts: HashMap::new(),
+            active_profile: None,
+            searches: HashMap::new(),
+            input_cursor: 0,
+            motion: Default::default(),
+            vim_keys: false,
             kind: Kind::Proxy,
             selections: [0; 2],
             editor: None,
@@ -249,8 +296,29 @@ impl Session {
             "Saved session exceeds 4 MiB"
         );
         let mut session: Self = serde_json::from_slice(&bytes)?;
+        session.session_version = session.session_version.max(1);
         if let Some(editor) = &mut session.editor {
             editor.normalize();
+        }
+        for draft in session.drafts.values_mut() {
+            draft.editor.normalize();
+        }
+        if session.keymap_version < drafts::KEYMAP_VERSION {
+            if let Some(editor) = &session.editor {
+                session.drafts.insert(
+                    format!("{}\n", editor.name),
+                    drafts::Draft {
+                        path: PathBuf::new(),
+                        kind: session.kind,
+                        editor: editor.clone(),
+                        conflict: false,
+                        observed_disk: None,
+                    },
+                );
+            }
+            session.input_cursor = session.input.chars().count();
+            session.keymap_version = drafts::KEYMAP_VERSION;
+            session.keymap_notice_pending = true;
         }
         Ok(session)
     }
@@ -263,14 +331,23 @@ impl Session {
 
 struct Ui {
     session: Session,
+    focus: focus::Focus,
+    animations: animation::Motion,
+    live_state: live::LiveState,
+    confirmation_accept: bool,
+    update_status: Option<crate::protocol::updates::UpdateStatus>,
+    update_view: Option<update::View>,
     page: usize,
     navigation_stack: Vec<usize>,
     palette: Option<shell::Palette>,
+    /// Reject late view-opening results after the user has switched overlays.
+    overlay_epoch: u64,
     runtime_snapshot: Option<astra_ipc::runtime::Snapshot>,
     runtime_instance: String,
     runtime_error: String,
     runtime_sample: Instant,
     rates: [u64; 2],
+    direct_rates: [u64; 2],
     history: [std::collections::VecDeque<u64>; 2],
     group_selection: usize,
     connection_selection: usize,
@@ -301,6 +378,7 @@ struct Ui {
     explanation: Option<crate::explanation::View>,
     vim_g: bool,
     help_scroll: Option<u16>,
+    help_override: Option<String>,
     operation_steps: Vec<String>,
     operation_result: Option<String>,
     tasks: background::Tasks,
@@ -360,7 +438,7 @@ impl Ui {
         };
         self.external_draft = Some(draft.clone());
         self.message = tr!(
-            "External draft: {} · F5 read again · Ctrl-S save",
+            "External draft: {} · F2 → Read external draft · Ctrl-S save",
             draft.path.display()
         );
         let directory = self
@@ -376,7 +454,7 @@ impl Ui {
         let draft = self
             .external_draft
             .clone()
-            .context(t("No external draft; press F4 to open an editor"))?;
+            .context(t("No external draft; use F2 → Open external editor"))?;
         let text = draft.read()?;
         let editor = self
             .editor
@@ -396,22 +474,32 @@ impl Ui {
         }
         self.external_draft.as_mut().unwrap().base = text;
         self.message = tr!(
-            "External draft: {} · F5 read again · Ctrl-S save",
+            "External draft: {} · F2 → Read external draft · Ctrl-S save",
             path.display()
         );
         Ok(())
     }
     fn new(session: Session) -> Self {
+        let animations = animation::Motion::new(session.motion);
+        let migration = session.keymap_notice_pending;
         Self {
             session,
+            focus: Default::default(),
+            animations,
+            live_state: Default::default(),
+            confirmation_accept: false,
+            update_status: None,
+            update_view: None,
             page: 0,
             navigation_stack: Vec::new(),
             palette: None,
+            overlay_epoch: 0,
             runtime_snapshot: None,
             runtime_instance: String::new(),
             runtime_error: String::new(),
             runtime_sample: Instant::now(),
             rates: [0, 0],
+            direct_rates: [0, 0],
             history: Default::default(),
             group_selection: 0,
             connection_selection: 0,
@@ -438,7 +526,8 @@ impl Ui {
             open_nettools: false,
             explanation: None,
             vim_g: false,
-            help_scroll: None,
+            help_scroll: migration.then_some(0),
+            help_override: migration.then(|| t("Keyboard layout updated\n\nTab / Shift-Tab now moves focus. Enter activates the focused item.\nSpace pauses connections and logs, or toggles a checkbox.\nF2 / Ctrl-K opens every command. Q, R and 0 no longer run destructive actions.\nEsc, page changes and quitting retain configuration drafts.\n\nF1 opens the complete key map. Enter / Esc dismisses this notice.").into()),
             operation_steps: Vec::new(),
             operation_result: None,
             tasks: Default::default(),
@@ -584,11 +673,10 @@ impl Ui {
                 }
             }
             Operation::Edit => {
-                if let Some(editor) = self.ready_editors.remove(&name) {
-                    self.editor = Some(editor);
-                    self.apply_pending_search();
-                    return Input::Idle;
-                }
+                self.suspend_editor();
+                // A cached editor's original is a baseline, not the current source file.
+                // Re-read through the manager so external changes and conflict metadata survive.
+                self.ready_editors.remove(&name);
                 Some(Action::Read(name))
             }
             Operation::Logs => return self.open_logs(name),
@@ -673,6 +761,15 @@ impl Ui {
         self.details_supported = details.is_ok();
         self.details = details.unwrap_or_default();
         self.rows = reply.rows;
+        if self.active_profile.is_none() {
+            self.active_profile = self
+                .rows
+                .iter()
+                .filter(|r| r.instance.kind == Kind::Proxy)
+                .nth(self.selections[0])
+                .or_else(|| self.rows.iter().find(|r| r.instance.kind == Kind::Proxy))
+                .map(|r| r.instance.name.clone());
+        }
         for (index, kind) in [Kind::Proxy, Kind::Rule].into_iter().enumerate() {
             let count = self
                 .rows
@@ -683,6 +780,7 @@ impl Ui {
         }
     }
     fn prompt(&mut self, prompt: Prompt) {
+        self.confirmation_accept = false;
         if matches!(
             prompt,
             Prompt::AddName
@@ -690,6 +788,7 @@ impl Ui {
                 | Prompt::Clone(_)
                 | Prompt::ImportNode(_)
                 | Prompt::ImportRule(_)
+                | Prompt::UpdatePackage
                 | Prompt::ExportConfig { .. }
                 | Prompt::ExportNode { .. }
                 | Prompt::ExportRule { .. }
@@ -725,29 +824,44 @@ impl Ui {
             | Prompt::ExportNode { .. }
             | Prompt::ExportRule { .. }
             | Prompt::ExportTerminal { .. } => String::new(),
-            Prompt::Find(_) => self.last_find.clone(),
+            Prompt::Find(page) => self.searches.get(page).cloned().unwrap_or_default(),
             _ => String::new(),
         };
         self.prefilled_input = !self.input.is_empty();
+        self.input_cursor = self.input.chars().count();
         self.prompt = Some(prompt);
     }
     fn paste_prompt(&mut self, text: &str) {
         if self.prefilled_input {
             self.input.clear();
+            self.input_cursor = 0;
             self.prefilled_input = false;
         }
         let links =
             matches!(self.prompt, Some(Prompt::Import)) && astra_convert::share::is_share(text);
-        self.input.extend(
-            text.chars()
-                .filter(|character| !character.is_control() || (links && *character == '\n')),
-        );
+        let inserted: String = text
+            .chars()
+            .filter(|character| !character.is_control() || (links && *character == '\n'))
+            .collect();
+        let byte = self.prompt_byte();
+        self.input.insert_str(byte, &inserted);
+        self.input_cursor += inserted.chars().count();
+    }
+    fn prompt_byte(&self) -> usize {
+        self.input
+            .char_indices()
+            .nth(self.input_cursor)
+            .map_or(self.input.len(), |(index, _)| index)
     }
     fn paste(&mut self, text: &str) {
         if self.background_paste(text) {
             return;
         }
         if self.help_scroll.is_some() {
+            return;
+        }
+        if let Some(palette) = &mut self.palette {
+            palette.insert(text);
             return;
         }
         if self.recovery.is_some()
@@ -783,6 +897,7 @@ impl Ui {
         self.scroll = 0;
     }
     fn checkpoint(&mut self, path: &std::path::Path) -> bool {
+        self.remember_draft();
         if let Some(viewer) = &self.viewer {
             let name = viewer.name.clone();
             let settings = viewer.settings.clone();
@@ -840,6 +955,8 @@ impl Ui {
                     Resume::Prompt(prompt, input) => {
                         self.prompt = Some(prompt);
                         self.input = input;
+                        self.input_cursor = self.input.chars().count();
+                        self.confirmation_accept = false;
                     }
                     Resume::Request(Action::Save { .. }) if self.editor.is_some() => {
                         self.message =
@@ -866,6 +983,8 @@ impl Ui {
     }
     fn submit(&mut self, prompt: Prompt, input: String) -> Result<Option<Action>> {
         Ok(match prompt {
+            Prompt::UpdatePackage => Some(update::package_action(&input, &self.working_dir)?),
+            Prompt::UpdateConfirm(request) => Some(Action::UpdateTransaction { request }),
             Prompt::AddName => {
                 anyhow::ensure!(
                     !input.is_empty()
@@ -906,12 +1025,13 @@ impl Ui {
 
             Prompt::Shutdown if input == "yes" => Some(Action::Shutdown),
             Prompt::Discard if input == "yes" => {
-                self.editor = None;
+                self.discard_current_draft();
                 None
             }
             Prompt::Find(page) => {
                 if !input.is_empty() {
                     self.last_find = input.clone();
+                    self.searches.insert(page, input.clone());
                     if !self.find(page, &input) {
                         self.message = tr!("No match for \"{}\"", input);
                     }
@@ -978,7 +1098,7 @@ impl Ui {
                         notices.push(t("Unsaved draft will be replaced").into());
                     }
                     notices.extend(imported.warnings.iter().map(|s| t(s).to_owned()));
-                    self.prompt = Some(Prompt::ImportConfirm {
+                    self.prompt(Prompt::ImportConfirm {
                         text: imported.text,
                         notices: notices.join("\n\n"),
                     });
@@ -1000,20 +1120,89 @@ impl Ui {
             _ => None,
         })
     }
-    fn key(&mut self, key: event::KeyEvent) -> Input {
+    fn key(&mut self, mut key: event::KeyEvent) -> Input {
+        if key.kind == KeyEventKind::Release {
+            return Input::Idle;
+        }
+        if key.kind == KeyEventKind::Repeat {
+            let navigation = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            );
+            let text = self.repeat_text_input_active()
+                && matches!(
+                    key.code,
+                    KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                )
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            if !navigation && !text && !commands::repeatable(key) {
+                return Input::Idle;
+            }
+        }
+        if self.keymap_notice_pending
+            && matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::F(1))
+        {
+            self.keymap_notice_pending = false;
+            self.help_override = None;
+            self.help_scroll = if key.code == KeyCode::F(1) {
+                Some(0)
+            } else {
+                None
+            };
+            return Input::Idle;
+        }
+        // Window shortcuts are global, including when task/log overlays own input.
         if let Some(input) = self.window_key(key) {
             return input;
         }
-        if let Some(input) = self.background_key(key) {
+        if let Some(input) = self.command_key(key) {
             return input;
         }
+        if self.tasks.showing_details() || self.tui_viewer.is_some() {
+            if let Some(input) = self.background_key(key) {
+                return input;
+            }
+        }
+        // Editable palette text must never pass through underlying editor aliases.
         if self.palette.is_some() {
             return self.palette_key(key);
+        }
+        if let Some(input) = self.focus_key(key) {
+            return input;
+        }
+        if !self.text_input_active()
+            && !self.vim_keys
+            && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'l' | 'g' | 'G'))
+        {
+            return Input::Idle;
+        }
+        if self.editor.as_ref().is_some_and(Editor::browsing)
+            || (self.page == PROFILES && self.prompt.is_none() && self.menu.is_none())
+        {
+            if key.code == KeyCode::Insert {
+                key.code = KeyCode::Char('n');
+            }
+            if key.code == KeyCode::Delete {
+                key.code = KeyCode::Char('d');
+            }
+        }
+        if let Some(input) = self.background_key(key) {
+            return input;
         }
         // Dialogs and local input modes consume Escape before page history.
         if key.code == KeyCode::Esc
             && self.can_switch_page()
             && !self.connection_filtering
+            && self.runtime_picker.is_none()
+            && !self.live_detail_open()
+            && self.editor.is_none()
             && !(self.page == shell::CONNECTIONS && !self.connection_filter.is_empty())
         {
             return self.navigate_back();
@@ -1147,8 +1336,12 @@ impl Ui {
         }
         if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('n') => self.prompt = None,
-                KeyCode::Enter | KeyCode::Char('y') => {
+                KeyCode::Esc => self.prompt = None,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                    self.confirmation_accept = !self.confirmation_accept
+                }
+                KeyCode::Enter if !self.confirmation_accept => self.prompt = None,
+                KeyCode::Enter => {
                     let prompt = self.prompt.take().unwrap();
                     match self.submit(prompt.clone(), "yes".into()) {
                         Ok(Some(action)) => {
@@ -1170,28 +1363,59 @@ impl Ui {
             match key.code {
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.input.clear();
+                    self.input_cursor = 0;
                     self.prefilled_input = false;
                 }
                 KeyCode::Esc => {
                     if let Some(Prompt::AddPath(name)) = self.prompt.take() {
                         self.prompt = Some(Prompt::AddName);
                         self.input = name;
+                        self.input_cursor = self.input.chars().count();
                     }
                 }
-                KeyCode::Backspace => {
-                    if self.prefilled_input {
-                        self.input.clear();
-                        self.prefilled_input = false;
-                    } else {
-                        self.input.pop();
-                    }
+                KeyCode::Left => {
+                    self.prefilled_input = false;
+                    self.input_cursor = self.input_cursor.saturating_sub(1);
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Right => {
+                    self.prefilled_input = false;
+                    self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count());
+                }
+                KeyCode::Home => {
+                    self.prefilled_input = false;
+                    self.input_cursor = 0;
+                }
+                KeyCode::End => {
+                    self.prefilled_input = false;
+                    self.input_cursor = self.input.chars().count();
+                }
+                KeyCode::Backspace | KeyCode::Delete if self.prefilled_input => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.prefilled_input = false;
+                }
+                KeyCode::Backspace if self.input_cursor > 0 => {
+                    self.input_cursor -= 1;
+                    let byte = self.prompt_byte();
+                    self.input.remove(byte);
+                }
+                KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
+                    let byte = self.prompt_byte();
+                    self.input.remove(byte);
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     if self.prefilled_input {
                         self.input.clear();
+                        self.input_cursor = 0;
                         self.prefilled_input = false;
                     }
-                    self.input.push(c)
+                    let byte = self.prompt_byte();
+                    self.input.insert(byte, c);
+                    self.input_cursor += 1;
                 }
                 KeyCode::Enter => {
                     let prompt = self.prompt.take().unwrap();
@@ -1224,15 +1448,6 @@ impl Ui {
                     self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
                 } else {
                     return Input::Run(Action::UpdateSubscriptions(editor.name.clone()), None);
-                }
-            } else if key.code == KeyCode::F(4) {
-                return Input::ExternalEditor;
-            } else if key.code == KeyCode::F(5) {
-                if !editor.browsing() {
-                    self.message =
-                        "Confirm or cancel the field before reading external changes".into();
-                } else if let Err(error) = self.read_external() {
-                    self.fail(format!("{error:#}"), Resume::Editor);
                 }
             } else if key.code == KeyCode::Char('o')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1303,11 +1518,7 @@ impl Ui {
                     self.fail(format!("{error:#}"), Resume::Editor);
                 }
             } else if key.code == KeyCode::Esc && editor.can_close() {
-                if editor.text() != editor.original {
-                    self.prompt(Prompt::Discard);
-                } else {
-                    self.editor = None;
-                }
+                self.suspend_editor();
             } else if let Err(error) = editor.key(key) {
                 self.fail(format!("{error:#}"), Resume::Editor);
             }
@@ -1342,7 +1553,6 @@ impl Ui {
             self.vim_g = false;
             match key.code {
                 KeyCode::Char('q') => return Input::Quit,
-                KeyCode::Char('Q') => self.prompt(Prompt::Shutdown),
                 KeyCode::Tab => {
                     self.switch_core(if self.kind == Kind::Proxy {
                         Kind::Rule
@@ -1385,14 +1595,13 @@ impl Ui {
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    // Same verbs as every other page: c/Space connect, r apply, R restart.
+                    // Activation is explicit; Space is reserved for local selection/pause.
                     let operation = match c {
-                        'c' | ' ' if running => Operation::Stop,
-                        'c' | ' ' => Operation::Start,
+                        'c' if running => Operation::Stop,
+                        'c' => Operation::Start,
                         's' => Operation::Start,
                         'x' => Operation::Stop,
                         'r' => Operation::Reload,
-                        'R' => Operation::Restart,
                         'e' => Operation::Edit,
                         'L' => Operation::Logs,
                         't' => {
@@ -1457,6 +1666,57 @@ impl Ui {
         mut origin: Option<(Prompt, String)>,
         mut terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>,
     ) -> bool {
+        if matches!(
+            &action,
+            Action::UpdateStatus
+                | Action::UpdateOperationStatus { .. }
+                | Action::UpdateTransaction { .. }
+                | Action::RecoverUpdate { .. }
+        ) {
+            self.progress(action_description(&action), &mut terminal);
+            match call(socket, action.clone())
+                .await
+                .and_then(|reply| update::View::decode(&reply.text))
+            {
+                Ok(view) => {
+                    let status = view.status.clone();
+                    self.operation_failed = status
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.error.is_some());
+                    self.message = status
+                        .operation
+                        .as_ref()
+                        .map(|operation| operation.phase.label().to_owned())
+                        .unwrap_or_else(|| t("Update status received").into());
+                    self.update_view = Some(view);
+                    self.update_status = Some(status);
+                }
+                Err(error) => {
+                    self.operation_failed = true;
+                    // A transport failure may follow an acknowledged commit. Never replay the transaction.
+                    self.message = format!(
+                        "{error:#} · {}",
+                        t("Read update status, then recover the existing operation")
+                    );
+                    let operation_id = match &action {
+                        Action::UpdateTransaction { request } => Some(request.operation_id.clone()),
+                        Action::RecoverUpdate { operation_id }
+                        | Action::UpdateOperationStatus { operation_id } => {
+                            Some(operation_id.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(operation_id) = operation_id {
+                        self.fail(
+                            self.message.clone(),
+                            Resume::Request(Action::UpdateOperationStatus { operation_id }),
+                        );
+                    }
+                }
+            }
+            return false;
+        }
         if let Action::Runtime { name, command, .. } = &action {
             self.progress(t("Applying runtime change").into(), &mut terminal);
             match call(socket, action.clone()).await.and_then(|reply| {
@@ -1518,6 +1778,8 @@ impl Ui {
             {
                 let settings = self.log_settings.get(name).cloned().unwrap_or_default();
                 self.viewer = Some(logs::Viewer::new(name.clone(), settings));
+                let enabled = self.vim_keys;
+                self.viewer.as_mut().unwrap().set_vim_navigation(enabled);
             }
             let result = async {
                 let level = call(socket, Action::GetLogLevel(name.clone()))
@@ -1540,8 +1802,7 @@ impl Ui {
                 self.progress(t("Checking saved configuration").to_owned(), &mut terminal);
                 match call(socket, Action::PrepareConfig(name.clone())).await {
                     Ok(reply) if !reply.text.is_empty() => {
-                        self.editor =
-                            Some(Editor::new(name.clone(), reply.text).with_kind(self.kind));
+                        self.open_draft(name.clone(), reply.text);
                         self.message = "Review configuration · Ctrl-S save".into();
                         self.refresh_node_tags(socket).await;
                         return false;
@@ -1564,10 +1825,23 @@ impl Ui {
             let reply = match call(socket, action.clone()).await {
                 Ok(reply) => reply,
                 Err(error) => {
+                    let mut message = format!("{error:#}");
+                    if let Action::Save { name, .. } = &action {
+                        if message.contains("File changed on disk")
+                            || message.contains("File changed during validation")
+                        {
+                            // Observe the conflicting version once. This is a read, never a write retry;
+                            // open_draft preserves both the original baseline and the unsaved form.
+                            if let Ok(reply) = call(socket, Action::Read(name.clone())).await {
+                                self.open_draft(name.clone(), reply.text);
+                                message.push_str("\nDraft retained. Cancel this error, then F2 → Compare draft with observed disk.");
+                            }
+                        }
+                    }
                     let resume = origin
                         .map(|(p, text)| Resume::Prompt(p, text))
                         .unwrap_or(Resume::Request(action));
-                    self.fail(format!("{error:#}"), resume);
+                    self.fail(message, resume);
                     return false;
                 }
             };
@@ -1592,8 +1866,7 @@ impl Ui {
                     origin = None;
                 }
                 Action::Read(name) => {
-                    self.editor = Some(Editor::new(name, reply.text).with_kind(self.kind));
-                    self.message.clear();
+                    self.open_draft(name, reply.text);
                     self.refresh_node_tags(socket).await;
                     return false;
                 }
@@ -1720,7 +1993,10 @@ impl Ui {
         }
     }
     fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        terminal.draw(|frame| self.render(frame))?;
+        terminal.draw(|frame| {
+            self.render(frame);
+            self.animations.finish_frame(frame);
+        })?;
         Ok(())
     }
     /// Details of the selected instance: labels muted, state in its status color.
@@ -1819,8 +2095,9 @@ impl Ui {
         self.hits.borrow_mut().clear();
         if let Some(view) = &self.diagnostics {
             view.render(f, f.area());
+            self.render_palette(f);
             if let Some(scroll) = self.help_scroll {
-                let text = crate::help::text(self.help_page());
+                let text = self.command_help();
                 f.render_widget(
                     Paragraph::new(text)
                         .scroll((scroll, 0))
@@ -1860,7 +2137,10 @@ impl Ui {
                 chunks[0],
             );
         } else if let Some(editor) = &self.editor {
+            let before = f.buffer_mut().clone();
             editor.render(f, chunks[0]);
+            self.animations
+                .surface(f, animation::Kind::Accordion, chunks[0], &before);
         } else if self.page == LOGS {
             self.render_logs_page(f, chunks[0]);
         } else if let Some(viewer) = &self.viewer {
@@ -1876,9 +2156,30 @@ impl Ui {
         }
         let detail: Text = if let Some(prompt) = &self.prompt {
             if prompt.confirmation() {
-                prompt.title().to_owned().into()
+                format!(
+                    "{}\n{}   {} · Tab / ←→ select · Enter apply · Esc cancel",
+                    prompt.title(),
+                    if self.confirmation_accept {
+                        "  Cancel  "
+                    } else {
+                        "[ Cancel ]"
+                    },
+                    if self.confirmation_accept {
+                        "[ Confirm ]"
+                    } else {
+                        "  Confirm  "
+                    }
+                )
+                .into()
             } else {
-                format!("{}\n> {}▏", prompt.title(), self.input).into()
+                let byte = self.prompt_byte();
+                format!(
+                    "{}\n> {}▏{}",
+                    prompt.title(),
+                    &self.input[..byte],
+                    &self.input[byte..]
+                )
+                .into()
             }
         } else if list_page {
             self.selection_status()
@@ -1906,8 +2207,47 @@ impl Ui {
                         Block::default()
                             .borders(Borders::ALL)
                             .title(t("Replace editor draft?"))
-                            .title_bottom(t("Enter confirm · Esc cancel · ↑↓ scroll")),
+                            .title_bottom(if self.confirmation_accept {
+                                t("Cancel   [Confirm] · Tab select · Enter apply · Esc cancel")
+                            } else {
+                                t("[Cancel]   Confirm · Tab select · Enter apply · Esc cancel")
+                            }),
                     ),
+                popup,
+            );
+        }
+        if let Some(Prompt::UpdateConfirm(request)) = &self.prompt {
+            let target = match &request.intent {
+                crate::protocol::updates::UpdateIntent::Stage { package } => {
+                    package.display().to_string()
+                }
+                crate::protocol::updates::UpdateIntent::Activate { release_id } => {
+                    release_id.clone()
+                }
+                crate::protocol::updates::UpdateIntent::Rollback { target_directory } => {
+                    target_directory.display().to_string()
+                }
+            };
+            let text = format!(
+                "{}\n\n{}\n\n{}: {}",
+                t("Apply this exact update target?"),
+                target,
+                t("Operation"),
+                request.operation_id
+            );
+            let popup = crate::help::popup(f.area(), &text);
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(t("Confirm update"))
+                        .title_bottom(if self.confirmation_accept {
+                            t("Cancel   [Confirm] · Tab select · Enter apply · Esc cancel")
+                        } else {
+                            t("[Cancel]   Confirm · Tab select · Enter apply · Esc cancel")
+                        }),
+                ),
                 popup,
             );
         }
@@ -1995,7 +2335,7 @@ impl Ui {
         }
         self.render_palette(f);
         if let Some(scroll) = self.help_scroll {
-            let text = crate::help::text(self.help_page());
+            let text = self.command_help();
             let popup = crate::help::popup(f.area(), &text);
             f.render_widget(Clear, popup);
             f.render_widget(
@@ -2038,6 +2378,9 @@ pub(crate) fn action_description(action: &Action) -> String {
         Action::Read(name) => ("Edit", name.as_str()),
         Action::Save { name, .. } => ("Save", name.as_str()),
         Action::UpdateSubscriptions(name) => ("Update subscriptions", name.as_str()),
+        Action::UpdatePackage(_) => ("Import local update package", ""),
+        Action::UpdateStatus => ("Update status", ""),
+        Action::Rollback => ("Roll back release", ""),
         Action::BindStart { name, .. } => ("Startup bindings", name.as_str()),
         Action::Remove(name) => ("Remove", name.as_str()),
         Action::SetConfig(name, _) => ("Config path", name.as_str()),
@@ -2073,190 +2416,9 @@ pub async fn run(
     launch: crate::windows::Launch,
 ) -> Result<()> {
     tokio::task::LocalSet::new()
-        .run_until(run_local(socket, context, launch))
+        .run_until(event_loop::run_local(socket, context, launch))
         .await
 }
-async fn run_local(
-    socket: PathBuf,
-    context: crate::windows::Context,
-    launch: crate::windows::Launch,
-) -> Result<()> {
-    let session_path =
-        launch.session_path(socket.parent().context("Manager socket has no directory")?)?;
-    let mut ui = match Session::load(&session_path) {
-        Ok(session) => Ui::new(session),
-        Err(error) => {
-            let mut ui = Ui::new(Session::default());
-            ui.fail(
-                tr!("Cannot restore session: {}", format!("{error:#}")),
-                Resume::Session,
-            );
-            ui
-        }
-    };
-    if let Some(view) = launch.view {
-        if let Some(page) = view.page() {
-            ui.page = page;
-        }
-    }
-    if let Some(kind) = launch.kind {
-        ui.kind = kind;
-    }
-    let mut initial = Some(launch);
-    let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
-    enable_raw_mode()?;
-    let _screen = Screen;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut jobs = background::Jobs::new(&socket);
-    let mut feeds = background::Feeds::new(&socket);
-    if let Some(name) = ui.active_log.clone() {
-        jobs.start(&mut ui, Action::Logs(name), None);
-    }
-    let mut refreshed = Instant::now() - crate::UI_REFRESH_INTERVAL;
-    let mut redraw = true;
-    loop {
-        tokio::task::yield_now().await;
-        if refreshed.elapsed() >= crate::UI_REFRESH_INTERVAL {
-            feeds.poll(&mut ui).await;
-            if feeds.ready {
-                if let Some(launch) = initial.take() {
-                    if let Some(action) = ui.apply_launch(&launch) {
-                        jobs.start(&mut ui, action, None);
-                    }
-                }
-            }
-            let mut index = 0;
-            while index < opening.len() {
-                if opening[index].is_finished() {
-                    ui.message = match opening.remove(index).await {
-                        Ok(Ok(())) => t("Opened in a new window").into(),
-                        Ok(Err(error)) => format!("{}: {error:#}", t("Cannot open a new window")),
-                        Err(error) => error.to_string(),
-                    };
-                    ui.tasks.notice_message(&ui.message);
-                } else {
-                    index += 1;
-                }
-            }
-            let quit = jobs.poll(&mut ui).await;
-            if jobs.take_changed() || quit {
-                let remembered = ui.checkpoint(&session_path);
-                if quit && remembered {
-                    break;
-                }
-            }
-            if let Some(view) = &mut ui.diagnostics {
-                view.poll();
-            }
-            if let Some(viewer) = &mut ui.viewer {
-                viewer.poll();
-            }
-            if let Some(viewer) = &mut ui.tui_viewer {
-                viewer.poll();
-            }
-            // Start the next period after processing; do not catch up missed ticks.
-            refreshed = Instant::now();
-            redraw = true;
-        }
-        if redraw {
-            ui.draw(&mut terminal)?;
-            redraw = false;
-        }
-        if !event::poll(Duration::from_millis(35))? {
-            continue;
-        }
-        redraw = true;
-        let input = match event::read()? {
-            Event::Paste(text) if ui.recovery.is_none() => {
-                ui.paste(&text);
-                Input::Idle
-            }
-            Event::Key(key) if key.kind != KeyEventKind::Release => ui.key(key),
-            Event::Mouse(mouse) => ui.mouse(mouse),
-            _ => Input::Idle,
-        };
-        let quit = match input {
-            Input::Quit => true,
-            Input::Run(action, origin) => {
-                if let Action::PrepareElevation { name, expected_pid } = action {
-                    // sudo needs the real terminal, so this step cannot run as a
-                    // background job; the wait for the new core can.
-                    elevate(
-                        &mut ui,
-                        &mut jobs,
-                        &socket,
-                        name,
-                        expected_pid,
-                        &mut terminal,
-                    )
-                    .await;
-                } else {
-                    jobs.start(&mut ui, action, origin);
-                }
-                false
-            }
-            Input::Idle => false,
-            Input::OpenWindow(launch) => {
-                if opening.len() < 4 {
-                    let context = context.clone();
-                    opening.push(tokio::task::spawn_blocking(move || context.open(&launch)));
-                }
-                false
-            }
-            Input::ExternalEditor => {
-                let result = (|| -> Result<()> {
-                    let command = crate::external_editor::command()?;
-                    let (draft, directory) = ui.prepare_external(
-                        socket.parent().context("Manager socket has no directory")?,
-                    )?;
-                    anyhow::ensure!(
-                        ui.checkpoint(&session_path),
-                        t("Cannot open editor until the draft is checkpointed")
-                    );
-                    let launched = (|| -> Result<()> {
-                        disable_raw_mode()?;
-                        execute!(
-                            io::stdout(),
-                            DisableBracketedPaste,
-                            DisableMouseCapture,
-                            crossterm::cursor::Show,
-                            LeaveAlternateScreen
-                        )?;
-                        crate::external_editor::launch(&command, &draft, &directory)
-                    })();
-                    // Always restore the TUI, including when the executable cannot start.
-                    enable_raw_mode()?;
-                    execute!(
-                        io::stdout(),
-                        EnterAlternateScreen,
-                        EnableBracketedPaste,
-                        EnableMouseCapture
-                    )?;
-                    terminal.clear()?;
-                    launched?;
-                    ui.read_external()
-                })();
-                if let Err(error) = result {
-                    ui.fail(format!("{error:#}"), Resume::Editor);
-                }
-                false
-            }
-        };
-        let remembered = ui.checkpoint(&session_path);
-        // A failed checkpoint is recoverable too: show c/b instead of dropping the draft.
-        if quit && remembered {
-            break;
-        }
-    }
-    Ok(())
-}
-
 /// Ctrl-C is normally a raw-mode key event, but sudo needs a real terminal.
 /// Ignore the signal in this process while sudo runs so it reaches sudo only.
 #[cfg(unix)]
@@ -2474,7 +2636,7 @@ mod tests {
         let selected = ui.selections;
         assert!(matches!(ui.key(key('?')), Input::Idle));
         assert_eq!(ui.help_scroll, Some(0));
-        assert!(matches!(ui.key(key('j')), Input::Idle));
+        assert!(matches!(press(&mut ui, KeyCode::Down), Input::Idle));
         assert_eq!(ui.help_scroll, Some(1));
         assert_eq!(ui.selections, selected);
         ui.key(key('?'));
@@ -2504,6 +2666,7 @@ mod tests {
     #[test]
     fn vim_list_navigation_and_log_shortcut_leave_prompt_text_intact() {
         let mut ui = sample_ui(false);
+        ui.vim_keys = true;
         let mut second = ui.rows[0].clone();
         second.instance.name = "second".into();
         ui.rows.insert(1, second);
@@ -2872,6 +3035,7 @@ mod tests {
             restored.prompt,
             Some(Prompt::ImportConfirm { .. })
         ));
+        press(&mut restored, KeyCode::Tab);
         press(&mut restored, KeyCode::Enter);
         assert!(restored.prompt.is_none());
         assert!(restored.editor.as_ref().unwrap().text().contains("9876"));
@@ -2916,6 +3080,7 @@ mod tests {
                 }
             });
         }
+        press(&mut ui, KeyCode::Tab);
         press(&mut ui, KeyCode::Enter);
         assert_eq!(ui.editor.as_ref().unwrap().original, "standalone=true\n");
         assert!(ui.editor.as_ref().unwrap().text().contains("1088"));
@@ -2967,6 +3132,11 @@ mod tests {
                 .clone();
             ui.paste(path.to_str().unwrap());
             assert!(matches!(ui.prompt, Some(Prompt::ImportConfirm { .. })));
+            assert!(
+                !ui.confirmation_accept,
+                "each import starts with Cancel selected"
+            );
+            press(&mut ui, KeyCode::Tab);
             press(&mut ui, KeyCode::Enter);
             assert_eq!(std::fs::read_to_string(&bound).unwrap(), original);
             let Input::Run(action, _) = ui.key(event::KeyEvent::new(
@@ -3020,10 +3190,11 @@ mod tests {
             operation,
             Operation::Stop | Operation::Restart | Operation::Reload
         )));
-        // r applies (hot reload) and needs a running core; R restarts or starts.
+        // Restart is available through the command palette, never a capital-letter default.
         assert!(matches!(ui.key(key('r')), Input::Idle));
+        assert!(matches!(ui.key(key('R')), Input::Idle));
         assert!(
-            matches!(ui.key(key('R')), Input::Run(Action::Start(name), None) if name == "proxy")
+            matches!(ui.operation(Operation::Restart), Input::Run(Action::Start(name), None) if name == "proxy")
         );
         assert!(
             matches!(ui.key(key('c')), Input::Run(Action::Start(name), None) if name == "proxy")
@@ -3094,17 +3265,32 @@ mod tests {
         );
     }
     #[test]
-    fn confirmations_use_enter_and_escape_without_a_typed_phrase() {
+    fn confirmations_default_to_cancel_and_require_fresh_explicit_selection() {
         let mut ui = sample_ui(false);
         ui.key(key('d'));
+        assert!(matches!(press(&mut ui, KeyCode::Enter), Input::Idle));
+        assert!(ui.prompt.is_none());
+        ui.key(key('d'));
+        press(&mut ui, KeyCode::Tab);
+        let mut repeated = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        repeated.kind = KeyEventKind::Repeat;
+        assert!(matches!(ui.key(repeated), Input::Idle));
+        assert!(ui.prompt.is_some());
         assert!(
             matches!(press(&mut ui, KeyCode::Enter), Input::Run(Action::Remove(name), _) if name == "proxy")
         );
         ui.key(key('Q'));
+        assert!(ui.prompt.is_none());
+        ui.run_command(commands::Id::Shutdown);
         press(&mut ui, KeyCode::Esc);
         assert!(ui.prompt.is_none());
-        ui.key(key('Q'));
-        assert!(matches!(ui.key(key('y')), Input::Run(Action::Shutdown, _)));
+        ui.run_command(commands::Id::Shutdown);
+        assert!(matches!(ui.key(key('y')), Input::Idle));
+        press(&mut ui, KeyCode::Right);
+        assert!(matches!(
+            press(&mut ui, KeyCode::Enter),
+            Input::Run(Action::Shutdown, _)
+        ));
     }
     #[test]
     fn configuration_paths_are_prefilled_and_paste_replaces_the_default() {
@@ -3211,6 +3397,81 @@ mod tests {
         assert_eq!(ui.kind, Kind::Rule);
         assert!(ui.recovery.is_none());
     }
+    #[tokio::test]
+    async fn save_conflicts_read_disk_once_and_keep_original_and_draft() {
+        for (index, error) in [
+            "File changed on disk; reopen before editing",
+            "File changed during validation; reopen before editing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = crate::import::tests::Fixture::new();
+            let socket = fixture.0.join(format!("conflict-{index}.sock"));
+            let listener = astra_ipc::platform::LocalListener::bind(&socket).unwrap();
+            let disk = "standalone=true\n# external edit\n";
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let hello: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
+                assert!(matches!(hello.action, Action::Session));
+                astra_ipc::send_management(
+                    &mut stream,
+                    &astra_ipc::session::Event::<Reply>::Ready(astra_ipc::API_VERSION),
+                )
+                .await
+                .unwrap();
+                let request: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
+                assert!(matches!(request.action, Action::Save { .. }));
+                let mut reply = Reply::text("");
+                reply.error = Some(error.into());
+                astra_ipc::send_management(&mut stream, &astra_ipc::session::Event::Reply(reply))
+                    .await
+                    .unwrap();
+                let request: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
+                assert!(matches!(request.action,Action::Read(name) if name=="proxy"));
+                astra_ipc::send_management(
+                    &mut stream,
+                    &astra_ipc::session::Event::Reply(Reply::text(disk)),
+                )
+                .await
+                .unwrap();
+            });
+            let original = "standalone=true\n";
+            let changed = "standalone=false\n";
+            let mut ui = Ui::new(Session::default());
+            ui.editor = Some(Editor::new("proxy".into(), original.into()).with_kind(Kind::Proxy));
+            ui.editor.as_mut().unwrap().import(changed.into()).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                ui.execute(
+                    &socket,
+                    Action::Save {
+                        name: "proxy".into(),
+                        original: original.into(),
+                        text: changed.into(),
+                    },
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(ui.editor.as_ref().unwrap().text(), changed);
+            assert_eq!(ui.editor.as_ref().unwrap().original, original);
+            assert!(ui.recovery.as_ref().unwrap().message.contains(error));
+            let observed = ui.drafts.values().next().unwrap();
+            assert!(observed.conflict);
+            assert_eq!(observed.observed_disk.as_deref(), Some(disk));
+            ui.recover_key(KeyCode::Esc);
+            ui.compare_draft();
+            assert!(ui
+                .help_override
+                .as_ref()
+                .unwrap()
+                .contains("- # external edit"));
+            astra_ipc::platform::remove_socket(&socket);
+        }
+    }
     #[test]
     fn retry_save_preserves_form_draft_and_b_ends_only_operation() {
         let mut ui = Ui::new(Session::default());
@@ -3304,7 +3565,7 @@ default_action = "direct"
         let original = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n";
         ui.editor = Some(Editor::new("proxy".into(), original.into()));
         assert!(matches!(
-            press(&mut ui, KeyCode::F(4)),
+            ui.run_command(commands::Id::ExternalEditor),
             Input::ExternalEditor
         ));
         let (draft, _) = ui.prepare_external(&home).unwrap();
@@ -3312,7 +3573,7 @@ default_action = "direct"
         std::fs::write(&draft.path, &changed).unwrap();
         let session = serde_json::to_string(&ui.session).unwrap();
         let mut ui = Ui::new(serde_json::from_str(&session).unwrap());
-        press(&mut ui, KeyCode::F(5));
+        ui.run_command(commands::Id::ReadExternal);
         assert_eq!(ui.editor.as_ref().unwrap().text(), changed);
         assert_eq!(ui.editor.as_ref().unwrap().original, original);
         assert!(
@@ -3384,6 +3645,7 @@ default_action = "direct"
             log_settings: HashMap::new(),
             active_log: None,
             external_draft: None,
+            ..Session::default()
         };
         session
             .editor

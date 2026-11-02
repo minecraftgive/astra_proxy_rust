@@ -20,12 +20,58 @@ pub(super) const PAGES: [&str; 6] = [
     "Profiles",
 ];
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) enum PaletteFocus {
+    #[default]
+    Search,
+    Type,
+    List,
+}
+#[derive(Clone)]
 pub(super) struct Palette {
     pub(super) query: String,
+    pub(super) cursor: usize,
     pub(super) selected: usize,
-    /// Opened with p: only lists profiles to switch to.
+    /// Opened with Ctrl-P: choose a proxy profile or a rule core.
     pub(super) profiles: bool,
+    pub(super) profile_kind: Kind,
+    pub(super) focus: PaletteFocus,
+    pub(super) viewport_height: std::cell::Cell<u16>,
+}
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            selected: 0,
+            profiles: false,
+            profile_kind: Kind::Proxy,
+            focus: PaletteFocus::Search,
+            viewport_height: std::cell::Cell::new(1),
+        }
+    }
+}
+impl Palette {
+    pub(super) fn profiles(kind: Kind) -> Self {
+        Self {
+            profiles: true,
+            profile_kind: kind,
+            ..Default::default()
+        }
+    }
+    fn byte(&self) -> usize {
+        self.query
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.query.len(), |(index, _)| index)
+    }
+    pub(super) fn insert(&mut self, text: &str) {
+        self.focus = PaletteFocus::Search;
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        self.query.insert_str(self.byte(), &text);
+        self.cursor += text.chars().count();
+        self.selected = 0;
+    }
 }
 
 #[derive(Clone)]
@@ -33,14 +79,17 @@ enum Run {
     Page(usize),
     /// Navigate, then deliver the key there.
     Key(usize, KeyCode),
-    /// Deliver the key on the current page (function keys, ?, q, Q).
-    Raw(KeyCode),
     /// Instance operation on the active profile.
     Op(Operation),
     Runtime(Command),
-    Activate(usize),
+    Activate {
+        name: String,
+        kind: Kind,
+    },
     Connect,
     Validate,
+    Update(update::Command),
+    Registered(commands::Id),
 }
 
 struct Entry {
@@ -64,10 +113,16 @@ pub(super) fn duration(seconds: u64) -> String {
 
 impl Ui {
     pub(super) fn active_proxy(&self) -> Option<&Row> {
-        self.rows
-            .iter()
-            .filter(|r| r.instance.kind == Kind::Proxy)
-            .nth(self.selections[0])
+        if let Some(name) = &self.active_profile {
+            self.rows
+                .iter()
+                .find(|r| r.instance.kind == Kind::Proxy && &r.instance.name == name)
+        } else {
+            self.rows
+                .iter()
+                .filter(|r| r.instance.kind == Kind::Proxy)
+                .nth(self.selections[0])
+        }
     }
     /// The rule core a profile uses: its startup binding, or the only rule instance.
     pub(super) fn active_rule(&self) -> Option<&Row> {
@@ -94,7 +149,7 @@ impl Ui {
     }
     /// Page switching is allowed whenever no dialog, editor or text input owns the keyboard.
     pub(super) fn can_switch_page(&self) -> bool {
-        self.editor.is_none()
+        self.editor.as_ref().is_none_or(Editor::browsing)
             && self.prompt.is_none()
             && self.recovery.is_none()
             && self.menu.is_none()
@@ -103,7 +158,6 @@ impl Ui {
             && self.explanation.is_none()
             && self.help_scroll.is_none()
             && self.palette.is_none()
-            && self.runtime_picker.is_none()
             && self.viewer.as_ref().is_none_or(logs::Viewer::browsing)
     }
     pub(super) fn close_viewer(&mut self) {
@@ -142,19 +196,30 @@ impl Ui {
             self.message = t("No profile yet · 6 then n to create one").into();
             return Input::Idle;
         }
+        let previous = self.selections;
         self.kind = Kind::Proxy;
-        self.operation(operation)
+        if let Some(name) = self.active_proxy().map(|r| r.instance.name.clone()) {
+            if let Some(index) = self.rows().iter().position(|r| r.instance.name == name) {
+                self.selections[0] = index;
+            }
+        }
+        let input = self.operation(operation);
+        self.selections = previous;
+        input
     }
     fn rule_operation(&mut self, operation: Operation) -> Input {
         let Some(name) = self.active_rule().map(|r| r.instance.name.clone()) else {
             self.message = t("No rule core for this profile · bind one with b in Profiles").into();
             return Input::Idle;
         };
+        let previous = self.selections;
         self.kind = Kind::Rule;
         if let Some(index) = self.rows().iter().position(|r| r.instance.name == name) {
             self.selections[1] = index;
         }
-        self.operation(operation)
+        let input = self.operation(operation);
+        self.selections = previous;
+        input
     }
 
     /// Keys shared by every page; `None` lets the page handle the key.
@@ -188,14 +253,8 @@ impl Ui {
         }
         match key.code {
             KeyCode::Char(c @ '1'..='6') => return Some(self.navigate(c as usize - '1' as usize)),
-            KeyCode::BackTab => {
-                return Some(self.navigate((self.page + PAGES.len() - 1) % PAGES.len()))
-            }
             KeyCode::Char('p') => {
-                self.palette = Some(Palette {
-                    profiles: true,
-                    ..Palette::default()
-                });
+                self.palette = Some(Palette::profiles(self.kind));
                 return Some(Input::Idle);
             }
             _ => {}
@@ -205,13 +264,8 @@ impl Ui {
         }
         Some(match (self.page, key.code) {
             (_, KeyCode::Char('q')) => Input::Quit,
-            (_, KeyCode::Char('Q')) => {
-                self.prompt(Prompt::Shutdown);
-                Input::Idle
-            }
-            (_, KeyCode::Char('c')) | (OVERVIEW, KeyCode::Char(' ')) => self.toggle_active(),
+            (_, KeyCode::Char('c')) => self.toggle_active(),
             (_, KeyCode::Char('r')) => self.active_operation(Operation::Reload),
-            (_, KeyCode::Char('R')) => self.active_operation(Operation::Restart),
             (_, KeyCode::Char('U')) => self.active_operation(Operation::UpdateSubscriptions),
             (OVERVIEW | PROXIES, KeyCode::Char('e')) => self.active_operation(Operation::Edit),
             (OVERVIEW | PROXIES, KeyCode::Char('D')) => {
@@ -236,7 +290,7 @@ impl Ui {
         })
     }
     /// Opens the profile's rule core in the editor and starts its search.
-    fn rule_search(&mut self) -> Input {
+    pub(super) fn rule_search(&mut self) -> Input {
         if self.active_rule().is_none() {
             self.message = t("No rule core for this profile · bind one with b in Profiles").into();
             return Input::Idle;
@@ -259,6 +313,9 @@ impl Ui {
     }
     /// Jumps to the next group/member (Proxies) or instance (Profiles) containing `query`.
     pub(super) fn find(&mut self, page: usize, query: &str) -> bool {
+        self.find_direction(page, query, false)
+    }
+    pub(super) fn find_direction(&mut self, page: usize, query: &str, backwards: bool) -> bool {
         let query = query.to_lowercase();
         let hit = |text: &str| text.to_lowercase().contains(&query);
         if page == PROXIES {
@@ -282,12 +339,19 @@ impl Ui {
                 self.group_selection,
                 self.runtime_picker.as_ref().map(|(_, cursor)| *cursor),
             );
-            let Some((g, m, name)) = found
-                .iter()
-                .find(|(g, m, _)| order(*g, *m) > current)
-                .or(found.first())
-                .cloned()
-            else {
+            let candidate = if backwards {
+                found
+                    .iter()
+                    .rev()
+                    .find(|(g, m, _)| order(*g, *m) < current)
+                    .or(found.last())
+            } else {
+                found
+                    .iter()
+                    .find(|(g, m, _)| order(*g, *m) > current)
+                    .or(found.first())
+            };
+            let Some((g, m, name)) = candidate.cloned() else {
                 return false;
             };
             self.group_selection = g;
@@ -331,11 +395,17 @@ impl Ui {
                     .filter(|&i| i < same.len())
                     .map(|i| (self.kind, i, same[i])),
             );
-        let Some((kind, index)) = candidates
+        let mut matches: Vec<_> = candidates
             .filter(|(_, _, row)| hit(&text(row)))
             .map(|(kind, index, _)| (kind, index))
-            .next()
-        else {
+            .collect();
+        if backwards {
+            matches.reverse();
+            if matches.first() == Some(&(self.kind, selected)) && matches.len() > 1 {
+                matches.rotate_left(1);
+            }
+        }
+        let Some((kind, index)) = matches.into_iter().next() else {
             return false;
         };
         self.kind = kind;
@@ -387,14 +457,20 @@ impl Ui {
 
     fn palette_entries(&self) -> Vec<Entry> {
         let mut entries = Vec::new();
-        let proxies: Vec<_> = self
+        let chooser = self.palette.as_ref().filter(|palette| palette.profiles);
+        let kind = chooser.map_or(Kind::Proxy, |palette| palette.profile_kind);
+        let profiles: Vec<_> = self
             .rows
             .iter()
-            .filter(|r| r.instance.kind == Kind::Proxy)
+            .filter(|r| r.instance.kind == kind)
             .collect();
-        for (index, row) in proxies.iter().enumerate() {
+        for row in profiles {
             entries.push(Entry {
-                scope: "Profile",
+                scope: if kind == Kind::Proxy {
+                    "Profile"
+                } else {
+                    "Rules"
+                },
                 label: format!(
                     "{} · {}",
                     row.instance.name,
@@ -404,8 +480,11 @@ impl Ui {
                         "Stopped"
                     })
                 ),
-                key: "p",
-                run: Run::Activate(index),
+                key: if chooser.is_some() { "" } else { "p" },
+                run: Run::Activate {
+                    name: row.instance.name.clone(),
+                    kind,
+                },
                 unavailable: None,
             });
         }
@@ -468,7 +547,7 @@ impl Ui {
         add(
             "Run",
             "Full restart",
-            "R",
+            "",
             Run::Op(Operation::Restart),
             not_running,
         );
@@ -519,7 +598,7 @@ impl Ui {
         add(
             "Takeover",
             "Reset runtime state",
-            "0",
+            "",
             Run::Runtime(Command::Reset),
             live,
         );
@@ -628,43 +707,48 @@ impl Ui {
             Run::Op(Operation::ExportTerminal),
             no_profile,
         );
-        add(
-            "General",
-            "Task details",
-            "F6",
-            Run::Raw(KeyCode::F(6)),
-            None,
-        );
-        add("General", "TUI log", "F7", Run::Raw(KeyCode::F(7)), None);
-        add(
-            "General",
-            "Open page in new window",
-            "F8",
-            Run::Raw(KeyCode::F(8)),
-            None,
-        );
-        add(
-            "General",
-            "Keyboard help",
-            "?",
-            Run::Raw(KeyCode::Char('?')),
-            None,
-        );
-        add(
-            "General",
-            "Leave interface (cores keep running)",
-            "q",
-            Run::Raw(KeyCode::Char('q')),
-            None,
-        );
-        add(
-            "General",
-            "Stop all instances and manager",
-            "Q",
-            Run::Raw(KeyCode::Char('Q')),
-            None,
-        );
+        for command in update::Command::ALL {
+            add(
+                "Updates",
+                command.label(),
+                "",
+                Run::Update(command),
+                command.unavailable(self.update_status.as_ref()),
+            );
+        }
+        for spec in commands::SPECS {
+            add(
+                "General",
+                spec.label,
+                spec.key,
+                Run::Registered(spec.id),
+                self.command_available(spec.id),
+            );
+        }
         entries
+    }
+    pub(super) fn command_help(&self) -> String {
+        if let Some(text) = &self.help_override {
+            return text.clone();
+        }
+        let mut result = commands::help();
+        result.push_str("\nPage and profile actions · F2 opens these commands\n");
+        for entry in self
+            .palette_entries()
+            .into_iter()
+            .filter(|entry| entry.scope != "General")
+        {
+            result.push_str(&format!(
+                "{}  {}{}\n",
+                entry.key,
+                entry.label,
+                entry
+                    .unavailable
+                    .map(|reason| format!(" ({})", t(reason)))
+                    .unwrap_or_default()
+            ));
+        }
+        result
     }
     fn palette_matches(&self) -> Vec<Entry> {
         let query = self
@@ -685,6 +769,41 @@ impl Ui {
     pub(super) fn palette_key(&mut self, key: event::KeyEvent) -> Input {
         let count = self.palette_matches().len();
         let palette = self.palette.as_mut().unwrap();
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let regions: &[PaletteFocus] = if palette.profiles {
+                &[PaletteFocus::Search, PaletteFocus::Type, PaletteFocus::List]
+            } else {
+                &[PaletteFocus::Search, PaletteFocus::List]
+            };
+            let index = regions
+                .iter()
+                .position(|focus| *focus == palette.focus)
+                .unwrap_or(0);
+            let next = if key.code == KeyCode::BackTab {
+                (index + regions.len() - 1) % regions.len()
+            } else {
+                (index + 1) % regions.len()
+            };
+            palette.focus = regions[next];
+            return Input::Idle;
+        }
+        if palette.profiles && palette.focus == PaletteFocus::Type {
+            match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    palette.profile_kind = Kind::Proxy;
+                    palette.selected = 0;
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    palette.profile_kind = Kind::Rule;
+                    palette.selected = 0;
+                }
+                KeyCode::Enter => palette.focus = PaletteFocus::List,
+                KeyCode::Esc => self.palette = None,
+                _ => {}
+            }
+            return Input::Idle;
+        }
+        let page_size = usize::from(palette.viewport_height.get().max(1));
         match key.code {
             KeyCode::Esc => self.palette = None,
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -693,20 +812,40 @@ impl Ui {
             KeyCode::Down => palette.selected = (palette.selected + 1).min(count.saturating_sub(1)),
             KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
             KeyCode::PageDown => {
-                palette.selected = (palette.selected + 10).min(count.saturating_sub(1))
+                palette.selected = (palette.selected + page_size).min(count.saturating_sub(1))
             }
-            KeyCode::PageUp => palette.selected = palette.selected.saturating_sub(10),
-            KeyCode::Backspace => {
-                palette.query.pop();
+            KeyCode::PageUp => palette.selected = palette.selected.saturating_sub(page_size),
+            KeyCode::Home if palette.focus == PaletteFocus::List => palette.selected = 0,
+            KeyCode::End if palette.focus == PaletteFocus::List => {
+                palette.selected = count.saturating_sub(1)
+            }
+            KeyCode::Left if palette.focus == PaletteFocus::Search => {
+                palette.cursor = palette.cursor.saturating_sub(1)
+            }
+            KeyCode::Right if palette.focus == PaletteFocus::Search => {
+                palette.cursor = (palette.cursor + 1).min(palette.query.chars().count())
+            }
+            KeyCode::Home => palette.cursor = 0,
+            KeyCode::End => palette.cursor = palette.query.chars().count(),
+            KeyCode::Backspace if palette.focus == PaletteFocus::Search && palette.cursor > 0 => {
+                palette.cursor -= 1;
+                palette.query.remove(palette.byte());
+                palette.selected = 0;
+            }
+            KeyCode::Delete
+                if palette.focus == PaletteFocus::Search
+                    && palette.cursor < palette.query.chars().count() =>
+            {
+                palette.query.remove(palette.byte());
                 palette.selected = 0;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 palette.query.clear();
+                palette.cursor = 0;
                 palette.selected = 0;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                palette.query.push(c);
-                palette.selected = 0;
+                palette.insert(&c.to_string());
             }
             KeyCode::Enter => {
                 let index = palette.selected;
@@ -727,19 +866,34 @@ impl Ui {
         self.palette = None;
         let press = |ui: &mut Ui, code| ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
         match entry.run {
-            Run::Page(page) => self.navigate(page),
+            Run::Page(page) => {
+                self.suspend_editor();
+                self.navigate(page)
+            }
             Run::Key(page, code) => match self.navigate(page) {
                 Input::Idle => press(self, code),
                 input => input,
             },
-            Run::Raw(code) => press(self, code),
             Run::Op(operation) => self.active_operation(operation),
             Run::Runtime(command) => self.runtime_action(command),
-            Run::Activate(index) => {
-                self.selections[0] = index;
-                self.kind = Kind::Proxy;
-                if self.page == LOGS {
-                    self.close_viewer();
+            Run::Activate { name, kind } => {
+                if let Some(index) = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.instance.kind == kind)
+                    .position(|r| r.instance.name == name)
+                {
+                    if kind == Kind::Proxy {
+                        self.activate_profile(name);
+                        if self.page == PROFILES {
+                            self.kind = Kind::Proxy;
+                            self.selections[0] = index;
+                        }
+                    } else {
+                        self.navigate(PROFILES);
+                        self.kind = Kind::Rule;
+                        self.selections[1] = index;
+                    }
                 }
                 Input::Idle
             }
@@ -748,6 +902,8 @@ impl Ui {
                 Some(row) => Input::Run(Action::Validate(row.instance.name.clone()), None),
                 None => Input::Idle,
             },
+            Run::Update(command) => command.run(self),
+            Run::Registered(id) => self.run_command(id),
         }
     }
 
@@ -785,7 +941,8 @@ impl Ui {
             (rows[2], rows[3])
         };
         // This page's keys, whole entries only; results live in the status line below.
-        let spans = crate::theme::key_hints_fit(&self.hint(), hint.width as usize, t("? more"));
+        let hint_text = format!("[{}] Tab focus · {}", self.focus_label(), self.hint());
+        let spans = crate::theme::key_hints_fit(&hint_text, hint.width as usize, t("F1 more"));
         f.render_widget(Paragraph::new(Line::from(spans)), hint);
         content
     }
@@ -876,7 +1033,11 @@ impl Ui {
                     // Rates sit at the right edge; idle traffic is muted rather than loud.
                     let rate = |arrow: &str, bytes: u64, active: Color| {
                         Span::styled(
-                            format!("{arrow} {}/s", live::bytes(bytes)),
+                            if self.runtime_rates_available() {
+                                format!("{arrow} {}/s", live::bytes(bytes))
+                            } else {
+                                format!("{arrow} —/s")
+                            },
                             if bytes == 0 {
                                 muted
                             } else {
@@ -885,10 +1046,15 @@ impl Ui {
                         )
                     };
                     right = vec![
+                        Span::styled(format!("{} ", self.runtime_health()), muted),
+                        Span::styled("Proxy ", muted),
                         rate("↑", self.rates[0], Color::Magenta),
                         Span::raw("  "),
                         rate("↓", self.rates[1], Color::Cyan),
-                        Span::raw(" "),
+                        Span::styled(" · Direct ", muted),
+                        rate("↑", self.direct_rates[0], Color::Magenta),
+                        Span::raw("  "),
+                        rate("↓", self.direct_rates[1], Color::Cyan),
                     ];
                 }
             }
@@ -921,20 +1087,27 @@ impl Ui {
             let width = Line::from(label.as_str()).width() as u16;
             let rect = Rect::new(x, area.y, width, 1).intersection(area);
             f.render_widget(
-                Paragraph::new(label).style(if index == self.page {
-                    Style::default()
-                        .bg(BLUE)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(MUTED)
-                }),
+                Paragraph::new(label).style(
+                    if self.focus.region == focus::Region::Tabs && index == self.focus.cursor {
+                        Style::default()
+                            .bg(Color::Cyan)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else if index == self.page {
+                        Style::default()
+                            .bg(BLUE)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                ),
                 rect,
             );
             self.hit(rect, Target::Page(index));
             x = x.saturating_add(width + 1);
         }
-        let right = t(": / Ctrl-K commands · ? help");
+        let right = t("F2 / Ctrl-K commands · F1 help");
         let width = Line::from(right).width() as u16;
         if x + width + 2 < area.right() {
             f.render_widget(
@@ -949,11 +1122,11 @@ impl Ui {
         } else if self.recovery.is_some() {
             "c retry · b cancel · ↑↓ scroll"
         } else if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
-            "Enter confirm · Esc cancel"
+            "Tab / ←→ choose · Enter apply · Esc cancel"
         } else if self.prompt.is_some() {
             "Enter confirm · Esc cancel · Ctrl-U clear"
         } else if self.editor.is_some() {
-            "Ctrl-O import · F4 external editor · F5 read draft · Ctrl-C leave, keep draft"
+            "Enter edit · Space toggle · Ctrl-S save · Ctrl-Z/Y undo/redo · Esc retain draft"
         } else if self.viewer.is_some() {
             "[ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
         } else if self.runtime_picker.is_some() {
@@ -965,7 +1138,7 @@ impl Ui {
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
                 RULES => "t test a route · / search rules · e edit rules",
                 LOGS => "Enter open · [ proxy log · ] rule core log · F7 TUI log",
-                _ => "↑↓ select · / find · Space/c connect · Enter actions · e edit · n new · Tab proxy/rule cores",
+                _ => "↑↓ browse · Ctrl-P activate profile · Enter actions · e edit · Insert new · Delete remove",
             }
         };
         format!(" {}", t(text))
@@ -974,6 +1147,7 @@ impl Ui {
         let Some(palette) = &self.palette else {
             return;
         };
+        let before = f.buffer_mut().clone();
         let entries = self.palette_matches();
         let area = f.area();
         let width = area.width.saturating_sub(4).min(76);
@@ -999,7 +1173,11 @@ impl Ui {
             ))
             .title_bottom(format!(
                 " {} ",
-                t("Right column: the same key on this page")
+                t(if palette.profiles {
+                    "Tab: search / type / list · arrows choose · Enter select"
+                } else {
+                    "Right column: the same key on this page"
+                })
             ));
         let inner = block.inner(popup);
         f.render_widget(block, popup);
@@ -1009,8 +1187,40 @@ impl Ui {
             Constraint::Min(0),
         ])
         .split(inner);
-        f.render_widget(Paragraph::new(format!("› {}▏", palette.query)), rows[0]);
-        let label_width = rows[2].width.saturating_sub(16) as usize;
+        palette.viewport_height.set(rows[2].height);
+        let cursor = palette.byte();
+        f.render_widget(
+            Paragraph::new(format!(
+                "› {}{}{}",
+                &palette.query[..cursor],
+                if palette.focus == PaletteFocus::Search {
+                    "▏"
+                } else {
+                    ""
+                },
+                &palette.query[cursor..]
+            ))
+            .style(if palette.focus == PaletteFocus::Search {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            }),
+            rows[0],
+        );
+        let content_width = rows[2].width.saturating_sub(2) as usize;
+        let scope_width = if content_width >= 40 { 9 } else { 0 };
+        let key_width = if content_width >= 40 {
+            entries
+                .iter()
+                .map(|e| Line::from(e.key).width())
+                .max()
+                .unwrap_or(0)
+                .min(18)
+        } else {
+            0
+        };
+        let label_width =
+            content_width.saturating_sub(scope_width + key_width + usize::from(key_width > 0));
         let items: Vec<_> = entries
             .iter()
             .map(|e| {
@@ -1023,23 +1233,95 @@ impl Ui {
                 if let Some(reason) = e.unavailable {
                     label = format!("{label} · {}", t(reason));
                 }
-                let used = Line::from(label.as_str()).width();
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<9}", t(e.scope)), Style::default().fg(MUTED)),
-                    Span::styled(label, style),
-                    Span::raw(" ".repeat(label_width.saturating_sub(used + 1).max(1))),
-                    Span::styled(e.key, Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        palette_column(t(e.scope), scope_width),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled(palette_column(&label, label_width), style),
+                    Span::raw(if key_width > 0 { " " } else { "" }),
+                    Span::styled(
+                        palette_column(e.key, key_width),
+                        Style::default().fg(Color::Cyan),
+                    ),
                 ]))
             })
             .collect();
         let empty = items.is_empty();
+        if palette.profiles {
+            let type_style = |kind| {
+                if palette.profile_kind == kind {
+                    if palette.focus == PaletteFocus::Type {
+                        crate::theme::selected()
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    }
+                } else {
+                    Style::default().fg(MUTED)
+                }
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!("{}: ", t("Type"))),
+                    Span::styled(
+                        format!(
+                            "{}{}{}",
+                            if palette.profile_kind == Kind::Proxy {
+                                "["
+                            } else {
+                                " "
+                            },
+                            t("Proxy"),
+                            if palette.profile_kind == Kind::Proxy {
+                                "]"
+                            } else {
+                                " "
+                            }
+                        ),
+                        type_style(Kind::Proxy),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!(
+                            "{}{}{}",
+                            if palette.profile_kind == Kind::Rule {
+                                "["
+                            } else {
+                                " "
+                            },
+                            t("Rules"),
+                            if palette.profile_kind == Kind::Rule {
+                                "]"
+                            } else {
+                                " "
+                            }
+                        ),
+                        type_style(Kind::Rule),
+                    ),
+                ])),
+                rows[1],
+            );
+        } else if let Some(reason) = entries
+            .get(palette.selected)
+            .and_then(|entry| entry.unavailable)
+        {
+            f.render_widget(
+                Paragraph::new(palette_column(t(reason), rows[1].width as usize))
+                    .style(Style::default().fg(Color::Yellow)),
+                rows[1],
+            );
+        }
         let mut state = ListState::default().with_selected(
             (!empty).then_some(palette.selected.min(entries.len().saturating_sub(1))),
         );
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(crate::theme::selected())
-                .highlight_symbol("› "),
+                .highlight_symbol(if palette.focus == PaletteFocus::List {
+                    "› "
+                } else {
+                    "  "
+                }),
             rows[2],
             &mut state,
         );
@@ -1057,6 +1339,8 @@ impl Ui {
                 Target::Palette(index),
             );
         }
+        self.animations
+            .surface(f, super::animation::Kind::Palette, popup, &before);
     }
     /// Tab-like title: the shown list is highlighted, the other one muted.
     pub(super) fn profiles_title(&self) -> Line<'static> {
@@ -1078,9 +1362,141 @@ impl Ui {
             Span::raw(" "),
             tab(tr!("Rule cores {}", rules), self.kind == Kind::Rule),
             Span::styled(
-                format!("  {} ", t("Tab switch")),
+                format!("  {} ", t("Tab controls · Enter switch")),
                 Style::default().fg(MUTED),
             ),
         ])
+    }
+}
+
+/// Pad terminal columns rather than Unicode scalar count (Chinese scopes are double width).
+fn palette_column(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let total = Line::from(text).width();
+    if total <= width {
+        return format!("{text}{}", " ".repeat(width - total));
+    }
+    let mut result = String::new();
+    for c in text.chars() {
+        if Line::from(result.as_str()).width() + Line::from(c.to_string()).width() + 1 > width {
+            break;
+        }
+        result.push(c);
+    }
+    result.push('…');
+    let remaining = width.saturating_sub(Line::from(result.as_str()).width());
+    result.push_str(&" ".repeat(remaining));
+    result
+}
+
+#[cfg(test)]
+mod palette_layout_tests {
+    use super::*;
+    fn profile_ui() -> Ui {
+        let mut ui = Ui::new(Session::default());
+        for (name, kind) in [
+            ("proxy-a", Kind::Proxy),
+            ("proxy-b", Kind::Proxy),
+            ("rules-a", Kind::Rule),
+            ("rules-b", Kind::Rule),
+        ] {
+            ui.rows.push(Row {
+                instance: Instance {
+                    name: name.into(),
+                    kind,
+                    config: format!("{name}.toml").into(),
+                },
+                pid: None,
+                state: "Stopped".into(),
+                uptime: 0,
+                changed: false,
+            });
+        }
+        ui.active_profile = Some("proxy-b".into());
+        ui
+    }
+    fn press(ui: &mut Ui, code: KeyCode) -> Input {
+        ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn configuration_type_control_selects_rules_without_changing_active_proxy() {
+        let mut ui = profile_ui();
+        ui.editor =
+            Some(Editor::new("proxy-a".into(), "standalone=true\n".into()).with_kind(Kind::Proxy));
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(ui.palette_matches().len(), 2);
+        press(&mut ui, KeyCode::Tab);
+        assert_eq!(ui.palette.as_ref().unwrap().focus, PaletteFocus::Type);
+        press(&mut ui, KeyCode::Right);
+        assert_eq!(ui.palette.as_ref().unwrap().profile_kind, Kind::Rule);
+        assert!(ui
+            .palette_matches()
+            .iter()
+            .all(|entry| entry.label.starts_with("rules-")));
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.palette.as_ref().unwrap().focus, PaletteFocus::List);
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.palette.is_none());
+        assert_eq!(ui.page, PROFILES);
+        assert_eq!(ui.kind, Kind::Rule);
+        assert_eq!(ui.selected().unwrap().instance.name, "rules-b");
+        assert_eq!(ui.active_proxy().unwrap().instance.name, "proxy-b");
+        assert_eq!(ui.drafts.len(), 1);
+        ui.run_command(commands::Id::Profiles);
+        press(&mut ui, KeyCode::Tab);
+        press(&mut ui, KeyCode::Left);
+        press(&mut ui, KeyCode::Enter);
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.active_proxy().unwrap().instance.name, "proxy-a");
+        assert_eq!(ui.kind, Kind::Proxy);
+    }
+    #[test]
+    fn palette_page_keys_follow_visible_rows_after_resize() {
+        use ratatui::backend::TestBackend;
+        let mut ui = profile_ui();
+        for index in 0..30 {
+            let mut row = ui.rows[0].clone();
+            row.instance.name = format!("extra-{index}");
+            ui.rows.push(row);
+        }
+        for profiles in [false, true] {
+            ui.palette = Some(if profiles {
+                Palette::profiles(Kind::Proxy)
+            } else {
+                Palette::default()
+            });
+            for height in [10, 6] {
+                let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+                terminal.draw(|frame| ui.render_palette(frame)).unwrap();
+                let visible = usize::from(ui.palette.as_ref().unwrap().viewport_height.get());
+                assert_eq!(visible, usize::from(height - 4));
+                let before = ui.palette.as_ref().unwrap().selected;
+                press(&mut ui, KeyCode::PageDown);
+                assert_eq!(ui.palette.as_ref().unwrap().selected, before + visible);
+                press(&mut ui, KeyCode::PageUp);
+                assert_eq!(ui.palette.as_ref().unwrap().selected, before);
+            }
+        }
+    }
+    #[test]
+    fn multilingual_columns_keep_the_shortcut_column_inside_the_popup() {
+        for width in [0, 1, 9, 24, 51] {
+            for text in ["通用", "Command palette", "右列为本页可直接使用的按键"] {
+                assert_eq!(Line::from(palette_column(text, width)).width(), width);
+            }
+        }
+        let line = Line::from(vec![
+            Span::raw(palette_column("通用", 9)),
+            Span::raw(palette_column("命令面板", 51)),
+            Span::raw(" "),
+            Span::raw(palette_column("Ctrl-K / F2", 11)),
+        ]);
+        assert_eq!(line.width(), 72);
     }
 }

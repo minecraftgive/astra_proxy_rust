@@ -227,6 +227,7 @@ impl View {
                     let event: Event = serde_json::from_str(&reply.text)?;
                     let done = matches!(event, Event::Done);
                     sender.send(Ok(event)).await?;
+                    crate::ui::wake();
                     if done {
                         break;
                     }
@@ -236,6 +237,7 @@ impl View {
             .await;
             if let Err(error) = result {
                 let _ = sender.send(Err(error)).await;
+                crate::ui::wake();
             }
         }));
         self.receiver = Some(receiver);
@@ -249,15 +251,18 @@ impl View {
             self.summary = Some(Summary::from_attempts(&self.attempts));
         }
     }
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
         let Some(mut receiver) = self.receiver.take() else {
-            return;
+            return changed;
         };
         loop {
-            match receiver.try_recv() {
+            let event = receiver.try_recv();
+            changed |= !matches!(&event, Err(mpsc::error::TryRecvError::Empty));
+            match event {
                 Ok(Ok(Event::Done)) => {
                     self.task = None;
-                    return;
+                    return changed;
                 }
                 Ok(Ok(Event::Started { note, .. })) => self.note = Some(note),
                 Ok(Ok(Event::Attempt(attempt))) => self.attempts.push(attempt),
@@ -265,16 +270,16 @@ impl View {
                 Ok(Err(error)) => {
                     self.error = Some(clean(&format!("{error:#}")));
                     self.task = None;
-                    return;
+                    return changed;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     self.receiver = Some(receiver);
-                    return;
+                    return changed;
                 }
                 Err(_) => {
                     self.error = Some(t("Diagnostics interrupted").into());
                     self.task = None;
-                    return;
+                    return changed;
                 }
             }
         }

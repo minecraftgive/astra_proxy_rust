@@ -18,18 +18,22 @@ pub fn tcp_listener(address: &str, transparent: bool) -> Result<TcpListener> {
         bail!("TPROXY/REDIRECT require Linux")
     }
 }
-pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Result<()> {
+pub(crate) fn destination(stream: &TcpStream, inbound: Inbound) -> Result<SocketAddr> {
     #[cfg(target_os = "linux")]
     let destination = if inbound == Inbound::Tproxy {
         stream.local_addr()?
     } else {
-        linux::original_destination(&stream)?
+        linux::original_destination(stream)?
     };
     #[cfg(not(target_os = "linux"))]
     let destination = {
         let _ = inbound;
         stream.local_addr()?
     };
+    Ok(destination)
+}
+pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Result<()> {
+    let destination = destination(&stream,inbound)?;
     let target = Target {
         host: destination.ip().to_string(),
         port: destination.port(),

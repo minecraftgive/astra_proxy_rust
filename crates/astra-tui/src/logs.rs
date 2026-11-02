@@ -36,6 +36,8 @@ pub struct Settings {
     memory_lines: usize,
     #[serde(default)]
     wrap: bool,
+    #[serde(default)]
+    vim_navigation: bool,
 }
 fn default_memory_lines() -> usize {
     5000
@@ -51,6 +53,7 @@ impl Default for Settings {
             mode: Mode::Browse,
             memory_lines: default_memory_lines(),
             wrap: false,
+            vim_navigation: false,
         }
     }
 }
@@ -63,6 +66,7 @@ impl Drop for Feed {
         self.task.abort();
     }
 }
+#[derive(Clone)]
 struct Record {
     text: String,
     level: Option<LogLevel>,
@@ -91,6 +95,8 @@ pub struct Viewer {
     viewport_width: Cell<u16>,
     source: std::path::PathBuf,
     vim_g: bool,
+    frozen: Option<(VecDeque<Record>, String)>,
+    revision: u64,
 }
 impl Viewer {
     pub fn new(name: String, mut settings: Settings) -> Self {
@@ -121,6 +127,8 @@ impl Viewer {
             viewport_width: Cell::new(80),
             source: Default::default(),
             vim_g: false,
+            frozen: None,
+            revision: 0,
         }
     }
     pub async fn connect(&mut self, socket: &Path) -> Result<()> {
@@ -142,11 +150,14 @@ impl Viewer {
                         let _ = sender
                             .send(LogEvent::Error(tr!("Log disconnected: {}", error)))
                             .await;
+                        crate::ui::wake();
                         break;
                     }
                 };
                 let failed = matches!(event, LogEvent::Error(_));
-                if sender.send(event).await.is_err() || failed {
+                let sent = sender.send(event).await;
+                crate::ui::wake();
+                if sent.is_err() || failed {
                     break;
                 }
             }
@@ -158,6 +169,37 @@ impl Viewer {
     pub fn stop(&mut self) {
         self.feed = None;
         self.status = t("已停止订阅；r 重连").into();
+        self.revision = self.revision.wrapping_add(1);
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn set_vim_navigation(&mut self, enabled: bool) {
+        self.settings.vim_navigation = enabled;
+    }
+    pub fn paused(&self) -> bool {
+        self.frozen.is_some()
+    }
+    pub fn toggle_pause(&mut self) {
+        if self.frozen.take().is_some() {
+            self.settings.follow = true;
+            self.top = self
+                .display_len()
+                .saturating_sub(self.viewport_height.get());
+        } else {
+            self.top = if self.settings.follow {
+                self.display_len()
+                    .saturating_sub(self.viewport_height.get())
+            } else {
+                self.top
+            };
+            self.frozen = Some((
+                self.records.clone(),
+                crate::tui_log::stamp(astra_ipc::progress::now_ms()),
+            ));
+            self.settings.follow = false;
+        }
+        self.revision = self.revision.wrapping_add(1);
     }
     pub fn cancel_input(&mut self) {
         self.settings.mode = Mode::Browse;
@@ -204,6 +246,7 @@ impl Viewer {
         None
     }
     fn apply(&mut self, event: LogEvent) {
+        self.revision = self.revision.wrapping_add(1);
         match event {
             LogEvent::Waiting => self.status = t("等待实例产生日志（订阅保持连接）").into(),
             LogEvent::Data {
@@ -262,7 +305,7 @@ impl Viewer {
             if let Some(line) = self.records.pop_front() {
                 self.bytes -= line.text.len();
                 self.dropped += 1;
-                if self.matches(&line) {
+                if self.frozen.is_none() && self.matches(&line) {
                     self.top = self.top.saturating_sub(self.row_count(&line));
                 }
             }
@@ -279,7 +322,9 @@ impl Viewer {
                 .contains(&self.settings.filter.to_lowercase()))
     }
     fn visible(&self) -> Vec<&Record> {
-        self.records
+        self.frozen
+            .as_ref()
+            .map_or(&self.records, |(records, _)| records)
             .iter()
             .filter(|line| self.matches(line))
             .collect()
@@ -302,6 +347,12 @@ impl Viewer {
     pub fn browsing(&self) -> bool {
         matches!(self.settings.mode, Mode::Browse)
     }
+    pub fn accepts_text_input(&self) -> bool {
+        matches!(
+            self.settings.mode,
+            Mode::Filter(_) | Mode::Search(_) | Mode::MemoryLimit(_)
+        )
+    }
     fn row_count(&self, record: &Record) -> usize {
         if self.settings.wrap {
             Paragraph::new(record.text.as_str())
@@ -319,6 +370,17 @@ impl Viewer {
             .sum()
     }
     pub fn key(&mut self, mut key: KeyEvent) -> Command {
+        if self.browsing()
+            && key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.settings.mode = Mode::Search(self.settings.search.clone());
+            return Command::None;
+        }
+        if self.browsing() && key.code == KeyCode::F(3) {
+            self.jump(key.modifiers.contains(KeyModifiers::SHIFT));
+            return Command::None;
+        }
         match &mut self.settings.mode {
             Mode::Filter(input) | Mode::Search(input) | Mode::MemoryLimit(input) => {
                 match key.code {
@@ -397,7 +459,10 @@ impl Viewer {
             }
             Mode::Browse => {}
         }
-        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+        if self.settings.vim_navigation
+            && key.code == KeyCode::Char('g')
+            && key.modifiers.is_empty()
+        {
             if !self.vim_g {
                 self.vim_g = true;
                 return Command::None;
@@ -405,18 +470,22 @@ impl Viewer {
             key.code = KeyCode::Home;
         }
         self.vim_g = false;
-        key.code = match key.code {
-            KeyCode::Char('j') => KeyCode::Down,
-            KeyCode::Char('k') => KeyCode::Up,
-            KeyCode::Char('h') => KeyCode::Left,
-            KeyCode::Char('l') => KeyCode::Right,
-            KeyCode::Char('G') => KeyCode::End,
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                KeyCode::PageDown
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyCode::PageUp,
-            code => code,
-        };
+        if self.settings.vim_navigation {
+            key.code = match key.code {
+                KeyCode::Char('j') => KeyCode::Down,
+                KeyCode::Char('k') => KeyCode::Up,
+                KeyCode::Char('h') => KeyCode::Left,
+                KeyCode::Char('l') => KeyCode::Right,
+                KeyCode::Char('G') => KeyCode::End,
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::PageDown
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::PageUp
+                }
+                code => code,
+            };
+        }
         match key.code {
             KeyCode::Esc => return Command::Close,
             KeyCode::Char('r') => return Command::Reconnect,
@@ -441,14 +510,7 @@ impl Viewer {
             }
             KeyCode::Char('n') => self.jump(false),
             KeyCode::Char('N') => self.jump(true),
-            KeyCode::Char(' ') => {
-                if self.settings.follow {
-                    self.top = self
-                        .display_len()
-                        .saturating_sub(self.viewport_height.get());
-                }
-                self.settings.follow = !self.settings.follow;
-            }
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Up | KeyCode::PageUp => {
                 if self.settings.follow {
                     self.top = self
@@ -456,9 +518,11 @@ impl Viewer {
                         .saturating_sub(self.viewport_height.get());
                 }
                 self.settings.follow = false;
-                self.top = self
-                    .top
-                    .saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+                self.top = self.top.saturating_sub(if key.code == KeyCode::Up {
+                    1
+                } else {
+                    self.viewport_height.get()
+                });
             }
             KeyCode::Down | KeyCode::PageDown => {
                 if self.settings.follow {
@@ -467,14 +531,22 @@ impl Viewer {
                         .saturating_sub(self.viewport_height.get());
                 }
                 self.settings.follow = false;
-                self.top = (self.top + if key.code == KeyCode::Down { 1 } else { 10 })
-                    .min(self.display_len().saturating_sub(1));
+                self.top = (self.top
+                    + if key.code == KeyCode::Down {
+                        1
+                    } else {
+                        self.viewport_height.get()
+                    })
+                .min(self.display_len().saturating_sub(1));
             }
             KeyCode::Home => {
                 self.settings.follow = false;
                 self.top = 0;
             }
-            KeyCode::End => self.settings.follow = true,
+            KeyCode::End => {
+                self.frozen = None;
+                self.settings.follow = true;
+            }
             KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(8),
             KeyCode::Right => self.horizontal = self.horizontal.saturating_add(8),
             KeyCode::Backspace => {
@@ -532,7 +604,9 @@ impl Viewer {
             .constraints([Constraint::Min(2), Constraint::Length(8)])
             .split(area);
         let visible = self.visible();
-        let height = parts[0].height.saturating_sub(2) as usize;
+        let height = parts[0]
+            .height
+            .saturating_sub(2 + u16::from(self.settings.follow)) as usize;
         self.viewport_height.set(height.max(1));
         self.viewport_width
             .set(parts[0].width.saturating_sub(2).max(1));
@@ -570,7 +644,9 @@ impl Viewer {
         let title = tr!(
             "实时日志 · {} · {} · 显示 {} · 记录 {}",
             self.name,
-            if self.settings.follow {
+            if self.paused() {
+                t("显示已暂停 · 后台仍更新 · Space 恢复")
+            } else if self.settings.follow {
                 t("跟随")
             } else {
                 t("暂停跟随")
@@ -591,9 +667,19 @@ impl Viewer {
             paragraph.scroll((0, self.horizontal))
         };
         frame.render_widget(paragraph, parts[0]);
+        if self.settings.follow && parts[0].height > 2 && parts[0].width > 2 {
+            let marker = Rect::new(parts[0].x + 1, parts[0].bottom() - 2, parts[0].width - 2, 1);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(Color::DarkGray)),
+                marker,
+            );
+        }
         let status = tr!(
             "{}\n{}/{} lines · limit {} · released {}\n过滤: {}\n搜索: {}\nLocal log: {}",
-            self.status,
+            self.frozen.as_ref().map_or_else(
+                || self.status.clone(),
+                |(_, stamp)| format!("{} · 冻结于 {stamp} · 后台仍更新", self.status)
+            ),
             visible.len(),
             self.records.len(),
             self.settings.memory_lines,
@@ -720,6 +806,43 @@ fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn pause_freezes_display_while_collection_and_rotation_continue() {
+        let mut view = Viewer::new("test".into(), Settings::default());
+        view.settings.memory_lines = 1;
+        view.push("INFO first".into());
+        view.toggle_pause();
+        view.push("INFO second".into());
+        assert!(view.paused());
+        assert_eq!(view.visible()[0].text, "INFO first");
+        assert_eq!(view.records[0].text, "INFO second");
+        view.apply(LogEvent::Data {
+            bytes: b"WARN rotated\n".to_vec(),
+            cursor: LogCursor {
+                device: 1,
+                inode: 2,
+                offset: 13,
+            },
+            reset: true,
+            skip_prefix: false,
+        });
+        assert_eq!(view.visible()[0].text, "INFO first");
+        view.toggle_pause();
+        assert!(!view.paused());
+        assert_eq!(view.visible()[0].text, "WARN rotated");
+        assert!(view.settings.follow);
+    }
+    #[test]
+    fn search_escape_restores_query_and_control_chords_do_not_pause() {
+        let mut view = Viewer::new("test".into(), Settings::default());
+        view.settings.search = "original".into();
+        view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        view.paste(" changed");
+        view.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(view.settings.search, "original");
+        view.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!view.paused());
+    }
+    #[test]
     fn wrapping_preserves_unicode_tail_navigation_search_and_settings() {
         let mut view = Viewer::new("test".into(), Settings::default());
         view.records.push_back(Record {
@@ -761,6 +884,7 @@ mod tests {
     #[test]
     fn vim_log_navigation_preserves_search_input_and_level_selection() {
         let mut view = Viewer::new("proxy".into(), Settings::default());
+        view.settings.vim_navigation = true;
         for index in 0..30 {
             view.push(format!("INFO {index}"));
         }

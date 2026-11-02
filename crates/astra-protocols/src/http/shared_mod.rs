@@ -1,10 +1,7 @@
 use crate::outbound::Stream;
 use anyhow::{bail, Context, Result};
 use astra_ipc::Target;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub async fn http_connect(
     server: &str,
     username: Option<&str>,
@@ -123,7 +120,9 @@ pub fn authority_target(value: &str) -> Result<Target> {
     Ok(Target { host, port })
 }
 
-pub async fn read_connect(client: &mut TcpStream) -> Result<(Target, Vec<u8>)> {
+pub async fn read_connect<S: tokio::io::AsyncRead + Unpin>(
+    client: &mut S,
+) -> Result<(Target, Vec<u8>)> {
     let mut data = Vec::with_capacity(1024);
     let end = loop {
         if data.len() >= 8192 {

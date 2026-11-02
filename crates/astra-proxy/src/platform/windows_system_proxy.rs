@@ -30,6 +30,51 @@ pub struct Guard {
     original: Option<Settings>,
     journal: Option<PathBuf>,
     lock: Option<File>,
+    monitor: Option<Monitor>,
+}
+
+// Stop and join before restoring settings so a pending repair cannot undo restore.
+struct Monitor {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+fn matches_expected(actual: &Settings, expected: &Settings) -> bool {
+    actual.flags == expected.flags
+        && actual.server.as_deref().unwrap_or("") == expected.server.as_deref().unwrap_or("")
+        && actual.bypass.as_deref().unwrap_or("") == expected.bypass.as_deref().unwrap_or("")
+        && actual.auto_config_url.as_deref().unwrap_or("") == expected.auto_config_url.as_deref().unwrap_or("")
+}
+fn monitor(expected: Settings) -> Result<Monitor> {
+    let (stop, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("system-proxy-monitor".into())
+        .spawn(move || {
+            while matches!(
+                receiver.recv_timeout(std::time::Duration::from_secs(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                match query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS)) {
+                    Ok(actual) if matches_expected(&actual, &expected) => continue,
+                    Ok(_) => tracing::warn!("Windows system proxy settings changed or disabled; reapplying"),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to check Windows system proxy; retrying next interval");
+                        continue;
+                    }
+                }
+                if let Err(error) = write(&expected) {
+                    tracing::warn!(%error, "failed to reapply Windows system proxy; retrying next interval");
+                }
+            }
+        })?;
+    Ok(Monitor { stop, thread: Some(thread) })
 }
 
 fn option(option: u32) -> INTERNET_PER_CONN_OPTIONW {
@@ -183,13 +228,13 @@ impl Guard {
         );
         super::mode_config::system_proxy_address(config)?;
         let (http, socks) = super::mode_config::system_proxy_addresses(config)?;
-        let mut endpoints = Vec::new();
-        if let Some(address) = http {
-            endpoints.extend([format!("http={address}"), format!("https={address}")]);
-        }
-        if let Some(address) = socks {
-            endpoints.push(format!("socks={address}"));
-        }
+        // Windows manual HTTP proxy uses a single host:port endpoint.
+        // Keep SOCKS-only configuration explicitly typed, never treat it as HTTP.
+        let server = match (http, socks) {
+            (Some(address), _) => address.to_string(),
+            (None, Some(address)) => format!("socks={address}"),
+            (None, None) => unreachable!("listener validated above"),
+        };
         let mut lock = lock(None)?;
         let original =
             query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;
@@ -223,6 +268,7 @@ impl Guard {
             original: Some(original),
             journal: Some(journal.to_owned()),
             lock: None,
+            monitor: None,
         };
         lock.set_len(0)?;
         lock.write_all(
@@ -234,15 +280,18 @@ impl Guard {
         lock.sync_all()?;
         guard.lock = Some(lock);
         // Only DIRECT + PROXY: temporarily suppress PAC and auto-detection.
-        write(&Settings {
+        let expected = Settings {
             flags: PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
-            server: Some(endpoints.join(";")),
+            server: Some(server),
             bypass: Some("<local>".into()),
             auto_config_url: Some(String::new()),
-        })?;
+        };
+        write(&expected)?;
+        guard.monitor = Some(monitor(expected)?);
         Ok(guard)
     }
     pub fn restore(&mut self) -> Result<()> {
+        drop(self.monitor.take());
         if let Some(original) = &self.original {
             write(original)?;
             if let Some(lock) = &mut self.lock {
@@ -285,6 +334,7 @@ pub fn recover(path: &Path) -> Result<()> {
         original: Some(snapshot.original),
         journal: Some(path.to_owned()),
         lock: Some(lock),
+        monitor: None,
     }
     .restore()
 }
