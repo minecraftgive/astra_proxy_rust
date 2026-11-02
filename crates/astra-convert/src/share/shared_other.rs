@@ -220,7 +220,22 @@ pub(super) fn parse(value: &str) -> Result<Y> {
                     "alpn",
                 ],
             )?;
-            put(&mut node, "password", auth(&url)?);
+            let password = auth(&url)?;
+            ensure!(!password.is_empty(), "Hysteria2 requires a password");
+            if let Some(value) = q.get("pinSHA256") {
+                ensure!(
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "Hysteria2 certificate pin must be 64 hexadecimal characters"
+                );
+            }
+            if q.get("obfs-password").is_some() {
+                ensure!(
+                    q.get("obfs-password")
+                        .is_some_and(|value| !value.is_empty()),
+                    "Hysteria2 obfs password is required"
+                );
+            }
+            put(&mut node, "password", password);
             for (from, to) in [
                 ("sni", "sni"),
                 ("obfs", "obfs"),
@@ -250,8 +265,21 @@ pub(super) fn parse(value: &str) -> Result<Y> {
             )?;
             let raw = auth(&url)?;
             let (uuid, password) = raw.split_once(':').context("TUIC requires UUID:password")?;
-            uuid::Uuid::parse_str(uuid).context("invalid TUIC UUID")?;
+            let parsed = uuid::Uuid::parse_str(uuid).context("invalid TUIC UUID")?;
+            ensure!(!parsed.is_nil(), "TUIC UUID must not be nil");
             ensure!(!password.is_empty(), "TUIC requires a password");
+            if let Some(value) = q.get("congestion_control") {
+                ensure!(
+                    matches!(value.as_str(), "cubic" | "bbr" | "new_reno"),
+                    "unsupported TUIC congestion control"
+                );
+            }
+            if let Some(value) = q.get("udp_relay_mode") {
+                ensure!(
+                    matches!(value.as_str(), "native" | "quic"),
+                    "unsupported TUIC UDP mode"
+                );
+            }
             put(&mut node, "uuid", uuid);
             put(&mut node, "password", password);
             for (from, to) in [
@@ -297,7 +325,20 @@ fn vmess(value: &str) -> Result<Y> {
     );
     let port: u16 = get("port").parse().context("invalid VMess port")?;
     ensure!(port > 0 && !get("add").is_empty(), "invalid VMess endpoint");
-    uuid::Uuid::parse_str(&get("id")).context("invalid VMess UUID")?;
+    let parsed_uuid = uuid::Uuid::parse_str(&get("id")).context("invalid VMess UUID")?;
+    ensure!(!parsed_uuid.is_nil(), "VMess UUID must not be nil");
+    let cipher = if get("scy").is_empty() {
+        "auto".to_owned()
+    } else {
+        get("scy")
+    };
+    ensure!(
+        matches!(
+            cipher.as_str(),
+            "auto" | "aes-128-gcm" | "chacha20-poly1305"
+        ),
+        "unsupported VMess cipher"
+    );
     let mut node = Mapping::new();
     put(
         &mut node,
@@ -312,15 +353,7 @@ fn vmess(value: &str) -> Result<Y> {
     put(&mut node, "server", get("add"));
     node.insert("port".into(), Y::Number(port.into()));
     put(&mut node, "uuid", get("id"));
-    put(
-        &mut node,
-        "cipher",
-        if get("scy").is_empty() {
-            "auto".into()
-        } else {
-            get("scy")
-        },
-    );
+    put(&mut node, "cipher", cipher);
     ensure!(
         matches!(get("tls").as_str(), "" | "none" | "tls"),
         "unsupported VMess security"

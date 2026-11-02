@@ -44,27 +44,121 @@ pub fn links(input: &str, kind: Kind, current: &str) -> Result<Imported> {
     ensure!(input.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
     let converted = astra_convert::share::convert_links(input, &Default::default())?;
     let imported: toml_edit::DocumentMut = converted.proxy.parse()?;
-    let mut doc: toml_edit::DocumentMut = current.parse()?;
+    append_nodes(imported, current)
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum MergeMode {
+    Append,
+    Replace,
+    Overwrite(usize),
+}
+
+/// An input accepted by [`load_node`] and [`load_rules`].
+///
+/// Strings are treated as pasted native TOML (or a share link), unless they
+/// name an existing file. Paths are read without invoking a shell. The trait
+/// is public so UI callers can pass either a text field or a `Path` without
+/// converting it first.
+pub trait ImportInput {
+    fn read_import(&self) -> Result<(String, PathBuf)>;
+}
+
+impl ImportInput for &str {
+    fn read_import(&self) -> Result<(String, PathBuf)> {
+        read_input(self, &std::env::current_dir()?)
+    }
+}
+
+impl ImportInput for String {
+    fn read_import(&self) -> Result<(String, PathBuf)> {
+        read_input(self, &std::env::current_dir()?)
+    }
+}
+
+impl ImportInput for &Path {
+    fn read_import(&self) -> Result<(String, PathBuf)> {
+        read_file(self)
+    }
+}
+
+impl ImportInput for PathBuf {
+    fn read_import(&self) -> Result<(String, PathBuf)> {
+        read_file(self)
+    }
+}
+
+/// Import one or more native outbounds into the current proxy TOML.
+///
+/// The input may be a pasted `vless://`/other supported share link, a native
+/// `[[outbounds]]` fragment, a complete TOML configuration, or a path to one.
+/// Existing draft settings are retained; only `outbounds` is appended.
+pub fn load_node<I: ImportInput>(input: I, current: &str) -> Result<Imported> {
+    let (source, _) = input.read_import()?;
+    load_node_source(&source, current)
+}
+
+/// Import rules and rule sets from native TOML into the current rule TOML.
+///
+/// Both `[[rules]]` fragments and complete rule-core TOML are accepted. Rule
+/// set definitions are merged by name and conflicting definitions are rejected.
+pub fn load_rules<I: ImportInput>(input: I, current: &str) -> Result<Imported> {
+    let (source, _) = input.read_import()?;
+    load_rules_source(&source, current)
+}
+
+/// String-input variant that resolves relative file names against `directory`.
+/// This is useful for a text field backed by the TUI working directory.
+pub fn load_node_at(input: &str, directory: &Path, current: &str) -> Result<Imported> {
+    let (source, _) = read_input(input, directory)?;
+    load_node_source(&source, current)
+}
+
+/// String-input variant that resolves relative file names against `directory`.
+pub fn load_rules_at(input: &str, directory: &Path, current: &str) -> Result<Imported> {
+    let (source, _) = read_input(input, directory)?;
+    load_rules_source(&source, current)
+}
+
+fn load_node_source(source: &str, current: &str) -> Result<Imported> {
+    let source = source.trim_start_matches('\u{feff}');
+    ensure!(!source.trim().is_empty(), t("No imported nodes"));
+    if astra_convert::share::is_share(source) {
+        return links(source, Kind::Proxy, current);
+    }
+    ensure!(source.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    let imported: toml_edit::DocumentMut = source.parse().context(t("Invalid configuration"))?;
+    append_nodes(imported, current)
+}
+
+fn append_nodes(imported: toml_edit::DocumentMut, current: &str) -> Result<Imported> {
+    let mut doc: toml_edit::DocumentMut = current.parse().context(t("Invalid configuration"))?;
     let incoming = imported
         .get("outbounds")
         .and_then(toml_edit::Item::as_array_of_tables)
         .context("No imported nodes")?;
+    ensure!(!incoming.is_empty(), "No imported nodes");
     let groups = doc_group_names(current)?;
     let existing = doc
         .entry("outbounds")
         .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
         .as_array_of_tables_mut()
         .context("Invalid outbounds")?;
+    let mut tags = existing
+        .iter()
+        .filter_map(|node| {
+            node.get("tag")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::HashSet<_>>();
     for node in incoming {
         let tag = node
             .get("tag")
             .and_then(toml_edit::Item::as_str)
             .context("Missing tag")?;
         ensure!(
-            !existing
-                .iter()
-                .any(|n| n.get("tag").and_then(toml_edit::Item::as_str) == Some(tag))
-                && groups.iter().all(|n| n != tag),
+            tags.insert(tag.to_owned()) && groups.iter().all(|name| name != tag),
             t("Proxy target name already exists")
         );
         existing.push(node.clone());
@@ -72,6 +166,76 @@ pub fn links(input: &str, kind: Kind, current: &str) -> Result<Imported> {
     // Imported tables carry positions from another document. Reassign them so
     // each node's config/TLS/transport tables follow their own array entry.
     crate::editor::position_tables(doc.as_table_mut(), &mut 0);
+    finish_document(doc)
+}
+
+fn load_rules_source(source: &str, current: &str) -> Result<Imported> {
+    let source = source.trim_start_matches('\u{feff}');
+    ensure!(!source.trim().is_empty(), t("No imported rules"));
+    ensure!(source.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    let imported: toml_edit::DocumentMut = source.parse().context(t("Invalid configuration"))?;
+    append_rules(imported, current)
+}
+
+fn append_rules(imported: toml_edit::DocumentMut, current: &str) -> Result<Imported> {
+    let mut doc: toml_edit::DocumentMut = current.parse().context(t("Invalid configuration"))?;
+    let incoming = imported
+        .get("rules")
+        .and_then(toml_edit::Item::as_array_of_tables);
+    let incoming_sets = imported
+        .get("rule_sets")
+        .and_then(toml_edit::Item::as_table_like);
+    ensure!(
+        incoming.is_some_and(|rules| !rules.is_empty())
+            || incoming_sets.is_some_and(|sets| sets.iter().next().is_some()),
+        "No imported rules"
+    );
+    if let Some(incoming) = incoming {
+        let existing = doc
+            .entry("rules")
+            .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
+            .as_array_of_tables_mut()
+            .context("Invalid rules")?;
+        let identity = |rule: &toml_edit::Table| {
+            ["kind", "value", "action"]
+                .iter()
+                .map(|key| rule.get(key).map(ToString::to_string).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        };
+        let mut identities = existing
+            .iter()
+            .map(identity)
+            .collect::<std::collections::HashSet<_>>();
+        for rule in incoming {
+            let key = identity(rule);
+            ensure!(identities.insert(key), "Duplicate rule");
+            existing.push(rule.clone());
+        }
+    }
+
+    if let Some(incoming_sets) = incoming_sets {
+        let sets = doc
+            .entry("rule_sets")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_like_mut()
+            .context("Invalid rule_sets")?;
+        for (name, incoming_set) in incoming_sets.iter() {
+            if let Some(existing_set) = sets.get(name) {
+                ensure!(
+                    existing_set.to_string() == incoming_set.to_string(),
+                    "Rule set name conflicts with existing definition"
+                );
+            } else {
+                sets.insert(name, incoming_set.clone());
+            }
+        }
+    }
+    crate::editor::position_tables(doc.as_table_mut(), &mut 0);
+    finish_document(doc)
+}
+
+fn finish_document(doc: toml_edit::DocumentMut) -> Result<Imported> {
     let text = doc.to_string();
     text.parse::<toml_edit::DocumentMut>()
         .context(t("Invalid configuration"))?;
@@ -80,6 +244,195 @@ pub fn links(input: &str, kind: Kind, current: &str) -> Result<Imported> {
         text,
         warnings: vec![],
     })
+}
+
+pub fn merge_at(
+    input: &str,
+    directory: &Path,
+    current: &str,
+    kind: Kind,
+    mode: MergeMode,
+) -> Result<Imported> {
+    let (source, base) = read_input(input, directory)?;
+    let source = source.trim_start_matches('\u{feff}');
+    let mut incoming: toml_edit::DocumentMut = if astra_convert::share::is_share(source) {
+        ensure!(
+            kind == Kind::Proxy,
+            t("Configuration does not match this core")
+        );
+        astra_convert::share::convert_links(source, &Default::default())?
+            .proxy
+            .parse()?
+    } else if let Ok(doc) = source.parse() {
+        doc
+    } else {
+        let converted = astra_convert::convert(
+            source,
+            &astra_convert::Options {
+                base_dir: base.clone(),
+                strict_rules: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|_| anyhow::anyhow!(t("Invalid configuration")))?;
+        if kind == Kind::Proxy {
+            converted.proxy
+        } else {
+            converted.rules
+        }
+        .parse()?
+    };
+    let key = if kind == Kind::Proxy {
+        "outbounds"
+    } else {
+        "rules"
+    };
+    normalize_collection(&mut incoming, key)?;
+    if let Some(sets) = incoming
+        .get_mut("rule_sets")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for (_, set) in sets.iter_mut() {
+            if let Some(path) = set.as_table_like_mut().and_then(|s| s.get_mut("path")) {
+                rebase(path, &base);
+            }
+        }
+    }
+    let mut doc: toml_edit::DocumentMut = current.parse()?;
+    normalize_collection(&mut doc, key)?;
+    let mut position = None;
+    match mode {
+        MergeMode::Append => {}
+        MergeMode::Replace => {
+            doc.remove(key);
+        }
+        MergeMode::Overwrite(index) => {
+            ensure!(
+                incoming
+                    .get(key)
+                    .and_then(toml_edit::Item::as_array_of_tables)
+                    .is_some_and(|a| a.len() == 1),
+                t("Choose exactly one imported item")
+            );
+            let array = doc
+                .get_mut(key)
+                .and_then(toml_edit::Item::as_array_of_tables_mut)
+                .context(t("Select an item first"))?;
+            ensure!(index < array.len(), t("Select an item first"));
+            if kind == Kind::Proxy {
+                let tag = array
+                    .get(index)
+                    .and_then(|n| n.get("tag"))
+                    .and_then(toml_edit::Item::as_str);
+                let new_tag = incoming[key]
+                    .as_array_of_tables()
+                    .and_then(|a| a.get(0))
+                    .and_then(|n| n.get("tag"))
+                    .and_then(toml_edit::Item::as_str);
+                ensure!(
+                    tag == new_tag,
+                    t("Keep the selected node tag when overwriting")
+                );
+            }
+            array.remove(index);
+            position = Some(index);
+        }
+    }
+    let result = if kind == Kind::Proxy {
+        append_nodes(incoming, &doc.to_string())?
+    } else {
+        append_rules(incoming, &doc.to_string())?
+    };
+    let mut doc: toml_edit::DocumentMut = result.text.parse()?;
+    if let Some(index) = position {
+        let array = doc[key].as_array_of_tables_mut().unwrap();
+        let mut tables: Vec<_> = array.iter().cloned().collect();
+        let table = tables.pop().unwrap();
+        tables.insert(index, table);
+        *array = tables.into_iter().collect();
+    }
+    if kind == Kind::Proxy {
+        let value: toml::Table = toml::from_str(&doc.to_string())?;
+        let tags: std::collections::HashSet<String> = value
+            .get("outbounds")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.get("tag").and_then(toml::Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        let groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> = value
+            .get("proxy_groups")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()?
+            .unwrap_or_default();
+        astra_ipc::groups::validate(&groups, &tags).map_err(anyhow::Error::msg)?;
+    } else if let Some(rules) = doc
+        .get("rules")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    {
+        for rule in rules {
+            if rule.get("kind").and_then(toml_edit::Item::as_str) == Some("rule_set") {
+                let name = rule
+                    .get("value")
+                    .and_then(toml_edit::Item::as_str)
+                    .context(t("Missing rule set"))?;
+                ensure!(
+                    doc.get("rule_sets")
+                        .and_then(toml_edit::Item::as_table_like)
+                        .is_some_and(|sets| sets.get(name).is_some()),
+                    t("Missing rule set")
+                );
+            }
+        }
+    }
+    crate::editor::position_tables(doc.as_table_mut(), &mut 0);
+    finish_document(doc)
+}
+
+fn normalize_collection(doc: &mut toml_edit::DocumentMut, key: &str) -> Result<()> {
+    if let Some(array) = doc.get(key).and_then(toml_edit::Item::as_array) {
+        let mut tables = toml_edit::ArrayOfTables::new();
+        for item in array {
+            tables.push(
+                item.as_inline_table()
+                    .context(t("Invalid configuration"))?
+                    .clone()
+                    .into_table(),
+            );
+        }
+        doc[key] = toml_edit::Item::ArrayOfTables(tables);
+    }
+    Ok(())
+}
+
+fn read_input(input: &str, directory: &Path) -> Result<(String, PathBuf)> {
+    let trimmed = input.trim();
+    let path = Path::new(trimmed);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        directory.join(path)
+    };
+    if path.is_file() {
+        return read_file(&path);
+    }
+    Ok((input.to_owned(), directory.to_path_buf()))
+}
+
+fn read_file(path: &Path) -> Result<(String, PathBuf)> {
+    ensure!(path.is_file(), t("Choose one TOML or YAML file"));
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    let source = String::from_utf8(bytes).context(t("Configuration must be UTF-8"))?;
+    Ok((
+        source,
+        path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+    ))
 }
 fn doc_group_names(current: &str) -> Result<Vec<String>> {
     let doc: toml::Value = toml::from_str(current)?;
@@ -246,6 +599,29 @@ pub(crate) mod tests {
         assert!(links(link, Kind::Rule, current).is_err());
     }
     #[test]
+    fn fragment_helpers_append_nodes_rules_and_sets_with_conflict_checks() {
+        let node = "[[outbounds]]\nkind='socks5'\ntag='new'\nserver='127.0.0.1:1'\n";
+        let imported = load_node(
+            node,
+            "standalone=true\n[[outbounds]]\ntag='old'\nkind='direct'\n",
+        )
+        .unwrap();
+        let value: toml::Value = toml::from_str(&imported.text).unwrap();
+        assert_eq!(value["outbounds"].as_array().unwrap().len(), 2);
+        assert!(load_node(node, &imported.text).is_err());
+
+        let rules = "[[rules]]\nkind='domain_suffix'\nvalue='example.com'\naction='direct'\n[rule_sets.ads]\nbehavior='domain'\n";
+        let imported = load_rules(rules, "socket='rules.sock'\n").unwrap();
+        let value: toml::Value = toml::from_str(&imported.text).unwrap();
+        assert_eq!(value["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["rule_sets"]["ads"]["behavior"].as_str(),
+            Some("domain")
+        );
+        assert!(load_rules(rules, &imported.text).is_err());
+        assert!(load_rules("[rule_sets.ads]\nbehavior='ip'\n[[rules]]\nkind='ip_cidr'\nvalue='127.0.0.1/32'\naction='direct'\n", &imported.text).is_err());
+    }
+
     fn appended_native_nodes_keep_nested_tables_with_their_node() {
         let link = "vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&sni=example.com&type=xhttp&mode=auto&path=%2Fhello#first";
         let current = "standalone=true\n[[outbounds]]\nkind='native'\ntag='existing'\n[outbounds.config]\nprotocol='vless'\nserver='old.example:443'\n[outbounds.config.tls]\nenabled=true\nserver_name='old.example'\n";

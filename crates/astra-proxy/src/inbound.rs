@@ -1,8 +1,11 @@
+#[path = "inbound/shared_http.rs"]
 mod http;
+#[path = "inbound/shared_socks5.rs"]
 mod socks5;
 pub use http::handle_http;
 pub use socks5::handle_socks5;
 
+#[path = "inbound/shared_authentication.rs"]
 mod authentication;
 pub(crate) use authentication::{authorize_connect, http_authorized};
 pub async fn handle_mixed(

@@ -233,6 +233,7 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Matched condition: {} {}", "Matched condition: {} {}", "具体匹配项：{} {}", "具體符合項目：{} {}"),
     ("Route explanation", "Route explanation", "规则命中查询", "規則命中查詢"),
     ("Proxy groups", "Proxy groups", "代理组", "代理組"),
+    ("Update proxy (group / node / DIRECT)", "Update proxy (group / node / DIRECT)", "更新代理（代理组 / 节点 / DIRECT）", "更新代理（代理組 / 節點 / DIRECT）"),
     ("Import subscription groups", "Import subscription groups", "导入订阅代理组", "匯入訂閱代理組"),
     ("Enter add subscription · n add · d remove · Ctrl-S save and update", "Enter add subscription · n add · d remove · Ctrl-S save and update", "Enter 添加订阅 · n 新增 · d 删除 · Ctrl-S 保存并更新", "Enter 新增訂閱 · n 新增 · d 刪除 · Ctrl-S 儲存並更新"),
     ("Import node links", "Import node links", "导入节点链接", "匯入節點連結"),

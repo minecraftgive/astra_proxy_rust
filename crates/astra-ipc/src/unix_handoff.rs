@@ -69,6 +69,51 @@ pub struct Commit {
     pub digest: u64,
 }
 
+/// Commands sent over the authenticated lifeline after the hand-off commits.
+/// The manager cannot signal a root-owned macOS core directly, so shutdown is
+/// requested by the core itself after it validates this framed message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LifelineCommand {
+    Graceful,
+    Forced,
+}
+
+pub fn lifecycle_frame(command: LifelineCommand) -> io::Result<Vec<u8>> {
+    frame(&command)
+}
+
+/// A program sudo runs as root must not be replaceable by the invoking user
+/// (or anything running as them) between this check and the exec: the file
+/// and every directory above it must be owned by root and writable only by
+/// root. Group write is tolerated only for gid 0.
+pub fn ensure_root_controlled(path: &std::path::Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path)?;
+    let check = |path: &std::path::Path, metadata: &std::fs::Metadata| {
+        let foreign_write =
+            metadata.mode() & 0o002 != 0 || (metadata.mode() & 0o020 != 0 && metadata.gid() != 0);
+        if metadata.uid() != 0 || foreign_write {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be owned by root and writable only by root before it can run with sudo",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    };
+    let metadata = std::fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err(invalid("the elevated program is not a regular file"));
+    }
+    check(&path, &metadata)?;
+    for ancestor in path.ancestors().skip(1) {
+        check(ancestor, &std::fs::metadata(ancestor)?)?;
+    }
+    Ok(path)
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -145,7 +190,10 @@ pub fn ticket_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// The kernel's view of the process on the other end of a connected Unix

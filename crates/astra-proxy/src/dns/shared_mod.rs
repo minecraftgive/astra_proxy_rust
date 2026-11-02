@@ -1,8 +1,11 @@
 //! DNS integration: resolver policy stays in astra-dns; only egress and listener
 //! lifetime live here. OS socket binding is delegated to platform::egress.
+#[path = "shared_server.rs"]
 mod server;
 #[cfg(test)]
+#[path = "shared_tests.rs"]
 mod tests;
+#[path = "upstream/shared_mod.rs"]
 mod upstream;
 use crate::App;
 use anyhow::Result;

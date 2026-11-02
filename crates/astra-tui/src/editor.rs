@@ -764,6 +764,19 @@ impl Editor {
             }
             return Some(values);
         }
+        if key == "proxy"
+            && (last_key(&self.form.path) == Some("subscription")
+                || (self.form.path.len() == 2
+                    && self.form.path.first() == Some(&Part::Key("subscriptions".into()))))
+        {
+            let mut values = vec!["PROXY".into(), "DIRECT".into()];
+            for target in proxy_targets(doc) {
+                if !values.contains(&target) {
+                    values.push(target);
+                }
+            }
+            return Some(values);
+        }
         if key == "selected" && proxy_group_name(&self.form.path).is_some() {
             if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
                 if groups.contains_key(proxy_group_name(&self.form.path).unwrap()) {
@@ -1136,6 +1149,67 @@ impl Editor {
         }
         Ok(self.text())
     }
+    /// Return the tag for the selected outbound row.
+    pub(crate) fn selected_node_tag(&self) -> Result<String> {
+        let doc = self.document()?;
+        let rows = self.visible_rows(&doc);
+        // Only the item's own row counts; its expanded field rows do not.
+        let row = rows
+            .get(self.form.selected)
+            .context(t("Select a node to export"))?;
+        let FlatRow::Node { index, .. } = row else {
+            bail!(t("Select a node to export"));
+        };
+        collection(&doc, &[Part::Key("outbounds".into())])
+            .and_then(|nodes| nodes.get(*index))
+            .and_then(|node| node.get("tag"))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+            .context(t("Selected node has no tag"))
+    }
+
+    /// Export the outbound represented by the currently selected visible row.
+    pub(crate) fn export_selected_node(&self) -> Result<String> {
+        let tag = self.selected_node_tag()?;
+        crate::export::selected_node(&self.text(), &tag)
+    }
+    pub(crate) fn export_selected_node_share(&self) -> Result<String> {
+        let tag = self.selected_node_tag()?;
+        let value: toml::Value = self.text().parse()?;
+        let node = value["outbounds"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find(|n| n.get("tag").and_then(toml::Value::as_str) == Some(tag.as_str()))
+            })
+            .context(t("Selected node has no tag"))?;
+        astra_convert::share::export_node(node)
+    }
+
+    /// Return the zero-based rule index for the selected rule row.
+    pub(crate) fn selected_rule_index(&self) -> Result<usize> {
+        let doc = self.document()?;
+        let rows = self.visible_rows(&doc);
+        // Only the item's own row counts; its expanded field rows do not.
+        let row = rows
+            .get(self.form.selected)
+            .context(t("Select a rule to export"))?;
+        let FlatRow::Rule { index, .. } = row else {
+            bail!(t("Select a rule to export"));
+        };
+        anyhow::ensure!(
+            collection(&doc, &[Part::Key("rules".into())]).is_some_and(|rules| *index < rules.len()),
+            t("Select a rule to export")
+        );
+        Ok(*index)
+    }
+
+    /// Export the rule represented by the currently selected visible row.
+    pub(crate) fn export_selected_rule(&self) -> Result<String> {
+        let index = self.selected_rule_index()?;
+        crate::export::selected_rule(&self.text(), index)
+    }
+
     fn schema_rows(&self, doc: &DocumentMut, path: &[Part]) -> Vec<Row> {
         if matches!(path.last(), Some(Part::Key(k)) if k == "rules" || k == "outbounds") {
             return collection(doc, path)
@@ -1296,6 +1370,12 @@ impl Editor {
                 text("url", t("Subscription URL"), "", true),
                 number("interval", t("Update interval (seconds)"), 3600, 60, 604800),
                 text("user_agent", "User-Agent", "clash.meta/astra", false),
+                text(
+                    "proxy",
+                    t("Update proxy (group / node / DIRECT)"),
+                    "PROXY",
+                    false,
+                ),
                 Spec {
                     kind: Type::Boolean,
                     ..text(
@@ -4182,6 +4262,127 @@ fn outbound_template(kind: &str, tag: &str) -> Table {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    #[test]
+    fn subscription_update_proxy_offers_groups_nodes_and_direct() {
+        let mut editor = Editor::new("proxy".into(), "standalone=true\n[[outbounds]]\ntag='node'\nkind='http'\nserver='127.0.0.1:1234'\n[subscriptions.remote]\nurl='https://example.com/sub'\n[proxy_groups.custom]\nmembers=['node']\n".into());
+        editor.form.path = vec![
+            Part::Key("subscriptions".into()),
+            Part::Key("remote".into()),
+        ];
+        let doc = editor.document().unwrap();
+        let choices = editor.reference_values(&doc, "proxy").unwrap();
+        for target in ["PROXY", "DIRECT", "node", "custom"] {
+            assert!(choices.contains(&target.to_owned()), "{target}");
+        }
+    }
+
+    #[test]
+    fn selected_node_export_uses_the_visible_node_row() {
+        let mut editor = Editor::new(
+            "proxy".into(),
+            "standalone=true\n[[outbounds]]\ntag='first'\nkind='http'\nserver='127.0.0.1:1234'\n[[outbounds]]\ntag='second'\nkind='socks5'\nserver='127.0.0.1:2345'\n".into(),
+        );
+        let doc = editor.document().unwrap();
+        editor.form.selected = editor
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Node { label, .. } if label.contains("second")))
+            .unwrap();
+
+        assert_eq!(editor.selected_node_tag().unwrap(), "second");
+        let output = editor.export_selected_node().unwrap();
+        let exported: toml_edit::DocumentMut = output.parse().unwrap();
+        let nodes = exported["outbounds"].as_array_of_tables().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes.get(0).unwrap()["tag"].as_str(), Some("second"));
+        assert!(!output.contains("first"));
+    }
+
+    #[test]
+    fn selected_rule_export_uses_the_visible_rule_row() {
+        let mut editor = Editor::new(
+            "rules".into(),
+            "socket='r'\ndefault_action='direct'\n[[rules]]\nkind='rule_set'\nvalue='ads'\naction='block'\n[[rules]]\nkind='domain_suffix'\nvalue='example.com'\naction='direct'\n[rule_sets.ads]\nbehavior='domain'\npayload=['+.ads.test']\n".into(),
+        );
+        let doc = editor.document().unwrap();
+        editor.form.expanded_collections.push("rules".into());
+        editor.form.expanded_rule_groups = collection(&doc, &[Part::Key("rules".into())])
+            .map(|rules| {
+                rule_groups(rules)
+                    .into_iter()
+                    .map(|group| group.0)
+                    .collect()
+            })
+            .unwrap();
+        let doc = editor.document().unwrap();
+        editor.form.selected = editor
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Rule { index: 1, .. }))
+            .unwrap();
+
+        assert_eq!(editor.selected_rule_index().unwrap(), 1);
+        let output = editor.export_selected_rule().unwrap();
+        let exported: toml_edit::DocumentMut = output.parse().unwrap();
+        let rules = exported["rules"].as_array_of_tables().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.get(0).unwrap()["value"].as_str(), Some("example.com"));
+        assert!(exported.get("rule_sets").is_none());
+    }
+
+    #[test]
+    fn selected_export_rejects_non_item_visible_rows() {
+        let mut editor = Editor::new("proxy".into(), "standalone=true\n".into());
+        let doc = editor.document().unwrap();
+        editor.form.selected = editor
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Section { .. }))
+            .unwrap();
+        assert!(editor.selected_node_tag().is_err());
+        assert!(editor.selected_rule_index().is_err());
+    }
+
+    #[test]
+    fn selected_export_rejects_child_rows() {
+        let mut node_editor = Editor::new(
+            "proxy".into(),
+            "standalone=true\n[[outbounds]]\ntag='node'\nkind='http'\nserver='127.0.0.1:1234'\n".into(),
+        );
+        node_editor.form.expanded_nodes.push(0);
+        let doc = node_editor.document().unwrap();
+        node_editor.form.selected = node_editor
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Field { path, .. } if node_index(path).is_some()))
+            .unwrap();
+        assert!(node_editor.selected_node_tag().is_err());
+
+        let mut rule_editor = Editor::new(
+            "rules".into(),
+            "socket='r'\ndefault_action='direct'\n[[rules]]\nkind='domain_suffix'\nvalue='example.com'\naction='direct'\n".into(),
+        );
+        rule_editor.form.expanded_collections.push("rules".into());
+        let doc = rule_editor.document().unwrap();
+        let start = rule_editor
+            .visible_rows(&doc)
+            .iter()
+            .find_map(|row| match row {
+                FlatRow::RuleGroup { start, .. } => Some(*start),
+                _ => None,
+            })
+            .unwrap();
+        // Expanding the group shows each rule's row followed by its fields.
+        rule_editor.form.expanded_rule_groups.push(start);
+        let doc = rule_editor.document().unwrap();
+        rule_editor.form.selected = rule_editor
+            .visible_rows(&doc)
+            .iter()
+            .position(|row| matches!(row, FlatRow::Field { path, .. } if item_index(path).is_some_and(|(kind, index)| kind == "rules" && index == start)))
+            .unwrap();
+        assert!(rule_editor.selected_rule_index().is_err());
+    }
+
     #[test]
     fn nested_subscription_picker_exposes_nodes_and_update_entry() {
         let mut editor = Editor::new("proxy".into(), "standalone=true\n[subscriptions.remote]\nurl='https://example.com/sub'\n[proxy_groups.parent]\nmembers=['remote']\n".into());

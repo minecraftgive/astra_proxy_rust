@@ -1,6 +1,8 @@
-mod server;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "manager/unix_elevation.rs"]
 mod elevation;
+#[path = "manager/shared_server.rs"]
+mod server;
 use crate::protocol::*;
 use anyhow::{bail, Context, Result};
 use astra_ipc::control::{self, Command};

@@ -104,7 +104,9 @@ mod tests {
             let this = self.get_mut();
             if let Some(stashed) = &this.stashed {
                 if stashed != buf {
-                    return Poll::Ready(Err(io::Error::other("write buffer changed after Pending")));
+                    return Poll::Ready(Err(io::Error::other(
+                        "write buffer changed after Pending",
+                    )));
                 }
             } else {
                 this.stashed = Some(buf.to_vec());
