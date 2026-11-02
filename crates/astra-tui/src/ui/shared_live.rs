@@ -1335,10 +1335,7 @@ mod tests {
         details.elevation_supported = true;
         ui.details.insert("proxy".into(), details);
 
-        assert!(matches!(
-            ui.runtime_action(Command::Tun(true)),
-            Input::Idle
-        ));
+        assert!(matches!(ui.runtime_action(Command::Tun(true)), Input::Idle));
         assert!(matches!(
             &ui.prompt,
             Some(Prompt::ElevateTun { name, pid }) if name == "proxy" && *pid == Some(42)

@@ -192,4 +192,5 @@ pub async fn reply_socks5(client: &mut TcpStream, reply: u8) -> Result<()> {
     Ok(())
 }
 
+#[path = "shared_udp.rs"]
 pub mod udp;

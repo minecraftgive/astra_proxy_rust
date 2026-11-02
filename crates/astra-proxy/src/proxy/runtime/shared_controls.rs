@@ -24,11 +24,7 @@ impl State {
     /// The overrides file must never record the TUN switch of an elevated
     /// core: that process holds CAP_NET_ADMIN, while the next launch of the
     /// same profile runs without it and would fail to create the device.
-    fn persist_overrides(
-        &self,
-        path: &std::path::Path,
-        overrides: &Overrides,
-    ) -> Result<()> {
+    fn persist_overrides(&self, path: &std::path::Path, overrides: &Overrides) -> Result<()> {
         let mut value = overrides.clone();
         if self.elevated_tun {
             value.tun = None;

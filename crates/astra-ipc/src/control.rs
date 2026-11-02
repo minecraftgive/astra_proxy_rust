@@ -1,4 +1,5 @@
 //! Separate, owner-only management socket. Routing IPC remains unchanged.
+#[path = "control/shared_server.rs"]
 mod server;
 use crate::platform::LocalListener as UnixListener;
 use serde::{Deserialize, Serialize};

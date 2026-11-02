@@ -135,9 +135,7 @@ impl Hub {
     pub(super) fn begin_elevation(&self, name: &str, ticket: &str) {
         let mut elevations = self.elevations.lock().unwrap();
         let now = std::time::Instant::now();
-        elevations.retain(|_, slot| {
-            now.duration_since(slot.started) < Duration::from_secs(600)
-        });
+        elevations.retain(|_, slot| now.duration_since(slot.started) < Duration::from_secs(600));
         elevations.insert(
             name.to_owned(),
             ElevationSlot {
@@ -148,7 +146,12 @@ impl Hub {
         );
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(super) fn finish_elevation(&self, name: &str, ticket: &str, outcome: super::elevation::Outcome) {
+    pub(super) fn finish_elevation(
+        &self,
+        name: &str,
+        ticket: &str,
+        outcome: super::elevation::Outcome,
+    ) {
         let mut elevations = self.elevations.lock().unwrap();
         if let Some(slot) = elevations.get_mut(name) {
             if astra_ipc::unix_handoff::ticket_eq(&slot.ticket, ticket) {

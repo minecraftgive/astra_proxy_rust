@@ -115,7 +115,7 @@ impl Ui {
     }
     /// Opens the log of `name` on the Logs page.
     pub(super) fn open_logs(&mut self, name: String) -> Input {
-        self.page = LOGS;
+        self.remember_page(LOGS);
         if self.viewer.as_ref().is_some_and(|v| v.name == name) {
             return Input::Idle;
         }
@@ -612,6 +612,20 @@ impl Ui {
             "Copy configuration",
             "y",
             Run::Op(Operation::Copy),
+            no_profile,
+        );
+        add(
+            "Profile",
+            "Export configuration",
+            "E",
+            Run::Op(Operation::ExportConfig),
+            no_profile,
+        );
+        add(
+            "Profile",
+            "Export terminal proxy commands",
+            "P",
+            Run::Op(Operation::ExportTerminal),
             no_profile,
         );
         add(

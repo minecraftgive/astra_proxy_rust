@@ -201,7 +201,10 @@ fn node_import_ignores_remote_rules_groups_and_listeners_by_default() {
     // PROXY plus the built-in DIRECT and REJECT groups.
     assert_eq!(proxy["proxy_groups"].as_table().unwrap().len(), 3);
     assert_eq!(
-        proxy["proxy_groups"]["DIRECT"]["members"].as_array().unwrap()[0].as_str(),
+        proxy["proxy_groups"]["DIRECT"]["members"]
+            .as_array()
+            .unwrap()[0]
+            .as_str(),
         Some("DIRECT")
     );
     assert!(proxy.get("tun").is_none());
@@ -395,4 +398,20 @@ fn remote_subscriptions_accept_http_refuse_downgrade_and_local_files() {
         format!("{error:#}").contains("local file providers"),
         "{error:#}"
     );
+}
+
+#[test]
+fn subscription_update_proxy_defaults_and_round_trips() {
+    let defaults: Subscription = toml::from_str("url='https://example.com/sub'").unwrap();
+    assert_eq!(defaults.proxy, "PROXY");
+    for proxy in ["DIRECT", "custom-group", "node"] {
+        let config: Subscription =
+            toml::from_str(&format!("url='https://example.com/sub'\nproxy='{proxy}'")).unwrap();
+        config.validate().unwrap();
+        let restored: Subscription = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.proxy, proxy);
+    }
+    let mut invalid = defaults;
+    invalid.proxy = " ".into();
+    assert!(invalid.validate().is_err());
 }

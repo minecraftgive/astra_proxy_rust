@@ -1,8 +1,14 @@
+#[path = "ui/shared_background.rs"]
 mod background;
+#[path = "ui/shared_dashboard.rs"]
 mod dashboard;
+#[path = "ui/shared_detached.rs"]
 mod detached;
+#[path = "ui/shared_live.rs"]
 mod live;
+#[path = "ui/shared_pages.rs"]
 mod pages;
+#[path = "ui/shared_shell.rs"]
 mod shell;
 use crate::editor::Editor;
 use crate::logs;
@@ -57,6 +63,21 @@ enum Prompt {
     Shutdown,
     Discard,
     Import,
+    ImportNode(crate::import::MergeMode),
+    ImportRule(crate::import::MergeMode),
+    ExportConfig {
+        text: String,
+    },
+    ExportNode {
+        text: String,
+        share: bool,
+    },
+    ExportRule {
+        text: String,
+    },
+    ExportTerminal {
+        text: String,
+    },
     ImportConfirm {
         text: String,
         notices: String,
@@ -97,6 +118,13 @@ impl Prompt {
             Self::Shutdown => t("Stop all instances?"),
             Self::Discard => t("Discard changes?"),
             Self::Import => t("Import config or proxy share links"),
+            Self::ImportNode(_) => t("Import node TOML or share link"),
+            Self::ImportRule(_) => t("Import rules TOML"),
+            Self::ExportConfig { .. } => t("Export configuration to path"),
+            Self::ExportNode { share: true, .. } => t("Export selected node as share link to path"),
+            Self::ExportNode { share: false, .. } => t("Export selected node TOML to path"),
+            Self::ExportRule { .. } => t("Export selected rule to path"),
+            Self::ExportTerminal { .. } => t("Export terminal proxy commands to path"),
             Self::ImportConfirm { .. } => t("Replace editor draft?"),
             Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
             Self::CloseAll { .. } => {
@@ -125,6 +153,8 @@ enum Operation {
     Diagnostics,
     NetTools,
     Explain,
+    ExportConfig,
+    ExportTerminal,
 }
 impl Operation {
     fn label(self) -> &'static str {
@@ -143,6 +173,8 @@ impl Operation {
             Self::Diagnostics => "Connectivity / Exit IP",
             Self::NetTools => "Network tools",
             Self::Explain => "Route explanation",
+            Self::ExportConfig => "Export config",
+            Self::ExportTerminal => "Export terminal proxy commands",
         })
     }
 }
@@ -232,6 +264,7 @@ impl Session {
 struct Ui {
     session: Session,
     page: usize,
+    navigation_stack: Vec<usize>,
     palette: Option<shell::Palette>,
     runtime_snapshot: Option<astra_ipc::runtime::Snapshot>,
     runtime_instance: String,
@@ -372,6 +405,7 @@ impl Ui {
         Self {
             session,
             page: 0,
+            navigation_stack: Vec::new(),
             palette: None,
             runtime_snapshot: None,
             runtime_instance: String::new(),
@@ -446,6 +480,8 @@ impl Ui {
             Operation::Bind,
             Operation::Config,
             Operation::Copy,
+            Operation::ExportConfig,
+            Operation::ExportTerminal,
         ]);
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
@@ -599,6 +635,26 @@ impl Ui {
                 self.prompt(Prompt::Clone(name));
                 None
             }
+            Operation::ExportConfig => {
+                let text = std::fs::read_to_string(&row.instance.config).with_context(|| {
+                    format!("Read configuration {}", row.instance.config.display())
+                });
+                match text.and_then(|text| crate::export::export_config(&text)) {
+                    Ok(text) => self.prompt(Prompt::ExportConfig { text }),
+                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+                }
+                None
+            }
+            Operation::ExportTerminal => {
+                let text = std::fs::read_to_string(&row.instance.config)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|text| crate::export::current_shell_commands(&text));
+                match text {
+                    Ok(text) => self.prompt(Prompt::ExportTerminal { text }),
+                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+                }
+                None
+            }
             Operation::Remove => {
                 if running {
                     self.message = "Stop instance before removing".into();
@@ -629,7 +685,15 @@ impl Ui {
     fn prompt(&mut self, prompt: Prompt) {
         if matches!(
             prompt,
-            Prompt::AddName | Prompt::Config(_) | Prompt::Clone(_)
+            Prompt::AddName
+                | Prompt::Config(_)
+                | Prompt::Clone(_)
+                | Prompt::ImportNode(_)
+                | Prompt::ImportRule(_)
+                | Prompt::ExportConfig { .. }
+                | Prompt::ExportNode { .. }
+                | Prompt::ExportRule { .. }
+                | Prompt::ExportTerminal { .. }
         ) {
             self.working_dir = launch_directory();
         }
@@ -657,6 +721,10 @@ impl Ui {
                     target.to_string_lossy().into_owned()
                 })
                 .unwrap_or_default(),
+            Prompt::ExportConfig { .. }
+            | Prompt::ExportNode { .. }
+            | Prompt::ExportRule { .. }
+            | Prompt::ExportTerminal { .. } => String::new(),
             Prompt::Find(_) => self.last_find.clone(),
             _ => String::new(),
         };
@@ -737,7 +805,7 @@ impl Ui {
     }
     fn recover_key(&mut self, key: KeyCode) -> Input {
         match key {
-            KeyCode::Char('b') => {
+            KeyCode::Esc | KeyCode::Char('b') => {
                 let recovery = self.recovery.take().unwrap();
                 if matches!(recovery.resume, Resume::Session) {
                     self.persistence_paused = true;
@@ -825,7 +893,17 @@ impl Ui {
                 name,
                 absolute(&input, &self.working_dir)?,
             )),
+            Prompt::ExportConfig { text }
+            | Prompt::ExportNode { text, .. }
+            | Prompt::ExportRule { text }
+            | Prompt::ExportTerminal { text, .. } => {
+                let path = absolute(&input, &self.working_dir)?;
+                crate::export::write_new(&path, &text)?;
+                self.message = tr!("Exported to {}", path.display());
+                None
+            }
             Prompt::Remove(name) if input == "yes" => Some(Action::Remove(name)),
+
             Prompt::Shutdown if input == "yes" => Some(Action::Shutdown),
             Prompt::Discard if input == "yes" => {
                 self.editor = None;
@@ -845,16 +923,40 @@ impl Ui {
                 command: astra_ipc::runtime::Command::Disconnect(None),
                 expected_pid: pid,
             }),
-            Prompt::ElevateTun { name, pid } if input == "yes" => {
-                Some(Action::PrepareElevation {
-                    name,
-                    expected_pid: pid,
-                })
-            }
+            Prompt::ElevateTun { name, pid } if input == "yes" => Some(Action::PrepareElevation {
+                name,
+                expected_pid: pid,
+            }),
             Prompt::Explain(name) => Some(Action::ExplainRoute {
                 name,
                 request: crate::explanation::request(&input)?,
             }),
+            Prompt::ImportNode(mode) => {
+                let editor = self.editor.as_ref().context("Missing editor")?;
+                let imported = crate::import::merge_at(
+                    &input,
+                    &self.working_dir,
+                    &editor.text(),
+                    Kind::Proxy,
+                    mode,
+                )?;
+                self.editor.as_mut().unwrap().import(imported.text)?;
+                self.message = "Imported nodes to draft · Ctrl-S save".into();
+                None
+            }
+            Prompt::ImportRule(mode) => {
+                let editor = self.editor.as_ref().context("Missing editor")?;
+                let imported = crate::import::merge_at(
+                    &input,
+                    &self.working_dir,
+                    &editor.text(),
+                    Kind::Rule,
+                    mode,
+                )?;
+                self.editor.as_mut().unwrap().import(imported.text)?;
+                self.message = "Imported rules to draft · Ctrl-S save".into();
+                None
+            }
             Prompt::Import => {
                 let share = astra_convert::share::is_share(&input);
                 let editor = self.editor.as_ref().context("Missing editor")?;
@@ -907,6 +1009,14 @@ impl Ui {
         }
         if self.palette.is_some() {
             return self.palette_key(key);
+        }
+        // Dialogs and local input modes consume Escape before page history.
+        if key.code == KeyCode::Esc
+            && self.can_switch_page()
+            && !self.connection_filtering
+            && !(self.page == shell::CONNECTIONS && !self.connection_filter.is_empty())
+        {
+            return self.navigate_back();
         }
         if let Some(input) = self.viewer_page_key(key) {
             return input;
@@ -1106,7 +1216,9 @@ impl Ui {
             && self.editor.as_ref().is_some_and(Editor::browsing)
         {
             self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
-        } else if let Some(editor) = &mut self.editor {
+        } else if self.editor.is_some() {
+            let editor_kind = self.kind;
+            let editor = self.editor.as_mut().unwrap();
             if editor.requests_subscription_update(key) {
                 if editor.text() != editor.original {
                     self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
@@ -1129,6 +1241,40 @@ impl Ui {
                     self.prompt(Prompt::Import);
                 } else {
                     self.message = "Confirm or cancel the field before importing".into();
+                }
+            } else if matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && editor.browsing()
+            {
+                self.prompt(
+                    if key.code == KeyCode::Char('I') || key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        Prompt::ImportRule(crate::import::MergeMode::Append)
+                    } else {
+                        Prompt::ImportNode(crate::import::MergeMode::Append)
+                    },
+                );
+            } else if matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && editor.browsing()
+            {
+                let share = key.code == KeyCode::Char('E') && editor_kind == Kind::Proxy;
+                let result = if editor_kind == Kind::Proxy {
+                    if share {
+                        editor.export_selected_node_share()
+                    } else {
+                        editor.export_selected_node()
+                    }
+                } else {
+                    editor.export_selected_rule()
+                };
+                match result {
+                    Ok(text) => self.prompt(if editor_kind == Kind::Proxy {
+                        Prompt::ExportNode { text, share }
+                    } else {
+                        Prompt::ExportRule { text }
+                    }),
+                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
                 }
             } else if key.code == KeyCode::Char('s')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1259,6 +1405,8 @@ impl Ui {
                         'b' => Operation::Bind,
                         'd' => Operation::Remove,
                         'y' => Operation::Copy,
+                        'E' => Operation::ExportConfig,
+                        'P' => Operation::ExportTerminal,
                         'v' => return Input::Run(Action::Validate(name.unwrap()), None),
                         _ => return Input::Idle,
                     };
@@ -1874,7 +2022,9 @@ pub(crate) fn action_description(action: &Action) -> String {
         Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
         Action::NetTool { name, .. } => ("Network tools", name.as_str()),
         Action::Runtime { name, .. } => ("Applying runtime change", name.as_str()),
-        Action::PrepareElevation { name, .. } => ("Enable TUN with administrator permission", name.as_str()),
+        Action::PrepareElevation { name, .. } => {
+            ("Enable TUN with administrator permission", name.as_str())
+        }
         Action::CancelElevation { name, .. } => ("Cancel TUN elevation", name.as_str()),
         Action::WaitElevation { name, .. } => ("Wait for the elevated core", name.as_str()),
         Action::ExplainRoute { name, .. } => ("Route explanation", name.as_str()),
@@ -2037,7 +2187,15 @@ async fn run_local(
                 if let Action::PrepareElevation { name, expected_pid } = action {
                     // sudo needs the real terminal, so this step cannot run as a
                     // background job; the wait for the new core can.
-                    elevate(&mut ui, &mut jobs, &socket, name, expected_pid, &mut terminal).await;
+                    elevate(
+                        &mut ui,
+                        &mut jobs,
+                        &socket,
+                        name,
+                        expected_pid,
+                        &mut terminal,
+                    )
+                    .await;
                 } else {
                     jobs.start(&mut ui, action, origin);
                 }
@@ -2151,6 +2309,13 @@ async fn elevate(
             return;
         }
     };
+    // Re-check right before sudo runs it: the reply only names a path.
+    if let Err(error) = astra_ipc::unix_handoff::ensure_root_controlled(&offer.binary)
+        .and_then(|_| astra_ipc::unix_handoff::ensure_root_controlled(&offer.sudo))
+    {
+        ui.message = format!("{error:#}");
+        return;
+    }
     let launched = (|| -> Result<std::process::ExitStatus> {
         disable_raw_mode()?;
         execute!(
@@ -2188,7 +2353,8 @@ async fn elevate(
     }
     match launched {
         Ok(status) if status.success() => {
-            ui.message = t("Administrator permission granted; waiting for the elevated core").into();
+            ui.message =
+                t("Administrator permission granted; waiting for the elevated core").into();
             jobs.start(
                 ui,
                 Action::WaitElevation {

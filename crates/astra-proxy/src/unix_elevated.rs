@@ -12,17 +12,22 @@
 //! configuration digest, and the lifeline that stops it when the manager exits).
 use anyhow::{bail, Context, Result};
 use astra_ipc::unix_handoff::{
-    self, ChildMessage, Commit, Handoff, Hello, Prepared, PROTOCOL_VERSION,
+    self, ChildMessage, Commit, Handoff, Hello, LifelineCommand, Prepared, PROTOCOL_VERSION,
 };
 use std::{
-    fs::OpenOptions,
+    ffi::CString,
+    fs::{File, OpenOptions},
     os::{
-        fd::AsRawFd,
-        unix::{fs::OpenOptionsExt, net::UnixStream},
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream},
     },
     path::{Path, PathBuf},
     time::Duration,
 };
+
+/// How long a stop request may take beyond the configured drain before the
+/// lifeline thread ends the process itself.
+const STOP_GRACE: Duration = Duration::from_secs(10);
 
 #[cfg(target_os = "linux")]
 const CAP_NET_BIND_SERVICE: u32 = 10;
@@ -183,36 +188,41 @@ fn child_main(
         );
         // Files this root process creates (control socket, caches, logs) live
         // in the user's state directory; hand them back to the invoking user.
-        std::env::set_var(
-            "ASTRA_ELEVATED_OWNER",
-            format!("{uid}:{gid}"),
-        );
+        std::env::set_var("ASTRA_ELEVATED_OWNER", format!("{uid}:{gid}"));
     }
     unsafe {
         libc::umask(0o077);
     }
+    // Every path below comes from the manager, i.e. from the user. On macOS
+    // this process is root, so each one is pinned to a directory the user
+    // already owns rather than trusted as given.
+    let runtime_dir = user_directory(&handoff.runtime_dir, uid, true)
+        .context("validate the runtime directory")?;
+    user_directory(
+        handoff.control.parent().context("control socket has no directory")?,
+        uid,
+        false,
+    )
+    .context("validate the control socket directory")?;
     std::env::set_current_dir(&handoff.cwd)?;
     std::env::set_var("ASTRA_CONTROL_SOCKET", &handoff.control);
     std::env::set_var("ASTRA_LOG_LEVEL", &handoff.log_level);
-    std::env::set_var("ASTRA_RUNTIME_DIR", &handoff.runtime_dir);
+    std::env::set_var("ASTRA_RUNTIME_DIR", &runtime_dir);
     // The elevated core turns TUN on for this process only; the switch is not
     // persisted, so a later unprivileged restart does not fail trying to
     // create a TUN device it cannot own.
     crate::ELEVATED_TUN.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let text = read_limited(&handoff.config)?;
+    let text = read_limited(&handoff.config, uid)?;
     anyhow::ensure!(
         astra_ipc::control::config_digest(&text) == handoff.digest,
         "Configuration changed while enabling TUN"
     );
-    let app = crate::App::load(&handoff.config).context("validate the configuration as the user")?;
+    let app =
+        crate::App::load(&handoff.config).context("validate the configuration as the user")?;
 
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&handoff.log)
-        .with_context(|| format!("open {}", handoff.log.display()))?;
+    let log =
+        open_user_log(&handoff.log, uid).with_context(|| format!("open {}", handoff.log.display()))?;
     #[cfg(target_os = "macos")]
     unsafe {
         // A log created here would otherwise be root-owned and unreadable to
@@ -269,16 +279,115 @@ fn child_main(
         "hand-off commit mismatch"
     );
     stream.set_read_timeout(None)?;
-    stream.set_nonblocking(true)?;
 
     let _log = astra_ipc::logging::init()?;
+    let grace = Duration::from_secs(app.config.shutdown_timeout_secs) + STOP_GRACE;
+    let stop = watch_lifeline(stream, grace)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let lifeline = tokio::net::UnixStream::from_std(stream)?;
-        crate::proxy::runtime::run_with_lifeline(handoff.config, app, lifeline).await
-    })
+    runtime.block_on(crate::proxy::runtime::run_with_lifeline(
+        handoff.config,
+        app,
+        stop,
+    ))
+}
+
+/// The manager cannot signal a root core, and a wedged runtime cannot be
+/// trusted to notice its lifeline. A dedicated thread therefore owns it:
+/// `Forced` ends the process at once; `Graceful`, EOF (the manager is gone)
+/// or a malformed frame request a normal stop, and the process still ends
+/// after `grace` if that stop hangs.
+fn watch_lifeline(
+    mut stream: UnixStream,
+    grace: Duration,
+) -> Result<tokio::sync::oneshot::Receiver<()>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("astra-lifeline".into())
+        .spawn(move || {
+            let command = unix_handoff::receive_sync::<LifelineCommand>(&mut stream);
+            if matches!(command, Ok(LifelineCommand::Forced)) {
+                eprintln!("manager forced the elevated core to stop");
+                unsafe { libc::_exit(1) }
+            }
+            let _ = sender.send(());
+            std::thread::sleep(grace);
+            eprintln!("elevated core did not stop within {grace:?}; exiting");
+            unsafe { libc::_exit(1) }
+        })
+        .context("start the lifeline thread")?;
+    Ok(receiver)
+}
+
+/// Open `path` as a directory that `uid` owns and that nobody else can
+/// write, without following a final symbolic link. With `canonical`, the
+/// path must also contain no symbolic links at all, because it is exported
+/// for later use by path rather than by descriptor.
+fn user_directory(path: &Path, uid: u32, canonical: bool) -> Result<PathBuf> {
+    anyhow::ensure!(path.is_absolute(), "{} is not absolute", path.display());
+    let directory = open_nofollow(path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0,
+        "{} must be a directory owned by uid {uid} and writable only by it",
+        path.display()
+    );
+    if canonical {
+        anyhow::ensure!(
+            std::fs::canonicalize(path)? == path,
+            "{} must not contain symbolic links",
+            path.display()
+        );
+    }
+    Ok(path.to_owned())
+}
+
+/// Open the core log for appending inside a directory the user owns. The
+/// file is opened relative to that directory's descriptor and never through a
+/// symbolic link, and an existing file must be a single-link regular file
+/// that the user (or an earlier run of this core) owns, so a root core cannot
+/// be pointed at a protected file.
+fn open_user_log(path: &Path, uid: u32) -> Result<File> {
+    let parent = path.parent().context("log path has no directory")?;
+    let name = path.file_name().context("log path has no file name")?;
+    user_directory(parent, uid, false)?;
+    let directory = open_nofollow(parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let name = CString::new(name.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY
+                | libc::O_APPEND
+                | libc::O_CREAT
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    anyhow::ensure!(fd >= 0, "{}", std::io::Error::last_os_error());
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && (metadata.uid() == uid || metadata.uid() == 0),
+        "{} is not a private log file of uid {uid}",
+        path.display()
+    );
+    Ok(file)
+}
+
+fn open_nofollow(path: &Path, flags: i32, mode: libc::c_uint) -> Result<File> {
+    let text = CString::new(path.as_os_str().as_bytes())?;
+    let fd = unsafe { libc::open(text.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
+    anyhow::ensure!(
+        fd >= 0,
+        "open {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn report_status(fd: i32, value: u8) {
@@ -289,17 +398,24 @@ fn report_status(fd: i32, value: u8) {
 }
 
 fn number(name: &str) -> Result<u32> {
-    let text = std::env::var(name).with_context(|| format!("{name} is missing; run through sudo"))?;
+    let text =
+        std::env::var(name).with_context(|| format!("{name} is missing; run through sudo"))?;
     let value: u32 = text.parse().with_context(|| format!("{name} is invalid"))?;
     Ok(value)
 }
 
-fn read_limited(path: &Path) -> Result<String> {
+fn read_limited(path: &Path, uid: u32) -> Result<String> {
     use std::io::Read;
     let mut text = String::new();
-    std::fs::File::open(path)?
-        .take(480 * 1024 + 1)
-        .read_to_string(&mut text)?;
+    let file = open_nofollow(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let metadata = file.metadata()?;
+    // On macOS this reads as root; only the user's own file may be read.
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == uid,
+        "{} is not a configuration file owned by uid {uid}",
+        path.display()
+    );
+    file.take(480 * 1024 + 1).read_to_string(&mut text)?;
     anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
     Ok(text)
 }
@@ -345,11 +461,7 @@ fn capset(effective: u64, permitted: u64, inheritable: u64) -> Result<()> {
         },
     ];
     let result = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
-    anyhow::ensure!(
-        result == 0,
-        "capset: {}",
-        std::io::Error::last_os_error()
-    );
+    anyhow::ensure!(result == 0, "capset: {}", std::io::Error::last_os_error());
     Ok(())
 }
 
@@ -413,13 +525,7 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
     }
     unsafe {
         anyhow::ensure!(
-            libc::prctl(
-                libc::PR_SET_NO_NEW_PRIVS,
-                1 as libc::c_ulong,
-                0,
-                0,
-                0
-            ) == 0,
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) == 0,
             "PR_SET_NO_NEW_PRIVS: {}",
             std::io::Error::last_os_error()
         );

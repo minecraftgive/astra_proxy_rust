@@ -1,6 +1,9 @@
 mod config;
+#[path = "protocols/shared_mod.rs"]
 mod protocols;
+#[path = "proxy/shared_mod.rs"]
 mod proxy;
+#[path = "transports/shared_mod.rs"]
 mod transports;
 use anyhow::{Context, Result};
 use astra_protocols::wire;

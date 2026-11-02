@@ -127,11 +127,12 @@ astra-convert mihomo.yaml -o converted --geoip-db /path/to/Country.mmdb --strict
 url = "https://example.com/clash?token=YOUR_TOKEN"
 interval = 3600
 user_agent = "clash.meta/astra"
+proxy = "PROXY" # 更新使用的代理组、节点名，或 DIRECT
 # 默认 false：只导入节点，保留本地代理组。
 import_groups = false
 ```
 
-可以直接为现有代理实例添加该段配置；原有手动节点会保留。订阅尚未下载时，动态 PROXY 组可以暂时为空，连接会明确失败，不会自动直连。首次下载成功后即可使用。链接和周期随实例配置保存，节点归属和成功结果由核心缓存管理。
+可以直接为现有代理实例添加该段配置；原有手动节点会保留。订阅尚未下载时，动态 PROXY 组可以暂时为空，连接会明确失败，不会自动直连。首次下载成功后即可使用。订阅更新的 `proxy` 默认是 `PROXY`，手动更新、定时更新及远程 provider 下载均使用此出口；可设为其他代理组、节点名或 `DIRECT`。默认组无可用节点时不会自动直连，首次下载可先设为 `DIRECT`，下载完成后再改回 `PROXY`。链接和周期随实例配置保存，节点归属和成功结果由核心缓存管理。
 
 converter 也能生成包含订阅链接的代理配置：
 

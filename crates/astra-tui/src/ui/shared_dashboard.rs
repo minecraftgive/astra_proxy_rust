@@ -70,12 +70,30 @@ impl Ui {
         self.live_input() && self.runtime_picker.is_none() && self.palette.is_none()
     }
 
+    pub(super) fn remember_page(&mut self, page: usize) {
+        if self.page != page {
+            self.navigation_stack.push(self.page);
+            self.page = page;
+        }
+    }
+
+    pub(super) fn navigate_back(&mut self) -> Input {
+        let Some(page) = self.navigation_stack.pop() else {
+            return Input::Idle;
+        };
+        // navigate performs normal page setup; returning must not push history.
+        let history_len = self.navigation_stack.len();
+        let input = self.navigate(page);
+        self.navigation_stack.truncate(history_len);
+        input
+    }
+
     pub(super) fn navigate(&mut self, page: usize) -> Input {
         let page = page.min(PAGES.len() - 1);
         if self.page == LOGS && page != LOGS {
             self.close_viewer();
         }
-        self.page = page;
+        self.remember_page(page);
         self.connection_filtering = false;
         self.runtime_picker = None;
         if page == LOGS && self.viewer.is_none() {
@@ -1149,6 +1167,26 @@ mod tests {
     use super::super::shell::{OVERVIEW, PROFILES};
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn escape_returns_through_page_history_after_closing_dialogs() {
+        let mut ui = Ui::new(Session::default());
+        ui.navigate(PROFILES);
+        ui.navigate(PROFILES); // Reselecting a page must not add a frame.
+        ui.navigate(PROXIES);
+        ui.help_scroll = Some(0);
+        let escape = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        ui.key(escape);
+        assert!(ui.help_scroll.is_none());
+        assert_eq!(ui.page, PROXIES);
+        ui.key(escape);
+        assert_eq!(ui.page, PROFILES);
+        ui.key(escape);
+        assert_eq!(ui.page, OVERVIEW);
+        ui.key(escape);
+        assert_eq!(ui.page, OVERVIEW);
+        assert!(ui.navigation_stack.is_empty());
+    }
 
     fn sample() -> Ui {
         let mut ui = Ui::new(Session::default());

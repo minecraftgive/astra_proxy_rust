@@ -3,6 +3,7 @@ mod availability;
 mod diagnostics;
 mod editor;
 mod explanation;
+mod export;
 mod external_editor;
 mod help;
 mod highlight;

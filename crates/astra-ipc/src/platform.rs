@@ -102,9 +102,31 @@ pub fn home_dir() -> io::Result<PathBuf> {
 pub fn set_private(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
-        adopt_owner(path.as_ref())?;
+        let path = path.as_ref();
+        // A root core (macOS TUN) applies this to paths inside the user's
+        // directories; following a swapped-in symlink would chmod/chown an
+        // arbitrary system file.
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is a symbolic link; refusing to change it", path.display()),
+            ));
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(io::Error::other)?;
+            if unsafe { libc::lchmod(text.as_ptr(), mode as libc::mode_t) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        adopt_owner(path)?;
         Ok(())
     }
     #[cfg(windows)]
@@ -134,7 +156,8 @@ pub fn adopt_owner(path: &Path) -> io::Result<()> {
         else {
             return Ok(());
         };
-        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+        // Never follow a link the user could have swapped in for this path.
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -253,7 +276,7 @@ mod windows {
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SetNamedSecurityInfoW, SE_FILE_OBJECT,
+                SetNamedSecurityInfoW, SetSecurityInfo, SE_FILE_OBJECT,
             },
             GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
             PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
@@ -278,8 +301,8 @@ mod windows {
     }
     /// Any other elevated process labels its pipes High integrity, so a
     /// non-elevated process of the same user cannot drive it (UAC boundary).
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     fn high_integrity_only() -> bool {
-        static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         !UNELEVATED_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
             && *ELEVATED.get_or_init(|| crate::elevation::is_elevated().unwrap_or(false))
     }
@@ -334,22 +357,43 @@ mod windows {
     }
     pub(super) fn set_private(path: &Path) -> io::Result<()> {
         let descriptor = descriptor()?;
-        let mut path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             let (mut present, mut defaulted, mut acl) = (0, 0, std::ptr::null_mut());
             if GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) == 0
             {
                 return Err(io::Error::last_os_error());
             }
-            let error = SetNamedSecurityInfoW(
-                path.as_mut_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                acl,
-                std::ptr::null_mut(),
-            );
+            let information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+            let error = if *ELEVATED.get_or_init(|| crate::elevation::is_elevated().unwrap_or(false))
+            {
+                // An elevated core gets this path from the unelevated user;
+                // set the ACL through a checked handle so a planted junction
+                // or link cannot hand the user a protected file.
+                let object = crate::elevation::open_user_object(
+                    path,
+                    windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+                )?;
+                SetSecurityInfo(
+                    object.0,
+                    SE_FILE_OBJECT,
+                    information,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl,
+                    std::ptr::null_mut(),
+                )
+            } else {
+                SetNamedSecurityInfoW(
+                    name.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    information,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl,
+                    std::ptr::null_mut(),
+                )
+            };
             if error != 0 {
                 return Err(io::Error::from_raw_os_error(error as i32));
             }

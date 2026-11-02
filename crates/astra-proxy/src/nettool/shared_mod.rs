@@ -1,6 +1,7 @@
 //! Connectivity probes pinned to one egress: the OS route, a local adapter, or
 //! any outbound / proxy group of the profile. ICMP and UDP cannot travel
 //! through a proxy, so those paths are refused instead of silently leaking DIRECT.
+#[path = "shared_icmp.rs"]
 mod icmp;
 
 use crate::{egress, App};

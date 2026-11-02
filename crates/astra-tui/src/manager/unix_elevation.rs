@@ -2,8 +2,12 @@
 //! core keeps serving, then adopted only after it has dropped root and proven
 //! the same configuration digest.
 use super::*;
-use astra_ipc::unix_handoff::{self, ChildMessage, Commit, Handoff, Hello, Offer, Prepared};
-use std::os::fd::AsRawFd;
+use astra_ipc::unix_handoff::{
+    self, ChildMessage, Commit, Handoff, Hello, LifelineCommand, Offer, Prepared,
+};
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream as StdUnixStream;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
@@ -13,6 +17,8 @@ use tokio::sync::oneshot;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(300);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(120);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(super) enum Outcome {
@@ -77,7 +83,9 @@ fn find_sudo() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
             let candidate = directory.join("sudo");
-            if executable(&candidate) {
+            // A sudo found through a user-writable directory could be swapped
+            // for another program before it runs.
+            if executable(&candidate) && unix_handoff::ensure_root_controlled(&candidate).is_ok() {
                 return Ok(candidate);
             }
         }
@@ -147,7 +155,15 @@ pub(super) async fn prepare(
         .clone()
         .context("Elevation is unavailable outside the manager service")?;
     let sudo = find_sudo()?;
-    let binary = fs::canonicalize(manager.bin.join(Kind::Proxy.binary()))?;
+    // sudo runs this file as root; if the user (or anything running as them)
+    // can replace it or a directory above it, that program gets root.
+    let binary = unix_handoff::ensure_root_controlled(&manager.bin.join(Kind::Proxy.binary()))
+        .context("The proxy core cannot be elevated safely; install it in a root-owned directory (for example `sudo install -o root -m 0755 astra-proxy /usr/local/bin/`)")?;
+    // Created here, as the user, so the root core never has to create
+    // directories on a path the user controls.
+    let runtime_dir = astra_ipc::storage::runtime_root()?;
+    fs::create_dir_all(&runtime_dir)?;
+    set_private(&runtime_dir, 0o700)?;
 
     let directory = manager.home.join("elevation");
     fs::create_dir_all(&directory)?;
@@ -193,7 +209,7 @@ pub(super) async fn prepare(
         control: socket,
         log: manager.log(&name),
         log_level: manager.level(&name).as_str().to_owned(),
-        runtime_dir: astra_ipc::storage::runtime_root()?,
+        runtime_dir: fs::canonicalize(&runtime_dir)?,
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         digest,
         uid: unsafe { libc::geteuid() },
@@ -597,10 +613,13 @@ impl AdoptedChild {
             }
         }
     }
+    /// Cancel-safe: a timed-out wait keeps the lifeline, so a later `kill`
+    /// can still deliver its command.
     pub(super) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(mut lifeline) = self.lifeline.take() {
+        if let Some(lifeline) = self.lifeline.as_mut() {
             let mut buffer = [0u8; 16];
-            while tokio::io::AsyncReadExt::read(&mut lifeline, &mut buffer).await? != 0 {}
+            while tokio::io::AsyncReadExt::read(lifeline, &mut buffer).await? != 0 {}
+            self.lifeline = None;
         }
         Ok(std::process::ExitStatus::from_raw(0))
     }
@@ -608,16 +627,38 @@ impl AdoptedChild {
         self.request_shutdown(libc::SIGTERM)
     }
     pub(super) async fn kill(&mut self) -> std::io::Result<()> {
-        self.request_shutdown(libc::SIGKILL)
+        self.request_shutdown(libc::SIGKILL)?;
+        // The user cannot signal the root macOS core; it exits on its own
+        // when its lifeline thread reads `Forced`, so confirm by EOF.
+        #[cfg(target_os = "macos")]
+        if timeout(KILL_TIMEOUT, self.wait()).await.is_err() {
+            // Closing the lifeline also arms the core's own exit watchdog.
+            self.lifeline = None;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the elevated core did not exit after a forced stop",
+            ));
+        }
+        Ok(())
     }
     fn request_shutdown(&mut self, signal: i32) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            let _ = signal;
-            if let Some(stream) = &self.lifeline {
-                if unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_WR) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            let command = if signal == libc::SIGKILL {
+                LifelineCommand::Forced
+            } else {
+                LifelineCommand::Graceful
+            };
+            let frame = unix_handoff::lifecycle_frame(command)?;
+            let Some(stream) = self.lifeline.as_mut() else {
+                return Ok(());
+            };
+            let written = stream.try_write(&frame)?;
+            if written != frame.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "lifecycle command was only partially written",
+                ));
             }
             Ok(())
         }

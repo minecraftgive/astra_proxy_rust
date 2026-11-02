@@ -1,0 +1,14 @@
+#[path = "shared_encryption.rs"]
+pub(crate) mod encryption;
+#[path = "shared_multiplex.rs"]
+pub(crate) mod multiplex;
+#[path = "shared_salamander.rs"]
+pub(crate) mod salamander;
+#[path = "shared_shadowsocks.rs"]
+pub(crate) mod shadowsocks;
+#[path = "shared_socks5.rs"]
+pub(crate) mod socks5;
+#[path = "shared_trojan.rs"]
+pub(crate) mod trojan;
+#[path = "shared_vision.rs"]
+pub(crate) mod vision;
