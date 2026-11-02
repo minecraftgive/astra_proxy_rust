@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use astra_ipc::Target;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+#[path = "shared_stream.rs"]
 mod stream;
 use stream::VlessStream;
 pub async fn vless_tls(server: &str, sni: &str, uuid: &str, target: &Target) -> Result<Stream> {

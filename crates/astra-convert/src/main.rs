@@ -174,6 +174,7 @@ fn run() -> Result<()> {
             interval,
             user_agent,
             import_groups: include_config,
+            proxy: "PROXY".into(),
             managed_nodes: proxy["outbounds"]
                 .as_array()
                 .unwrap()

@@ -1,7 +1,11 @@
 //! Node share links are credentials: never include the original URI in errors.
 use crate::{convert, Converted, Options};
+#[path = "share/shared_export.rs"]
+pub mod export;
+#[path = "share/shared_other.rs"]
 mod other;
 use anyhow::{ensure, Context, Result};
+pub use export::export_node;
 use serde_yaml::{Mapping, Value as Y};
 use std::collections::BTreeMap;
 
@@ -62,7 +66,8 @@ pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
                 "invalid VLESS authority or path"
             );
             let uuid = decode(url.username())?;
-            uuid::Uuid::parse_str(&uuid).context("invalid VLESS UUID")?;
+            let parsed_uuid = uuid::Uuid::parse_str(&uuid).context("invalid VLESS UUID")?;
+            ensure!(!parsed_uuid.is_nil(), "VLESS UUID must not be nil");
             let host = url
                 .host_str()
                 .context("missing VLESS server")?

@@ -1,8 +1,13 @@
+#[path = "shared_https.rs"]
 mod https;
+#[path = "shared_tcp.rs"]
 mod tcp;
 #[cfg(test)]
+#[path = "shared_tests.rs"]
 mod tests;
+#[path = "shared_tls.rs"]
 mod tls;
+#[path = "shared_udp.rs"]
 mod udp;
 use crate::App;
 use anyhow::{Context, Result};

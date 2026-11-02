@@ -8,8 +8,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// HTTP(S) downloads use the same physical egress as DIRECT traffic.
-pub(crate) async fn download(app: &App, url: &str, user_agent: &str) -> Result<String> {
+/// HTTP(S) downloads follow the configured group or outbound, including redirects.
+pub(crate) async fn download(
+    app: &App,
+    url: &str,
+    user_agent: &str,
+    proxy: &str,
+) -> Result<String> {
     use anyhow::Context;
     use http_body_util::{BodyExt, Empty};
     use hyper_util::rt::TokioIo;
@@ -42,7 +47,7 @@ pub(crate) async fn download(app: &App, url: &str, user_agent: &str) -> Result<S
             };
             phase.store(0, Ordering::Relaxed);
             let mut connection = app
-                .connect_resolved(&target, &astra_ipc::RouteAction::Direct)
+                .connect(&target, &astra_ipc::RouteAction::Proxy(proxy.into()))
                 .await
                 .with_context(|| {
                     format!(
@@ -259,7 +264,7 @@ pub(crate) async fn refresh_once(config: &Path, original: App) -> Result<String>
             let converted = astra_convert::subscription::fetch_with(
                 &settings,
                 path.parent().context("config has no parent")?,
-                &|url, agent| runtime.block_on(download(&app, url, agent)),
+                &|url, agent| runtime.block_on(download(&app, url, agent, &settings.proxy)),
             )
             .context("fetch subscription nodes")?;
             let text = astra_convert::subscription::merge_named(
@@ -326,6 +331,7 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
+    astra_ipc::platform::adopt_owner(&temporary)?;
     let result = (|| -> Result<()> {
         file.write_all(&data)?;
         file.sync_all()?;
@@ -340,6 +346,53 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn download_uses_selected_proxy_group_and_rejects_missing_groups() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .starts_with("CONNECT example.com:80 "));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(String::from_utf8(request).unwrap().starts_with("GET /sub "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nnodes",
+                )
+                .await
+                .unwrap();
+        });
+        let app = App::from_text(Path::new("proxy-download.toml"), format!(
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='http'\ntag='node'\nserver='{address}'\n[proxy_groups.custom]\nmembers=['node']\n"
+        )).unwrap();
+        assert_eq!(
+            download(&app, "http://example.com/sub", "astra-test", "custom")
+                .await
+                .unwrap(),
+            "nodes"
+        );
+        assert!(
+            download(&app, "http://example.com/sub", "astra-test", "missing")
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn stopped_refresh_updates_cache_and_preserves_saved_config_and_last_good_nodes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -362,7 +415,7 @@ mod tests {
                 stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
         });
-        let text = format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[subscriptions.remote]\nurl='http://{address}/sub'\n");
+        let text = format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[subscriptions.remote]\nurl='http://{address}/sub'\nproxy='DIRECT'\n");
         std::fs::write(&path, &text).unwrap();
         assert!(
             refresh_once(&path, App::from_text(&path, text.clone()).unwrap())
@@ -420,15 +473,21 @@ mod tests {
         let app = App::from_text(std::path::Path::new("download.toml"),
             "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1'\n".into()).unwrap();
         assert_eq!(
-            download(&app, &format!("http://{address}/first"), "astra-test")
-                .await
-                .unwrap(),
+            download(
+                &app,
+                &format!("http://{address}/first"),
+                "astra-test",
+                "DIRECT"
+            )
+            .await
+            .unwrap(),
             "nodes"
         );
         let error = download(
             &app,
             &format!("http://{address}/error?token=secret"),
             "astra-test",
+            "DIRECT",
         )
         .await
         .unwrap_err();

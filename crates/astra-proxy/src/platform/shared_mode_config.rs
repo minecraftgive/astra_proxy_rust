@@ -25,19 +25,24 @@ fn local_proxy_address(listener: &str) -> Result<SocketAddr> {
 }
 
 pub(crate) fn system_proxy_address(config: &crate::config::ProxyConfig) -> Result<SocketAddr> {
-    #[cfg(windows)]
-    let listener = config.http_listen.as_ref().or(config.mixed_listen.as_ref());
-    #[cfg(not(windows))]
-    let listener = config
-        .socks5_listen
+    let (http, socks) = system_proxy_addresses(config)?;
+    http.or(socks)
+        .ok_or_else(|| anyhow::anyhow!("system_proxy requires a mixed, HTTP or SOCKS5 listener"))
+}
+
+/// Mixed is preferred for every protocol; dedicated listeners are fallbacks.
+pub(crate) fn system_proxy_addresses(
+    config: &crate::config::ProxyConfig,
+) -> Result<(Option<SocketAddr>, Option<SocketAddr>)> {
+    let http = config.mixed_listen.as_ref().or(config.http_listen.as_ref());
+    let socks = config
+        .mixed_listen
         .as_ref()
-        .or(config.mixed_listen.as_ref());
-    let listener = listener.map(String::as_str).ok_or_else(|| {
-        anyhow::anyhow!(
-        "system_proxy requires an HTTP listener on Windows, or a SOCKS5 listener on macOS/Linux"
-    )
-    })?;
-    local_proxy_address(listener)
+        .or(config.socks5_listen.as_ref());
+    Ok((
+        http.map(|v| local_proxy_address(v)).transpose()?,
+        socks.map(|v| local_proxy_address(v)).transpose()?,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -264,11 +269,19 @@ mod tests {
         )
         .unwrap();
         validate(&config).unwrap();
-        let expected_port = if cfg!(windows) { 8080 } else { 1080 };
+        let expected_port = 8080;
         let target = system_proxy_address(&config).unwrap();
         assert_eq!(target.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(target.port(), expected_port);
         assert_eq!(config.http_listen.as_deref(), Some("0.0.0.0:8080"));
+    }
+
+    #[test]
+    fn mixed_port_is_preferred_for_all_system_proxy_protocols() {
+        let config = toml::from_str("mixed_listen='0.0.0.0:7890'\nhttp_listen='127.0.0.1:8080'\nsocks5_listen='127.0.0.1:1080'\n").unwrap();
+        let (http, socks) = system_proxy_addresses(&config).unwrap();
+        assert_eq!(http.unwrap().to_string(), "127.0.0.1:7890");
+        assert_eq!(http, socks);
     }
 
     #[tokio::test]
@@ -319,10 +332,7 @@ mod runtime_mode_tests {
         };
         runtime_modes(&mut config, &enabled);
         assert!(config.system_proxy.is_some());
-        assert_eq!(
-            system_proxy_address(&config).unwrap().port(),
-            if cfg!(windows) { 8080 } else { 1080 }
-        );
+        assert_eq!(system_proxy_address(&config).unwrap().port(), 8080);
         let tun = config.tun.as_ref().unwrap();
         assert_eq!(tun.routes, ["0.0.0.0/1", "128.0.0.0/1"]);
         assert!(tun.detects_interface());

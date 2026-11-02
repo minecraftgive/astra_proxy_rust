@@ -1,8 +1,10 @@
+#[path = "shared_controls.rs"]
 mod controls;
 use crate::{inbound, system_proxy, transparent, tun, App};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use astra_ipc::Inbound;
+use meow_common::ErrorBackoff;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 
@@ -37,6 +39,7 @@ pub struct State {
     system_journal: PathBuf,
     group_worker: Option<GroupWorker>,
     outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
+    elevated_tun: bool,
 }
 impl State {
     async fn refresh_egress(
@@ -315,6 +318,38 @@ impl State {
     }
 }
 pub async fn run(path: PathBuf, app: App) -> Result<()> {
+    run_inner(path, app, None).await
+}
+
+/// An elevated core is stopped through its lifeline to the unprivileged
+/// manager. The lifeline is watched outside this runtime (see
+/// `unix_elevated`), which fires `stop` on a graceful request or when the
+/// manager is gone, so the core removes its routes and listeners instead of
+/// lingering with administrator-granted permissions.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn run_with_lifeline(
+    path: PathBuf,
+    app: App,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    run_inner(path, app, Some(stop)).await
+}
+
+async fn lifeline_closed(lifeline: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    match lifeline {
+        // A dropped sender also means the watcher is gone.
+        Some(stop) => {
+            let _ = stop.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn run_inner(
+    path: PathBuf,
+    app: App,
+    mut lifeline: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
     let system_journal = if let Some(socket) = std::env::var_os("ASTRA_CONTROL_SOCKET") {
         PathBuf::from(socket).with_extension("system-proxy-state.toml")
     } else {
@@ -322,6 +357,12 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     };
     astra_ipc::storage::prepare_parent(&system_journal)?;
     *app.overrides.write().unwrap() = controls::load(&path)?;
+    let elevated_tun = crate::ELEVATED_TUN.swap(false, std::sync::atomic::Ordering::SeqCst);
+    if elevated_tun {
+        if let Ok(mut overrides) = app.overrides.write() {
+            overrides.tun = Some(true);
+        }
+    }
     let current = Arc::new(ArcSwap::from_pointee(app));
     let mut state = State {
         generation: 0,
@@ -332,6 +373,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
         listeners: HashMap::new(),
         group_worker: None,
         outbound_interface: None,
+        elevated_tun,
         tunnel: None,
         tproxy_udp: None,
         dns: None,
@@ -424,6 +466,7 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
                                 &download_app,
                                 url,
                                 agent,
+                                &settings.proxy,
                             ))
                         },
                     )
@@ -619,6 +662,10 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     let result = tokio::select! {
         result = service => result,
         _ = fatal.recv() => Err(std::io::Error::other("packet inbound stopped unexpectedly; see core log")),
+        _ = lifeline_closed(&mut lifeline) => {
+            tracing::warn!("manager exited; stopping the elevated core");
+            Ok(())
+        }
     };
     watch.abort();
     subscription_worker.abort();
@@ -640,12 +687,19 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
     result.map_err(Into::into)
 }
 async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) {
+    let mut backoff = ErrorBackoff::new();
     loop {
         let (stream, peer) = match listener.accept().await {
-            Ok(value) => value,
+            Ok(value) => {
+                backoff.succeeded();
+                value
+            }
             Err(error) => {
-                tracing::warn!(%error, "TCP accept error");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                if backoff.failed(&error).await {
+                    tracing::warn!(%error, ?inbound, "TCP accept error");
+                } else {
+                    tracing::debug!(%error, ?inbound, "TCP accept error");
+                }
                 continue;
             }
         };

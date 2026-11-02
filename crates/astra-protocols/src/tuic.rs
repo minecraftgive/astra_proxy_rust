@@ -374,7 +374,10 @@ async fn dispatch(connection: quinn::Connection, session: std::sync::Weak<Sessio
             },
             stream = connection.accept_uni() => match stream {
                 Ok(mut stream) => {
-                    if streams.len() >= 32 { let _ = stream.stop(0u32.into()); continue; }
+                    // A maximum-size UDP payload may need more than 32 MTU-sized
+                    // stream fragments. Keep admission bounded, but large enough
+                    // for one complete 65,507-byte payload at small QUIC MTUs.
+                    if streams.len() >= 128 { let _ = stream.stop(0u32.into()); continue; }
                     let session = session.clone();
                     streams.spawn(async move {
                         if let Ok(Ok(packet)) = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(MAX_WIRE)).await {

@@ -30,6 +30,15 @@ pub(super) struct Hub {
     list: watch::Sender<Reply>,
     generation: AtomicU64,
     log: Arc<crate::tui_log::Log>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    elevations: std::sync::Mutex<HashMap<String, ElevationSlot>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ElevationSlot {
+    ticket: String,
+    updates: watch::Sender<Option<super::elevation::Outcome>>,
+    started: std::time::Instant,
 }
 impl Hub {
     fn new(manager: &Manager) -> Result<Arc<Self>> {
@@ -48,6 +57,8 @@ impl Hub {
             list: watch::channel(Reply::text("")).0,
             generation: AtomicU64::new(0),
             log: Arc::new(crate::tui_log::Log::open(&manager.home.join("tui.log"))?),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            elevations: std::sync::Mutex::new(HashMap::new()),
         });
         hub.publish(manager);
         Ok(hub)
@@ -114,8 +125,62 @@ impl Hub {
             },
             running: HashMap::new(),
             exits: HashMap::new(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            elevations: HashMap::new(),
+            elevation_events: None,
             publisher: None,
         }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn begin_elevation(&self, name: &str, ticket: &str) {
+        let mut elevations = self.elevations.lock().unwrap();
+        let now = std::time::Instant::now();
+        elevations.retain(|_, slot| now.duration_since(slot.started) < Duration::from_secs(600));
+        elevations.insert(
+            name.to_owned(),
+            ElevationSlot {
+                ticket: ticket.to_owned(),
+                updates: watch::channel(None).0,
+                started: now,
+            },
+        );
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn finish_elevation(
+        &self,
+        name: &str,
+        ticket: &str,
+        outcome: super::elevation::Outcome,
+    ) {
+        let mut elevations = self.elevations.lock().unwrap();
+        if let Some(slot) = elevations.get_mut(name) {
+            if astra_ipc::unix_handoff::ticket_eq(&slot.ticket, ticket) {
+                slot.updates.send_replace(Some(outcome));
+            }
+            return;
+        }
+        elevations.insert(
+            name.to_owned(),
+            ElevationSlot {
+                ticket: ticket.to_owned(),
+                updates: watch::channel(Some(outcome)).0,
+                started: std::time::Instant::now(),
+            },
+        );
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_elevation(
+        &self,
+        name: &str,
+        ticket: &str,
+    ) -> Result<watch::Receiver<Option<super::elevation::Outcome>>> {
+        let elevations = self.elevations.lock().unwrap();
+        let slot = elevations.get(name).context("Unknown elevation request")?;
+        anyhow::ensure!(
+            astra_ipc::unix_handoff::ticket_eq(&slot.ticket, ticket),
+            "Elevation request changed"
+        );
+        Ok(slot.updates.subscribe())
     }
     fn route(&self, name: &str) -> Result<Route> {
         self.base
@@ -155,11 +220,17 @@ pub(super) async fn run(mut manager: Manager, listener: UnixListener) -> Result<
     manager.publisher = Some(hub.clone());
     let (sender, mut requests) = mpsc::channel::<Work>(32);
     let (stopped, mut stop) = mpsc::channel::<()>(1);
+    let (elevation_sender, mut elevation_events) = mpsc::unbounded_channel::<ElevationEvent>();
+    manager.elevation_events = Some(elevation_sender);
     let actor_hub = hub.clone();
     let actor = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
+                Some(event)=elevation_events.recv()=>{
+                    apply_elevation(&mut manager,event).await;
+                    actor_hub.publish(&manager);
+                }
                 work=requests.recv()=>{
                     let Some(work)=work else {break;};
                     let title=crate::ui::action_description(&work.action);
@@ -484,6 +555,35 @@ async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
         })
         .map(Reply::text)
         .map_err(Into::into),
+        Action::WaitElevation { name, ticket } => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                async {
+                    let mut updates = hub.wait_elevation(name, ticket)?;
+                    let outcome = timeout(Duration::from_secs(150), async {
+                        loop {
+                            if let Some(outcome) = updates.borrow().clone() {
+                                return outcome;
+                            }
+                            if updates.changed().await.is_err() {
+                                return super::elevation::Outcome::Failed(
+                                    "Elevation request was replaced".into(),
+                                );
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Timed out waiting for the elevated core"))?;
+                    outcome.into_reply()
+                }
+                .await
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = (name, ticket);
+                Err(anyhow::anyhow!("TUN elevation is supported on Linux only"))
+            }
+        }
         Action::Runtime {
             name,
             command,

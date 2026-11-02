@@ -19,10 +19,16 @@ pub fn runtime_path(source: &Path, category: &str) -> io::Result<PathBuf> {
     for byte in source.as_os_str().as_encoded_bytes() {
         hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
     }
-    let root = std::env::var_os("ASTRA_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(crate::platform::home_dir()?.join(".astra/runtime"));
+    let root = runtime_root()?;
     Ok(root.join(category).join(format!("{hash:016x}.cache")))
+}
+
+/// The directory writable runtime state belongs in, also for elevated cores
+/// that must keep using the invoking user's documents after dropping root.
+pub fn runtime_root() -> io::Result<PathBuf> {
+    Ok(std::env::var_os("ASTRA_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(crate::platform::home_dir()?.join(".astra/runtime")))
 }
 
 pub fn prepare_parent(path: &Path) -> io::Result<()> {
@@ -50,6 +56,7 @@ pub fn write_json(path: &Path, value: &impl serde::Serialize) -> io::Result<()> 
             .write(true)
             .mode(0o600)
             .open(&temporary)?;
+        crate::platform::adopt_owner(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);

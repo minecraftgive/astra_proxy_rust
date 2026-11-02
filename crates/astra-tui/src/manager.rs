@@ -1,3 +1,7 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "manager/unix_elevation.rs"]
+mod elevation;
+#[path = "manager/shared_server.rs"]
 mod server;
 use crate::protocol::*;
 use anyhow::{bail, Context, Result};
@@ -5,8 +9,6 @@ use astra_ipc::control::{self, Command};
 use astra_ipc::platform::LocalListener as UnixListener;
 use astra_ipc::platform::{set_private, DirBuilderExt, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
@@ -43,6 +45,8 @@ enum ManagedChild {
     Normal(Child),
     #[cfg(windows)]
     Elevated(astra_ipc::elevation::ElevatedChild),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Adopted(elevation::AdoptedChild),
 }
 impl ManagedChild {
     fn id(&self) -> Option<u32> {
@@ -50,6 +54,8 @@ impl ManagedChild {
             Self::Normal(child) => child.id(),
             #[cfg(windows)]
             Self::Elevated(child) => child.id(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(child) => child.id(),
         }
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -57,6 +63,8 @@ impl ManagedChild {
             Self::Normal(child) => child.try_wait(),
             #[cfg(windows)]
             Self::Elevated(child) => child.try_wait(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(child) => child.try_wait(),
         }
     }
     fn start_kill(&mut self) -> std::io::Result<()> {
@@ -64,6 +72,8 @@ impl ManagedChild {
             Self::Normal(child) => child.start_kill(),
             #[cfg(windows)]
             Self::Elevated(child) => child.start_kill(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(child) => child.start_kill(),
         }
     }
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -71,6 +81,8 @@ impl ManagedChild {
             Self::Normal(child) => child.wait().await,
             #[cfg(windows)]
             Self::Elevated(child) => child.wait().await,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(child) => child.wait().await,
         }
     }
     async fn kill(&mut self) -> std::io::Result<()> {
@@ -78,6 +90,8 @@ impl ManagedChild {
             Self::Normal(child) => child.kill().await,
             #[cfg(windows)]
             Self::Elevated(child) => child.kill().await,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(child) => child.kill().await,
         }
     }
 }
@@ -90,6 +104,21 @@ pub struct Manager {
     registry: Registry,
     running: HashMap<String, Running>,
     exits: HashMap<String, String>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    elevations: HashMap<String, elevation::Pending>,
+    elevation_events: Option<tokio::sync::mpsc::UnboundedSender<ElevationEvent>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) type ElevationEvent = elevation::Event;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) type ElevationEvent = std::convert::Infallible;
+
+pub(crate) async fn apply_elevation(manager: &mut Manager, event: ElevationEvent) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    elevation::handle(manager, event).await;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = (manager, event);
 }
 const CONFIG_LIMIT: usize = 480 * 1024;
 
@@ -538,6 +567,9 @@ impl Manager {
             registry,
             running: HashMap::new(),
             exits: HashMap::new(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            elevations: HashMap::new(),
+            elevation_events: None,
         };
         // Copy legacy metadata once; never move a file still referenced by a core.
         if !path.exists() {
@@ -1291,6 +1323,31 @@ impl Manager {
                 );
                 Ok(Reply::text(serde_json::to_string(&snapshot)?))
             }
+            Action::PrepareElevation { name, expected_pid } => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    elevation::prepare(self, name, expected_pid).await
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = (name, expected_pid);
+                    bail!("TUN elevation is supported on Linux only")
+                }
+            }
+            Action::CancelElevation { name, ticket } => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    elevation::cancel(self, &name, &ticket)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = (name, ticket);
+                    Ok(Reply::text("Elevation cancelled"))
+                }
+            }
+            Action::WaitElevation { .. } => {
+                bail!("Elevation status is served outside the mutation actor")
+            }
             Action::List => {
                 let mut reply = Reply::text("");
                 let mut details = HashMap::new();
@@ -1611,11 +1668,21 @@ impl Manager {
             }
             text
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let elevation_supported = instance.kind == Kind::Proxy
+            && elevation::supported()
+            && self
+                .running
+                .get(&instance.name)
+                .is_none_or(|run| !matches!(&run.child, ManagedChild::Adopted(_)));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let elevation_supported = false;
         let mut details = InstanceDetails {
             node_tags_supported: true,
             subscription_nodes_supported: true,
             diagnostics_supported: true,
             runtime_supported: true,
+            elevation_supported,
             explanation_supported: true,
             bindings: if instance.kind == Kind::Rule {
                 self.bound_proxies(&instance.name)
@@ -1738,6 +1805,8 @@ pub async fn serve_with_config(home: PathBuf, config_home: PathBuf, bin: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct Temp(PathBuf);

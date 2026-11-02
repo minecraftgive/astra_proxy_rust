@@ -472,7 +472,10 @@ mod tests {
         assert!(validate(&groups, &nodes).is_err());
         groups.get_mut("PROXY").unwrap().members.clear();
         groups.get_mut("all").unwrap().members = vec!["all".into()];
-        assert!(validate(&groups, &nodes).is_err(), "only built-ins may list themselves");
+        assert!(
+            validate(&groups, &nodes).is_err(),
+            "only built-ins may list themselves"
+        );
         for name in ["DIRECT", "REJECT", "PROXY"] {
             assert!(ensure_default(&mut BTreeMap::new(), &HashSet::from([name.into()])).is_err());
         }

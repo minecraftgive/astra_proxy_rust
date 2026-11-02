@@ -42,9 +42,9 @@
 将本地配置的 `standalone` 设置为 `true` 后，可直接启动（替换下列配置路径）：
 
 ```sh
-./target/release/astra-proxy /path/to/proxy-standalone.toml
+./target/<本机 Rust target>/release/astra-proxy /path/to/proxy-standalone.toml
 # 启动器也会根据 standalone 自动只启动 Proxy Core：
-python3 scripts/astra.py --bin-dir target/release --proxy /path/to/proxy-standalone.toml
+python3 scripts/astra.py --bin-dir target/<本机 Rust target>/release --proxy /path/to/proxy-standalone.toml
 ```
 
 独立模式可省略 `rule_socket`；`ipc_connections`、`decision_timeout_ms` 和决策缓存设置在此模式不参与流量路由。默认 `standalone = false`，保留双核心行为。
@@ -84,10 +84,10 @@ VLESS Encryption、Vision 与 XHTTP 的配置字段见 [原生协议说明](docs
 
 ```sh
 cargo build --release -p astra-convert
-target/release/astra-convert your-mihomo.yaml -o converted
+target/<本机 Rust target>/release/astra-convert your-mihomo.yaml -o converted
 # 可选：--select '代理组=成员'、--check、--rule-socket /tmp/custom.sock
-target/release/astra-rule --check converted/rule.toml
-target/release/astra-proxy --check converted/proxy.toml
+target/<本机 Rust target>/release/astra-rule --check converted/rule.toml
+target/<本机 Rust target>/release/astra-proxy --check converted/proxy.toml
 ```
 
 保留 select、url-test、fallback 和轮询 load-balance 代理组，以及混合端口、入站认证和来源 CIDR 限制；未知规则会跳过。详见 [转换范围和使用说明](docs/MIHOMO_CONVERTER.md)，本地示例见 [mihomo-example.yaml](configs/mihomo-example.yaml)。
@@ -116,14 +116,14 @@ Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同
 加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--debug`、`--role client|server|all`、`--package`、`--label`、`--output-dir`；测试套件见 `scripts/test.py --help`，详见 [构建与打包说明](docs/INSTALL.md)。
 
 ```sh
-cargo build --release
-cargo test --workspace
+./scripts/build.sh
+python3 scripts/test.py
 ```
 
 原生 Rust TUI（无需 Python）：
 
 ```sh
-./target/release/astra-tui
+./target/<本机 Rust target>/release/astra-tui
 ```
 
 按 1–6 或点击页面栏切换概览、代理、连接、规则、日志和配置档，`:` / Ctrl-K 打开列出全部命令的命令面板，p 切换当前配置档，c 连接/断开，r 应用改动、R 完整重启，e 编辑配置；在配置档页按 n 添加实例，Tab 切换代理实例与路由引擎。q 退出界面后实例继续运行；Q 确认后停止全部实例。规则模式首次请添加并启动 Rule Core，再添加 Proxy Core；独立模式只需添加并启动 Proxy Core。详见 [TUI 管理说明](docs/TUI.md)。客户端打包脚本会包含 `client/astra-tui`；旧安装包需重新构建。
@@ -149,8 +149,8 @@ python3 scripts/astra.py --proxy configs/native.toml --rules configs/proxy-all-r
 也可以分别启动：
 
 ```sh
-target/release/astra-rule configs/rule.toml
-target/release/astra-proxy configs/proxy.toml
+target/<本机 Rust target>/release/astra-rule configs/rule.toml
+target/<本机 Rust target>/release/astra-proxy configs/proxy.toml
 ```
 
 若 UDS 路径已存在，程序拒绝覆盖。确认没有运行中的规则进程后再删除遗留 socket；正常 SIGINT/SIGTERM 会清理它。

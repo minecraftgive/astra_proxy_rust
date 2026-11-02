@@ -1,4 +1,12 @@
+#[path = "platform/shared_mod.rs"]
 pub mod platform;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_elevated;
+/// Set by the sudo hand-off before the runtime starts; the elevated TUN mode
+/// lives only in this process and is never written back to the overrides file.
+pub(crate) static ELEVATED_TUN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[path = "proxy/shared_mod.rs"]
 mod proxy;
 use platform::system_proxy;
 mod config;
@@ -15,8 +23,10 @@ use proxy::packet;
 use proxy::rule_client;
 use proxy::runtime;
 mod diagnostics;
+#[path = "dns/shared_mod.rs"]
 mod dns;
 mod http_forward;
+#[path = "nettool/shared_mod.rs"]
 mod nettool;
 mod subscription;
 pub use astra_protocols::xhttp;
@@ -208,6 +218,7 @@ impl App {
             .decide_network(target, inbound, network, process.clone(), destination_ip)
             .await;
         let result = match result {
+            Ok(action @ (RouteAction::Direct | RouteAction::Block)) => Ok(action),
             Ok(action) => self.resolve_action(&action).await.map(|resolved| {
                 if resolved == RouteAction::Block {
                     resolved

@@ -46,6 +46,8 @@ lan_disallowed_ips = ["192.168.1.100/32"]
 skip_auth_prefixes = []
 ```
 
+系统代理优先使用 `mixed_listen`，将 HTTP、HTTPS 和 SOCKS 指向同一混合端口；没有混合端口时，分别使用 `http_listen`（HTTP/HTTPS）和 `socks5_listen`（SOCKS）。关闭系统代理时恢复原来的端点和启用状态。
+
 LAN 开关只保存在独立运行状态，默认关闭并拒绝非回环新连接；通过 TUI A 或运行时命令开启。来源必须同时通过允许列表和拒绝列表，拒绝优先；允许列表为空表示不额外限制来源，拒绝列表为空表示无额外拒绝。CIDR 限制只作用于显式 SOCKS5/HTTP/Mixed 入站，不改变 TUN/透明代理流量的规则路由。`authentication` 非空时，SOCKS5 使用 RFC 1929、HTTP 使用 Basic；HTTP 每个请求单独检查并剥离 Proxy-Authorization，不转发给目标。`skip_auth_prefixes` 是明确指定的免认证来源，不跳过 LAN/CIDR 检查。
 
 配置文件不再存放 `allow_lan` 开关；转换器不生成该项，编辑器保存时移除旧项。运行时关闭 LAN 只拒绝后续非回环连接，不搬动监听地址、不改配置文件、不主动关闭原连接。
