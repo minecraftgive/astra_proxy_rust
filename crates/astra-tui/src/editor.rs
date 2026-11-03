@@ -1123,6 +1123,91 @@ impl Editor {
             })
             .context(t("字段已不存在"))
     }
+    fn field_item(spec: &Spec, input: &str, remove: bool) -> Result<Item> {
+        Ok(match &spec.kind {
+            Type::Number(min, max) if !remove => {
+                let n: i64 = input.parse().context(t("请输入整数"))?;
+                anyhow::ensure!(
+                    (*min..=*max).contains(&n),
+                    tr!("{} 必须在 {}–{} 之间", spec.label, min, max)
+                );
+                value(n)
+            }
+            Type::Choice(choices) if !remove => {
+                anyhow::ensure!(
+                    choices.contains(&input),
+                    tr!("请用 ↑↓ 选择支持的值：{}", choices.join(", "))
+                );
+                value(input)
+            }
+            Type::StringList if !remove => {
+                let parsed: DocumentMut = format!("values = {input}")
+                    .parse()
+                    .context(t("请输入 TOML 字符串列表，例如 [\"en0\", \"eth0\"]"))?;
+                let array = parsed["values"].as_array().context(t("必须是字符串列表"))?;
+                anyhow::ensure!(
+                    array.iter().all(|value| value.as_str().is_some()),
+                    t("列表中的值必须是字符串")
+                );
+                Item::Value(toml_edit::Value::Array(array.clone()))
+            }
+            Type::Boolean if !remove => {
+                value(input.parse::<bool>().context(t("请选择 true 或 false"))?)
+            }
+            _ => {
+                anyhow::ensure!(
+                    !spec.required || !input.trim().is_empty(),
+                    tr!("{} 不能为空", spec.label)
+                );
+                value(input)
+            }
+        })
+    }
+    fn replace_outbound_fields(table: &mut dyn TableLike, input: &str) {
+        let tag = table.get("tag").cloned();
+        let replacement = outbound_template(input, "edge");
+        let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+        for k in keys {
+            table.remove(&k);
+        }
+        for (k, v) in replacement.iter() {
+            table.insert(k, v.clone());
+        }
+        if let Some(tag) = tag {
+            table.insert("tag", tag);
+        }
+    }
+    fn replace_native_fields(table: &mut dyn TableLike, input: &str) {
+        let shared: Vec<_> = ["server", "port", "uuid", "password"]
+            .into_iter()
+            .filter_map(|key| table.get(key).cloned().map(|v| (key, v)))
+            .collect();
+        let tls = table.get("tls").cloned();
+        let mut replacement = native_config(input);
+        for (key, item) in shared {
+            if replacement.contains_key(key) {
+                replacement.insert(key, item);
+            }
+        }
+        if input != "shadowsocks" {
+            if let Some(tls) = tls {
+                replacement.insert("tls", tls);
+            } else if let Some(server) = replacement
+                .get("server")
+                .and_then(Item::as_str)
+                .map(str::to_owned)
+            {
+                replacement["tls"]["server_name"] = value(server);
+            }
+        }
+        let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+        for k in keys {
+            table.remove(&k);
+        }
+        for (k, v) in replacement.iter() {
+            table.insert(k, v.clone());
+        }
+    }
     fn commit_field(&mut self) -> Result<()> {
         let Mode::Field { key, input, .. } = &self.form.mode else {
             return Ok(());
@@ -1184,44 +1269,7 @@ impl Editor {
             );
         }
         let remove = input.is_empty() && !spec.required;
-        let item = match &spec.kind {
-            Type::Number(min, max) if !remove => {
-                let n: i64 = input.parse().context(t("请输入整数"))?;
-                anyhow::ensure!(
-                    (*min..=*max).contains(&n),
-                    tr!("{} 必须在 {}–{} 之间", spec.label, min, max)
-                );
-                value(n)
-            }
-            Type::Choice(choices) if !remove => {
-                anyhow::ensure!(
-                    choices.contains(&input.as_str()),
-                    tr!("请用 ↑↓ 选择支持的值：{}", choices.join(", "))
-                );
-                value(&input)
-            }
-            Type::StringList if !remove => {
-                let parsed: DocumentMut = format!("values = {input}")
-                    .parse()
-                    .context(t("请输入 TOML 字符串列表，例如 [\"en0\", \"eth0\"]"))?;
-                let array = parsed["values"].as_array().context(t("必须是字符串列表"))?;
-                anyhow::ensure!(
-                    array.iter().all(|value| value.as_str().is_some()),
-                    t("列表中的值必须是字符串")
-                );
-                Item::Value(toml_edit::Value::Array(array.clone()))
-            }
-            Type::Boolean if !remove => {
-                value(input.parse::<bool>().context(t("请选择 true 或 false"))?)
-            }
-            _ => {
-                anyhow::ensure!(
-                    !spec.required || !input.trim().is_empty(),
-                    tr!("{} 不能为空", spec.label)
-                );
-                value(&input)
-            }
-        };
+        let item = Self::field_item(&spec, &input, remove)?;
         if !remove
             && last_key(&self.form.path) == Some("tls")
             && table_at(doc.as_table(), &self.form.path).is_none()
@@ -1266,51 +1314,12 @@ impl Editor {
                 && last_key(&self.form.path) == Some("outbounds")
                 && previous != input
             {
-                let tag = table.get("tag").cloned();
-                let replacement = outbound_template(&input, "edge");
-                let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
-                for k in keys {
-                    table.remove(&k);
-                }
-                for (k, v) in replacement.iter() {
-                    table.insert(k, v.clone());
-                }
-                if let Some(tag) = tag {
-                    table.insert("tag", tag);
-                }
+                Self::replace_outbound_fields(table, &input);
             } else if key == "protocol"
                 && last_key(&self.form.path) == Some("config")
                 && previous != input
             {
-                let shared: Vec<_> = ["server", "port", "uuid", "password"]
-                    .into_iter()
-                    .filter_map(|key| table.get(key).cloned().map(|v| (key, v)))
-                    .collect();
-                let tls = table.get("tls").cloned();
-                let mut replacement = native_config(&input);
-                for (key, item) in shared {
-                    if replacement.contains_key(key) {
-                        replacement.insert(key, item);
-                    }
-                }
-                if input != "shadowsocks" {
-                    if let Some(tls) = tls {
-                        replacement.insert("tls", tls);
-                    } else if let Some(server) = replacement
-                        .get("server")
-                        .and_then(Item::as_str)
-                        .map(str::to_owned)
-                    {
-                        replacement["tls"]["server_name"] = value(server);
-                    }
-                }
-                let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
-                for k in keys {
-                    table.remove(&k);
-                }
-                for (k, v) in replacement.iter() {
-                    table.insert(k, v.clone());
-                }
+                Self::replace_native_fields(table, &input);
             } else {
                 replace_field(table, &key, item);
                 if key == "kind" && last_key(&self.form.path) == Some("transport") {
