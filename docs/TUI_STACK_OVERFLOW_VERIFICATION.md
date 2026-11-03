@@ -34,3 +34,20 @@
 本机诊断原件保存在 `.test-tools/tui-stack-repro/`，包含原始 CDB 栈、dump、栈帧测量及实际终端复验报告；旧实现失败证据在 `.test-tools/tui-stack-red/result.json`。这些临时诊断产物不进入安装包。
 
 之前 `dist/2026-11-03_11-19-12_403702/` 的验证包包含旧 TUI，保留为历史产物。应使用本次修复后重新构建的客户端和服务端包；旧 CI 通过记录不能代替本次栈回归结果。
+
+## 安装包与 CI 记录
+
+修复代码为 `336a42f4101bb6c52a1d216a2caa26177777b700`。以下 Windows MSVC Debug 包均以该提交构建，索引中的 `source_revision` 和归档摘要已核对。两包分别独立解压验收，且包内实际 TUI 另行完成初始日志、`c` 启停、32 KiB SOCKS 回环和正常退出；仍使用 1 MiB 主栈。完整记录为 `.test-tools/tui-stack-repro/packaged-report.json`。
+
+| 角色 | ArtifactIndex | 归档 SHA-256 |
+| --- | --- | --- |
+| Client | `dist/2026-11-03_13-05-10_486631/artifacts.json` | `d32a36866a949cac0a4dfc96d93f2f26c4ca44701217b072bbecaa2be79ab3ca` |
+| Server | `dist/2026-11-03_13-12-11_217322/artifacts.json` | `3825a2ae1ce4b54319df260b8baf2b71b16acbbf6a18761ac86813fd6faabedf` |
+
+本机 Server 单角色构建时，CMake 误选另一套 Visual Studio，与已选 MSVC 工具版本不匹配。保留失败构建目录后，仅对本次构建进程设置与选定 VS 匹配的 `VS180COMNTOOLS`，完成构建；没有修改系统设置或运行代码。
+
+首轮 [CI 41581796288](https://github.com/minecraftgive/astra_proxy_rust/actions/runs/41581796288) 的 Windows 栈测试在初始化临时 IPC 端点时失败，未进入待测请求路径：管理员 runner 将新目录与标记文件的默认所有者设为 Administrators，触发了生产权限检查。测试提交 `b4878d5` 只对新建的测试目录明确设置当前用户为所有者，再应用原私有 ACL；没有弱化 IPC 的所有者、链接检查或 512 KiB 栈预算。修正后本机新版绿测和旧实现双路径栈溢出再次验证通过。
+
+该测试修正不改变上述安装包的运行代码。[CI 41583573793](https://github.com/minecraftgive/astra_proxy_rust/actions/runs/41583573793) 对 `b4878d533e8bd216653724e79eebf1045e83c014` 的验证已完成，10/10 jobs 全部成功：Windows 日志确认实际执行了精确受限栈回归并通过；Linux 完整 workspace 测试、严格 Clippy、管理与浏览器验收通过；macOS ARM64 与 Intel 均完成四包构建、workspace/live/client/server 回归、解压包和真实浏览器管理部署验收。Windows runner 使用 Rust 1.99.1。
+
+最终 CI 摘要保存在 `.test-tools/ci-41583573793-summary.json`，Windows 精确栈测试证据在 `.test-tools/ci-41583573793-windows-stack.json`；首轮失败和取消状态继续保留在 `.test-tools/ci-41581796288-summary.json`，未改写为通过。
