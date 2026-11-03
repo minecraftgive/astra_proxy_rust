@@ -256,11 +256,7 @@ pub fn peer_credentials(fd: std::os::fd::RawFd) -> io::Result<PeerCredentials> {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(PeerCredentials {
-            uid,
-            gid,
-            pid,
-        })
+        Ok(PeerCredentials { uid, gid, pid })
     }
 }
 
