@@ -1,8 +1,8 @@
 //! Persistent control service, independent of every frontend and proxy implementation.
 pub use astra_management as protocol;
 mod log_stream;
-mod monitor;
 mod manager;
+mod monitor;
 use astra_management::subscription_view;
 use astra_platform::tui_log;
 pub use manager::{atomic_write, private_dir, serve, serve_with_config};
