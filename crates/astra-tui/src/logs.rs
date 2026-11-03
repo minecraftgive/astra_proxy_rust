@@ -82,6 +82,7 @@ pub struct Viewer {
     pub name: String,
     pub settings: Settings,
     pub capture_level: LogLevel,
+    capture_supported: bool,
     pub cursor: Option<LogCursor>,
     feed: Option<Feed>,
     records: VecDeque<Record>,
@@ -114,6 +115,7 @@ impl Viewer {
             name,
             settings,
             capture_level: LogLevel::Info,
+            capture_supported: true,
             cursor: None,
             feed: None,
             records: VecDeque::new(),
@@ -177,6 +179,12 @@ impl Viewer {
     }
     pub fn set_vim_navigation(&mut self, enabled: bool) {
         self.settings.vim_navigation = enabled;
+    }
+    pub fn set_capture_supported(&mut self, supported: bool) {
+        self.capture_supported = supported;
+        if !supported && matches!(self.settings.mode, Mode::CaptureLevel(_)) {
+            self.cancel_input();
+        }
     }
     pub fn paused(&self) -> bool {
         self.frozen.is_some()
@@ -371,6 +379,10 @@ impl Viewer {
             .sum()
     }
     pub fn key(&mut self, mut key: KeyEvent) -> Command {
+        if !self.capture_supported && matches!(self.settings.mode, Mode::CaptureLevel(_)) {
+            self.cancel_input();
+            return Command::None;
+        }
         if self.browsing()
             && key.code == KeyCode::Char('f')
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -506,7 +518,7 @@ impl Viewer {
                         .unwrap_or(0),
                 )
             }
-            KeyCode::Char('L') => {
+            KeyCode::Char('L') if self.capture_supported => {
                 self.settings.mode = Mode::CaptureLevel(self.capture_level.severity() as usize)
             }
             KeyCode::Char('n') => self.jump(false),
@@ -642,22 +654,36 @@ impl Viewer {
                 ))
             })
             .collect();
-        let title = tr!(
-            "实时日志 · {} · {} · 显示 {} · 记录 {}",
-            self.name,
-            if self.paused() {
-                t("显示已暂停 · 后台仍更新 · Space 恢复")
-            } else if self.settings.follow {
-                t("跟随")
-            } else {
-                t("暂停跟随")
-            },
-            self.settings
-                .min_level
-                .map(|l| format!("{}+", l.as_str()))
-                .unwrap_or(t("全部").into()),
-            self.capture_level.as_str()
-        );
+        let follow = if self.paused() {
+            t("显示已暂停 · 后台仍更新 · Space 恢复")
+        } else if self.settings.follow {
+            t("跟随")
+        } else {
+            t("暂停跟随")
+        };
+        let display = self
+            .settings
+            .min_level
+            .map(|l| format!("{}+", l.as_str()))
+            .unwrap_or(t("全部").into());
+        let title = if self.capture_supported {
+            tr!(
+                "实时日志 · {} · {} · 显示 {} · 记录 {}",
+                self.name,
+                follow,
+                display,
+                self.capture_level.as_str()
+            )
+        } else {
+            format!(
+                "{} · {} · {} · {} {}",
+                t("Logs"),
+                self.name,
+                follow,
+                t("Filter"),
+                display
+            )
+        };
         let paragraph =
             Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
         let paragraph = if self.settings.wrap {
@@ -1037,6 +1063,39 @@ mod tests {
             view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Command::Capture(LogLevel::Info)
         ));
+    }
+    #[test]
+    fn fixed_capture_logs_discard_pending_capture_and_keep_display_filtering() {
+        let settings = Settings {
+            mode: Mode::CaptureLevel(LogLevel::Debug.severity() as usize),
+            ..Settings::default()
+        };
+        let mut view = Viewer::new("server".into(), settings);
+        view.set_capture_supported(false);
+        assert!(view.browsing());
+        assert!(matches!(view.key(key('L')), Command::None));
+        assert!(view.browsing());
+        assert!(matches!(
+            view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Command::None
+        ));
+        let screen = view.test_screen(120, 24);
+        assert!(!screen.contains("info"), "A fixed capture level is unknown");
+
+        view.push("DEBUG diagnostic".into());
+        view.push("ERROR failed".into());
+        view.key(key('v'));
+        assert!(matches!(view.settings.mode, Mode::DisplayLevel(_)));
+        for _ in 0..LogLevel::ALL.len() {
+            view.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(matches!(
+            view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Command::None
+        ));
+        assert_eq!(view.settings.min_level, Some(LogLevel::Error));
+        assert_eq!(view.visible().len(), 1);
+        assert_eq!(view.visible()[0].text, "ERROR failed");
     }
     fn event(bytes: &[u8], offset: u64, reset: bool) -> LogEvent {
         LogEvent::Data {

@@ -113,115 +113,82 @@ fn runtime(c: astra_model::runtime::Command) -> v::RuntimeCommand {
         C::AllowLan(x) => R::AllowLan(x),
     }
 }
-pub async fn call(p: &Path, action: Action) -> Result<Reply> {
+// Translate actions before entering the async dispatcher: an await in every
+// arm made the debug poll frame exceed 300 KiB and exhaust the Windows UI stack.
+enum CallPlan {
+    Request(v::RequestBody),
+    Execute {
+        operation_id: String,
+        command: v::Command,
+    },
+    Save {
+        name: String,
+        original: String,
+        text: String,
+    },
+    Rollback,
+}
+impl CallPlan {
+    fn query(query: v::Query) -> Self {
+        Self::Request(v::RequestBody::Query(query))
+    }
+    fn execute(command: v::Command) -> Self {
+        Self::Execute {
+            operation_id: id(),
+            command,
+        }
+    }
+}
+fn call_plan(action: Action, local: bool) -> Result<CallPlan> {
     use v::{Command as C, Query as Q};
-    let result = match action {
-        Action::List | Action::WatchList => query(p, Q::Instances).await?,
-        Action::Add(i) => {
-            execute(
-                p,
-                C::Add {
-                    name: i.name,
-                    kind: kind(i.kind),
-                    config: i.config,
-                },
-            )
-            .await?
-        }
-        Action::Create { name, kind: k } => {
-            execute(
-                p,
-                C::Create {
-                    name,
-                    kind: kind(k),
-                },
-            )
-            .await?
-        }
-        Action::Remove(instance) => execute(p, C::Remove { instance }).await?,
-        Action::Start(instance) => execute(p, C::Start { instance }).await?,
-        Action::Stop(instance) => execute(p, C::Stop { instance }).await?,
-        Action::Restart(instance) => execute(p, C::Restart { instance }).await?,
-        Action::Reload(instance) => execute(p, C::Reload { instance }).await?,
-        Action::SetConfig(instance, path) => execute(p, C::SetConfig { instance, path }).await?,
-        Action::Read(instance) => query(p, Q::Document { instance }).await?,
+    Ok(match action {
+        Action::List | Action::WatchList => CallPlan::query(Q::Instances),
+        Action::Add(i) => CallPlan::execute(C::Add {
+            name: i.name,
+            kind: kind(i.kind),
+            config: i.config,
+        }),
+        Action::Create { name, kind: k } => CallPlan::execute(C::Create {
+            name,
+            kind: kind(k),
+        }),
+        Action::Remove(instance) => CallPlan::execute(C::Remove { instance }),
+        Action::Start(instance) => CallPlan::execute(C::Start { instance }),
+        Action::Stop(instance) => CallPlan::execute(C::Stop { instance }),
+        Action::Restart(instance) => CallPlan::execute(C::Restart { instance }),
+        Action::Reload(instance) => CallPlan::execute(C::Reload { instance }),
+        Action::SetConfig(instance, path) => CallPlan::execute(C::SetConfig { instance, path }),
+        Action::Read(instance) => CallPlan::query(Q::Document { instance }),
         Action::Save {
             name,
             original,
             text,
-        } => {
-            let draft_id = id();
-            let v::ResponseBody::Draft(d) = request(
-                p,
-                v::RequestBody::Drafts(v::DraftCommand::Open {
-                    instance: name,
-                    draft_id: draft_id.clone(),
-                }),
-            )
-            .await?
-            else {
-                anyhow::bail!("Expected draft")
-            };
-            anyhow::ensure!(
-                d.original == original,
-                "File changed on disk; reopen before editing"
-            );
-            let v::ResponseBody::Draft(d) = request(
-                p,
-                v::RequestBody::Drafts(v::DraftCommand::Edit {
-                    draft_id: draft_id.clone(),
-                    expected_revision: d.revision,
-                    text,
-                }),
-            )
-            .await?
-            else {
-                anyhow::bail!("Expected draft")
-            };
-            request(
-                p,
-                v::RequestBody::Drafts(v::DraftCommand::Save {
-                    draft_id,
-                    expected_revision: d.revision,
-                    expected_source_revision: d.source_revision,
-                    operation_id: id(),
-                }),
-            )
-            .await?
-        }
-        Action::CloneConfig(instance, destination) => {
-            execute(
-                p,
-                C::CloneConfig {
-                    instance,
-                    destination,
-                },
-            )
-            .await?
-        }
-        Action::Validate(instance) => execute(p, C::Validate { instance }).await?,
-        Action::PrepareConfig(instance) => execute(p, C::PrepareConfig { instance }).await?,
-        Action::Logs(instance) => query(p, Q::Logs { instance }).await?,
-        Action::Shutdown => execute(p, C::Shutdown).await?,
-        Action::GetLogLevel(instance) => query(p, Q::LogLevel { instance }).await?,
+        } => CallPlan::Save {
+            name,
+            original,
+            text,
+        },
+        Action::CloneConfig(instance, destination) => CallPlan::execute(C::CloneConfig {
+            instance,
+            destination,
+        }),
+        Action::Validate(instance) => CallPlan::execute(C::Validate { instance }),
+        Action::PrepareConfig(instance) => CallPlan::execute(C::PrepareConfig { instance }),
+        Action::Logs(instance) => CallPlan::query(Q::Logs { instance }),
+        Action::Shutdown => CallPlan::execute(C::Shutdown),
+        Action::GetLogLevel(instance) => CallPlan::query(Q::LogLevel { instance }),
         Action::SetLogLevel {
             name: instance,
             level,
-        } => execute(p, C::SetLogLevel { instance, level }).await?,
+        } => CallPlan::execute(C::SetLogLevel { instance, level }),
         Action::BindStart {
             name: instance,
             targets,
-        } => execute(p, C::BindStart { instance, targets }).await?,
-        Action::Diagnostics(instance) => {
-            execute(
-                p,
-                C::Diagnostics {
-                    instance,
-                    targets: None,
-                },
-            )
-            .await?
-        }
+        } => CallPlan::execute(C::BindStart { instance, targets }),
+        Action::Diagnostics(instance) => CallPlan::execute(C::Diagnostics {
+            instance,
+            targets: None,
+        }),
         Action::DiagnosticsSelected {
             name: instance,
             targets,
@@ -229,173 +196,184 @@ pub async fn call(p: &Path, action: Action) -> Result<Reply> {
         | Action::DiagnosticsStream {
             name: instance,
             targets,
-        } => {
-            execute(
-                p,
-                C::Diagnostics {
-                    instance,
-                    targets: Some(targets),
-                },
-            )
-            .await?
-        }
-        Action::NodeTags(instance) => query(p, Q::NodeTags { instance }).await?,
-        Action::SubscriptionNodes(instance) => query(p, Q::SubscriptionNodes { instance }).await?,
-        Action::DiagnosticTargets(instance) => query(p, Q::DiagnosticTargets { instance }).await?,
+        } => CallPlan::execute(C::Diagnostics {
+            instance,
+            targets: Some(targets),
+        }),
+        Action::NodeTags(instance) => CallPlan::query(Q::NodeTags { instance }),
+        Action::SubscriptionNodes(instance) => CallPlan::query(Q::SubscriptionNodes { instance }),
+        Action::DiagnosticTargets(instance) => CallPlan::query(Q::DiagnosticTargets { instance }),
         Action::ExplainRoute {
             name: instance,
             request: r,
-        } => {
-            execute(
-                p,
-                C::ExplainRoute {
-                    instance,
-                    request: v::RouteQuery {
-                        host: r.target.host,
-                        port: r.target.port,
-                        network: r.network,
-                        inbound: r.inbound,
-                        destination_ip: r.destination_ip,
-                        process: r.process,
-                    },
-                },
-            )
-            .await?
-        }
+        } => CallPlan::execute(C::ExplainRoute {
+            instance,
+            request: v::RouteQuery {
+                host: r.target.host,
+                port: r.target.port,
+                network: r.network,
+                inbound: r.inbound,
+                destination_ip: r.destination_ip,
+                process: r.process,
+            },
+        }),
         Action::UpdateSubscriptions(instance) => {
-            execute(p, C::UpdateSubscriptions { instance }).await?
+            CallPlan::execute(C::UpdateSubscriptions { instance })
         }
         Action::NetTool {
             name: instance,
             request,
-        } => {
-            execute(
-                p,
-                C::NetTool {
-                    instance,
-                    request: request.into(),
-                },
-            )
-            .await?
-        }
-        Action::StoragePaths => query(p, Q::StoragePaths).await?,
+        } => CallPlan::execute(C::NetTool {
+            instance,
+            request: request.into(),
+        }),
+        Action::StoragePaths => CallPlan::query(Q::StoragePaths),
         Action::Runtime {
             name: instance,
             command: astra_model::runtime::Command::Snapshot,
             ..
         }
-        | Action::WatchRuntime { name: instance, .. } => query(p, Q::Runtime { instance }).await?,
+        | Action::WatchRuntime { name: instance, .. } => CallPlan::query(Q::Runtime { instance }),
         Action::Runtime {
             name: instance,
             command: astra_model::runtime::Command::Tun(true),
             expected_pid,
-        } if TARGET
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|(_, agent)| agent.is_none()) =>
-        {
-            request(
-                p,
-                v::RequestBody::Local(v::LocalCommand::EnableTun {
-                    instance,
-                    expected_pid,
-                }),
-            )
-            .await?
-        }
+        } if local => CallPlan::Request(v::RequestBody::Local(v::LocalCommand::EnableTun {
+            instance,
+            expected_pid,
+        })),
         Action::Runtime {
             name: instance,
             command,
             expected_pid,
-        } => {
-            execute(
-                p,
-                C::Runtime {
-                    instance,
-                    command: runtime(command),
-                    expected_pid,
-                },
-            )
-            .await?
-        }
-        Action::UpdateStatus | Action::WatchUpdates => query(p, Q::UpdateStatus).await?,
+        } => CallPlan::execute(C::Runtime {
+            instance,
+            command: runtime(command),
+            expected_pid,
+        }),
+        Action::UpdateStatus | Action::WatchUpdates => CallPlan::query(Q::UpdateStatus),
         Action::UpdateOperationStatus { operation_id } => {
-            query(p, Q::UpdateOperationStatus { operation_id }).await?
+            CallPlan::query(Q::UpdateOperationStatus { operation_id })
         }
-        Action::UpdateTransaction { request: r } => {
-            execute_id(p, r.operation_id.clone(), C::Update { request: r }).await?
-        }
-        Action::UpdatePackage(package) => {
-            execute(
-                p,
-                C::Update {
-                    request: updates::UpdateRequest::new(updates::UpdateIntent::Stage { package }),
-                },
-            )
-            .await?
-        }
-        Action::Rollback => {
-            let v::ResponseBody::UpdateStatus(status) = query(p, Q::UpdateStatus).await? else {
-                anyhow::bail!("Expected update status")
-            };
-            let target_directory = status
-                .capabilities
-                .rollback_target
-                .context("No rollback target")?;
-            execute(
-                p,
-                C::Update {
-                    request: updates::UpdateRequest::new(updates::UpdateIntent::Rollback {
-                        target_directory,
-                    }),
-                },
-            )
-            .await?
-        }
+        Action::UpdateTransaction { request: r } => CallPlan::Execute {
+            operation_id: r.operation_id.clone(),
+            command: C::Update { request: r },
+        },
+        Action::UpdatePackage(package) => CallPlan::execute(C::Update {
+            request: updates::UpdateRequest::new(updates::UpdateIntent::Stage { package }),
+        }),
+        Action::Rollback => CallPlan::Rollback,
         Action::RecoverUpdate { operation_id } => {
-            execute(p, C::RecoverUpdate { operation_id }).await?
+            CallPlan::execute(C::RecoverUpdate { operation_id })
         }
         Action::PrepareElevation {
             name: instance,
             expected_pid,
-        } => {
-            request(
-                p,
-                v::RequestBody::Local(v::LocalCommand::PrepareElevation {
-                    instance,
-                    expected_pid,
-                }),
-            )
-            .await?
-        }
+        } => CallPlan::Request(v::RequestBody::Local(v::LocalCommand::PrepareElevation {
+            instance,
+            expected_pid,
+        })),
         Action::WaitElevation {
             name: instance,
             ticket,
-        } => {
-            request(
-                p,
-                v::RequestBody::Local(v::LocalCommand::WaitElevation { instance, ticket }),
-            )
-            .await?
-        }
+        } => CallPlan::Request(v::RequestBody::Local(v::LocalCommand::WaitElevation {
+            instance,
+            ticket,
+        })),
         Action::CancelElevation {
             name: instance,
             ticket,
-        } => {
-            request(
-                p,
-                v::RequestBody::Local(v::LocalCommand::CancelElevation { instance, ticket }),
-            )
-            .await?
-        }
+        } => CallPlan::Request(v::RequestBody::Local(v::LocalCommand::CancelElevation {
+            instance,
+            ticket,
+        })),
         Action::FollowLogs { .. } | Action::Session => {
             anyhow::bail!("Subscription action requires a v2 stream adapter")
         }
+    })
+}
+pub async fn call(p: &Path, action: Action) -> Result<Reply> {
+    let local = TARGET
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|(_, agent)| agent.is_none());
+    let result = match call_plan(action, local)? {
+        CallPlan::Request(body) => request(p, body).await?,
+        CallPlan::Execute {
+            operation_id,
+            command,
+        } => execute_id(p, operation_id, command).await?,
+        CallPlan::Save {
+            name,
+            original,
+            text,
+        } => save(p, name, original, text).await?,
+        CallPlan::Rollback => rollback(p).await?,
     };
     reply(result)
 }
+async fn save(p: &Path, name: String, original: String, text: String) -> Result<v::ResponseBody> {
+    let draft_id = id();
+    let v::ResponseBody::Draft(d) = request(
+        p,
+        v::RequestBody::Drafts(v::DraftCommand::Open {
+            instance: name,
+            draft_id: draft_id.clone(),
+        }),
+    )
+    .await?
+    else {
+        anyhow::bail!("Expected draft")
+    };
+    anyhow::ensure!(
+        d.original == original,
+        "File changed on disk; reopen before editing"
+    );
+    let v::ResponseBody::Draft(d) = request(
+        p,
+        v::RequestBody::Drafts(v::DraftCommand::Edit {
+            draft_id: draft_id.clone(),
+            expected_revision: d.revision,
+            text,
+        }),
+    )
+    .await?
+    else {
+        anyhow::bail!("Expected draft")
+    };
+    request(
+        p,
+        v::RequestBody::Drafts(v::DraftCommand::Save {
+            draft_id,
+            expected_revision: d.revision,
+            expected_source_revision: d.source_revision,
+            operation_id: id(),
+        }),
+    )
+    .await
+}
+async fn rollback(p: &Path) -> Result<v::ResponseBody> {
+    use v::{Command as C, Query as Q};
+    let v::ResponseBody::UpdateStatus(status) = query(p, Q::UpdateStatus).await? else {
+        anyhow::bail!("Expected update status")
+    };
+    let target_directory = status
+        .capabilities
+        .rollback_target
+        .context("No rollback target")?;
+    execute(
+        p,
+        C::Update {
+            request: updates::UpdateRequest::new(updates::UpdateIntent::Rollback {
+                target_directory,
+            }),
+        },
+    )
+    .await
+}
+
 fn reply(r: v::ResponseBody) -> Result<Reply> {
     use v::ResponseBody as R;
     Ok(match r {
@@ -692,4 +670,112 @@ async fn stream_job(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_transaction_retains_the_callers_operation_identity() {
+        let request = updates::UpdateRequest::new(updates::UpdateIntent::Rollback {
+            target_directory: PathBuf::from("chosen-release"),
+        });
+        let expected = request.operation_id.clone();
+        let CallPlan::Execute {
+            operation_id,
+            command: v::Command::Update { request },
+        } = call_plan(Action::UpdateTransaction { request }, true).unwrap()
+        else {
+            panic!("An explicit update transaction must use the durable Execute path");
+        };
+        assert_eq!(operation_id, expected);
+        assert_eq!(request.operation_id, expected);
+        assert!(
+            matches!(request.intent, updates::UpdateIntent::Rollback { target_directory }
+            if target_directory == Path::new("chosen-release"))
+        );
+    }
+
+    #[test]
+    fn save_and_rollback_defer_their_state_checks_until_execution() {
+        let CallPlan::Save {
+            name,
+            original,
+            text,
+        } = call_plan(
+            Action::Save {
+                name: "proxy".into(),
+                original: "expected source revision".into(),
+                text: "edited document".into(),
+            },
+            true,
+        )
+        .unwrap()
+        else {
+            panic!("Saving must retain the original document for the draft conflict check");
+        };
+        assert_eq!(name, "proxy");
+        assert_eq!(original, "expected source revision");
+        assert_eq!(text, "edited document");
+        assert!(matches!(
+            call_plan(Action::Rollback, true).unwrap(),
+            CallPlan::Rollback
+        ));
+    }
+
+    #[test]
+    fn local_tun_enable_keeps_elevation_off_the_remote_execute_path() {
+        let action = Action::Runtime {
+            name: "proxy".into(),
+            command: astra_model::runtime::Command::Tun(true),
+            expected_pid: Some(123),
+        };
+        assert!(matches!(
+            call_plan(action.clone(), true).unwrap(),
+            CallPlan::Request(v::RequestBody::Local(v::LocalCommand::EnableTun {
+                instance, expected_pid: Some(123)
+            })) if instance == "proxy"
+        ));
+        assert!(matches!(
+            call_plan(action, false).unwrap(),
+            CallPlan::Execute { command: v::Command::Runtime {
+                instance, command: v::RuntimeCommand::Tun(true), expected_pid: Some(123)
+            }, .. } if instance == "proxy"
+        ));
+        assert!(matches!(
+            call_plan(
+                Action::Runtime {
+                    name: "proxy".into(),
+                    command: astra_model::runtime::Command::Tun(false),
+                    expected_pid: Some(123),
+                },
+                true
+            )
+            .unwrap(),
+            CallPlan::Execute {
+                command: v::Command::Runtime {
+                    command: v::RuntimeCommand::Tun(false),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn subscription_only_actions_cannot_be_sent_as_single_requests() {
+        for action in [
+            Action::Session,
+            Action::FollowLogs {
+                name: "proxy".into(),
+                cursor: None,
+            },
+        ] {
+            let Err(error) = call_plan(action, true) else {
+                panic!("Subscription-only actions require the stream adapter");
+            };
+            assert!(error.to_string().contains("stream adapter"));
+        }
+    }
 }

@@ -56,6 +56,19 @@ jobs:
       - if: runner.os == 'Windows'
         run: choco install nasm llvm --no-progress -y
       - run: python scripts/test.py check --debug
+      - name: Verify TUI Connect and Logs with a constrained Windows stack
+        if: runner.os == 'Windows'
+        shell: python {0}
+        run: |
+          import subprocess, sys
+          sys.path.insert(0, 'scripts')
+          from astra_tools.workspace import build_environment
+          subprocess.run([
+              'cargo', 'test', '-p', 'astra-tui', '--lib', '--locked',
+              '--target', 'x86_64-pc-windows-msvc',
+              'ui::stack_tests::connect_and_logs_fit_background_stack_budget',
+              '--', '--exact',
+          ], env=build_environment(), check=True)
   web:
     runs-on: ubuntu-latest
     defaults:

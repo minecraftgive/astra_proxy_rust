@@ -303,12 +303,18 @@ impl AgentService {
                         .text,
                 )?))
             }
-            Query::LogLevel { instance } => ResponseBody::LogLevel(
-                self.call(old::Action::GetLogLevel(instance))
-                    .await?
-                    .text
-                    .parse()?,
-            ),
+            Query::LogLevel { instance } => {
+                anyhow::ensure!(
+                    self.server_path(&instance).await?.is_none(),
+                    "Unsupported: server cores do not expose a configurable log capture level"
+                );
+                ResponseBody::LogLevel(
+                    self.call(old::Action::GetLogLevel(instance))
+                        .await?
+                        .text
+                        .parse()?,
+                )
+            }
             Query::StoragePaths => ResponseBody::StoragePaths(old::StoragePaths {
                 config: self.config.config_dir.clone(),
                 state: self.config.state_dir.clone(),
@@ -664,6 +670,7 @@ impl AgentService {
             | Command::Validate { instance }
             | Command::CloneConfig { instance, .. }
             | Command::SetConfig { instance, .. }
+            | Command::SetLogLevel { instance, .. }
             | Command::PrepareConfig { instance } => Some(instance.clone()),
             _ => None,
         };
@@ -1000,8 +1007,15 @@ impl AgentService {
             Command::PrepareConfig { .. } => {
                 self.validate_server(path, &bounded_text(path)?).await?;
                 return Ok(ResponseBody::Done {
-                    message: path.display().to_string(),
+                    // The frontend opens a nonempty prepare result as a new
+                    // document. An existing, valid profile is ready to start.
+                    message: String::new(),
                 });
+            }
+            Command::SetLogLevel { .. } => {
+                anyhow::bail!(
+                    "Unsupported: server cores do not expose a configurable log capture level"
+                );
             }
             Command::SetConfig { path: new_path, .. } => {
                 let new_path = std::fs::canonicalize(new_path)?;

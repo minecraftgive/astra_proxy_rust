@@ -15,6 +15,8 @@ mod operations;
 mod pages;
 mod shell;
 #[cfg(test)]
+mod stack_tests;
+#[cfg(test)]
 mod test_rpc;
 mod update;
 use crate::editor::Editor;

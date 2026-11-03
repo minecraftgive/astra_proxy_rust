@@ -237,12 +237,16 @@ fn progress(message: String) {
     astra_ipc::progress::report("Working", message);
 }
 
-pub(super) async fn perform(
+pub(super) fn perform(
     socket: &std::path::Path,
-    mut input: OperationInput,
-    mut action: Action,
-    mut origin: Option<(Prompt, String)>,
-) -> JobResult {
+    input: OperationInput,
+    action: Action,
+    origin: Option<(Prompt, String)>,
+) -> futures_util::future::LocalBoxFuture<'_, JobResult> {
+    // Keep each operation's await points in a separate poll function. In debug
+    // builds, one large async match reserves stack temporaries for every arm,
+    // including the operations that this task will never execute. Dispatch
+    // before polling so the progress scope also carries only a pinned pointer.
     if matches!(
         &action,
         Action::UpdateStatus
@@ -250,92 +254,185 @@ pub(super) async fn perform(
             | Action::UpdateTransaction { .. }
             | Action::RecoverUpdate { .. }
     ) {
-        progress(action_description(&action));
-        return match call(socket, action.clone())
-            .await
-            .and_then(|r| update::View::decode(&r.text))
-        {
-            Ok(view) => JobResult::Update(view),
-            Err(error) => {
-                let operation_id = match &action {
-                    Action::UpdateTransaction { request } => Some(request.operation_id.clone()),
-                    Action::RecoverUpdate { operation_id }
-                    | Action::UpdateOperationStatus { operation_id } => Some(operation_id.clone()),
-                    _ => None,
-                };
-                failure(
-                    format!(
-                        "{error:#} · {}",
-                        t("Read update status, then recover the existing operation")
-                    ),
-                    operation_id.map(|operation_id| {
-                        Resume::Request(Action::UpdateOperationStatus { operation_id })
-                    }),
-                )
-            }
-        };
+        return Box::pin(perform_update(socket, action));
     }
     if let Action::Runtime { name, .. } | Action::WaitElevation { name, .. } = &action {
-        let message = match &action {
-            Action::WaitElevation { .. } => t("TUN enabled by the elevated core"),
-            Action::Runtime {
-                command: astra_model::runtime::Command::TestGroup(_),
-                ..
-            } => t("Group test started"),
-            _ => t("Runtime updated; profile unchanged"),
+        return Box::pin(perform_runtime(socket, name.clone(), action));
+    }
+    if let Action::Diagnostics(name) = action {
+        return Box::pin(async move {
+            JobResult::Diagnostics {
+                socket: socket.into(),
+                name,
+            }
+        });
+    }
+    if let Action::Logs(name) = action {
+        return Box::pin(perform_logs(socket, input, name));
+    }
+    Box::pin(perform_profile(socket, input, action, origin))
+}
+
+async fn perform_update(socket: &std::path::Path, action: Action) -> JobResult {
+    progress(action_description(&action));
+    match call(socket, action.clone())
+        .await
+        .and_then(|r| update::View::decode(&r.text))
+    {
+        Ok(view) => JobResult::Update(view),
+        Err(error) => {
+            let operation_id = match &action {
+                Action::UpdateTransaction { request } => Some(request.operation_id.clone()),
+                Action::RecoverUpdate { operation_id }
+                | Action::UpdateOperationStatus { operation_id } => Some(operation_id.clone()),
+                _ => None,
+            };
+            failure(
+                format!(
+                    "{error:#} · {}",
+                    t("Read update status, then recover the existing operation")
+                ),
+                operation_id.map(|operation_id| {
+                    Resume::Request(Action::UpdateOperationStatus { operation_id })
+                }),
+            )
         }
-        .into();
-        return match call(socket, action.clone())
-            .await
-            .and_then(|r| Ok(serde_json::from_str(&r.text)?))
-        {
-            Ok(snapshot) => JobResult::Runtime {
-                name: name.clone(),
-                snapshot,
-                message,
-            },
-            Err(error) => failure(format!("{error:#}"), None),
-        };
     }
-    if let Action::Diagnostics(name) = &action {
-        return JobResult::Diagnostics {
-            socket: socket.into(),
-            name: name.clone(),
-        };
+}
+
+async fn perform_runtime(socket: &std::path::Path, name: String, action: Action) -> JobResult {
+    let message = match &action {
+        Action::WaitElevation { .. } => t("TUN enabled by the elevated core"),
+        Action::Runtime {
+            command: astra_model::runtime::Command::TestGroup(_),
+            ..
+        } => t("Group test started"),
+        _ => t("Runtime updated; profile unchanged"),
     }
-    if let Action::Logs(name) = &action {
-        let mut viewer = logs::Viewer::new(
-            name.clone(),
-            input.log_settings.remove(name).unwrap_or_default(),
-        );
-        viewer.set_vim_navigation(input.vim_keys);
-        let result: Result<()> = async {
+    .into();
+    match call(socket, action)
+        .await
+        .and_then(|r| Ok(serde_json::from_str(&r.text)?))
+    {
+        Ok(snapshot) => JobResult::Runtime {
+            name,
+            snapshot,
+            message,
+        },
+        Err(error) => failure(format!("{error:#}"), None),
+    }
+}
+
+async fn perform_logs(
+    socket: &std::path::Path,
+    mut input: OperationInput,
+    name: String,
+) -> JobResult {
+    // The legacy UI rows retain each instance's kind, while the server adapter
+    // deliberately offers log reading without dynamic capture-level control.
+    let capture_supported = name == "@tui" || input.target(&name).kind != Kind::Server;
+    let mut viewer = logs::Viewer::new(
+        name.clone(),
+        input.log_settings.remove(&name).unwrap_or_default(),
+    );
+    viewer.set_vim_navigation(input.vim_keys);
+    viewer.set_capture_supported(capture_supported);
+    let result: Result<()> = async {
+        if capture_supported {
             viewer.capture_level = call(socket, Action::GetLogLevel(name.clone()))
                 .await?
                 .text
                 .parse()?;
-            viewer.connect(socket).await
         }
-        .await;
-        return match result {
-            Ok(()) => JobResult::Logs(viewer),
-            Err(error) => failure(format!("{error:#}"), Some(Resume::Request(action))),
-        };
+        viewer.connect(socket).await
     }
+    .await;
+    match result {
+        Ok(()) => JobResult::Logs(viewer),
+        Err(error) => failure(
+            format!("{error:#}"),
+            Some(Resume::Request(Action::Logs(name))),
+        ),
+    }
+}
+
+async fn prepare_profile(
+    socket: &std::path::Path,
+    input: &OperationInput,
+    name: &str,
+) -> Result<Option<DocumentReady>> {
+    progress(t("Checking saved configuration").into());
+    let reply = call(socket, Action::PrepareConfig(name.into())).await?;
+    if reply.text.is_empty() {
+        return Ok(None);
+    }
+    let mut prepared = input.prepare(name.into(), reply.text);
+    metadata(socket, input.target(name))
+        .await
+        .apply_editor(&mut prepared.editor);
+    prepared.message = "Review configuration · Ctrl-S save".into();
+    Ok(Some(prepared))
+}
+
+async fn profile_failure(
+    socket: &std::path::Path,
+    input: &OperationInput,
+    action: Action,
+    origin: Option<(Prompt, String)>,
+    error: anyhow::Error,
+) -> JobResult {
+    let mut message = format!("{error:#}");
+    let mut observed = None;
+    if let Action::Save { name, .. } = &action {
+        if message.contains("File changed on disk")
+            || message.contains("File changed during validation")
+        {
+            if let Ok(reply) = call(socket, Action::Read(name.clone())).await {
+                observed = Some(input.prepare(name.clone(), reply.text));
+                message.push_str("\nDraft retained. Cancel this error, then F2 → Compare draft with observed disk.");
+            }
+        }
+    }
+    let resume = origin
+        .map(|(p, text)| Resume::Prompt(p, text))
+        .unwrap_or(Resume::Request(action));
+    JobResult::Failed {
+        message,
+        resume: Some(resume),
+        observed,
+    }
+}
+
+async fn read_profile(
+    socket: &std::path::Path,
+    input: &OperationInput,
+    name: String,
+    text: String,
+    binding: Option<Reply>,
+) -> JobResult {
+    let mut prepared = input.prepare(name.clone(), text);
+    let metadata = metadata(socket, input.target(&name)).await;
+    metadata.apply_editor(&mut prepared.editor);
+    if metadata.unavailable {
+        prepared.message = "Node suggestions unavailable; manual entry is supported".into();
+    }
+    JobResult::Document { prepared, binding }
+}
+
+async fn perform_profile(
+    socket: &std::path::Path,
+    mut input: OperationInput,
+    mut action: Action,
+    mut origin: Option<(Prompt, String)>,
+) -> JobResult {
     let mut binding = None;
     loop {
         if let Action::Start(name) | Action::Restart(name) | Action::Validate(name) = &action {
-            progress(t("Checking saved configuration").into());
-            match call(socket, Action::PrepareConfig(name.clone())).await {
-                Ok(reply) if !reply.text.is_empty() => {
-                    let mut prepared = input.prepare(name.clone(), reply.text);
-                    metadata(socket, input.target(name))
-                        .await
-                        .apply_editor(&mut prepared.editor);
-                    prepared.message = "Review configuration · Ctrl-S save".into();
+            match prepare_profile(socket, &input, name).await {
+                Ok(Some(prepared)) => {
                     return JobResult::Document { prepared, binding };
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(error) => return failure(format!("{error:#}"), Some(Resume::Request(action))),
             }
         }
@@ -347,26 +444,7 @@ pub(super) async fn perform(
         let reply = match call(socket, action.clone()).await {
             Ok(reply) => reply,
             Err(error) => {
-                let mut message = format!("{error:#}");
-                let mut observed = None;
-                if let Action::Save { name, .. } = &action {
-                    if message.contains("File changed on disk")
-                        || message.contains("File changed during validation")
-                    {
-                        if let Ok(reply) = call(socket, Action::Read(name.clone())).await {
-                            observed = Some(input.prepare(name.clone(), reply.text));
-                            message.push_str("\nDraft retained. Cancel this error, then F2 → Compare draft with observed disk.");
-                        }
-                    }
-                }
-                let resume = origin
-                    .map(|(p, text)| Resume::Prompt(p, text))
-                    .unwrap_or(Resume::Request(action));
-                return JobResult::Failed {
-                    message,
-                    resume: Some(resume),
-                    observed,
-                };
+                return profile_failure(socket, &input, action, origin, error).await;
             }
         };
         match action {
@@ -397,14 +475,7 @@ pub(super) async fn perform(
                 origin = None;
             }
             Action::Read(name) => {
-                let mut prepared = input.prepare(name.clone(), reply.text);
-                let metadata = metadata(socket, input.target(&name)).await;
-                metadata.apply_editor(&mut prepared.editor);
-                if metadata.unavailable {
-                    prepared.message =
-                        "Node suggestions unavailable; manual entry is supported".into();
-                }
-                return JobResult::Document { prepared, binding };
+                return read_profile(socket, &input, name, reply.text, binding).await;
             }
             Action::ExplainRoute { .. } => {
                 return match serde_json::from_str(&reply.text) {
@@ -638,6 +709,86 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn server_logs_read_chunks_without_requesting_capture_control() {
+        use astra_management::v2 as v;
+        let fixture = crate::import::tests::Fixture::new();
+        let socket = fixture.0.join("management.sock");
+        let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, request) = test_rpc::next(&listener).await;
+            assert!(
+                matches!(
+                    &request.body,
+                    v::RequestBody::Query(v::Query::LogChunk { instance, .. }) if instance == "edge"
+                ),
+                "Server logs must not issue a capture-level request: {:?}",
+                request.body
+            );
+            test_rpc::reply(
+                stream,
+                request,
+                v::ResponseBody::LogChunk(v::LogChunk::Data {
+                    bytes: b"INFO server started\n".to_vec(),
+                    cursor: v::LogCursor {
+                        device: "1".into(),
+                        inode: "2".into(),
+                        offset: "20".into(),
+                    },
+                    reset: true,
+                    skip_prefix: false,
+                }),
+            )
+            .await;
+        });
+        let mut ui = Ui::new(Session::default());
+        // The target kind wins even when a server's log is opened from the
+        // client perspective or a detached log window.
+        ui.kind = Kind::Proxy;
+        ui.rows.push(Row {
+            instance: Instance {
+                name: "edge".into(),
+                kind: Kind::Server,
+                config: fixture.0.join("server.toml"),
+            },
+            pid: None,
+            state: "Stopped".into(),
+            uptime: 0,
+            changed: false,
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let result = perform(
+                &socket,
+                OperationInput::capture(&ui),
+                Action::Logs("edge".into()),
+                None,
+            )
+            .await;
+            let JobResult::Logs(mut viewer) = result else {
+                panic!("Server log viewer did not open: {}", result.message());
+            };
+            server.await.unwrap();
+            loop {
+                assert!(viewer.poll().is_none());
+                if let Some(cursor) = viewer.cursor {
+                    assert_eq!(cursor.offset, 20);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(matches!(
+                viewer.key(event::KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)),
+                logs::Command::None
+            ));
+            assert!(viewer.browsing());
+            viewer.stop();
+        })
+        .await
+        .unwrap();
+        astra_platform::platform::remove_socket(&socket);
+    }
+
     #[test]
     fn late_document_is_cached_without_replacing_a_newer_view_or_save_baseline() {
         let mut ui = Ui::new(Session::default());
