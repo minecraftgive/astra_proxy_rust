@@ -23,7 +23,6 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
-ipnet = { version = "2", features = ["serde"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }

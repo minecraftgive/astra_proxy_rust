@@ -12,6 +12,5 @@ serde.workspace = true
 tokio.workspace = true
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 ipnet = "2"
-url = "2"
 uuid = { version = "1", features = ["v4"] }
 
