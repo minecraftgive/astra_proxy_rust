@@ -2,6 +2,7 @@ use crate::config::Config;
 use anyhow::{bail, ensure, Context, Result};
 use astra_model::Target;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -226,23 +227,7 @@ pub async fn relay(client: Stream, remote: TcpStream, app: Arc<App>) -> Result<(
             activity.send_replace(tokio::time::Instant::now());
         }
     };
-    let download = async {
-        let mut buf = [0; 16384];
-        loop {
-            let n = rr.read(&mut buf).await?;
-            if n == 0 {
-                cw.shutdown().await?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            tokio::time::timeout(idle, async {
-                cw.write_all(&buf[..n]).await?;
-                cw.flush().await
-            })
-            .await??;
-            app.stats.download.fetch_add(n as u64, Ordering::Relaxed);
-            activity.send_replace(tokio::time::Instant::now());
-        }
-    };
+    let download = download(&mut rr, &mut cw, &app.stats, &activity, idle);
     let watchdog = async {
         loop {
             let deadline = *updates.borrow_and_update() + idle;
@@ -250,6 +235,47 @@ pub async fn relay(client: Stream, remote: TcpStream, app: Arc<App>) -> Result<(
         }
     };
     tokio::select! {r=async{tokio::try_join!(upload,download)?;Ok(())}=>r,r=watchdog=>r}
+}
+
+async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    stats: &Stats,
+    activity: &tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle: Duration,
+) -> Result<()> {
+    let mut buf = [0; 16384];
+    let mut next = None;
+    let mut unflushed = 0;
+    let mut deadline = None;
+    loop {
+        let n = match next.take() {
+            Some(result) => result?,
+            None => reader.read(&mut buf).await?,
+        };
+        if n == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        let batch_deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + idle);
+        tokio::time::timeout_at(batch_deadline, async {
+            writer.write_all(&buf[..n]).await?;
+            unflushed += n;
+            if n == buf.len() && unflushed < 64 * 1024 {
+                next = reader.read(&mut buf).now_or_never();
+                if matches!(next, Some(Ok(count)) if count > 0) {
+                    return Ok::<(), std::io::Error>(());
+                }
+            }
+            writer.flush().await?;
+            stats.download.fetch_add(unflushed as u64, Ordering::Relaxed);
+            activity.send_replace(tokio::time::Instant::now());
+            unflushed = 0;
+            deadline = None;
+            Ok(())
+        })
+        .await??;
+    }
 }
 
 pub struct Packet {
@@ -308,6 +334,152 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        future::Future,
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    #[derive(Default)]
+    struct FlushWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+        max_write: Option<usize>,
+        fail_flush: bool,
+    }
+    impl AsyncWrite for FlushWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = self.max_write.unwrap_or(bytes.len()).min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(if self.fail_flush {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+            } else {
+                Ok(())
+            })
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct SlowWriter {
+        timer: Option<Pin<Box<tokio::time::Sleep>>>,
+        bytes: usize,
+    }
+    impl AsyncWrite for SlowWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+            if timer.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.timer = None;
+            self.bytes += bytes.len();
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn download_batches_ready_blocks_and_flushes_at_eof() {
+        for size in [16384usize, 16384 * 8, 16384 * 8 + 3] {
+            let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut writer = FlushWriter { max_write: Some(113), ..Default::default() };
+            let stats = Stats::default();
+            let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+            download(
+                &mut payload.as_slice(),
+                &mut writer,
+                &stats,
+                &activity,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(writer.bytes, payload);
+            assert_eq!(writer.flushes, size.div_ceil(64 * 1024));
+            assert_eq!(stats.download.load(Ordering::Relaxed), size as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_does_not_count_a_batch_when_flush_fails() {
+        let payload = vec![37; 16384 * 3];
+        let mut writer = FlushWriter { max_write: Some(113), fail_flush: true, ..Default::default() };
+        let stats = Stats::default();
+        let initial = tokio::time::Instant::now();
+        let (activity, updates) = tokio::sync::watch::channel(initial);
+        let error = download(&mut payload.as_slice(), &mut writer, &stats, &activity, Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(stats.download.load(Ordering::Relaxed), 0);
+        assert_eq!(*updates.borrow(), initial);
+        assert!(!updates.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn download_keeps_the_first_write_deadline_for_a_batch() {
+        let payload = vec![37; 16384 * 3];
+        let mut writer = SlowWriter { timer: None, bytes: 0 };
+        let stats = Stats::default();
+        let initial = tokio::time::Instant::now();
+        let (activity, updates) = tokio::sync::watch::channel(initial);
+        let error = download(&mut payload.as_slice(), &mut writer, &stats, &activity, Duration::from_millis(400)).await.unwrap_err();
+        assert!(error.is::<tokio::time::error::Elapsed>());
+        assert!(writer.bytes >= 16384 && writer.bytes < payload.len());
+        assert_eq!(stats.download.load(Ordering::Relaxed), 0);
+        assert_eq!(*updates.borrow(), initial);
+        assert!(!updates.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn download_flushes_full_and_short_responses_before_waiting_for_more() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut source, mut reader) = tokio::io::duplex(32768);
+            let (sink, mut client) = tokio::io::duplex(32768);
+            let task = tokio::spawn(async move {
+                let mut writer = tokio::io::BufWriter::with_capacity(65536, sink);
+                let stats = Stats::default();
+                let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+                download(
+                    &mut reader,
+                    &mut writer,
+                    &stats,
+                    &activity,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                stats.download.load(Ordering::Relaxed)
+            });
+            for size in [16384, 7, 16384] {
+                let payload = vec![61; size];
+                source.write_all(&payload).await.unwrap();
+                let mut response = vec![0; size];
+                client.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, payload);
+            }
+            source.shutdown().await.unwrap();
+            assert_eq!(task.await.unwrap(), 32775);
+        })
+        .await
+        .unwrap();
+    }
+
     fn app(config: Config) -> Arc<App> {
         App::new(
             config,
