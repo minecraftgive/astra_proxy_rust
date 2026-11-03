@@ -1,43 +1,29 @@
-#[path = "ui/animation.rs"]
 mod animation;
-#[path = "ui/commands.rs"]
 mod commands;
-#[path = "ui/drafts.rs"]
 mod drafts;
-#[path = "ui/event_loop.rs"]
 mod event_loop;
-#[path = "ui/focus.rs"]
 mod focus;
+mod server;
 pub(crate) fn wake() {
     animation::wake();
 }
-#[path = "ui/shared_background.rs"]
 mod background;
-#[path = "ui/shared_dashboard.rs"]
 mod dashboard;
-#[path = "ui/shared_detached.rs"]
 mod detached;
-#[path = "ui/shared_live.rs"]
 mod live;
-#[path = "ui/shared_pages.rs"]
+mod operations;
 mod pages;
-#[path = "ui/shared_shell.rs"]
 mod shell;
-#[path = "update.rs"]
+#[cfg(test)]
+mod test_rpc;
 mod update;
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
 use crate::{i18n::t, tr};
 use anyhow::{Context, Result};
-use crossterm::{
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers,
-    },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use astra_tui_kit::{TerminalOptions, TerminalSession};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -55,19 +41,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Screen;
-impl Drop for Screen {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            crossterm::cursor::Show,
-            LeaveAlternateScreen
-        );
-    }
-}
 #[derive(Clone, Serialize, Deserialize)]
 enum Prompt {
     AddName,
@@ -213,11 +186,13 @@ enum Resume {
     Editor,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Recovery {
     message: String,
     resume: Resume,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Session {
     #[serde(default)]
     session_version: u32,
@@ -238,7 +213,8 @@ struct Session {
     #[serde(default)]
     vim_keys: bool,
     kind: Kind,
-    selections: [usize; 2],
+    #[serde(deserialize_with = "read_selections")]
+    selections: [usize; 3],
     editor: Option<Editor>,
     prompt: Option<Prompt>,
     input: String,
@@ -268,7 +244,7 @@ impl Default for Session {
             motion: Default::default(),
             vim_keys: false,
             kind: Kind::Proxy,
-            selections: [0; 2],
+            selections: [0; 3],
             editor: None,
             prompt: None,
             input: String::new(),
@@ -281,6 +257,33 @@ impl Default for Session {
     }
 }
 const SESSION_LIMIT: u64 = 4 * 1024 * 1024;
+fn read_selections<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<[usize; 3], D::Error> {
+    let old = Vec::<usize>::deserialize(deserializer)?;
+    if !(2..=3).contains(&old.len()) {
+        return Err(serde::de::Error::custom(
+            "Invalid saved instance selections; original session is retained",
+        ));
+    }
+    let mut result = [0; 3];
+    result[..old.len()].copy_from_slice(&old);
+    Ok(result)
+}
+fn kind_index(kind: Kind) -> usize {
+    match kind {
+        Kind::Proxy => 0,
+        Kind::Rule => 1,
+        Kind::Server => 2,
+    }
+}
+fn next_kind(kind: Kind) -> Kind {
+    match kind {
+        Kind::Proxy => Kind::Rule,
+        Kind::Rule => Kind::Server,
+        Kind::Server => Kind::Proxy,
+    }
+}
 impl Session {
     fn load(path: &std::path::Path) -> Result<Self> {
         use std::io::Read;
@@ -296,6 +299,48 @@ impl Session {
             "Saved session exceeds 4 MiB"
         );
         let mut session: Self = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            session.session_version <= 1,
+            "Saved session version is newer than this TUI; original file is retained: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            session.keymap_version <= drafts::KEYMAP_VERSION,
+            "Saved keymap version is newer than this TUI; original file is retained: {}",
+            path.display()
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let needs_migration = session.session_version == 0
+            || session.keymap_version < drafts::KEYMAP_VERSION
+            || value
+                .get("selections")
+                .and_then(|v| v.as_array())
+                .is_some_and(|v| v.len() == 2);
+        if needs_migration {
+            use astra_platform::platform::OpenOptionsExt;
+            use std::io::Write;
+            let backup = path.with_extension("pre-v2.json");
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)
+            {
+                Ok(mut output) => {
+                    astra_platform::platform::set_private(&backup, 0o600)?;
+                    output.write_all(&bytes)?;
+                    output.sync_all()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    anyhow::ensure!(
+                        std::fs::symlink_metadata(&backup)?.is_file(),
+                        "Session migration backup is not a regular file: {}",
+                        backup.display()
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         session.session_version = session.session_version.max(1);
         if let Some(editor) = &mut session.editor {
             editor.normalize();
@@ -342,7 +387,7 @@ struct Ui {
     palette: Option<shell::Palette>,
     /// Reject late view-opening results after the user has switched overlays.
     overlay_epoch: u64,
-    runtime_snapshot: Option<astra_ipc::runtime::Snapshot>,
+    runtime_snapshot: Option<astra_model::runtime::Snapshot>,
     runtime_instance: String,
     runtime_error: String,
     runtime_sample: Instant,
@@ -350,6 +395,7 @@ struct Ui {
     direct_rates: [u64; 2],
     history: [std::collections::VecDeque<u64>; 2],
     group_selection: usize,
+    profile_viewport: std::cell::Cell<usize>,
     connection_selection: usize,
     overview_scroll: usize,
     /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
@@ -360,7 +406,7 @@ struct Ui {
     connection_filter: String,
     connection_filtering: bool,
     runtime_picker: Option<(String, usize)>,
-    hits: std::cell::RefCell<Vec<(ratatui::layout::Rect, dashboard::Target)>>,
+    hits: std::cell::RefCell<astra_tui_kit::HitMap<dashboard::Target>>,
     rows: Vec<Row>,
     message: String,
     viewer: Option<logs::Viewer>,
@@ -404,7 +450,7 @@ impl std::ops::DerefMut for Ui {
 enum Input {
     Idle,
     Quit,
-    Run(Action, Option<(Prompt, String)>),
+    Run(Action, Option<Box<(Prompt, String)>>),
     ExternalEditor,
     OpenWindow(crate::windows::Launch),
 }
@@ -502,6 +548,7 @@ impl Ui {
             direct_rates: [0, 0],
             history: Default::default(),
             group_selection: 0,
+            profile_viewport: std::cell::Cell::new(1),
             connection_selection: 0,
             overview_scroll: 0,
             overview_scroll_limit: Default::default(),
@@ -510,7 +557,7 @@ impl Ui {
             connection_filter: String::new(),
             connection_filtering: false,
             runtime_picker: None,
-            hits: std::cell::RefCell::new(Vec::new()),
+            hits: Default::default(),
             rows: vec![],
             message: String::new(),
             viewer: None,
@@ -539,11 +586,7 @@ impl Ui {
         }
     }
     fn index(&self) -> usize {
-        if self.kind == Kind::Proxy {
-            0
-        } else {
-            1
-        }
+        kind_index(self.kind)
     }
     fn rows(&self) -> Vec<&Row> {
         self.rows
@@ -563,15 +606,15 @@ impl Ui {
         } else {
             vec![Operation::Start]
         };
-        operations.extend([
-            Operation::Edit,
-            Operation::Logs,
-            Operation::Bind,
-            Operation::Config,
-            Operation::Copy,
-            Operation::ExportConfig,
-            Operation::ExportTerminal,
-        ]);
+        operations.extend([Operation::Edit, Operation::Logs, Operation::ExportConfig]);
+        if row.instance.kind != Kind::Server {
+            operations.extend([
+                Operation::Bind,
+                Operation::Config,
+                Operation::Copy,
+                Operation::ExportTerminal,
+            ]);
+        }
         if row.instance.kind == Kind::Proxy {
             operations.push(Operation::Diagnostics);
             operations.push(Operation::NetTools);
@@ -770,7 +813,10 @@ impl Ui {
                 .or_else(|| self.rows.iter().find(|r| r.instance.kind == Kind::Proxy))
                 .map(|r| r.instance.name.clone());
         }
-        for (index, kind) in [Kind::Proxy, Kind::Rule].into_iter().enumerate() {
+        for (index, kind) in [Kind::Proxy, Kind::Rule, Kind::Server]
+            .into_iter()
+            .enumerate()
+        {
             let count = self
                 .rows
                 .iter()
@@ -1040,7 +1086,7 @@ impl Ui {
             }
             Prompt::CloseAll { name, pid } if input == "yes" => Some(Action::Runtime {
                 name,
-                command: astra_ipc::runtime::Command::Disconnect(None),
+                command: astra_model::runtime::Command::Disconnect(None),
                 expected_pid: pid,
             }),
             Prompt::ElevateTun { name, pid } if input == "yes" => Some(Action::PrepareElevation {
@@ -1345,7 +1391,7 @@ impl Ui {
                     let prompt = self.prompt.take().unwrap();
                     match self.submit(prompt.clone(), "yes".into()) {
                         Ok(Some(action)) => {
-                            return Input::Run(action, Some((prompt, "yes".into())))
+                            return Input::Run(action, Some(Box::new((prompt, "yes".into()))))
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -1425,7 +1471,9 @@ impl Ui {
                         self.input.trim().to_owned()
                     };
                     match self.submit(prompt.clone(), input.clone()) {
-                        Ok(Some(action)) => return Input::Run(action, Some((prompt, input))),
+                        Ok(Some(action)) => {
+                            return Input::Run(action, Some(Box::new((prompt, input))))
+                        }
                         Ok(None) => {}
                         Err(error) => {
                             self.fail(format!("{error:#}"), Resume::Prompt(prompt, input))
@@ -1554,14 +1602,11 @@ impl Ui {
             match key.code {
                 KeyCode::Char('q') => return Input::Quit,
                 KeyCode::Tab => {
-                    self.switch_core(if self.kind == Kind::Proxy {
-                        Kind::Rule
-                    } else {
-                        Kind::Proxy
-                    });
+                    self.switch_core(next_kind(self.kind));
                 }
                 KeyCode::Left | KeyCode::Char('h') => self.switch_core(Kind::Proxy),
                 KeyCode::Right | KeyCode::Char('l') => self.switch_core(Kind::Rule),
+                KeyCode::Char('3') => self.switch_core(Kind::Server),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selections[index] = self.selections[index].saturating_sub(1)
                 }
@@ -1574,18 +1619,22 @@ impl Ui {
                     self.selections[index] = self.rows().len().saturating_sub(1)
                 }
                 KeyCode::PageDown => {
-                    self.selections[index] =
-                        (self.selections[index] + 10).min(self.rows().len().saturating_sub(1))
+                    self.selections[index] = (self.selections[index]
+                        + self.profile_viewport.get().max(1))
+                    .min(self.rows().len().saturating_sub(1))
                 }
                 KeyCode::PageUp => {
-                    self.selections[index] = self.selections[index].saturating_sub(10)
+                    self.selections[index] =
+                        self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.selections[index] =
-                        (self.selections[index] + 10).min(self.rows().len().saturating_sub(1))
+                    self.selections[index] = (self.selections[index]
+                        + self.profile_viewport.get().max(1))
+                    .min(self.rows().len().saturating_sub(1))
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.selections[index] = self.selections[index].saturating_sub(10)
+                    self.selections[index] =
+                        self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
                 }
                 KeyCode::Char('n') => self.prompt(Prompt::AddName),
                 KeyCode::Enter if name.is_some() => self.menu = Some(0),
@@ -1637,360 +1686,24 @@ impl Ui {
         }
         self.operation_steps.last().cloned().unwrap_or_default()
     }
-    fn progress(
-        &mut self,
-        text: String,
-        terminal: &mut Option<&mut Terminal<CrosstermBackend<Stdout>>>,
-    ) {
-        astra_ipc::progress::report("UI", &text);
-        if terminal.is_some() {
-            self.operation_steps
-                .push(format!("{}. {}", self.operation_steps.len() + 1, text));
-            if let Some(terminal) = terminal.as_deref_mut() {
-                let _ = self.draw(terminal);
-            }
-        }
-    }
+    #[cfg(test)]
     async fn execute(
         &mut self,
         socket: &std::path::Path,
         action: Action,
         origin: Option<(Prompt, String)>,
     ) -> bool {
-        self.execute_inner(socket, action, origin, None).await
-    }
-    async fn execute_inner(
-        &mut self,
-        socket: &std::path::Path,
-        mut action: Action,
-        mut origin: Option<(Prompt, String)>,
-        mut terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>,
-    ) -> bool {
-        if matches!(
+        let input = operations::OperationInput::capture(self);
+        let result = operations::perform(socket, input, action.clone(), origin).await;
+        self.apply_operation(
+            result,
             &action,
-            Action::UpdateStatus
-                | Action::UpdateOperationStatus { .. }
-                | Action::UpdateTransaction { .. }
-                | Action::RecoverUpdate { .. }
-        ) {
-            self.progress(action_description(&action), &mut terminal);
-            match call(socket, action.clone())
-                .await
-                .and_then(|reply| update::View::decode(&reply.text))
-            {
-                Ok(view) => {
-                    let status = view.status.clone();
-                    self.operation_failed = status
-                        .operation
-                        .as_ref()
-                        .is_some_and(|operation| operation.error.is_some());
-                    self.message = status
-                        .operation
-                        .as_ref()
-                        .map(|operation| operation.phase.label().to_owned())
-                        .unwrap_or_else(|| t("Update status received").into());
-                    self.update_view = Some(view);
-                    self.update_status = Some(status);
-                }
-                Err(error) => {
-                    self.operation_failed = true;
-                    // A transport failure may follow an acknowledged commit. Never replay the transaction.
-                    self.message = format!(
-                        "{error:#} · {}",
-                        t("Read update status, then recover the existing operation")
-                    );
-                    let operation_id = match &action {
-                        Action::UpdateTransaction { request } => Some(request.operation_id.clone()),
-                        Action::RecoverUpdate { operation_id }
-                        | Action::UpdateOperationStatus { operation_id } => {
-                            Some(operation_id.clone())
-                        }
-                        _ => None,
-                    };
-                    if let Some(operation_id) = operation_id {
-                        self.fail(
-                            self.message.clone(),
-                            Resume::Request(Action::UpdateOperationStatus { operation_id }),
-                        );
-                    }
-                }
-            }
-            return false;
-        }
-        if let Action::Runtime { name, command, .. } = &action {
-            self.progress(t("Applying runtime change").into(), &mut terminal);
-            match call(socket, action.clone()).await.and_then(|reply| {
-                Ok(serde_json::from_str::<astra_ipc::runtime::Snapshot>(
-                    &reply.text,
-                )?)
-            }) {
-                Ok(snapshot) => {
-                    self.accept_runtime(name.clone(), snapshot);
-                    self.message = t(
-                        if matches!(command, astra_ipc::runtime::Command::TestGroup(_)) {
-                            "Group test started"
-                        } else {
-                            "Runtime updated; profile unchanged"
-                        },
-                    )
-                    .into();
-                }
-                Err(error) => {
-                    self.operation_failed = true;
-                    self.message = format!("{error:#}");
-                }
-            }
-            return false;
-        }
-        if let Action::WaitElevation { name, .. } = &action {
-            self.progress(t("Waiting for the elevated core").into(), &mut terminal);
-            match call(socket, action.clone()).await.and_then(|reply| {
-                Ok(serde_json::from_str::<astra_ipc::runtime::Snapshot>(
-                    &reply.text,
-                )?)
-            }) {
-                Ok(snapshot) => {
-                    self.accept_runtime(name.clone(), snapshot);
-                    self.message = t("TUN enabled by the elevated core").into();
-                }
-                Err(error) => {
-                    self.operation_failed = true;
-                    self.message = format!("{error:#}");
-                }
-            }
-            return false;
-        }
-        if let Action::Diagnostics(name) = &action {
-            let mut view = crate::diagnostics::View::start(socket, name.clone());
-            if std::mem::take(&mut self.open_nettools) {
-                view.open_tools();
-            }
-            self.diagnostics = Some(view);
-            self.message.clear();
-            return false;
-        }
-        if let Action::Logs(name) = &action {
-            self.active_log = Some(name.clone());
-            if self
-                .viewer
-                .as_ref()
-                .is_none_or(|viewer| viewer.name != *name)
-            {
-                let settings = self.log_settings.get(name).cloned().unwrap_or_default();
-                self.viewer = Some(logs::Viewer::new(name.clone(), settings));
-                let enabled = self.vim_keys;
-                self.viewer.as_mut().unwrap().set_vim_navigation(enabled);
-            }
-            let result = async {
-                let level = call(socket, Action::GetLogLevel(name.clone()))
-                    .await?
-                    .text
-                    .parse::<LogLevel>()?;
-                let viewer = self.viewer.as_mut().unwrap();
-                viewer.capture_level = level;
-                viewer.connect(socket).await
-            }
-            .await;
-            if let Err(error) = result {
-                self.fail(format!("{error:#}"), Resume::Request(action));
-            }
-            return false;
-        }
-        loop {
-            // A missing configuration must be edited before a start/validation proceeds.
-            if let Action::Start(name) | Action::Restart(name) | Action::Validate(name) = &action {
-                self.progress(t("Checking saved configuration").to_owned(), &mut terminal);
-                match call(socket, Action::PrepareConfig(name.clone())).await {
-                    Ok(reply) if !reply.text.is_empty() => {
-                        self.open_draft(name.clone(), reply.text);
-                        self.message = "Review configuration · Ctrl-S save".into();
-                        self.refresh_node_tags(socket).await;
-                        return false;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.fail(format!("{error:#}"), Resume::Request(action));
-                        return false;
-                    }
-                }
-            }
-            self.progress(
-                format!(
-                    "{} · {}",
-                    action_description(&action),
-                    t("Waiting for manager confirmation")
-                ),
-                &mut terminal,
-            );
-            let reply = match call(socket, action.clone()).await {
-                Ok(reply) => reply,
-                Err(error) => {
-                    let mut message = format!("{error:#}");
-                    if let Action::Save { name, .. } = &action {
-                        if message.contains("File changed on disk")
-                            || message.contains("File changed during validation")
-                        {
-                            // Observe the conflicting version once. This is a read, never a write retry;
-                            // open_draft preserves both the original baseline and the unsaved form.
-                            if let Ok(reply) = call(socket, Action::Read(name.clone())).await {
-                                self.open_draft(name.clone(), reply.text);
-                                message.push_str("\nDraft retained. Cancel this error, then F2 → Compare draft with observed disk.");
-                            }
-                        }
-                    }
-                    let resume = origin
-                        .map(|(p, text)| Resume::Prompt(p, text))
-                        .unwrap_or(Resume::Request(action));
-                    self.fail(message, resume);
-                    return false;
-                }
-            };
-            self.refresh_paused = false;
-            match action {
-                Action::Create { name, kind } => {
-                    self.kind = kind;
-                    self.refresh_binding(socket, &name).await;
-                    action = Action::Read(name);
-                    origin = None;
-                }
-                Action::Add(i) => {
-                    self.kind = i.kind;
-                    self.refresh_binding(socket, &i.name).await;
-                    action = Action::Read(i.name);
-                    // Registration succeeded: retries now resume reading, never add twice.
-                    origin = None;
-                }
-                Action::SetConfig(name, _) => {
-                    self.refresh_binding(socket, &name).await;
-                    action = Action::Read(name);
-                    origin = None;
-                }
-                Action::Read(name) => {
-                    self.open_draft(name, reply.text);
-                    self.refresh_node_tags(socket).await;
-                    return false;
-                }
-                Action::ExplainRoute { .. } => {
-                    match serde_json::from_str(&reply.text) {
-                        Ok(report) => {
-                            self.explanation = Some(crate::explanation::View { report, scroll: 0 });
-                            self.message.clear();
-                        }
-                        Err(error) => self.fail(error.to_string(), Resume::Request(action)),
-                    }
-                    return false;
-                }
-                Action::SetLogLevel { level, .. } => {
-                    if let Some(viewer) = &mut self.viewer {
-                        viewer.capture_changed(level);
-                    }
-                    self.message = tr!("记录级别已改为 {}，无需重启", level.as_str());
-                    return false;
-                }
-                Action::UpdateSubscriptions(_) => {
-                    self.refresh_node_tags(socket).await;
-                    self.message = reply.text;
-                    return false;
-                }
-                Action::Save { .. } => {
-                    if let Some(editor) = &mut self.editor {
-                        editor.original = editor.text();
-                    }
-                    self.message = reply.text;
-                    return false;
-                }
-                Action::List => {
-                    self.update_rows(reply);
-                    return false;
-                }
-                Action::BindStart { .. } => {
-                    self.message = reply.text;
-                    if let Ok(reply) = call(socket, Action::List).await {
-                        self.update_rows(reply);
-                    }
-                    return false;
-                }
-                Action::Shutdown => {
-                    self.message = reply.text;
-                    return true;
-                }
-                _ => {
-                    self.message = reply.text;
-                    return false;
-                }
-            }
-        }
-    }
-    async fn refresh_binding(&mut self, socket: &std::path::Path, name: &str) {
-        if let Ok(reply) = call(socket, Action::List).await {
-            self.update_rows(reply);
-            if let Some(index) = self.rows().iter().position(|r| r.instance.name == name) {
-                let kind = self.index();
-                self.selections[kind] = index;
-            }
-        }
-    }
-    async fn refresh_subscription_nodes(&mut self, socket: &std::path::Path) {
-        if self.kind != Kind::Proxy {
-            return;
-        }
-        let Some(name) = self.editor.as_ref().map(|e| e.name.clone()) else {
-            return;
-        };
-        if !self
-            .details
-            .get(&name)
-            .is_some_and(|d| d.subscription_nodes_supported)
-        {
-            if let Some(path) = self
-                .rows
-                .iter()
-                .find(|row| row.instance.name == name)
-                .map(|row| row.instance.config.clone())
-            {
-                if let Ok(Ok(nodes)) =
-                    tokio::task::spawn_blocking(move || crate::subscription_view::read(&path)).await
-                {
-                    if let Some(editor) = &mut self.editor {
-                        editor.set_subscription_nodes(nodes);
-                    }
-                }
-            }
-            return;
-        }
-        if let Ok(nodes) = call(socket, Action::SubscriptionNodes(name))
-            .await
-            .and_then(|r| Ok(serde_json::from_str(&r.text)?))
-        {
-            if let Some(editor) = &mut self.editor {
-                editor.set_subscription_nodes(nodes);
-            }
-        }
-    }
-    async fn refresh_node_tags(&mut self, socket: &std::path::Path) {
-        self.refresh_subscription_nodes(socket).await;
-        if self.kind != Kind::Rule {
-            return;
-        }
-        let Some(name) = self.editor.as_ref().map(|editor| editor.name.clone()) else {
-            return;
-        };
-        if !self
-            .details
-            .get(&name)
-            .is_some_and(|details| details.node_tags_supported)
-        {
-            return;
-        }
-        match call(socket, Action::NodeTags(name))
-            .await
-            .and_then(|reply| Ok(serde_json::from_str::<Vec<String>>(&reply.text)?))
-        {
-            Ok(tags) => self.editor.as_mut().unwrap().set_node_tags(tags),
-            Err(_) => {
-                self.message = "Node suggestions unavailable; manual entry is supported".into()
-            }
-        }
+            operations::ApplyContext {
+                same: true,
+                log_target_current: true,
+                background: false,
+            },
+        )
     }
     fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
@@ -2063,34 +1776,6 @@ impl Ui {
         text.extend(lines.into_iter().map(Line::from));
         text
     }
-    fn help_page(&self) -> crate::help::Page {
-        use crate::help::Page;
-        if self.recovery.is_some() {
-            Page::Recovery
-        } else if self.menu.is_some() {
-            Page::Menu
-        } else if self.binding_picker.is_some() {
-            Page::Bindings
-        } else if self.explanation.is_some() {
-            Page::Route
-        } else if self.diagnostics.is_some() {
-            Page::Diagnostics
-        } else if self.viewer.is_some() {
-            Page::Logs
-        } else if let Some(editor) = &self.editor {
-            if editor.subscription_page() {
-                Page::Subscriptions
-            } else if self.kind == Kind::Rule {
-                Page::RuleEditor
-            } else {
-                Page::ProxyEditor
-            }
-        } else if self.page == PROFILES {
-            Page::Instances
-        } else {
-            Page::General
-        }
-    }
     fn render(&self, f: &mut Frame<'_>) {
         self.hits.borrow_mut().clear();
         if let Some(view) = &self.diagnostics {
@@ -2145,6 +1830,8 @@ impl Ui {
             self.render_logs_page(f, chunks[0]);
         } else if let Some(viewer) = &self.viewer {
             viewer.render(f, chunks[0]);
+        } else if self.kind == Kind::Server && self.page != PROFILES {
+            self.render_server(f, chunks[0]);
         } else {
             match self.page {
                 shell::OVERVIEW => self.render_overview(f, chunks[0]),
@@ -2448,6 +2135,7 @@ async fn elevate(
     name: String,
     expected_pid: Option<u32>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    screen: &mut TerminalSession,
 ) {
     let reply = match call(
         socket,
@@ -2464,7 +2152,7 @@ async fn elevate(
             return;
         }
     };
-    let offer: astra_ipc::unix_handoff::Offer = match serde_json::from_str(&reply.text) {
+    let offer: astra_platform::unix_handoff::Offer = match serde_json::from_str(&reply.text) {
         Ok(offer) => offer,
         Err(error) => {
             ui.message = format!("{error:#}");
@@ -2472,21 +2160,14 @@ async fn elevate(
         }
     };
     // Re-check right before sudo runs it: the reply only names a path.
-    if let Err(error) = astra_ipc::unix_handoff::ensure_root_controlled(&offer.binary)
-        .and_then(|_| astra_ipc::unix_handoff::ensure_root_controlled(&offer.sudo))
+    if let Err(error) = astra_platform::unix_handoff::ensure_root_controlled(&offer.binary)
+        .and_then(|_| astra_platform::unix_handoff::ensure_root_controlled(&offer.sudo))
     {
         ui.message = format!("{error:#}");
         return;
     }
     let launched = (|| -> Result<std::process::ExitStatus> {
-        disable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            crossterm::cursor::Show,
-            LeaveAlternateScreen
-        )?;
+        screen.suspend()?;
         #[cfg(unix)]
         let _interrupt = IgnoreInterrupt::install();
         std::process::Command::new(&offer.sudo)
@@ -2499,13 +2180,7 @@ async fn elevate(
     })();
     // Always restore the TUI, including when sudo or the terminal setup fails.
     let restored = (|| -> Result<()> {
-        enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        )?;
+        screen.resume()?;
         terminal.clear()?;
         Ok(())
     })();
@@ -2559,6 +2234,7 @@ async fn elevate(
     _name: String,
     _expected_pid: Option<u32>,
     _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    _screen: &mut TerminalSession,
 ) {
     ui.message = t("TUN elevation is only available on Linux").into();
 }
@@ -2629,6 +2305,31 @@ mod tests {
         ui.message = "new result".into();
         ui.operation_result = Some("old result".into());
         assert_eq!(ui.operation_text(), "new result");
+    }
+    #[test]
+    fn help_is_context_specific_and_popups_fit_content_and_small_terminals() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let running = sample_ui(true).command_help();
+            let stopped = sample_ui(false).command_help();
+            assert!(running.contains("Disconnect profile") && !running.contains("Connect profile"));
+            assert!(stopped.contains("Connect profile") && stopped.contains("Not running"));
+            assert!(
+                running.contains("F2")
+                    && running.contains("All other actions are in the command palette")
+            );
+            let mut ui = sample_ui(false);
+            ui.help_override = Some("Context help\nSpecific action".into());
+            let context = ui.command_help();
+            assert_eq!(context, "Context help\nSpecific action");
+            let area = ratatui::layout::Rect::new(0, 0, 200, 60);
+            let popup = crate::help::popup(area, &context);
+            assert!(popup.width < 76 && popup.height < 12 && popup.x > 0 && popup.y > 0);
+            for (w, h) in [(10, 5), (30, 12), (80, 24)] {
+                let area = ratatui::layout::Rect::new(0, 0, w, h);
+                let popup = crate::help::popup(area, &running);
+                assert!(popup.right() <= w && popup.bottom() <= h);
+            }
+        });
     }
     #[test]
     fn help_overlay_preserves_state_and_does_not_capture_question_marks_in_inputs() {
@@ -2719,14 +2420,8 @@ mod tests {
     async fn live_rule_query_keeps_draft_and_explains_rule_set_toggle() {
         let fixture = crate::import::tests::Fixture::new();
         let home = fixture.0.join("query-manager");
-        let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let socket = home.join("management.sock");
+        let bin = crate::manager::test_binaries();
         let manager = tokio::spawn(crate::manager::serve(home, bin));
         for _ in 0..100 {
             if socket.exists() {
@@ -2757,9 +2452,10 @@ mod tests {
         let Input::Run(action, origin) = press(&mut ui, KeyCode::Enter) else {
             panic!("query action");
         };
-        ui.execute(&socket, action, origin).await;
+        ui.execute(&socket, action, origin.map(|origin| *origin))
+            .await;
         let report = &ui.explanation.as_ref().unwrap().report;
-        assert_eq!(report.action, astra_ipc::RouteAction::Block);
+        assert_eq!(report.action, astra_model::RouteAction::Block);
         assert!(report.path.starts_with("rules[1] -> rule_set(\"sites\")"));
         assert_eq!(
             report.condition,
@@ -2777,7 +2473,8 @@ mod tests {
         let Input::Run(action, origin) = press(&mut ui, KeyCode::Enter) else {
             panic!("draft query");
         };
-        ui.execute(&socket, action, origin).await;
+        ui.execute(&socket, action, origin.map(|origin| *origin))
+            .await;
         assert_eq!(
             ui.explanation.as_ref().unwrap().report.default_action,
             "direct"
@@ -2803,9 +2500,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let report: astra_ipc::control::RouteExplanation =
+        let report: astra_model::control::RouteExplanation =
             serde_json::from_str(&reply.text).unwrap();
-        assert_eq!(report.action, astra_ipc::RouteAction::Direct);
+        assert_eq!(report.action, astra_model::RouteAction::Direct);
         assert_eq!(report.path, "default_action");
         assert!(report.revision > previous_revision);
         call(&socket, Action::Shutdown).await.unwrap();
@@ -2816,14 +2513,8 @@ mod tests {
     async fn live_rule_editor_completes_a_bound_proxy_node_and_saves_valid_action() {
         let fixture = crate::import::tests::Fixture::new();
         let home = fixture.0.join("manager");
-        let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let socket = home.join("management.sock");
+        let bin = crate::manager::test_binaries();
         let manager = tokio::spawn(crate::manager::serve(home, bin));
         for _ in 0..100 {
             if socket.exists() {
@@ -3090,14 +2781,8 @@ mod tests {
     async fn live_import_saves_each_core_without_changing_source_or_binding() {
         let fixture = crate::import::tests::Fixture::new();
         let home = fixture.0.join("manager");
-        let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let socket = home.join("management.sock");
+        let bin = crate::manager::test_binaries();
         let manager = tokio::spawn(crate::manager::serve(home, bin));
         for _ in 0..100 {
             if socket.exists() {
@@ -3370,10 +3055,13 @@ mod tests {
         ui.kind = Kind::Rule;
         ui.prompt(Prompt::AddName);
         ui.input = "rules".into();
-        let Input::Run(Action::Create { name, kind }, Some((Prompt::AddName, input))) =
+        let Input::Run(Action::Create { name, kind }, Some(origin)) =
             ui.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         else {
             panic!("create action")
+        };
+        let (Prompt::AddName, input) = *origin else {
+            panic!("create origin")
         };
         assert_eq!(name, "rules");
         assert_eq!(input, "rules");
@@ -3408,33 +3096,30 @@ mod tests {
         {
             let fixture = crate::import::tests::Fixture::new();
             let socket = fixture.0.join(format!("conflict-{index}.sock"));
-            let listener = astra_ipc::platform::LocalListener::bind(&socket).unwrap();
+            let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
             let disk = "standalone=true\n# external edit\n";
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let hello: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
-                assert!(matches!(hello.action, Action::Session));
-                astra_ipc::send_management(
-                    &mut stream,
-                    &astra_ipc::session::Event::<Reply>::Ready(astra_ipc::API_VERSION),
+                use astra_management::v2::*;
+                let (stream, request) =
+                    test_rpc::save_request(&listener, "standalone=true\n", "standalone=false\n")
+                        .await;
+                test_rpc::error(stream, request, error).await;
+                let (stream, request) = test_rpc::next(&listener).await;
+                assert!(
+                    matches!(&request.body,RequestBody::Query(Query::Document{instance}) if instance=="proxy")
+                );
+                test_rpc::reply(
+                    stream,
+                    request,
+                    ResponseBody::Document(Document {
+                        instance: "proxy".into(),
+                        path: "proxy.toml".into(),
+                        text: disk.into(),
+                        revision: "disk-revision".into(),
+                        kind: InstanceKind::Proxy,
+                    }),
                 )
-                .await
-                .unwrap();
-                let request: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
-                assert!(matches!(request.action, Action::Save { .. }));
-                let mut reply = Reply::text("");
-                reply.error = Some(error.into());
-                astra_ipc::send_management(&mut stream, &astra_ipc::session::Event::Reply(reply))
-                    .await
-                    .unwrap();
-                let request: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
-                assert!(matches!(request.action,Action::Read(name) if name=="proxy"));
-                astra_ipc::send_management(
-                    &mut stream,
-                    &astra_ipc::session::Event::Reply(Reply::text(disk)),
-                )
-                .await
-                .unwrap();
+                .await;
             });
             let original = "standalone=true\n";
             let changed = "standalone=false\n";
@@ -3469,7 +3154,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("- # external edit"));
-            astra_ipc::platform::remove_socket(&socket);
+            astra_platform::platform::remove_socket(&socket);
         }
     }
     #[test]
@@ -3628,7 +3313,7 @@ default_action = "direct"
     fn session_roundtrip_retains_draft_recovery_and_selection() {
         let mut session = Session {
             kind: Kind::Rule,
-            selections: [2, 3],
+            selections: [2, 3, 0],
             editor: Some(Editor::new(
                 "rules".into(),
                 r#"socket = "/tmp/a.sock"
@@ -3658,7 +3343,7 @@ default_action = "direct"
         let restored: Session =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
         assert_eq!(restored.kind, Kind::Rule);
-        assert_eq!(restored.selections, [2, 3]);
+        assert_eq!(restored.selections, [2, 3, 0]);
         assert_eq!(restored.input, "/tmp/a b.toml");
         assert_eq!(
             serde_json::to_value(restored.editor.unwrap()).unwrap(),
@@ -3675,14 +3360,8 @@ default_action = "direct"
             std::env::temp_dir().join(format!("astra-ui-recover-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let home = directory.join("state");
-        let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let socket = home.join("management.sock");
+        let bin = crate::manager::test_binaries();
         let manager = tokio::spawn(crate::manager::serve(home.clone(), bin));
         for _ in 0..100 {
             if socket.exists() {
@@ -3800,7 +3479,8 @@ default_action = "direct"
         else {
             panic!("retry action");
         };
-        ui.execute(&socket, retry, origin).await;
+        ui.execute(&socket, retry, origin.map(|origin| *origin))
+            .await;
         assert!(ui.recovery.is_none());
         assert!(ui.editor.is_some());
         assert!(locked_path.is_file());

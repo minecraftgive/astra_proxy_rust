@@ -10,10 +10,14 @@ name = "astra-tui"
 path = "src/main.rs"
 
 [[bin]]
-name = "astra-host"
-path = "src/host_main.rs"
+name = "astra-server-tui"
+path = "src/server_main.rs"
 
 [dependencies]
+astra-platform = { path = "../astra-platform" }
+astra-app = { path = "../astra-app" }
+astra-model = { path = "../astra-model" }
+astra-tui-kit = { path = "../astra-tui-kit" }
 anyhow.workspace = true
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -21,16 +25,17 @@ tokio.workspace = true
 serde.workspace = true
 toml.workspace = true
 astra-ipc = { path = "../astra-ipc" }
+astra-management = { path = "../astra-management" }
 astra-update = { path = "../astra-update" }
-astra-proxy = { path = "../astra-proxy" }
 astra-convert = { path = "../astra-convert" }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 serde_json = "1"
 toml_edit = "0.23"
+sha2 = "0.10"
 
 [dev-dependencies]
-sha2 = "0.10"
+astra-manager = { path = "../astra-manager" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

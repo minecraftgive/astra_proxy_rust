@@ -1,24 +1,37 @@
 # 安装与启动
 
-当前分发分为 client 和 server，两端完全独立。每包只有对应运行程序和一份完整示例配置；文档、验证记录、许可材料、源码及脚本保留在仓库。当前 Windows 预览包为原生开发构建，其他平台需在对应系统构建验证。
+当前锁定依赖要求 Rust 1.91 或更新版本；构建和回归脚本使用 Python 3.11+。Web 组件另外需要 Node 22+，纯核心和终端构建不需要 Node。
+
+当前分发分为 client、server、controller、web 四个角色。每包包含对应程序、版本清单，client/server 另带完整 Core 示例；文档、验证记录、许可材料、源码及脚本保留在仓库。当前 Windows 预览包为原生开发构建，其他平台需在对应系统构建验证。
 
 ## 客户端
 
-解压 `astra-client-版本-平台-架构.tar.gz` 后进入 `client/`。包含 `astra-proxy`、`astra-rule`、`astra-tui`、`astra-convert` 和 `client.example.toml`；Windows 程序带 `.exe` 后缀，有本地 Wintun 时附运行库 `wintun.dll`。直接运行 `astra-tui` 即可管理客户端。
+解压 `astra-client-版本-平台-架构.tar.gz` 后进入 `client/`。包含 `astra-proxy`、`astra-rule`、`astra-tui`、`astra-manager`、兼容入口 `astra-host`、`astra-convert` 和 `client.example.toml`；Windows 程序带 `.exe` 后缀，有本地 Wintun 时附运行库 `wintun.dll`。直接运行 `astra-tui` 即可管理客户端。
 
 完整示例默认独立模式，按注释填写节点后运行 `astra-proxy --check client.example.toml` 校验，然后运行 `astra-proxy client.example.toml`。需要规则核心时，按文件末尾说明把注释中的完整规则模板另存为 `rule.toml`，修改独立模式设置后分别启动两个核心；也可由 TUI 管理。示例列出全部协议变体，部署时删除不用的节点。客户端默认本机入站没有认证，保持回环监听。
 
 ## 服务端
 
-解压 `astra-server-版本-平台-架构.tar.gz` 后进入 `server/`。仅包含 `astra-server-core`、`astra-server-tui` 与 `server.example.toml`。按配置注释替换凭据和证书路径，运行 `astra-server-core --config server.example.toml --check`，再运行 `astra-server-tui --config server.example.toml`。
+解压 `astra-server-版本-平台-架构.tar.gz` 后进入 `server/`。包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host` 与 `server.example.toml`。按注释替换凭据和证书，运行 `astra-server-core --config server.example.toml --check`。终端入口 `astra-server-tui` 默认打开 Server 配置档，在界面中注册并绑定配置；也可通过 Agent/Web 管理。旧专用 TUI 的 `--config`/`--control` 用法不适用于统一 TUI。
 
 示例覆盖全部八类入站协议、传输与扩展；服务端私钥与客户端公钥分别配置。部署和管理方法见 [服务端说明](SERVER.md)，扩展字段见 [服务端扩展](SERVER_EXTENSIONS.md)。
+
+## Controller 与 Web
+
+Controller 包包含独立 `astra-manager`；Web 包包含独立 `astra-web`，编译时嵌入 React 构建产物。二者运行时不需要 Node/Python。Web 构建需要 Node/npm，其他三个角色不需要。配置模板和初始化流程见 [MANAGEMENT.md](MANAGEMENT.md)；没有预置 Agent token 或管理员密码。
+
+```sh
+python scripts/build.py --role controller --package
+python scripts/build.py --role web --package
+```
+
+首次迁移前备份旧状态、配置、更新目录和凭据，正常退出旧管理服务。新的角色配置与 v2 API 不保证旧管理程序兼容；不可让两个管理进程共用同一状态目录。
 
 ## 从源码构建及打包
 
 ### Windows 原生构建
 
-需要 Rust MSVC 工具链、Visual Studio C++ 构建工具及 Windows SDK、CMake、NASM（x64 的 BoringSSL 依赖）、libclang 和 Python 3.8+。NASM 可从 [官方发布目录](https://www.nasm.us/pub/nasm/releasebuilds/) 获取；将 `nasm.exe` 加入 PATH。libclang 可通过 LLVM 安装或 `python -m pip install --target .build-tools/windows/python libclang` 提供，系统安装时设置 `LIBCLANG_PATH` 指向包含 `libclang.dll` 的目录。构建脚本会识别项目内 `.build-tools/windows/nasm-*/nasm.exe` 和 `.build-tools/windows/python/clang/native/libclang.dll`。
+需要 Rust MSVC 工具链、Visual Studio C++ 构建工具及 Windows SDK、CMake、NASM（x64 的 BoringSSL 依赖）、libclang 和 Python 3.11+。NASM 可从 [官方发布目录](https://www.nasm.us/pub/nasm/releasebuilds/) 获取；将 `nasm.exe` 加入 PATH。libclang 可通过 LLVM 安装或 `python -m pip install --target .build-tools/windows/python libclang` 提供，系统安装时设置 `LIBCLANG_PATH` 指向包含 `libclang.dll` 的目录。构建脚本会识别项目内 `.build-tools/windows/nasm-*/nasm.exe` 和 `.build-tools/windows/python/clang/native/libclang.dll`。
 
 ```powershell
 ./scripts/build.ps1                         # release 构建客户端（不测试、不打包）
@@ -55,24 +68,24 @@ python scripts/install_wintun.py --bin-dir target/debug
 
 ### Linux / macOS 构建
 
-需要 Rust、CMake、Clang/C++、libclang；Linux 构建产物仍需在目标机器验证。启用 Unix TUN 或需要特权路由时，请在终端中用 `sudo` 重新启动对应程序；Astra 不读取、保存或转发 sudo 密码，也不会在 TUI 中提供密码输入框。普通 SOCKS/HTTP 模式无需 root。
+需要当前稳定版 Rust、CMake、Clang/C++、libclang；本轮使用 Rust 1.99，当前锁定的 shadowsocks 依赖至少需要 Rust 1.91。已完成 WSL/CachyOS 全 workspace 编译检查和基础/管理库测试，范围与命令见 [Linux 验证记录](LINUX_REFACTOR_VERIFICATION.md)。Linux 程序部署与系统接管仍需在目标机器验证。启用 Unix TUN 或需要特权路由时，请在终端中用 `sudo` 重新启动对应程序；Astra 不读取、保存或转发 sudo 密码，也不会在 TUI 中提供密码输入框。普通 SOCKS/HTTP 模式无需 root。
 
 ```sh
 ./scripts/build.sh
 ```
 
-`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖构建本机 release 版本的客户端程序，**不运行测试、不打包**。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.8+，分发程序无需 Python。
+`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖构建本机 release 版本的客户端程序，**不运行测试、不打包**。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
 
 ```sh
 ./scripts/build.sh --debug                        # 调试构建
-./scripts/build.sh --role server                  # 构建服务端（client / server / all）
-./scripts/build.sh --role all --package           # 构建并为客户端、服务端各生成一个压缩包
+./scripts/build.sh --role server                  # 构建服务端（client / server / controller / web / all）
+./scripts/build.sh --role all --package           # 构建并按四个角色分别生成压缩包
 ./scripts/build.sh --package --label 0.1.0-tui --output-dir dist
 ```
 
-二进制输出位于 `target/<本机 Rust target>/release/`（调试版本为 `debug/`），支持 `CARGO_TARGET_DIR`。脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自客户端程序共同的 Cargo 版本，`--label` 可覆盖；分发目录仅生成 `.tar.gz`，SHA-256 输出到控制台。同名输出会被替换，保留旧包时请使用不同标签或输出目录。客户端与服务端程序分别打包，互不混入。
+二进制输出位于 `target/<本机 Rust target>/release/`（调试版本为 `debug/`），支持 `CARGO_TARGET_DIR`。脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自客户端程序共同的 Cargo 版本，`--label` 可覆盖；分发目录仅生成 `.tar.gz`，SHA-256 输出到控制台。每次构建使用独立时间戳目录并生成 artifacts.json；有多次产物时，通过 --artifact-dir 明确选择待验证的目录。四个角色分别打包，Web 与 Controller 不被嵌入 Core。
 
-解压包中的程序与完整示例配置直接位于 `client/` 或 `server/`，TUI 自动找到旁边的核心。
+解压包中的程序位于对应角色目录；client/server 包另含 Core 示例，TUI 使用旁边的管理程序和 Core。
 
 ### 测试
 

@@ -48,30 +48,7 @@ pub struct Database {
 
 /// Group names may contain ! (e.g. geolocation-!cn); only an attribute's
 /// leading ! negates its presence. Multiple attributes are intersected.
-pub fn selector(input: &str) -> Result<(String, Vec<(String, bool)>)> {
-    let mut parts = input.split('@');
-    let group = parts.next().unwrap_or_default().to_ascii_lowercase();
-    let valid = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.!".contains(&b))
-    };
-    ensure!(valid(&group), "invalid GEOSITE group: {input}");
-    let filters = parts
-        .map(|part| {
-            let (part, negated) = part.strip_prefix('!').map_or((part, false), |s| (s, true));
-            ensure!(
-                valid(part) && !part.contains('!'),
-                "invalid GEOSITE attribute: {input}"
-            );
-            Ok((part.to_ascii_lowercase(), negated))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(filters.len() <= 16, "too many GEOSITE attribute filters");
-    Ok((group, filters))
-}
+pub use astra_model::config::ruleset::geosite_selector as selector;
 impl Database {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let list = GeoSiteList::decode(bytes).context("invalid geosite.dat protobuf")?;

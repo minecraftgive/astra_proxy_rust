@@ -12,9 +12,10 @@ import tempfile
 import threading
 import time
 
-from platform_support import executable, process_flags
-from protocol_matrix import Echo, EchoServer, UdpEcho, UdpEchoServer, exact, free_port, udp_probe, wait_port
-from smoke_test import socks_connect
+from astra_tools.platform import executable, process_flags
+from astra_tools.net import Echo, EchoServer, UdpEcho, UdpEchoServer, exact, free_port, udp_probe
+from astra_tools.processes import wait_port
+from astra_tools.net import socks_connect
 
 
 class HttpEcho(http.server.BaseHTTPRequestHandler):

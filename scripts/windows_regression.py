@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Native local regression: IPC, TCP/UDP, reload, standalone and graceful exit."""
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import contextlib
 import json
@@ -12,15 +13,17 @@ import sys
 import tempfile
 import threading
 import time
-from platform_support import executable, process_flags, interrupt
-from protocol_matrix import ROOT, Echo, EchoServer, UdpEcho, UdpEchoServer, exact, free_port, wait_port, udp_probe
-from smoke_test import socks_connect
+from astra_tools.platform import executable, process_flags, interrupt
+from astra_tools.workspace import ROOT
+from astra_tools.net import Echo, EchoServer, UdpEcho, UdpEchoServer, exact, free_port, udp_probe
+from astra_tools.processes import wait_port
+from astra_tools.net import socks_connect
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/debug')
-    args = parser.parse_args()
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     binaries = args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra windows 中文 ') as td, contextlib.ExitStack() as stack:
         directory = pathlib.Path(td)

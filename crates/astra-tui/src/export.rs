@@ -4,7 +4,7 @@
 //! shell snippets are returned as data and are never passed to a shell.
 
 use anyhow::{bail, ensure, Context, Result};
-use astra_ipc::platform::OpenOptionsExt;
+use astra_platform::platform::OpenOptionsExt;
 use std::{
     collections::BTreeSet,
     fs::OpenOptions,
@@ -30,9 +30,6 @@ pub struct ShellProxyCommands {
     /// Windows Command Prompt.
     pub cmd: String,
 }
-
-/// A convenient alias for callers that prefer the shorter name.
-pub type ProxyCommands = ShellProxyCommands;
 
 /// Validate and return a complete native TOML configuration unchanged.
 ///
@@ -73,11 +70,6 @@ pub fn selected_node(text: &str, tag: &str) -> Result<String> {
     serialize_fragment(table)
 }
 
-/// UI-friendly alias for [`selected_node`].
-pub fn extract_node(text: &str, tag: &str) -> Result<String> {
-    selected_node(text, tag)
-}
-
 /// Extract one rule by its zero-based position in `[[rules]]`.
 ///
 /// Direct `rule_set` references bring along their matching definitions under
@@ -113,6 +105,7 @@ pub fn selected_rule(text: &str, index: usize) -> Result<String> {
 }
 
 /// Extract one rule by its `value` field, requiring that it be unambiguous.
+#[cfg(test)]
 pub fn selected_rule_by_value(text: &str, value: &str) -> Result<String> {
     ensure_name(value, "rule value")?;
     let document = parse(text)?;
@@ -150,12 +143,8 @@ pub fn selected_rule_by_value(text: &str, value: &str) -> Result<String> {
     }
 }
 
-/// UI-friendly alias for [`selected_rule`].
-pub fn extract_rule(text: &str, index: usize) -> Result<String> {
-    selected_rule(text, index)
-}
-
 /// Return the names of rule sets directly referenced by one rule.
+#[cfg(test)]
 pub fn rule_set_dependencies(text: &str, index: usize) -> Result<Vec<String>> {
     let value = parse(text)?;
     let rules = value
@@ -253,11 +242,6 @@ pub fn shell_proxy_commands(text: &str) -> Result<ShellProxyCommands> {
     })
 }
 
-/// Alias for [`shell_proxy_commands`].
-pub fn proxy_commands(text: &str) -> Result<ShellProxyCommands> {
-    shell_proxy_commands(text)
-}
-
 /// Select the snippet matching the current platform and user's shell.
 pub fn current_shell_commands(text: &str) -> Result<String> {
     let commands = shell_proxy_commands(text)?;
@@ -266,11 +250,11 @@ pub fn current_shell_commands(text: &str) -> Result<String> {
         let shell = std::env::var_os("ComSpec")
             .and_then(|value| value.to_str().map(str::to_ascii_lowercase))
             .unwrap_or_default();
-        return Ok(if shell.contains("powershell") || shell.contains("pwsh") {
+        Ok(if shell.contains("powershell") || shell.contains("pwsh") {
             commands.powershell
         } else {
             commands.cmd
-        });
+        })
     }
     #[cfg(not(windows))]
     {
@@ -300,7 +284,10 @@ pub fn write_new(path: &Path, text: &str) -> Result<()> {
 
     let (temporary, mut file) = loop {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".{name}.astra-export-{}-{id}.tmp", std::process::id()));
+        let temporary = parent.join(format!(
+            ".{name}.astra-export-{}-{id}.tmp",
+            std::process::id()
+        ));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -310,8 +297,9 @@ pub fn write_new(path: &Path, text: &str) -> Result<()> {
             Ok(file) => break (temporary, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Create export temporary file in {}", parent.display()))
+                return Err(error).with_context(|| {
+                    format!("Create export temporary file in {}", parent.display())
+                })
             }
         }
     };
@@ -542,14 +530,27 @@ payload = ["+.ads.example"]
         ));
         let _ = std::fs::remove_file(&path);
         write_new(&path, "standalone = true\n").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone = true\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "standalone = true\n"
+        );
         assert!(write_new(&path, "overwritten = true\n").is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone = true\n");
-        let temporary_prefix = format!(".{}-{}.astra-export-", path.file_name().unwrap().to_string_lossy(), std::process::id());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "standalone = true\n"
+        );
+        let temporary_prefix = format!(
+            ".{}-{}.astra-export-",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        );
         assert!(!std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(&temporary_prefix)));
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&temporary_prefix)));
         std::fs::remove_file(path).unwrap();
     }
 }

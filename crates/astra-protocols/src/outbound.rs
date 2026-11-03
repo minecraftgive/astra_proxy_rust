@@ -1,6 +1,6 @@
 use crate::config::OutboundConfig;
 use anyhow::{bail, Context, Result};
-use astra_ipc::Target;
+use astra_model::Target;
 use std::sync::{Arc, OnceLock};
 use tokio::{
     io::{AsyncRead, AsyncWrite},

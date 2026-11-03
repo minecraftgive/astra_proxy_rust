@@ -1,4 +1,4 @@
-use astra_ipc::Target;
+use astra_model::Target;
 use astra_protocols::{
     accept::{Request, User},
     http, socks5, trojan, vless, wire,

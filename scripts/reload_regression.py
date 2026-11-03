@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Hot switch/reload: existing TCP survives, new traffic switches, invalid candidates roll back."""
+from astra_tools.workspace import resolve_binary_dir, reference_engine
 import argparse
 import contextlib
 import pathlib
@@ -9,22 +10,26 @@ import subprocess
 import tempfile
 import threading
 import time
-from protocol_matrix import ROOT, Echo, EchoServer, free_port, process, wait_port, fixture, write_json, exact
-from core_regression import socks, wait_socket
-from mux_regression import Meter
+from astra_tools.workspace import ROOT
+from astra_tools.net import Echo, EchoServer, free_port, exact
+from astra_tools.processes import process, wait_port
+from astra_tools.fixtures.protocols import fixture, write_json
+from astra_tools.net import socks
+from astra_tools.processes import wait_socket
+from astra_tools.fixtures.meter import Meter
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug')
-    args=parser.parse_args(); binaries=args.bin_dir.resolve()
+    parser.add_argument('--bin-dir',type=pathlib.Path,default=None)
+    args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug'); binaries=args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra-reload-') as td, contextlib.ExitStack() as stack:
         d=pathlib.Path(td)
         echo=stack.enter_context(EchoServer(('127.0.0.1',0),Echo))
         threading.Thread(target=echo.serve_forever,daemon=True).start();stack.callback(echo.shutdown)
         destination=echo.server_address[1]
         peer_port=free_port();_,server,_=fixture('socks-plain',peer_port,None,None)
-        peer,log=stack.enter_context(process([str(ROOT/'.test-tools/bin/xray'),'run','-config',str(write_json(d/'peer.json',server))],d,'peer'))
+        peer,log=stack.enter_context(process([str(reference_engine('xray')),'run','-config',str(write_json(d/'peer.json',server))],d,'peer'))
         wait_port(peer_port,peer,log)
         meters=[]
         for _ in range(2):

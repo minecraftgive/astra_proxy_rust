@@ -1,74 +1,11 @@
 //! Separate, owner-only management socket. Routing IPC remains unchanged.
-#[path = "control/shared_server.rs"]
 mod server;
-use crate::platform::LocalListener as UnixListener;
-use serde::{Deserialize, Serialize};
+use astra_platform::platform::LocalListener as UnixListener;
+use serde::Serialize;
 use std::{io, path::PathBuf, time::Instant};
 use tokio::time::{timeout, Duration};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Command {
-    Status,
-    Stop,
-    Reload { path: Option<PathBuf> },
-    SetLogLevel(crate::logging::LogLevel),
-    GetConfig,
-    ExplainRoute(crate::RouteRequest),
-    UpdateSubscriptions,
-    Runtime(crate::runtime::Command),
-    Session,
-    WatchRuntime { interval_ms: u64 },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    Status(Status),
-    Config(Result<ConfigSnapshot, String>),
-    Explanation(Result<RouteExplanation, String>),
-    Runtime(Result<crate::runtime::Snapshot, String>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteExplanation {
-    pub api_version: u16,
-    pub pid: u32,
-    pub revision: u64,
-    pub config: PathBuf,
-    pub request: crate::RouteRequest,
-    pub action: crate::RouteAction,
-    pub path: String,
-    pub default_action: String,
-    pub condition: Option<(String, String)>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConfigSnapshot {
-    pub api_version: u16,
-    pub pid: u32,
-    pub path: PathBuf,
-    pub text: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Request {
-    pub api_version: u16,
-    pub command: Command,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Status {
-    pub api_version: u16,
-    pub pid: u32,
-    pub uptime_secs: u64,
-    pub error: Option<String>,
-    pub applied: Option<Applied>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Applied {
-    pub path: PathBuf,
-    pub digest: u64,
-}
+use astra_model::control::*;
 static APPLIED: std::sync::RwLock<Option<Applied>> = std::sync::RwLock::new(None);
 pub fn config_digest(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -99,11 +36,12 @@ impl Control {
     pub fn bind(path: Option<PathBuf>) -> io::Result<Self> {
         let listener = match &path {
             Some(path) => {
-                let listener = crate::platform::bind_listener(path)?;
-                if let Err(e) =
-                    crate::platform::set_private(crate::platform::endpoint_path(path), 0o600)
-                {
-                    crate::platform::remove_socket(path);
+                let listener = astra_platform::platform::bind_listener(path)?;
+                if let Err(e) = astra_platform::platform::set_private(
+                    astra_platform::platform::endpoint_path(path),
+                    0o600,
+                ) {
+                    astra_platform::platform::remove_socket(path);
                     return Err(e);
                 }
                 Some(listener)
@@ -220,9 +158,9 @@ impl Control {
         ExplainFuture: std::future::Future<Output = Result<RouteExplanation, String>> + Send,
         U: FnMut() -> UpdateFuture,
         UpdateFuture: std::future::Future<Output = Result<(), String>> + Send,
-        R: FnMut(crate::runtime::Command) -> RuntimeFuture,
+        R: FnMut(astra_model::runtime::Command) -> RuntimeFuture,
         RuntimeFuture:
-            std::future::Future<Output = Result<crate::runtime::Snapshot, String>> + Send,
+            std::future::Future<Output = Result<astra_model::runtime::Snapshot, String>> + Send,
     {
         server::run(self, reload, snapshot, explain, update, runtime).await
     }
@@ -231,7 +169,7 @@ impl Control {
 impl Drop for Control {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
-            crate::platform::remove_socket(path);
+            astra_platform::platform::remove_socket(path);
         }
     }
 }
@@ -244,7 +182,7 @@ async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Resu
     type Peer = crate::session::Peer<Request, Response>;
     static POOL: OnceLock<Mutex<HashMap<(PathBuf, u8), Peer>>> = OnceLock::new();
     let lane = match &command {
-        Command::Status | Command::Runtime(crate::runtime::Command::Snapshot) => 0,
+        Command::Status | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
         Command::GetConfig | Command::ExplainRoute(_) => 2,
         _ => 1,
     };
@@ -342,9 +280,9 @@ pub async fn explain_route(
 }
 pub async fn runtime(
     path: &std::path::Path,
-    command: crate::runtime::Command,
-) -> io::Result<crate::runtime::Snapshot> {
-    let seconds = if matches!(command, crate::runtime::Command::Snapshot) {
+    command: astra_model::runtime::Command,
+) -> io::Result<astra_model::runtime::Snapshot> {
+    let seconds = if matches!(command, astra_model::runtime::Command::Snapshot) {
         4
     } else {
         65
@@ -357,10 +295,10 @@ pub async fn runtime(
 pub async fn watch_runtime(
     path: &std::path::Path,
     interval_ms: u64,
-) -> io::Result<crate::platform::LocalStream> {
+) -> io::Result<astra_platform::platform::LocalStream> {
     let mut stream = timeout(
         Duration::from_secs(3),
-        crate::platform::connect_trusted(path),
+        astra_platform::platform::connect_trusted(path),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "watch connection timeout"))??;
@@ -419,7 +357,9 @@ mod tests {
             request(&path, Command::Status).await.unwrap().pid,
             std::process::id()
         );
-        let mut stream = crate::platform::LocalStream::connect(&path).await.unwrap();
+        let mut stream = astra_platform::platform::LocalStream::connect(&path)
+            .await
+            .unwrap();
         crate::send(
             &mut stream,
             &Request {
@@ -459,7 +399,7 @@ mod tests {
                     |_| async { Err("unused".into()) },
                     || async { Ok(()) },
                     |_| async {
-                        Ok(crate::runtime::Snapshot {
+                        Ok(astra_model::runtime::Snapshot {
                             pid: std::process::id(),
                             ..Default::default()
                         })
@@ -484,7 +424,7 @@ mod tests {
             );
             let mut push = watch_runtime(&path, 100).await.unwrap();
             for _ in 0..2 {
-                let snapshot: Result<crate::runtime::Snapshot, String> =
+                let snapshot: Result<astra_model::runtime::Snapshot, String> =
                     crate::receive_management(&mut push).await.unwrap();
                 assert_eq!(snapshot.unwrap().pid, std::process::id());
             }

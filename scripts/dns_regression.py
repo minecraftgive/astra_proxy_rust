@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the built DNS service using private loopback ports, without OS changes."""
+from astra_tools.processes import running_core as running
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import contextlib
 import os
@@ -13,8 +15,10 @@ import threading
 import secrets
 import time
 import tomllib
-from platform_support import executable, interrupt, process_flags
-from protocol_matrix import ROOT, exact, wait_port
+from astra_tools.platform import executable, interrupt, process_flags
+from astra_tools.workspace import ROOT
+from astra_tools.net import exact
+from astra_tools.processes import wait_port
 
 
 def dns_port():
@@ -65,29 +69,12 @@ def lookup(port, name, ident, tcp=False):
     return socket.inet_ntoa(reply[-4:])
 
 
-@contextlib.contextmanager
-def running(core, config, control, directory):
-    env = dict(os.environ, ASTRA_CONTROL_SOCKET=str(control))
-    log_path = directory / (config.stem + '.log')
-    with log_path.open('w', encoding='utf-8') as log:
-        child = subprocess.Popen([str(core), str(config)], cwd=ROOT, env=env,
-                                 stdout=log, stderr=subprocess.STDOUT, **process_flags())
-        try:
-            yield child, log_path, env
-        finally:
-            if child.poll() is None:
-                interrupt(child)
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/release')
-    args = parser.parse_args()
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='release')
     binaries = args.bin_dir.resolve()
     core = binaries/executable('astra-proxy')
     with tempfile.TemporaryDirectory(prefix='astra-dns-') as temp, socketserver.UDPServer(('127.0.0.1', 0), Upstream) as upstream:

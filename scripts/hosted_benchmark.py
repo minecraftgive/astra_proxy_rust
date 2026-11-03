@@ -4,6 +4,7 @@
 Never enables TUN, OS proxy settings, transparent interception or external nodes.
 Optional psutil measures the complete proxy process tree (including workers).
 """
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import asyncio
 import contextlib
@@ -20,9 +21,11 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from platform_support import executable, interrupt, process_flags
-from protocol_matrix import ROOT, free_port, wait_port
-from core_regression import wait_socket
+from astra_tools.platform import executable, interrupt, process_flags
+from astra_tools.workspace import ROOT
+from astra_tools.net import free_port
+from astra_tools.processes import wait_port
+from astra_tools.processes import wait_socket
 
 try:
     import psutil
@@ -323,7 +326,7 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT / 'target/debug')
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
     parser.add_argument('--output', type=pathlib.Path, default=ROOT / 'docs/hosted-performance.json')
     parser.add_argument('--connections', type=int, default=100)
     parser.add_argument('--concurrency', type=int, default=1)
@@ -332,7 +335,7 @@ def main():
     parser.add_argument('--seconds', type=float, default=3)
     parser.add_argument('--streams', type=int, default=2)
     parser.add_argument('--settle-seconds', type=float, default=2)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     if min(args.connections, args.concurrency, args.warmup, args.rounds, args.seconds, args.streams) <= 0:
         parser.error('all workload sizes and durations must be positive')
     if args.settle_seconds < 0:

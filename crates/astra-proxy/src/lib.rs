@@ -1,12 +1,10 @@
-#[path = "platform/shared_mod.rs"]
 pub mod platform;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod unix_elevated;
+pub use platform::entry;
+pub use proxy::runtime::run_with_lifeline;
 /// Set by the sudo hand-off before the runtime starts; the elevated TUN mode
 /// lives only in this process and is never written back to the overrides file.
 pub(crate) static ELEVATED_TUN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[path = "proxy/shared_mod.rs"]
 mod proxy;
 use platform::system_proxy;
 mod config;
@@ -23,19 +21,23 @@ use proxy::packet;
 use proxy::rule_client;
 use proxy::runtime;
 mod diagnostics;
-pub mod hosted;
-#[path = "dns/shared_mod.rs"]
 mod dns;
+pub mod hosted;
 mod http_forward;
-#[path = "nettool/shared_mod.rs"]
 mod nettool;
 mod subscription;
 pub use astra_protocols::xhttp;
 use proxy::udp;
 
 use anyhow::{bail, Context, Result};
-use astra_ipc::{Inbound, Network, ProcessInfo, RouteAction, RouteRequest, Target, API_VERSION};
-use config::{OutboundConfig, ProxyConfig};
+use astra_ipc::API_VERSION;
+use astra_model::Inbound;
+use astra_model::Network;
+use astra_model::ProcessInfo;
+use astra_model::RouteAction;
+use astra_model::RouteRequest;
+use astra_model::Target;
+use config::{OutboundConfig, ProxyConfig, ProxyConfigExt};
 use moka::sync::Cache;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::time::timeout;
@@ -54,7 +56,7 @@ pub struct App {
     hosted: Option<Arc<hosted::Host>>,
     worker_host: Option<hosted::WorkerHost>,
     metrics: Arc<proxy::traffic::Metrics>,
-    overrides: Arc<std::sync::RwLock<astra_ipc::runtime::Overrides>>,
+    overrides: Arc<std::sync::RwLock<astra_model::runtime::Overrides>>,
     egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
     dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
@@ -256,9 +258,9 @@ impl App {
         destination_ip: Option<std::net::IpAddr>,
     ) -> Result<RouteAction> {
         match self.overrides.read().unwrap().mode {
-            astra_ipc::runtime::Mode::Direct => return Ok(RouteAction::Direct),
-            astra_ipc::runtime::Mode::Global => return Ok(RouteAction::Proxy("PROXY".into())),
-            astra_ipc::runtime::Mode::Rule => {}
+            astra_model::runtime::Mode::Direct => return Ok(RouteAction::Direct),
+            astra_model::runtime::Mode::Global => return Ok(RouteAction::Proxy("PROXY".into())),
+            astra_model::runtime::Mode::Rule => {}
         }
         if let Some(action) = &self.standalone_action {
             return Ok(action.clone());
@@ -370,6 +372,7 @@ impl App {
         .await
         .context("proxy group selection timed out; health checks are still running")?
     }
+    #[cfg(test)]
     async fn connect_resolved(
         &self,
         target: &Target,
@@ -406,31 +409,31 @@ impl App {
         action: &RouteAction,
         interface: Option<&str>,
     ) -> Result<outbound::Stream> {
-        if *action == RouteAction::Direct {
-            if interface.is_some() || self.config.tun.is_some() || self.dns.is_some() {
-                return timeout(
-                    Duration::from_secs(self.config.connect_timeout_secs),
-                    async {
-                        let mut last = None;
-                        for address in self.lookup_real(&target.host, target.port).await? {
-                            let literal = Target {
-                                host: address.ip().to_string(),
-                                port: address.port(),
-                            };
-                            match egress::connect(&literal, interface).await {
-                                Ok(stream) => return Ok(stream),
-                                Err(error) => last = Some(error),
-                            }
+        if *action == RouteAction::Direct
+            && (interface.is_some() || self.config.tun.is_some() || self.dns.is_some())
+        {
+            return timeout(
+                Duration::from_secs(self.config.connect_timeout_secs),
+                async {
+                    let mut last = None;
+                    for address in self.lookup_real(&target.host, target.port).await? {
+                        let literal = Target {
+                            host: address.ip().to_string(),
+                            port: address.port(),
+                        };
+                        match egress::connect(&literal, interface).await {
+                            Ok(stream) => return Ok(stream),
+                            Err(error) => last = Some(error),
                         }
-                        Err(last.unwrap_or_else(|| {
-                            anyhow::anyhow!("direct DNS lookup returned no addresses")
-                        }))
-                    },
-                )
-                .await
-                .context("direct egress timeout")?
-                .map(|stream| Box::new(stream) as outbound::Stream);
-            }
+                    }
+                    Err(last.unwrap_or_else(|| {
+                        anyhow::anyhow!("direct DNS lookup returned no addresses")
+                    }))
+                },
+            )
+            .await
+            .context("direct egress timeout")?
+            .map(|stream| Box::new(stream) as outbound::Stream);
         }
         if let RouteAction::Proxy(tag) = action {
             if let Some(adapter) = self.native_for(interface).get(tag) {
@@ -498,10 +501,10 @@ impl App {
             .iter()
             .map(|o| o.tag().to_owned())
             .collect();
-        astra_ipc::groups::ensure_default(&mut config.proxy_groups, &tags)
+        astra_model::groups::ensure_default(&mut config.proxy_groups, &tags)
             .map_err(anyhow::Error::msg)?;
         config.proxy_groups =
-            astra_ipc::groups::expand(&config.proxy_groups, &tags).map_err(anyhow::Error::msg)?;
+            astra_model::groups::expand(&config.proxy_groups, &tags).map_err(anyhow::Error::msg)?;
         let outbounds = config.validate()?;
         let native = native::compile(
             &config.outbounds,
@@ -605,7 +608,7 @@ impl App {
 
 pub async fn run() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--host-worker") {
-        let _log = astra_ipc::logging::init()?;
+        let _log = astra_platform::logging::init()?;
         return hosted::worker().await;
     }
     let elevated_config = platform::privilege::bootstrap()?;
@@ -626,7 +629,7 @@ pub async fn run() -> Result<()> {
             input.len() <= 512 * 1024,
             "Network tool request exceeds limit"
         );
-        let request: astra_ipc::nettool::Request = serde_json::from_str(&input)?;
+        let request: astra_model::nettool::Request = serde_json::from_str(&input)?;
         // Interface and system probes work without a loadable profile.
         let app = if request.config.is_empty() {
             None
@@ -684,7 +687,7 @@ pub async fn run() -> Result<()> {
                 first.as_deref(),
                 Some("--diagnose-request" | "--diagnose-stream")
             ) {
-                let payload: astra_ipc::diagnostics::Request = serde_json::from_str(&input)?;
+                let payload: astra_model::diagnostics::Request = serde_json::from_str(&input)?;
                 let text = payload.config.clone();
                 request = Some(payload);
                 text
@@ -730,9 +733,10 @@ pub async fn run() -> Result<()> {
         println!("{output}");
         return Ok(());
     }
-    let _log = astra_ipc::logging::init()?;
+    let _log = astra_platform::logging::init()?;
     if first.as_deref() == Some("--runtime") {
-        use astra_ipc::runtime::{Command, Mode};
+        use astra_model::runtime::Command;
+        use astra_model::runtime::Mode;
         let socket = args
             .next()
             .context("--runtime requires a core management socket")?;
@@ -799,7 +803,7 @@ pub async fn run() -> Result<()> {
         let socket = args.next().context("expected management socket")?;
         astra_ipc::control::request(
             std::path::Path::new(&socket),
-            astra_ipc::control::Command::Stop,
+            astra_model::control::Command::Stop,
         )
         .await?;
         return Ok(());
@@ -814,7 +818,7 @@ pub async fn run() -> Result<()> {
         let socket = args.next().context("expected management socket")?;
         astra_ipc::control::request(
             std::path::Path::new(&socket),
-            astra_ipc::control::Command::UpdateSubscriptions,
+            astra_model::control::Command::UpdateSubscriptions,
         )
         .await?;
         println!("Subscription update scheduled");
@@ -831,7 +835,7 @@ pub async fn run() -> Result<()> {
         };
         astra_ipc::control::request(
             std::path::Path::new(&socket),
-            astra_ipc::control::Command::Reload { path },
+            astra_model::control::Command::Reload { path },
         )
         .await?;
         return Ok(());
@@ -870,7 +874,7 @@ pub async fn run() -> Result<()> {
     }
     if platform::privilege::delegate(
         std::path::Path::new(&path),
-        astra_ipc::runtime::load_overrides(std::path::Path::new(&path))?.tun == Some(true),
+        astra_platform::runtime::load_overrides(std::path::Path::new(&path))?.tun == Some(true),
     )
     .await?
     {

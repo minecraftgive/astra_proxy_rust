@@ -4,6 +4,7 @@ use super::*;
 pub(super) const KEYMAP_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Draft {
     pub(super) path: PathBuf,
     pub(super) kind: Kind,
@@ -16,7 +17,7 @@ pub(super) struct Draft {
 }
 
 impl Ui {
-    fn draft_key(&self, name: &str) -> (String, PathBuf) {
+    pub(super) fn draft_key(&self, name: &str) -> (String, PathBuf) {
         let path = self
             .rows
             .iter()
@@ -63,32 +64,22 @@ impl Ui {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn open_draft(&mut self, name: String, disk: String) {
         self.suspend_editor();
-        let (key, path) = self.draft_key(&name);
-        // Legacy sessions had a single editor and no bound path. Adopt it once.
-        let legacy = format!("{name}\n");
-        let draft = self
-            .drafts
-            .remove(&key)
-            .or_else(|| self.drafts.remove(&legacy));
-        if let Some(mut draft) = draft {
-            draft.conflict = draft.editor.original != disk;
-            draft.observed_disk = draft.conflict.then_some(disk);
-            draft.path = path;
-            draft.editor.name = name;
-            self.kind = draft.kind;
-            self.editor = Some(draft.editor.clone());
-            if draft.conflict {
-                self.message = t("Configuration changed on disk; draft retained. Saving will not overwrite external changes.").into();
-            } else {
-                self.message = t("Restored configuration draft").into();
-            }
-            self.drafts.insert(key, draft);
-        } else {
-            self.editor = Some(Editor::new(name, disk).with_kind(self.kind));
-            self.message.clear();
-        }
+        let prepared = operations::OperationInput::capture(self).prepare(name.clone(), disk);
+        self.apply_operation(
+            operations::JobResult::Document {
+                prepared,
+                binding: None,
+            },
+            &Action::Read(name),
+            operations::ApplyContext {
+                same: true,
+                log_target_current: true,
+                background: false,
+            },
+        );
     }
 
     pub(super) fn discard_current_draft(&mut self) {
@@ -168,7 +159,12 @@ mod tests {
         value["editor"] =
             serde_json::to_value(Editor::new("legacy".into(), "standalone=true\n".into())).unwrap();
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let original = std::fs::read(&path).unwrap();
         let session = Session::load(&path).unwrap();
+        assert_eq!(
+            std::fs::read(path.with_extension("pre-v2.json")).unwrap(),
+            original
+        );
         assert_eq!(session.session_version, 1);
         assert!(session.keymap_notice_pending);
         assert_eq!(session.drafts.len(), 1);
@@ -178,6 +174,26 @@ mod tests {
         assert!(!ui.keymap_notice_pending);
         ui.session.save(&path).unwrap();
         assert!(!Session::load(&path).unwrap().keymap_notice_pending);
+        assert_eq!(
+            std::fs::read(path.with_extension("pre-v2.json")).unwrap(),
+            original
+        );
+    }
+    #[test]
+    fn future_or_unknown_session_state_is_rejected_without_overwrite() {
+        let fixture = crate::import::tests::Fixture::new();
+        let path = fixture.0.join("ui-session.json");
+        for (key, value) in [
+            ("session_version", serde_json::json!(999)),
+            ("unknown_field", serde_json::json!({"draft":"retain"})),
+        ] {
+            let mut session = serde_json::to_value(Session::default()).unwrap();
+            session[key] = value;
+            let original = serde_json::to_vec(&session).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            assert!(Session::load(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
     }
     #[test]
     fn two_drafts_survive_navigation_and_external_conflicts() {

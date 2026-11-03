@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Black-box regressions for admission, fail-closed routing and rule restart."""
+from astra_tools.processes import wait_socket
+from astra_tools.platform import interrupt
+from astra_tools.net import socks
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import contextlib
 import pathlib
@@ -7,31 +11,19 @@ import socket
 import tempfile
 import threading
 import time
-from protocol_matrix import ROOT, Echo, EchoServer, exact, free_port, process, wait_port
+from astra_tools.workspace import ROOT
+from astra_tools.net import Echo, EchoServer, exact, free_port
+from astra_tools.processes import process, wait_port
 
 
-def socks(port, target_port):
-    sock = socket.create_connection(('127.0.0.1', port), timeout=3)
-    sock.sendall(b'\x05\x01\x00')
-    assert exact(sock, 2) == b'\x05\x00'
-    sock.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01' + target_port.to_bytes(2, 'big'))
-    return sock, exact(sock, 10)[1]
 
 
-def wait_socket(path, child, log):
-    for _ in range(100):
-        if path.exists():
-            return
-        if child.poll() is not None:
-            raise RuntimeError(log.read_text())
-        time.sleep(.02)
-    raise TimeoutError('rule socket not ready')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT / 'target/debug')
-    args = parser.parse_args()
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     binaries = args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra-regression-') as td, EchoServer(('127.0.0.1', 0), Echo) as echo:
         directory = pathlib.Path(td)
@@ -39,10 +31,10 @@ def main():
         destination = echo.server_address[1]
         rule_path = directory / 'rule.toml'
         socket_path = directory / 'rule.sock'
-        rule_path.write_text(f'socket="{socket_path}"\ndefault_action="direct"\n')
+        rule_path.write_text(f'socket="{socket_path.as_posix()}"\ndirect_local=false\ndefault_action="direct"\n')
         sp, hp = free_port(), free_port()
         proxy_path = directory / 'proxy.toml'
-        proxy_path.write_text(f'rule_socket="{socket_path}"\nsocks5_listen="127.0.0.1:{sp}"\nhttp_listen="127.0.0.1:{hp}"\nmax_connections=1\ndecision_cache_ttl_secs=0\nshutdown_timeout_secs=1\n')
+        proxy_path.write_text(f'rule_socket="{socket_path.as_posix()}"\nsocks5_listen="127.0.0.1:{sp}"\nhttp_listen="127.0.0.1:{hp}"\nmax_connections=1\ndecision_cache_ttl_secs=0\nshutdown_timeout_secs=1\n')
         with process([str(binaries / 'astra-rule'), str(rule_path)], directory, 'rule') as (rule, rule_log):
             wait_socket(socket_path, rule, rule_log)
             with process([str(binaries / 'astra-proxy'), str(proxy_path)], directory, 'proxy') as (proxy, proxy_log):
@@ -66,15 +58,15 @@ def main():
                 existing, status = socks(sp, destination)
                 with existing:
                     assert status == 0
-                    rule.terminate()
+                    interrupt(rule)
                     rule.wait(timeout=3)
-                    assert not socket_path.exists(), 'SIGTERM left stale rule socket'
+                    assert not socket_path.exists(), 'graceful shutdown left stale rule socket'
                     denied, status = socks(sp, destination)
                     denied.close()
                     assert status == 1, status
                     existing.sendall(b'alive')
                     assert exact(existing, 5) == b'alive'
-                    rule_path.write_text(f'socket="{socket_path}"\ndefault_action="block"\n')
+                    rule_path.write_text(f'socket="{socket_path.as_posix()}"\ndirect_local=false\ndefault_action="block"\n')
                     with process([str(binaries / 'astra-rule'), str(rule_path)], directory, 'rule-restarted') as (new_rule, new_log):
                         wait_socket(socket_path, new_rule, new_log)
                         denied, status = socks(sp, destination)
@@ -82,7 +74,7 @@ def main():
                         assert status == 2, status
                         existing.sendall(b'still-alive')
                         assert exact(existing, 11) == b'still-alive'
-                print('PASS rule outage/restart: fail closed, established TCP survives, SIGTERM cleans socket', flush=True)
+                print('PASS rule outage/restart: fail closed, established TCP survives, graceful shutdown cleans socket', flush=True)
         echo.shutdown()
 
 if __name__ == '__main__':

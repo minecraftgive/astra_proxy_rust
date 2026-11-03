@@ -12,10 +12,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable, process_flags
-from protocol_matrix import Echo, EchoServer, exact, free_port, wait_port
-from smoke_test import socks_connect
-from rule_test_data import mmdb, geosite, geoip
+from astra_tools.platform import executable, process_flags
+from astra_tools.net import Echo, EchoServer, exact, free_port
+from astra_tools.processes import wait_port
+from astra_tools.net import socks_connect
+from astra_tools.fixtures.rules import mmdb, geosite, geoip
 
 
 def main():
@@ -246,10 +247,23 @@ rules:
         missing_text, replacements = re.subn(r'rule-cache/provider-\d+\.[a-z]+', 'rule-cache/missing.text', rules.read_text(encoding='utf-8'))
         assert replacements == 1, 'expected one remote provider cache reference'
         missing.write_text(missing_text, encoding='utf-8')
-        result = run([str(binaries / executable('astra-rule')), '--check', str(missing)], capture_output=True, timeout=20)
-        assert result.returncode != 0, 'uncached remote failure must reject startup'
+        # Unavailable resources retain the existing warn-and-skip behavior; invalid
+        # content is rejected above. Check in an isolated runtime without a cache.
+        empty_runtime = root / 'empty-runtime'
+        result = run([str(binaries / executable('astra-rule')), '--check', str(missing)], capture_output=True, timeout=20, env=dict(env, ASTRA_RUNTIME_DIR=str(empty_runtime)))
+        warning = result.stdout + result.stderr
+        assert result.returncode == 0, warning.decode(errors='replace')
+        assert b'rule-set unavailable' in warning and b'skipping dependent rules' in warning, warning
+        assert not list((empty_runtime / 'resources').glob('*.cache')), 'unavailable provider unexpectedly produced a cache'
+        # The missing provider must leave the inline/local rules and explicit
+        # default action intact, rather than replacing the whole engine.
+        result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(missing)], capture_output=True, timeout=20)
+        assert result.returncode == 0, result.stderr.decode(errors='replace')
+        until(0)
+        assert status('a.blocked.test') == 2
+        assert status('127.0.0.2') == 2
         assert cache.read_bytes() == cached
-    print('PASS offline conversion, inline/file/HTTP providers, reference order, live updates, invalid-download cache retention, MMDB/GeoIP DAT/GEOSITE lookup, missing-category rejection, failed reload retention, offline cached startup')
+    print('PASS offline conversion, inline/file/HTTP providers, reference order, live updates, invalid-download cache retention, MMDB/GeoIP DAT/GEOSITE lookup, missing-category rejection, failed reload retention, offline cached startup, unavailable-provider warning and preserved inline/local/default decisions')
 
 
 if __name__ == '__main__':

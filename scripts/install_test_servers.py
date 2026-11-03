@@ -10,15 +10,18 @@ import platform
 import tarfile
 import urllib.request
 import zipfile
+from astra_tools.workspace import reference_engine_dir
+from astra_tools.platform import executable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--destination', type=pathlib.Path, default=ROOT / '.test-tools' / 'bin')
+    parser.add_argument('--destination', type=pathlib.Path, default=None)
     parser.add_argument('--engine', choices=['xray', 'sing-box'])
     args = parser.parse_args()
-    machine = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine())
+    args.destination = reference_engine_dir(args.destination)
+    machine = {'amd64': 'amd64', 'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine().lower())
     key = platform.system().lower() + '-' + str(machine)
     manifest = json.loads((ROOT / 'scripts' / 'reference-servers.lock.json').read_text())
     args.destination.mkdir(parents=True, exist_ok=True)
@@ -38,14 +41,17 @@ def main():
             raise SystemExit('SHA-256 mismatch: ' + name)
         if asset['url'].endswith('.zip'):
             with zipfile.ZipFile(io.BytesIO(archive)) as z:
-                contents = z.read(name)
+                candidates = [item for item in z.infolist() if not item.is_dir() and pathlib.PurePosixPath(item.filename).name == executable(name)]
+                if len(candidates) != 1:
+                    raise SystemExit('Unexpected engine archive layout')
+                contents = z.read(candidates[0])
         else:
             with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as t:
                 candidates = [m for m in t.getmembers() if m.isfile() and pathlib.PurePosixPath(m.name).name == name]
                 if len(candidates) != 1:
                     raise SystemExit('Unexpected engine archive layout')
                 contents = t.extractfile(candidates[0]).read()
-        target = args.destination / name
+        target = args.destination / executable(name)
         temporary = target.with_suffix('.download')
         temporary.write_bytes(contents)
         temporary.chmod(0o755)

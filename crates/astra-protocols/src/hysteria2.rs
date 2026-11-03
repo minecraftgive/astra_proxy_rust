@@ -99,12 +99,12 @@ pub async fn authenticate(
     send.finish()?;
     let mut stream = conn.open_uni().await?;
     stream.write_all(&[0, 4, 0]).await?;
-    return Ok(stream);
+    Ok(stream)
 }
 
 pub async fn accept_tcp<R: tokio::io::AsyncRead + Unpin>(
     recv: &mut R,
-) -> Result<astra_ipc::Target> {
+) -> Result<astra_model::Target> {
     use crate::http::authority_target;
 
     ensure!(wire::varint(recv).await? == 0x401, "Hysteria TCP request");
@@ -116,7 +116,7 @@ pub async fn accept_tcp<R: tokio::io::AsyncRead + Unpin>(
 pub(crate) async fn decode_datagram(
     bytes: &[u8],
     fragments: &mut crate::datagram::Fragments,
-) -> Result<Option<(u32, astra_ipc::Target, Vec<u8>)>> {
+) -> Result<Option<(u32, astra_model::Target, Vec<u8>)>> {
     use crate::{http::authority_target, wire};
     use tokio::io::AsyncReadExt;
     let mut r = bytes;

@@ -2,6 +2,8 @@
 """Process-level smoke test for both separately running binaries.
 Build first: cargo build --release. Works on Linux/macOS (UDS).
 """
+from astra_tools.net import exact as recv_exact, socks_connect, Echo, EchoServer as ThreadedServer
+from astra_tools.processes import wait_port as wait_for_tcp
 import pathlib
 import signal
 import socket
@@ -11,60 +13,23 @@ import tempfile
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BIN = ROOT / 'target' / 'release'
-
-class Echo(socketserver.BaseRequestHandler):
-    def handle(self):
-        self.request.settimeout(5)
-        while True:
-            data = self.request.recv(8192)
-            if not data:
-                return
-            self.request.sendall(data)
-
-class ThreadedServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
 
 
-from protocol_matrix import free_port  # noqa: E402  (one port picker for every script)
 
 
-def wait_for_tcp(port, proc):
-    for _ in range(100):
-        if proc.poll() is not None:
-            raise RuntimeError(f'core exited early: {proc.returncode}')
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise TimeoutError(f'port {port} did not open')
+
+from astra_tools.net import free_port
 
 
-def recv_exact(conn, size):
-    result = bytearray()
-    while len(result) < size:
-        data = conn.recv(size - len(result))
-        if not data:
-            raise EOFError('socket closed before expected reply')
-        result.extend(data)
-    return bytes(result)
 
 
-def socks_connect(port, host, dest_port):
-    conn = socket.create_connection(('127.0.0.1', port), timeout=5)
-    conn.sendall(b'\x05\x01\x00')
-    assert recv_exact(conn, 2) == b'\x05\x00'
-    encoded = host.encode()
-    req = b'\x05\x01\x00\x03' + bytes([len(encoded)]) + encoded + dest_port.to_bytes(2, 'big')
-    conn.sendall(req)
-    rep = recv_exact(conn, 10)
-    assert len(rep) == 10
-    return conn, rep[1]
+
+
 
 
 def main():
+    from astra_tools.workspace import resolve_binary_dir
+    BIN = resolve_binary_dir()
     for name in ('astra-rule', 'astra-proxy'):
         if not (BIN / name).exists():
             raise SystemExit('missing release executable; run cargo build --release first')

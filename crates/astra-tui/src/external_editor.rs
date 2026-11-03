@@ -1,6 +1,6 @@
 use crate::i18n::t;
 use anyhow::{ensure, Context, Result};
-use astra_ipc::platform::OpenOptionsExt;
+use astra_platform::platform::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -10,6 +10,7 @@ use std::{
 };
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Draft {
     pub name: String,
     pub path: PathBuf,

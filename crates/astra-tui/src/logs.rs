@@ -24,6 +24,7 @@ enum Mode {
     MemoryLimit(String),
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
     level_order_version: u8,
@@ -946,15 +947,36 @@ mod tests {
             .map(|i| format!("INFO line {i}\n"))
             .collect::<String>();
         let path = fixture.write("proxy.log", &text);
-        let socket = fixture.0.join("manager.sock");
-        let listener = astra_ipc::platform::LocalListener::bind(&socket).unwrap();
+        let socket = fixture.0.join("management.sock");
+        let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _: Request = astra_ipc::receive_management(&mut stream).await.unwrap();
-            astra_ipc::send_management(&mut stream, &Reply::text("Streaming"))
-                .await
-                .unwrap();
-            crate::log_stream::serve(stream, path, None).await;
+            use astra_management::{client, v2::*};
+            let request: Request = client::receive(&mut stream).await.unwrap();
+            assert!(matches!(
+                request.body,
+                RequestBody::Query(Query::LogChunk { .. })
+            ));
+            let bytes = std::fs::read(path).unwrap();
+            let offset = bytes.len().to_string();
+            client::send(
+                &mut stream,
+                &Response::success(
+                    request.id,
+                    ResponseBody::LogChunk(LogChunk::Data {
+                        bytes,
+                        cursor: LogCursor {
+                            device: "1".into(),
+                            inode: "1".into(),
+                            offset,
+                        },
+                        reset: true,
+                        skip_prefix: false,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
         });
         let mut view = Viewer::new(
             "proxy".into(),
@@ -979,7 +1001,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        astra_ipc::platform::remove_socket(&socket);
+        astra_platform::platform::remove_socket(&socket);
     }
     #[test]
     fn route_is_between_debug_and_info_in_filter_and_capture_picker() {

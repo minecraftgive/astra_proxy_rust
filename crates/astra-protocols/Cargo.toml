@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-astra-ipc = { path = "../astra-ipc" }
+astra-model = { path = "../astra-model" }
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true

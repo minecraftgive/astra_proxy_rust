@@ -1,8 +1,8 @@
 //! Real forwarding through mixed listeners and the owner-only management API.
-use astra_ipc::{
-    control,
-    runtime::{Command, Mode, Snapshot},
-};
+use astra_ipc::control;
+use astra_model::runtime::Command;
+use astra_model::runtime::Mode;
+use astra_model::runtime::Snapshot;
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -32,7 +32,7 @@ impl Drop for Core {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            astra_ipc::platform::background_command(&mut stop, false);
+            astra_platform::platform::background_command(&mut stop, false);
             let _ = stop.status();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while self.child.try_wait().ok().flatten().is_none()
@@ -95,12 +95,12 @@ impl Core {
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
-        astra_ipc::platform::background_command(&mut command, false);
+        astra_platform::platform::background_command(&mut command, false);
         command.spawn().unwrap()
     }
     async fn ready(&self) {
         for _ in 0..100 {
-            if control::request(&self.socket, control::Command::Status)
+            if control::request(&self.socket, astra_model::control::Command::Status)
                 .await
                 .is_ok()
             {
@@ -273,7 +273,7 @@ async fn modes_selection_traffic_disconnect_and_restart_never_modify_profile() {
     let previous = test.pid;
     core.unchanged();
     drop((first, second, third, fourth));
-    control::request(&core.socket, control::Command::Stop)
+    control::request(&core.socket, astra_model::control::Command::Stop)
         .await
         .unwrap();
     assert!(core.child.wait().unwrap().success());
@@ -299,7 +299,7 @@ async fn modes_selection_traffic_disconnect_and_restart_never_modify_profile() {
     std::fs::write(&second_path, &second_source).unwrap();
     control::request(
         &core.socket,
-        control::Command::Reload {
+        astra_model::control::Command::Reload {
             path: Some(second_path.clone()),
         },
     )
@@ -324,7 +324,7 @@ async fn modes_selection_traffic_disconnect_and_restart_never_modify_profile() {
     core.command(Command::SetMode(Mode::Direct)).await;
     control::request(
         &core.socket,
-        control::Command::Reload {
+        astra_model::control::Command::Reload {
             path: Some(core.root.join("config/proxy.toml")),
         },
     )
@@ -496,9 +496,12 @@ async fn missing_system_proxy_listener_rejects_runtime_change_without_touching_p
     core.source
         .push_str(&format!("\n[dns]\nlisten=['{dns_address}']\n"));
     std::fs::write(core.root.join("config/proxy.toml"), &core.source).unwrap();
-    control::request(&core.socket, control::Command::Reload { path: None })
-        .await
-        .unwrap();
+    control::request(
+        &core.socket,
+        astra_model::control::Command::Reload { path: None },
+    )
+    .await
+    .unwrap();
     let before = core.command(Command::Snapshot).await;
     let error = control::runtime(&core.socket, Command::SystemProxy(true))
         .await

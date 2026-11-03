@@ -3,7 +3,8 @@ use crate::{
     protocol::{self, Action},
     tr,
 };
-use astra_ipc::diagnostics::{Event, Report};
+use astra_model::diagnostics::Event;
+use astra_model::diagnostics::Report;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -112,15 +113,7 @@ impl View {
                         .await?;
                     crate::ui::wake();
                 } else {
-                    let mut stream = astra_ipc::platform::connect_trusted(&socket).await?;
-                    astra_ipc::send_management(
-                        &mut stream,
-                        &protocol::Request {
-                            version: astra_ipc::API_VERSION,
-                            action,
-                        },
-                    )
-                    .await?;
+                    let mut stream = crate::protocol::subscribe(&socket, action).await?;
                     loop {
                         let reply: protocol::Reply = tokio::time::timeout(
                             std::time::Duration::from_secs(45),
@@ -487,7 +480,7 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_ipc::diagnostics::Probe;
+    use astra_model::diagnostics::Probe;
     use ratatui::{backend::TestBackend, Terminal};
     #[tokio::test]
     async fn updates_latency_and_results_without_waiting_for_done_and_cancel_retains_results() {

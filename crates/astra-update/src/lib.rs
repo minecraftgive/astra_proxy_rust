@@ -13,7 +13,7 @@ pub use store::{
     TransactionPhase,
 };
 
-pub const HOST_PROTOCOL_VERSION: u32 = 1;
+pub const HOST_PROTOCOL_VERSION: u32 = astra_model::HOST_PROTOCOL_VERSION as u32;
 pub const TARGET: &str = env!("ASTRA_UPDATE_TARGET");
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -37,11 +37,23 @@ pub struct ReleaseFile {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
     pub schema_version: u32,
+    /// Legacy manifests without a role are client worker bundles.
+    #[serde(default)]
+    pub role: ReleaseRole,
     pub release_id: String,
     pub target: String,
     pub host_protocol: ProtocolRange,
     pub components: BTreeMap<String, String>,
     pub files: Vec<ReleaseFile>,
+}
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseRole {
+    #[default]
+    Client,
+    Server,
+    Controller,
+    Web,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +133,8 @@ impl ReleaseManifest {
             self.schema_version == 1,
             "Unsupported release manifest schema"
         );
+        ensure!(self.role == ReleaseRole::Client,
+            "This is a {:?} package, not a client worker update; install it through the corresponding service maintenance restart", self.role);
         validate_id(&self.release_id)?;
         ensure!(
             self.target == options.target,

@@ -19,7 +19,7 @@ fn strings(value: &Y) -> Result<Vec<String>> {
 }
 pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Value> {
     let map = value.as_mapping().context("dns must be a mapping")?;
-    let mut config = astra_dns::Config::default();
+    let mut config = astra_model::config::dns::Config::default();
     for (key, value) in map {
         let key = key.as_str().context("DNS key must be a string")?;
         match key {
@@ -42,7 +42,7 @@ pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Val
                 config.bootstrap = strings(value)?
                     .iter()
                     .map(|raw| {
-                        let upstream = astra_dns::Upstream::parse(raw)?;
+                        let upstream = astra_model::config::dns::Upstream::parse(raw)?;
                         ensure!(
                             upstream.scheme == "udp" && upstream.port == 53,
                             "DNS default-nameserver bootstrap supports literal UDP IP:53 only"

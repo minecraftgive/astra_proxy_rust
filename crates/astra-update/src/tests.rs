@@ -11,6 +11,32 @@ struct Fixture {
     source: PathBuf,
     store: ReleaseStore,
 }
+#[test]
+fn package_roles_preserve_legacy_clients_and_reject_service_bundles() {
+    let fixture = Fixture::new("roles");
+    let manifest = fixture.manifest();
+    let mut legacy = serde_json::to_value(&manifest).unwrap();
+    legacy.as_object_mut().unwrap().remove("role");
+    let decoded: ReleaseManifest = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.role, ReleaseRole::Client);
+    decoded.validate(&ImportOptions::default()).unwrap();
+    for role in [
+        ReleaseRole::Server,
+        ReleaseRole::Controller,
+        ReleaseRole::Web,
+    ] {
+        let mut candidate = manifest.clone();
+        candidate.role = role;
+        assert!(candidate
+            .validate(&ImportOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("service maintenance"));
+    }
+    let mut unknown = serde_json::to_value(manifest).unwrap();
+    unknown["role"] = "unknown".into();
+    assert!(serde_json::from_value::<ReleaseManifest>(unknown).is_err());
+}
 impl Fixture {
     fn new(id: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -23,6 +49,7 @@ impl Fixture {
         };
         let mut manifest = ReleaseManifest {
             schema_version: 1,
+            role: Default::default(),
             release_id: id.into(),
             target: TARGET.into(),
             host_protocol: ProtocolRange { min: 1, max: 1 },
@@ -168,7 +195,8 @@ fn rejects_packages_without_the_resident_host() {
             if remove_version {
                 m.components.remove("astra-host");
             } else {
-                m.files.retain(|file| file.path != "astra-host" && file.path != "astra-host.exe");
+                m.files
+                    .retain(|file| file.path != "astra-host" && file.path != "astra-host.exe");
             }
         });
         let error = f.import().unwrap_err().to_string();

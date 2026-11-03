@@ -2,7 +2,7 @@ use astra_convert::{subscription::*, Options};
 
 #[test]
 fn subscriptions_become_groups_and_proxy_membership_is_controlled_on_each_group() {
-    use astra_ipc::groups::{ensure_default, expand, validate, Group};
+    use astra_model::groups::{ensure_default, expand, validate, Group};
     use std::collections::{BTreeMap, HashSet};
     let mut doc: toml::Table = toml::from_str("[[outbounds]]\ntag='a'\nkind='socks5'\nserver='localhost:1'\n[[outbounds]]\ntag='b'\nkind='socks5'\nserver='localhost:2'\n[subscriptions.first]\nurl='https://example.com/a'\nmanaged_nodes=['a']\n[subscriptions.second]\nurl='https://example.com/b'\nmanaged_nodes=['b']\n").unwrap();
     prepare_groups(&mut doc).unwrap();

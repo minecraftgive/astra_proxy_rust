@@ -1,171 +1,29 @@
 //! Shared rule-provider format and bounded resource loading.
 pub mod geoip;
 pub mod geosite;
-use anyhow::{bail, ensure, Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
+pub use astra_model::config::ruleset::{compile_domain_regex, parse_classical, MatchSpec, RuleSet};
+use std::path::Path;
+#[cfg(test)]
 use std::{
     fs,
     io::{Read, Write},
-    path::{Path, PathBuf},
     time::Duration,
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MatchSpec {
-    pub kind: String,
-    pub value: String,
+pub trait RuleSetExt {
+    fn load(&self, base: &Path) -> Result<Vec<MatchSpec>>;
+    fn load_with(&self, base: &Path, loader: &ResourceLoader) -> Result<Vec<MatchSpec>>;
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RuleSet {
-    #[serde(skip_serializing_if = "is_enabled")]
-    pub enabled: bool,
-    pub behavior: String,
-    pub format: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    pub interval: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub payload: Vec<String>,
-}
-impl Default for RuleSet {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            behavior: "classical".into(),
-            format: "yaml".into(),
-            path: None,
-            url: None,
-            interval: 86400,
-            payload: Vec::new(),
-        }
+impl RuleSetExt for RuleSet {
+    fn load(&self, base: &Path) -> Result<Vec<MatchSpec>> {
+        self.load_with(base, &ResourceLoader::default())
     }
-}
-fn is_enabled(value: &bool) -> bool {
-    *value
-}
-pub fn compile_domain_regex(pattern: &str) -> Result<regex::Regex> {
-    ensure!(pattern.len() <= 4096, "domain regex exceeds 4096 bytes");
-    regex::RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .size_limit(2 * 1024 * 1024)
-        .build()
-        .context("invalid or unsupported domain regex")
-}
-impl RuleSet {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            matches!(self.behavior.as_str(), "classical" | "domain" | "ipcidr"),
-            "unsupported rule-set behavior: {}",
-            self.behavior
-        );
-        ensure!(
-            matches!(self.format.as_str(), "yaml" | "text"),
-            "unsupported rule-set format: {} (use yaml or text; MRS is not supported)",
-            self.format
-        );
-        ensure!(
-            self.interval <= 31_536_000,
-            "rule-set interval exceeds one year"
-        );
-        ensure!(
-            self.url.is_none() || self.path.is_some(),
-            "HTTP rule-set requires a cache path"
-        );
-        if let Some(path) = &self.path {
-            ensure!(
-                !path.trim().is_empty() && !path.contains('\0'),
-                "rule-set path must be a nonempty file path"
-            );
-        }
-        ensure!(
-            self.payload.is_empty() || (self.path.is_none() && self.url.is_none()),
-            "inline payload cannot be combined with path or url"
-        );
-        if let Some(url) = &self.url {
-            validate_url(url)?;
-        }
-        Ok(())
-    }
-    pub fn parse(&self, data: &[u8]) -> Result<Vec<MatchSpec>> {
-        let text = std::str::from_utf8(data)
-            .context("rule-set must be UTF-8")?
-            .trim_start_matches('\u{feff}');
-        let entries: Vec<String> =
-            match self.format.as_str() {
-                "yaml" => {
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct Payload {
-                        payload: Vec<String>,
-                    }
-                    serde_yaml::from_str::<Payload>(text)
-                        .context("expected YAML payload list")?
-                        .payload
-                }
-                "text" => {
-                    let mut output = Vec::new();
-                    for (line, entry) in text.lines().enumerate() {
-                        let entry = entry.trim();
-                        if entry.is_empty() || entry.starts_with('#') || entry.starts_with("//") {
-                            continue;
-                        }
-                        ensure!(output.len() < 500_000, "rule-set exceeds 500000 entries");
-                        let index = output.len() + 1;
-                        output.push(self.parse_entry(entry).with_context(|| {
-                            format!("rule-set entry {index} (line {})", line + 1)
-                        })?);
-                    }
-                    return Ok(output);
-                }
-                _ => bail!("unsupported rule-set format"),
-            };
-        self.parse_entries(&entries)
-    }
-    pub fn parse_entries(&self, entries: &[String]) -> Result<Vec<MatchSpec>> {
-        ensure!(entries.len() <= 500_000, "rule-set exceeds 500000 entries");
-        entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                self.parse_entry(entry.trim())
-                    .with_context(|| format!("rule-set entry {}", i + 1))
-            })
-            .collect()
-    }
-    fn parse_entry(&self, entry: &str) -> Result<MatchSpec> {
-        match self.behavior.as_str() {
-            "classical" => {
-                let matcher = parse_classical(entry)?;
-                ensure!(
-                    matcher.kind != "rule_set",
-                    "RULE-SET cannot be nested in a classical provider"
-                );
-                Ok(matcher)
-            }
-            "ipcidr" => {
-                entry
-                    .parse::<ipnet::IpNet>()
-                    .context("invalid rule-set CIDR")?;
-                Ok(MatchSpec {
-                    kind: "ip_cidr".into(),
-                    value: entry.into(),
-                })
-            }
-            "domain" => domain(entry),
-            _ => bail!("unsupported rule-set behavior"),
-        }
-    }
-    pub fn load(&self, base: &Path) -> Result<Vec<MatchSpec>> {
+    fn load_with(&self, base: &Path, loader: &ResourceLoader) -> Result<Vec<MatchSpec>> {
         self.validate()?;
         if self.path.is_none() {
             return self.parse_entries(&self.payload);
         }
-        let bytes = load_resource(
+        let bytes = loader.load_resource(
             base,
             self.path.as_deref().unwrap(),
             self.url.as_deref(),
@@ -176,310 +34,16 @@ impl RuleSet {
         self.parse(&bytes)
     }
 }
-
-fn domain(value: &str) -> Result<MatchSpec> {
-    let value = value.trim_end_matches('.').to_ascii_lowercase();
-    ensure!(
-        !value.is_empty()
-            && value.len() <= 253
-            && !value.chars().any(char::is_whitespace)
-            && !value.contains([',', '/', '\\']),
-        "invalid rule-set domain"
-    );
-    let (kind, value) = if let Some(suffix) = value.strip_prefix("+.") {
-        ("domain_suffix", suffix.to_owned())
-    } else if let Some(suffix) = value.strip_prefix('.') {
-        ("domain_subdomain", suffix.to_owned())
-    } else if value.contains('*') {
-        ("domain_pattern", value)
-    } else {
-        ("domain_exact", value)
-    };
-    ensure!(
-        !value.is_empty()
-            && value.split('.').all(|label| !label.is_empty()
-                && !label.contains('+')
-                && (!label.contains('*') || label == "*")),
-        "invalid domain wildcard"
-    );
-    Ok(MatchSpec {
-        kind: kind.into(),
-        value,
-    })
-}
-
-/// Classical providers omit the routing action. All native matchers operate on
-/// the supplied target without DNS lookups, so trailing `no-resolve` is redundant
-/// but accepted for every supported matcher (including domain rules).
-pub fn parse_classical(input: &str) -> Result<MatchSpec> {
-    let parts: Vec<_> = input.split(',').map(str::trim).collect();
-    ensure!(
-        parts.len() == 2 || (parts.len() == 3 && parts[2] == "no-resolve"),
-        "unsupported classical rule parameters: {input}"
-    );
-    let value = parts[1];
-    ensure!(!value.is_empty(), "empty rule value");
-    let kind = match parts[0] {
-        "DOMAIN" => "domain_exact",
-        "DOMAIN-SUFFIX" => "domain_suffix",
-        "DOMAIN-KEYWORD" => "domain_keyword",
-        "DOMAIN-REGEX" => "domain_regex",
-        "GEOSITE" => {
-            geosite::selector(value)?;
-            "geosite"
-        }
-        "IP-CIDR" | "IP-CIDR6" => {
-            value.parse::<ipnet::IpNet>().context("invalid CIDR")?;
-            "ip_cidr"
-        }
-        "DST-PORT" => {
-            ensure!(
-                value.parse::<u16>().is_ok_and(|p| p > 0),
-                "expected single nonzero destination port"
-            );
-            "port"
-        }
-        "NETWORK" => {
-            ensure!(
-                matches!(value.to_ascii_lowercase().as_str(), "tcp" | "udp"),
-                "invalid network"
-            );
-            "network"
-        }
-        "PROCESS-NAME" => "process_name",
-        "PROCESS-PATH" => "process_path",
-        "GEOIP" => {
-            geoip::category(value)?;
-            "geoip"
-        }
-        "RULE-SET" => "rule_set",
-        other => bail!("unsupported rule type {other}"),
-    };
-    match kind {
-        "domain_keyword" => ensure!(
-            value.len() <= 253 && !value.chars().any(char::is_whitespace),
-            "invalid domain keyword"
-        ),
-        "domain_regex" => {
-            compile_domain_regex(value)?;
-        }
-        "domain_exact" | "domain_suffix" => ensure!(
-            value.len() <= 253
-                && !value.chars().any(char::is_whitespace)
-                && !value.starts_with('.')
-                && !value.trim_end_matches('.').is_empty()
-                && !value.trim_end_matches('.').split('.').any(str::is_empty)
-                && !value.contains(['*', '+', '/', '\\', '\0']),
-            "invalid domain matcher"
-        ),
-        "process_name" => ensure!(
-            value.len() <= 256 && !value.contains(['/', '\\', '\0']),
-            "invalid process name"
-        ),
-        "process_path" => ensure!(
-            value.len() <= 4096
-                && !value.contains('\0')
-                && (value.starts_with('/')
-                    || value.starts_with("\\\\")
-                    || (value.as_bytes().get(1) == Some(&b':')
-                        && matches!(value.as_bytes().get(2), Some(b'/' | b'\\')))),
-            "process_path requires an absolute executable path"
-        ),
-        _ => {}
-    }
-    Ok(MatchSpec {
-        kind: kind.into(),
-        value: match kind {
-            "network" => value.to_ascii_lowercase(),
-            "geoip" => value.to_ascii_uppercase(),
-            _ => value.into(),
-        },
-    })
-}
-
-pub fn resolve(base: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.into()
-    } else {
-        base.join(path)
-    }
-}
-fn validate_url(url: &str) -> Result<()> {
-    validate_remote_url(url).map(|_| ())
-}
-
-/// Remote subscriptions, providers and rule data accept HTTP(S) without URL
-/// credentials. Plain HTTP stays allowed for providers that offer no TLS.
-pub fn validate_remote_url(value: &str) -> Result<url::Url> {
-    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid resource URL"))?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.host().is_some()
-            && url.username().is_empty()
-            && url.password().is_none(),
-        "resource URL requires HTTP(S) without URL credentials"
-    );
-    Ok(url)
-}
-
-/// A redirect may never downgrade HTTPS to plain HTTP: a URL configured as
-/// HTTPS keeps its TLS protection. Configured plain HTTP may redirect anywhere.
-pub fn validate_redirect(from: &str, to: &str) -> Result<()> {
-    let target = validate_remote_url(to)?;
-    ensure!(
-        !from.starts_with("https://") || target.scheme() == "https",
-        "redirect from HTTPS to plain HTTP refused"
-    );
-    Ok(())
-}
-
-static SERVE_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SERVED_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Immutable rule generations consume the resident owner's validated cache;
-/// preparing an update must never download or overwrite shared resources.
-pub fn read_only_cache(enabled: bool) { READ_ONLY.store(enabled,std::sync::atomic::Ordering::Relaxed); }
-/// While enabled, an expired but valid cache is used immediately instead of
-/// blocking on a download. Cores enable it for cold start and validation, then
-/// refresh expired resources in the background.
-pub fn serve_stale_cache(enabled: bool) {
-    SERVE_STALE.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-/// Whether an expired cache was served since the last call.
-pub fn take_served_stale() -> bool {
-    SERVED_STALE.swap(false, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// A failed update retains a validated cache. Invalid new content never replaces it.
-pub fn load_resource(
-    base: &Path,
-    path: &str,
-    url: Option<&str>,
-    interval: u64,
-    limit: u64,
-    validate: impl Fn(&[u8]) -> Result<()>,
-) -> Result<Vec<u8>> {
-    load_resource_with(base, path, url, interval, limit, validate).map(|(bytes, ())| bytes)
-}
-
-/// Preserve the validated value alongside its bytes, including on update fallback.
-/// Callers can reuse a parsed index instead of decoding the resource a second time.
-pub fn load_resource_with<T>(
-    base: &Path,
-    path: &str,
-    url: Option<&str>,
-    interval: u64,
-    limit: u64,
-    decode: impl Fn(&[u8]) -> Result<T>,
-) -> Result<(Vec<u8>, T)> {
-    let source = resolve(base, path);
-    let path = if url.is_some() {
-        astra_ipc::storage::runtime_path(&source, "resources")?
-    } else {
-        source.clone()
-    };
-    let read = || -> Result<(Vec<u8>, T)> {
-        let mut data = Vec::new();
-        let input = if path.exists() { &path } else { &source };
-        fs::File::open(input)?
-            .take(limit + 1)
-            .read_to_end(&mut data)?;
-        ensure!(data.len() as u64 <= limit, "resource exceeds size limit");
-        let parsed = decode(&data)?;
-        Ok((data, parsed))
-    };
-    let Some(url) = url else {
-        return read().with_context(|| format!("load resource {}", path.display()));
-    };
-    validate_url(url)?;
-    let cached = read().ok();
-    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        return cached.context("rule generation requires a validated cached resource; refresh it through the resident rule owner first");
-    }
-    let fresh = fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age.as_secs() < interval);
-    let serve = fresh || SERVE_STALE.load(std::sync::atomic::Ordering::Relaxed);
-    let cached = match cached {
-        Some(cached) if serve => {
-            if !fresh {
-                SERVED_STALE.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            return Ok(cached);
-        }
-        cached => cached,
-    };
-    let update = (|| -> Result<(Vec<u8>, T)> {
-        let response = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(15))
-            .redirects(3)
-            .build()
-            .get(url)
-            .call()
-            .context("resource download failed")?;
-        validate_redirect(url, response.get_url())?;
-        let mut data = Vec::new();
-        response
-            .into_reader()
-            .take(limit + 1)
-            .read_to_end(&mut data)?;
-        ensure!(data.len() as u64 <= limit, "download exceeds size limit");
-        let parsed = decode(&data).context("downloaded resource is invalid")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-            astra_ipc::platform::set_private(parent, 0o700)?;
-        }
-        // Unique create-new temporary file; never truncate the active cache.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let temporary = path.with_extension(format!("download-{}-{nonce}", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&data)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
-        Ok((data, parsed))
-    })();
-    match (update, cached) {
-        (Ok(data), _) => Ok(data),
-        (Err(error), Some(data)) => {
-            tracing::warn!(%error,resource=%path.display(),"resource update failed; keeping validated cache");
-            Ok(data)
-        }
-        (Err(error), None) => Err(error),
-    }
-}
+pub use astra_resource::{
+    load_resource, load_resource_with, resolve, validate_redirect, validate_remote_url, LoadPolicy,
+    ResourceLoader,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn immutable_generation_never_downloads_or_rewrites_shared_cache() {
-        // The policy is process-wide, just as it is in a real Rule worker.
-        // Isolate it from ordinary loader tests running in parallel.
-        const CHILD: &str = "ASTRA_TEST_READ_ONLY_RULE_CACHE";
-        if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::immutable_generation_never_downloads_or_rewrites_shared_cache", "--nocapture"])
-                .env(CHILD, "1")
-                .status().unwrap();
-            assert!(status.success());
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("astra-read-only-rule-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("resource");
@@ -488,14 +52,23 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         let url = format!("http://{}/resource", server.local_addr().unwrap());
         let decode = |bytes: &[u8]| -> Result<u32> { Ok(std::str::from_utf8(bytes)?.parse()?) };
-        read_only_cache(true);
-        let (_, number) = load_resource_with(&dir, "resource", Some(&url), 0, 100, decode).unwrap();
+        let loader = ResourceLoader::new(LoadPolicy::ReadOnly);
+        let (_, number) = loader
+            .load_resource_with(&dir, "resource", Some(&url), 0, 100, decode)
+            .unwrap();
         assert_eq!(number, 42);
         assert_eq!(fs::read(&source).unwrap(), b"42");
-        assert!(load_resource_with(&dir, "missing", Some(&url), 0, 100, decode).is_err());
+        assert!(loader
+            .load_resource_with(&dir, "missing", Some(&url), 0, 100, decode)
+            .is_err());
         fs::write(&source, b"invalid").unwrap();
-        assert!(load_resource_with(&dir, "resource", Some(&url), 0, 100, decode).is_err());
-        assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(loader
+            .load_resource_with(&dir, "resource", Some(&url), 0, 100, decode)
+            .is_err());
+        assert_eq!(
+            server.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         assert_eq!(fs::read(&source).unwrap(), b"invalid");
         fs::remove_file(source).unwrap();
         fs::remove_dir(dir).unwrap();
@@ -524,7 +97,8 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut request = [0; 1024];
-            stream.read(&mut request).unwrap();
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
                 .unwrap();
@@ -545,7 +119,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("resource");
         fs::write(&source, b"original local resource").unwrap();
-        let runtime = astra_ipc::storage::runtime_path(&source, "resources").unwrap();
+        let runtime = astra_platform::storage::runtime_path(&source, "resources").unwrap();
         let _ = fs::remove_file(&runtime);
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/resource", server.local_addr().unwrap());
@@ -555,7 +129,8 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut request = [0; 1024];
-            stream.read(&mut request).unwrap();
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n42")
                 .unwrap();

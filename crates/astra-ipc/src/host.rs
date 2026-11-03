@@ -15,52 +15,13 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-pub const HOST_PROTOCOL_VERSION: u16 = 1;
+pub const HOST_PROTOCOL_VERSION: u16 = astra_model::HOST_PROTOCOL_VERSION;
 pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
 pub const MAX_STREAM_DATA: usize = 32 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 65535;
 
-/// Additive JSON telemetry. Deliberately not part of the bincode runtime Snapshot.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RuntimeView {
-    #[serde(flatten)]
-    pub snapshot: crate::runtime::Snapshot,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub telemetry: Option<RuntimeTelemetry>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Coverage {
-    #[default]
-    Unknown,
-    Complete,
-    Partial,
-    Stale,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RuntimeTelemetry {
-    pub host_boot_id: String,
-    pub active_generation: Option<u64>,
-    pub ingress_paused: bool,
-    pub sample_sequence: u64,
-    /// Milliseconds on the host's monotonic clock, not wall-clock timestamps.
-    pub sample_elapsed_ms: u64,
-    pub sample_age_ms: u64,
-    pub coverage: Coverage,
-    pub generations: Vec<GenerationTelemetry>,
-    pub connection_generations: std::collections::BTreeMap<u64, u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GenerationTelemetry {
-    pub generation: u64,
-    pub sample_age_ms: Option<u64>,
-    pub healthy: bool,
-}
-
+#[cfg(test)]
+use astra_model::runtime::{RuntimeTelemetry, RuntimeView};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FlowId {
     /// Unique host boot identifier. Never reuse it after a host restart.
@@ -582,11 +543,42 @@ pub async fn receive_datagram<R: AsyncRead + Unpin>(stream: &mut R) -> io::Resul
     Ok(payload)
 }
 
+pub async fn send_message<T: Serialize, S: AsyncWrite + Unpin>(
+    s: &mut S,
+    body: T,
+) -> anyhow::Result<()> {
+    send_control(s, &ControlEnvelope::new(0, body)).await?;
+    Ok(())
+}
+pub async fn receive_message<T: serde::de::DeserializeOwned, S: AsyncRead + Unpin>(
+    s: &mut S,
+) -> anyhow::Result<T> {
+    Ok(receive_control(s).await?.message)
+}
+
+pub async fn request_json_control<T: Serialize>(
+    path: &std::path::Path,
+    command: T,
+) -> anyhow::Result<serde_json::Value> {
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        astra_platform::platform::connect_trusted(path),
+    )
+    .await??;
+    send_message(&mut stream, command).await?;
+    let result: std::result::Result<serde_json::Value, String> = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        receive_message(&mut stream),
+    )
+    .await??;
+    result.map_err(anyhow::Error::msg)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn runtime_telemetry_json_is_additive_to_legacy_snapshot() {
-        let snapshot = crate::runtime::Snapshot {
+        let snapshot = astra_model::runtime::Snapshot {
             pid: 42,
             upload: 123,
             ..Default::default()
@@ -604,7 +596,7 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&enhanced).unwrap();
-        let old_reader: crate::runtime::Snapshot = serde_json::from_str(&json).unwrap();
+        let old_reader: astra_model::runtime::Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(old_reader.upload, 123);
         let new_reader: super::RuntimeView = serde_json::from_str(&json).unwrap();
         assert_eq!(new_reader.telemetry.unwrap().sample_sequence, 7);
@@ -714,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn half_close_over_platform_local_stream() {
-        let (left, right) = crate::platform::stream_pair().await.unwrap();
+        let (left, right) = astra_platform::platform::stream_pair().await.unwrap();
         timeout(Duration::from_secs(10), half_close(left, right))
             .await
             .unwrap();

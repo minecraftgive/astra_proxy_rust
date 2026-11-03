@@ -53,7 +53,7 @@ struct Rules {
     #[serde(skip_serializing_if = "Option::is_none")]
     geosite_url: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    rule_sets: BTreeMap<String, astra_rule_data::RuleSet>,
+    rule_sets: BTreeMap<String, astra_model::config::ruleset::RuleSet>,
     rules: Vec<Rule>,
 }
 
@@ -344,10 +344,10 @@ impl Resolver<'_> {
 fn native_groups(
     resolver: &Resolver<'_>,
 ) -> (
-    BTreeMap<String, astra_ipc::groups::Group>,
+    BTreeMap<String, astra_model::groups::Group>,
     Vec<(String, String)>,
 ) {
-    use astra_ipc::groups::{Group, Mode};
+    use astra_model::groups::{Group, Mode};
     let names: HashSet<_> = resolver
         .groups
         .iter()
@@ -450,7 +450,7 @@ fn native_groups(
                 subset.insert(name, group.clone());
             }
         }
-        match astra_ipc::groups::validate(&subset, resolver.nodes) {
+        match astra_model::groups::validate(&subset, resolver.nodes) {
             Ok(_) => {
                 valid.insert(name.clone(), candidates[name].clone());
             }
@@ -656,7 +656,7 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             warnings.push(source::at(group_lines.get(name).copied().flatten(), format!("代理组 {name}: load-balance 使用健康节点轮询，未保留 consistent-hashing / sticky-sessions 策略")));
         }
     }
-    astra_ipc::groups::validate(&proxy_groups, &nodes)
+    astra_model::groups::validate(&proxy_groups, &nodes)
         .map_err(anyhow::Error::msg)
         .context("代理组配置超过原生限制或包含无效引用")?;
     resolver.preserved.extend(proxy_groups.keys().cloned());
@@ -703,10 +703,10 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
                 .as_str()
                 .context("rule-provider name must be a string")?
                 .to_owned();
-            let parsed = (|| -> Result<astra_rule_data::RuleSet> {
+            let parsed = (|| -> Result<astra_model::config::ruleset::RuleSet> {
                 let behavior = required(provider, "behavior")?;
                 let format = s(provider, "format").unwrap_or_else(|| "yaml".into());
-                let mut source = astra_rule_data::RuleSet {
+                let mut source = astra_model::config::ruleset::RuleSet {
                     behavior,
                     format,
                     ..Default::default()
@@ -733,7 +733,7 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
                     }
                     "file" => {
                         source.path = Some(
-                            astra_rule_data::resolve(
+                            astra_model::config::resolve(
                                 &options.base_dir,
                                 &required(provider, "path")?,
                             )
@@ -895,7 +895,7 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             .filter(|set| set.behavior == "classical")
             .any(|set| {
                 set.payload.iter().any(|item| {
-                    astra_rule_data::parse_classical(item).is_ok_and(|rule| {
+                    astra_model::config::ruleset::parse_classical(item).is_ok_and(|rule| {
                         rule.kind == "geoip" && rule.value != "LAN" && rule.value.len() != 2
                     })
                 })
@@ -916,7 +916,7 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
                 .any(|set| set.behavior == "classical"))
     {
         let filename = if use_dat { "geoip.dat" } else { "Country.mmdb" };
-        let local = astra_rule_data::resolve(&options.base_dir, filename);
+        let local = astra_model::config::resolve(&options.base_dir, filename);
         rules.geoip_database = Some(if rules.geoip_url.is_some() {
             format!("geoip/{filename}")
         } else if use_dat && !local.is_file() {
@@ -940,7 +940,7 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             .values()
             .any(|source| source.behavior == "classical");
     if rules.geosite_database.is_none() && (needs_geosite || rules.geosite_url.is_some()) {
-        let local = astra_rule_data::resolve(&options.base_dir, "geosite.dat");
+        let local = astra_model::config::resolve(&options.base_dir, "geosite.dat");
         if rules.geosite_url.is_none() && local.is_file() {
             rules.geosite_database = Some(local.to_string_lossy().into_owned());
         } else {
@@ -951,8 +951,8 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
         }
     }
     let node_count = outbounds.len();
-    astra_ipc::groups::ensure_default(&mut proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
-    astra_ipc::groups::validate(&proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
+    astra_model::groups::ensure_default(&mut proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
+    astra_model::groups::validate(&proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
     for rule in &mut rules.rules {
         if rule.action.starts_with("proxy:") {
             rule.action = "proxy:PROXY".into();
@@ -984,6 +984,6 @@ fn parse_rule(parts: &[&str]) -> Result<(String, String)> {
     } else {
         format!("{},{}", parts[0], parts[1])
     };
-    let matcher = astra_rule_data::parse_classical(&classical)?;
+    let matcher = astra_model::config::ruleset::parse_classical(&classical)?;
     Ok((matcher.kind, matcher.value))
 }

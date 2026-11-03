@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import tempfile
 import time
-from platform_support import executable, process_flags
+from astra_tools.platform import executable, process_flags
+from astra_tools.workspace import resolve_binary_dir
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -19,10 +20,10 @@ def main():
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--bin-dir', type=pathlib.Path, help='directory containing Astra executables (only astra-proxy is needed for standalone)')
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--artifact-dir', type=pathlib.Path, help='build run containing artifacts.json')
     args = parser.parse_args()
-    binary_dir = (args.bin_dir.resolve() if args.bin_dir else
-                  ROOT / 'bin' if not args.debug and (ROOT / 'bin').is_dir() else
-                  ROOT / 'target' / ('debug' if args.debug else 'release'))
+    binary_dir = resolve_binary_dir(args.bin_dir, artifact_dir=args.artifact_dir,
+                                    profile='debug' if args.debug else 'release', role='client')
     env = dict(os.environ)
     proxy_command = [str(binary_dir / executable('astra-proxy')), str(args.proxy.resolve())]
     if not pathlib.Path(proxy_command[0]).is_file():

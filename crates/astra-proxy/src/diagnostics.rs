@@ -1,9 +1,10 @@
 use crate::App;
 use anyhow::{ensure, Context, Result};
-use astra_ipc::{
-    diagnostics::{Event, Probe, Report},
-    RouteAction, Target,
-};
+use astra_model::diagnostics::Event;
+use astra_model::diagnostics::Probe;
+use astra_model::diagnostics::Report;
+use astra_model::RouteAction;
+use astra_model::Target;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http_body_util::{BodyExt, Empty};
@@ -29,7 +30,7 @@ pub fn targets(app: &App) -> Vec<String> {
             app.config
                 .proxy_groups
                 .keys()
-                .filter(|name| !astra_ipc::groups::builtin(name))
+                .filter(|name| !astra_model::groups::builtin(name))
                 .cloned(),
         )
         .collect()
@@ -72,7 +73,7 @@ pub async fn run(app: &App) -> Report {
                 app.config
                     .proxy_groups
                     .keys()
-                    .filter(|name| !astra_ipc::groups::builtin(name))
+                    .filter(|name| !astra_model::groups::builtin(name))
                     .cloned()
                     .map(RouteAction::Proxy),
             ),

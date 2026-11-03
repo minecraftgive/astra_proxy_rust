@@ -1,24 +1,22 @@
 use crate::{accept::Protocol, wire};
 use anyhow::{ensure, Context, Result};
-use astra_ipc::Target;
+use astra_model::Target;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 type HeldFragment = (Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+type FragmentAssembly = (
+    Instant,
+    u8,
+    Option<Target>,
+    Vec<Option<HeldFragment>>,
+    usize,
+);
 pub struct Fragments {
     budget: Arc<tokio::sync::Semaphore>,
-    entries: HashMap<
-        (u32, u16),
-        (
-            Instant,
-            u8,
-            Option<Target>,
-            Vec<Option<HeldFragment>>,
-            usize,
-        ),
-    >,
+    entries: HashMap<(u32, u16), FragmentAssembly>,
 }
 impl Default for Fragments {
     fn default() -> Self {

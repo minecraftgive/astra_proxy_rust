@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-astra-ipc = { path = "../astra-ipc" }
+astra-model = { path = "../astra-model" }
+astra-resource = { path = "../astra-resource" }
 anyhow.workspace = true
 serde.workspace = true
 serde_yaml = "0.9"
 ipnet = "2"
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2"
 tracing.workspace = true
 
 prost = "0.14"
 regex = "1"
+
+[dev-dependencies]
+astra-platform = { path = "../astra-platform" }

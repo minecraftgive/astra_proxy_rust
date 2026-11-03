@@ -1,5 +1,5 @@
 //! Private UI/manager activity log. Configuration payloads are never logged.
-use astra_ipc::platform::OpenOptionsExt;
+use astra_platform::platform::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,

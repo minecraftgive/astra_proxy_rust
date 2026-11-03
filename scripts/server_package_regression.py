@@ -6,7 +6,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from platform_support import executable
+from astra_tools.platform import executable
+from astra_tools.package_checks import verify_manifest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 
 def main():
@@ -18,9 +19,10 @@ def main():
         roots=list(directory.iterdir());assert len(roots)==1;root=roots[0]
         actual={p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
         assert root.name=='server'
-        assert actual=={executable('astra-server-core'),executable('astra-server-tui'),'server.example.toml'},actual
+        assert actual=={executable(n) for n in ('astra-server-core','astra-server-tui','astra-manager','astra-host')} | {'server.example.toml','manifest.json'},actual
         assert {p.name for p in root.iterdir()}==actual
-        for name in ('astra-server-core','astra-server-tui'):
+        verify_manifest(root, 'server')
+        for name in ('astra-server-core','astra-server-tui','astra-manager','astra-host'):
             subprocess.run([str(root/executable(name)),'--help'],check=True,capture_output=True,timeout=10)
         binary=str(root/executable('astra-server-core'))
         subprocess.run([binary,'--generate-cert',str(root/'tls'),'localhost'],check=True,capture_output=True,timeout=10)

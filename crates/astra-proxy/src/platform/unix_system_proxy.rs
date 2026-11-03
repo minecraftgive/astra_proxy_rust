@@ -1,7 +1,7 @@
 //! OS settings are snapshotted before any write and restored on normal shutdown.
 use crate::config::ProxyConfig;
 use anyhow::{bail, ensure, Context, Result};
-use astra_ipc::platform::OpenOptionsExt;
+use astra_platform::platform::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
@@ -210,7 +210,7 @@ impl Guard {
         })?;
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(journal)
             .with_context(|| format!("system proxy recovery file exists or cannot be created: {}; restore it using --restore-system-proxy before starting", journal.display()))?;
-        if let Err(error) = astra_ipc::platform::adopt_owner(journal) {
+        if let Err(error) = astra_platform::platform::adopt_owner(journal) {
             let _ = std::fs::remove_file(journal);
             return Err(anyhow::Error::new(error)
                 .context("hand the system proxy journal to the invoking user"));

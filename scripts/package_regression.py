@@ -11,9 +11,11 @@ import sys
 import tarfile
 import tempfile
 import threading
-from protocol_matrix import EchoServer, Echo, free_port, exact, process, wait_port
-from core_regression import socks, wait_socket
-from platform_support import executable, interrupt
+from astra_tools.net import EchoServer, Echo, free_port, exact
+from astra_tools.processes import process, wait_port
+from astra_tools.net import socks
+from astra_tools.processes import wait_socket
+from astra_tools.platform import executable, interrupt
 
 
 def main():
@@ -35,14 +37,14 @@ def main():
                 assert member.isfile() or member.isdir()
             tar.extractall(directory, filter="data")
         root, = directory.iterdir()
-        expected_files = {executable(n) for n in ('astra-rule','astra-proxy','astra-tui','astra-host','astra-convert')} | {'client.example.toml', 'manifest.json'}
+        expected_files = {executable(n) for n in ('astra-rule','astra-proxy','astra-tui','astra-host','astra-manager','astra-convert')} | {'client.example.toml', 'manifest.json'}
         if os.name == 'nt' and (root/'wintun.dll').exists():expected_files.add('wintun.dll')
         actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
         assert root.name == 'client' and actual == expected_files and {p.name for p in root.iterdir()} == expected_files, actual
         manifest = json.loads((root/'manifest.json').read_text(encoding='utf-8'))
         assert manifest['schema_version'] == 1 and manifest['release_id']
         assert manifest['host_protocol']['min'] <= 1 <= manifest['host_protocol']['max']
-        assert {'astra-rule', 'astra-proxy', 'astra-tui', 'astra-host'} <= manifest['components'].keys()
+        assert {'astra-rule', 'astra-proxy', 'astra-tui', 'astra-host', 'astra-manager'} <= manifest['components'].keys()
         listed = {entry['path'] for entry in manifest['files']}
         assert len(listed) == len(manifest['files']) and listed == actual - {'manifest.json'}
         for entry in manifest['files']:
@@ -54,6 +56,7 @@ def main():
             assert digest.hexdigest() == entry['sha256'], entry['path']
         subprocess.run([str(root/executable('astra-tui')), '--help'],check=True,capture_output=True,timeout=10)
         subprocess.run([str(root/executable('astra-host')), '--help'],check=True,capture_output=True,timeout=10)
+        subprocess.run([str(root/executable('astra-manager')), '--help'],check=True,capture_output=True,timeout=10)
         subprocess.run([str(root/executable('astra-proxy')), '--check', str(root/'client.example.toml')],check=True,timeout=15)
         # The single client example contains a commented complete Rule Core template.
         text = (root/'client.example.toml').read_text(encoding='utf-8')
@@ -61,15 +64,15 @@ def main():
         template = directory/'rule-template.toml'
         template.write_text('\n'.join(line[2:] for line in appendix.splitlines()),encoding='utf-8')
         subprocess.run([str(root/executable('astra-rule')),'--check',str(template)],check=True,timeout=10)
-        tui = str(root/executable('astra-tui'))
+        manager = str(root/executable('astra-manager'))
         # A short state path fits macOS UDS limits even when extraction uses /var/folders.
         with tempfile.TemporaryDirectory(prefix='astra-tui-package-', dir=None if os.name == 'nt' else '/tmp') as state:
             state = pathlib.Path(state)
-            with process([tui, '--manager', '--state-dir', str(state)], directory, 'tui-manager') as (child, log):
-                wait_socket(state/'manager.sock', child, log)
-                subprocess.run([tui, '--shutdown', '--state-dir', str(state)], check=True, cwd=directory, timeout=10)
+            with process([manager, '--state-dir', str(state/'state'), '--config-dir', str(state/'config'), '--bin-dir', str(root)], directory, 'manager') as (child, log):
+                wait_socket(state/'state/management.sock', child, log, timeout=20)
+                subprocess.run([manager, '--shutdown', '--state-dir', str(state/'state')], check=True, cwd=directory, timeout=10)
                 assert child.wait(timeout=5) == 0, log.read_text()
-                assert not (state/'manager.sock').exists(), 'TUI manager left a stale socket'
+                assert not (state/'state/management.sock').exists(), 'Manager left a stale socket'
         port = free_port()
         sock = directory/'rules.sock'
         rules = directory/'rules.toml'

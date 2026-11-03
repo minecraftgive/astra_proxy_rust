@@ -5,74 +5,11 @@ use base64::Engine;
 use meow_common::{Metadata, ProxyAdapter};
 use meow_proxy::{dialer::DirectDialer, TransportChain};
 use meow_transport::tls::{RealityConfig, TlsConfig, TlsLayer};
-use serde::Deserialize;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Protocol {
-    Tuic,
-    Vless,
-    Vmess,
-    Shadowsocks,
-    Hysteria2,
-    Trojan,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NodeConfig {
-    pub protocol: Protocol,
-    pub server: String,
-    pub port: u16,
-    pub uuid: Option<String>,
-    pub password: Option<String>,
-    pub cipher: Option<String>,
-    pub encryption: Option<String>,
-    pub flow: Option<String>,
-    pub tls: Option<TlsOptions>,
-    #[serde(default)]
-    pub transport: TransportOptions,
-    pub mux: Option<String>,
-    pub obfs_password: Option<String>,
-    pub pin_sha256: Option<String>,
-    pub tuic_udp_mode: Option<String>,
-    pub tuic_idle_timeout_secs: Option<u64>,
-    pub congestion_control: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TlsOptions {
-    pub server_name: String,
-    pub ca_file: Option<String>,
-    pub fingerprint: Option<String>,
-    pub cert_pin_sha256: Option<String>,
-    pub reality_public_key: Option<String>,
-    pub reality_short_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TransportOptions {
-    pub kind: TransportKind,
-    pub path: Option<String>,
-    pub host: Option<String>,
-    pub service_name: Option<String>,
-    pub mode: Option<String>,
-    pub headers: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportKind {
-    #[default]
-    Tcp,
-    Ws,
-    Grpc,
-    HttpUpgrade,
-    Xhttp,
-}
+pub use astra_model::config::protocol::{
+    NodeConfig, Protocol, TlsOptions, TransportKind, TransportOptions,
+};
 
 pub enum NativeOutbound {
     Tuic(crate::tuic::Client),
@@ -151,7 +88,7 @@ pub fn compile(configs: &[OutboundConfig], base: &Path) -> Result<Registry> {
     Ok(registry)
 }
 
-pub async fn connect(outbound: &NativeOutbound, target: &astra_ipc::Target) -> Result<Stream> {
+pub async fn connect(outbound: &NativeOutbound, target: &astra_model::Target) -> Result<Stream> {
     use crate::stable_write::StableWrite;
     // meow transports (gRPC, h2) require identical bytes when a pending write is retried.
     match outbound {
@@ -167,7 +104,7 @@ pub async fn connect(outbound: &NativeOutbound, target: &astra_ipc::Target) -> R
 
 pub async fn connect_udp(
     outbound: &NativeOutbound,
-    target: &astra_ipc::Target,
+    target: &astra_model::Target,
 ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
     match outbound {
         NativeOutbound::Tuic(client) => client.connect_udp(target).await,
@@ -193,7 +130,7 @@ pub async fn connect_udp(
     }
 }
 
-pub fn metadata(target: &astra_ipc::Target) -> Metadata {
+pub fn metadata(target: &astra_model::Target) -> Metadata {
     let ip = target.host.parse().ok();
     Metadata {
         dst_ip: ip,
@@ -478,7 +415,7 @@ mod tests {
             let registry = compile(&configs, Path::new(".")).unwrap();
             let packet = connect_udp(
                 &registry["socks"],
-                &astra_ipc::Target {
+                &astra_model::Target {
                     host: "example.test".into(),
                     port: 53,
                 },
@@ -498,7 +435,7 @@ mod tests {
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
-    #[derive(Deserialize)]
+    #[derive(serde::Deserialize)]
     struct TestConfig {
         outbounds: Vec<OutboundConfig>,
     }

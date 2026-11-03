@@ -15,7 +15,8 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
-from windows_modes_regression import Core, base, free_port, powershell, proxy_state, wininet_get
+from astra_tools.windows import Core, base, powershell, proxy_state, wininet_get
+from astra_tools.net import free_port
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 K=C.WinDLL('kernel32',use_last_error=True)

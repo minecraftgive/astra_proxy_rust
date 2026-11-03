@@ -1,0 +1,41 @@
+[package]
+name = "astra-manager"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+[[bin]]
+name = "astra-manager"
+path = "src/main.rs"
+[[bin]]
+name = "astra-host"
+path = "src/host_main.rs"
+[dependencies]
+astra-platform = { path = "../astra-platform" }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json = "1"
+toml.workspace = true
+toml_edit = "0.23"
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+astra-ipc = { path = "../astra-ipc" }
+astra-management = { path = "../astra-management" }
+astra-app = { path = "../astra-app" }
+astra-model = { path = "../astra-model" }
+astra-update = { path = "../astra-update" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+subtle = "2"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.14"

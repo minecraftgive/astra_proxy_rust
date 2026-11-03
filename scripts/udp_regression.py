@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """UDP association routing, endpoint isolation, limits and lifecycle regressions."""
+from astra_tools.workspace import resolve_binary_dir
 import contextlib
 import argparse
 import pathlib
@@ -7,8 +8,11 @@ import socket
 import tempfile
 import threading
 import time
-from protocol_matrix import ROOT, UdpEcho, UdpEchoServer, exact, free_port, process, wait_port
-from core_regression import wait_socket, socks
+from astra_tools.workspace import ROOT
+from astra_tools.net import UdpEcho, UdpEchoServer, exact, free_port
+from astra_tools.processes import process, wait_port
+from astra_tools.processes import wait_socket
+from astra_tools.net import socks
 
 
 def association(port, source_port=0):
@@ -28,15 +32,15 @@ def packet(port, payload=b'udp'):
 def silent(sock):
     try:
         data = sock.recv(65536)
-    except (socket.timeout, TimeoutError, ConnectionRefusedError):
+    except (socket.timeout, TimeoutError, ConnectionRefusedError, ConnectionResetError):
         return
     raise AssertionError(f'unexpected UDP response: {data!r}')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT / 'target/debug')
-    args = parser.parse_args()
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     binaries = args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra-udp-') as td, contextlib.ExitStack() as stack:
         directory = pathlib.Path(td)
@@ -45,9 +49,9 @@ def main():
             threading.Thread(target=echo.serve_forever, daemon=True).start()
         ports = [echo.server_address[1] for echo in echoes]
         rule_path, proxy_path, rule_socket = directory/'rule.toml', directory/'proxy.toml', directory/'rule.sock'
-        rule_path.write_text(f'socket="{rule_socket}"\ndefault_action="block"\n[[rules]]\nkind="network"\nvalue="udp"\naction="direct"\n')
+        rule_path.write_text(f'socket="{rule_socket.as_posix()}"\ndirect_local=false\ndefault_action="block"\n[[rules]]\nkind="network"\nvalue="udp"\naction="direct"\n')
         port = free_port()
-        proxy_path.write_text(f'rule_socket="{rule_socket}"\nsocks5_listen="127.0.0.1:{port}"\nmax_udp_flows=1\nudp_targets_per_association=1\nudp_idle_timeout_secs=2\nshutdown_timeout_secs=1\n')
+        proxy_path.write_text(f'rule_socket="{rule_socket.as_posix()}"\nsocks5_listen="127.0.0.1:{port}"\nmax_udp_flows=1\nudp_targets_per_association=1\nudp_idle_timeout_secs=2\nshutdown_timeout_secs=1\n')
         rule, log = stack.enter_context(process([str(binaries/'astra-rule'),str(rule_path)],directory,'rule'))
         wait_socket(rule_socket,rule,log)
         proxy, log = stack.enter_context(process([str(binaries/'astra-proxy'),str(proxy_path)],directory,'proxy'))

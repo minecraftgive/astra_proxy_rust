@@ -1,8 +1,6 @@
 //! Node share links are credentials: never include the original URI in errors.
 use crate::{convert, Converted, Options};
-#[path = "share/shared_export.rs"]
 pub mod export;
-#[path = "share/shared_other.rs"]
 mod other;
 use anyhow::{ensure, Context, Result};
 pub use export::export_node;

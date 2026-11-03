@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Server extension interoperability; server and client fixtures are separate."""
+from astra_tools.workspace import resolve_binary_dir
 import os,argparse,base64,contextlib,concurrent.futures,hashlib,json,pathlib,socket,socketserver,ssl,subprocess,tempfile,threading,time
-from protocol_matrix import Echo,UdpEcho,UdpEchoServer,UdpEchoServer6,TlsEcho,exact,free_port,process,wait_port,udp_probe,tls_probe
-from server_regression import ROOT,USER,PASSWORD,connect,command
-from platform_support import executable
+from astra_tools.net import Echo, UdpEcho, UdpEchoServer, UdpEchoServer6, TlsEcho, exact, free_port, udp_probe, tls_probe
+from astra_tools.processes import process, wait_port
+from astra_tools.workspace import ROOT
+from astra_tools.fixtures.server import USER, PASSWORD, connect, command
+from astra_tools.platform import executable
 CASES=['reality','vision','vision-reality','reality-grpc','reality-xhttp',
        'mux-smux','mux-yamux','mux-h2mux','mux-muxcool',
        'vmess-mux-smux','vmess-mux-yamux','vmess-mux-h2mux',
@@ -123,6 +126,6 @@ def empty_cool(peer,target,cert):
             n=int.from_bytes(exact(stream,2),'big');reply=exact(stream,n);assert reply[:4]==bytes([0,1,2,1]);assert exact(stream,2)==bytes([0,0])
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug');parser.add_argument('--case',action='append',choices=CASES);parser.add_argument('--bad-auth',action='store_true');parser.add_argument('--fault',choices=['reality-key','short-id','decryption-key','salamander-password']);args=parser.parse_args();os.environ['ASTRA_SERVER_DEBUG']='1'
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=None);parser.add_argument('--case',action='append',choices=CASES);parser.add_argument('--bad-auth',action='store_true');parser.add_argument('--fault',choices=['reality-key','short-id','decryption-key','salamander-password']);args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug');os.environ['ASTRA_SERVER_DEBUG']='1'
     for case in args.case or CASES:run(case,args.bin_dir.resolve(),args.bad_auth,args.fault)
 if __name__=='__main__':main()

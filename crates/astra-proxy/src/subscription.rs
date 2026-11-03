@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 use astra_convert::subscription::Subscription;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -39,7 +39,7 @@ pub(crate) async fn download(
                 .host_str()
                 .context("subscription host missing")?
                 .trim_matches(['[', ']']);
-            let target = astra_ipc::Target {
+            let target = astra_model::Target {
                 host: host.into(),
                 port: url
                     .port_or_known_default()
@@ -47,7 +47,7 @@ pub(crate) async fn download(
             };
             phase.store(0, Ordering::Relaxed);
             let mut connection = app
-                .connect(&target, &astra_ipc::RouteAction::Proxy(proxy.into()))
+                .connect(&target, &astra_model::RouteAction::Proxy(proxy.into()))
                 .await
                 .with_context(|| {
                     format!(
@@ -158,7 +158,10 @@ pub(crate) struct Cache {
     pub subscriptions: std::collections::BTreeMap<String, Subscription>,
 }
 fn path(config: &Path) -> Result<PathBuf> {
-    Ok(astra_ipc::storage::runtime_path(config, "subscriptions")?)
+    Ok(astra_platform::storage::runtime_path(
+        config,
+        "subscriptions",
+    )?)
 }
 pub(crate) fn read(config: &Path, base: &str) -> Option<Cache> {
     let load = || -> Result<Cache> {
@@ -321,26 +324,12 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
         "subscription cache too large"
     );
     let target = path(config)?;
-    astra_ipc::storage::prepare_parent(&target)?;
-    let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    astra_ipc::platform::adopt_owner(&temporary)?;
-    let result = (|| -> Result<()> {
-        file.write_all(&data)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, &target)?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(temporary);
-    result
+    astra_platform::storage::atomic_write(
+        &target,
+        &data,
+        astra_platform::storage::WritePolicy::runtime(),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -527,7 +516,7 @@ mod tests {
         assert!(app.outbounds.contains_key("cached-node"));
         assert_eq!(
             app.standalone_action,
-            Some(astra_ipc::RouteAction::Proxy("PROXY".into()))
+            Some(astra_model::RouteAction::Proxy("PROXY".into()))
         );
         assert_eq!(
             app.config.proxy_groups["subscription"].members,
@@ -539,7 +528,10 @@ mod tests {
         // shared cache changes or disappears after candidate preparation.
         let worker = App::from_text(&config, app.effective_text.clone()).unwrap();
         assert!(worker.outbounds.contains_key("cached-node"));
-        assert_eq!(worker.config.proxy_groups["subscription"].members, ["cached-node"]);
+        assert_eq!(
+            worker.config.proxy_groups["subscription"].members,
+            ["cached-node"]
+        );
         assert!(read(&config, &format!("{base}\n# changed")).is_none());
         std::fs::write(path(&config).unwrap(), b"invalid").unwrap();
         let app = cached_app(&config, App::from_text(&config, base.into()).unwrap());

@@ -10,8 +10,9 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable, process_flags
-from protocol_matrix import free_port, wait_port
+from astra_tools.platform import executable, process_flags
+from astra_tools.net import free_port
+from astra_tools.processes import wait_port
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -47,7 +48,7 @@ def main():
         base = f'standalone=true\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\nwatch_config=true\n'
         base += '[proxy_groups.one]\nsubscription="one"\ninclude_in_proxy=false\n'
         def source(name, path):
-            return f'[subscriptions.{name}]\nurl={json.dumps(url+path)}\ninterval=3600\n'
+            return f'[subscriptions.{name}]\nproxy="DIRECT"\nurl={json.dumps(url+path)}\ninterval=3600\n'
         config.write_text(base+source('one', '/a')+source('two', '/b'), encoding='utf-8')
         with log_path.open('w', encoding='utf-8') as log:
             child = subprocess.Popen([binary, str(config)], stdout=log, stderr=subprocess.STDOUT,

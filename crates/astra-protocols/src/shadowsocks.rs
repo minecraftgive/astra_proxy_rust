@@ -1,4 +1,4 @@
-use astra_ipc::Target;
+use astra_model::Target;
 use std::net::SocketAddr;
 pub fn from_ss(a: shadowsocks::relay::socks5::Address) -> Target {
     match a {

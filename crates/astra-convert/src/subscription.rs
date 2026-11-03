@@ -1,68 +1,23 @@
 //! Bounded Clash subscription and proxy-provider loading, shared with Proxy Core.
 use crate::{convert, get, required, s, seq, yes, Converted, Options};
 use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_yaml::Value as Y;
-use std::{collections::HashSet, io::Read, path::Path, time::Duration};
+use std::{collections::HashSet, io::Read, path::Path};
 
 const LIMIT: u64 = 8 * 1024 * 1024;
-#[path = "subscription/shared_diagnostics.rs"]
 pub mod diagnostics;
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct Subscription {
-    pub url: String,
-    pub interval: u64,
-    pub user_agent: String,
-    /// Proxy group or outbound used by Proxy Core for subscription downloads.
-    pub proxy: String,
-    pub import_groups: bool,
-    pub managed_nodes: Vec<String>,
-    pub managed_groups: Vec<String>,
-}
-impl Default for Subscription {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            interval: 3600,
-            user_agent: "clash.meta/astra".into(),
-            proxy: "PROXY".into(),
-            import_groups: false,
-            managed_nodes: vec![],
-            managed_groups: vec![],
-        }
-    }
-}
-impl Subscription {
-    pub fn validate(&self) -> Result<()> {
-        validate_url(&self.url)?;
-        ensure!(
-            !self.proxy.trim().is_empty() && !self.proxy.contains(['\r', '\n']),
-            "invalid subscription update proxy"
-        );
-        ensure!(
-            (60..=604800).contains(&self.interval),
-            "subscription interval must be 60..604800 seconds"
-        );
-        ensure!(
-            !self.user_agent.is_empty()
-                && self.user_agent.len() <= 256
-                && !self.user_agent.contains(['\r', '\n']),
-            "invalid subscription user agent"
-        );
-        Ok(())
-    }
-}
+pub use astra_model::config::subscription::Subscription;
 pub fn validate_url(value: &str) -> Result<()> {
-    astra_rule_data::validate_remote_url(value)
+    astra_model::config::validate_remote_url(value)
         .map(|_| ())
         .context("subscription requires HTTP(S) without URL credentials")
 }
-pub use astra_rule_data::validate_redirect;
+pub use astra_model::config::validate_redirect;
+#[cfg(feature = "download")]
 pub fn download(url: &str, user_agent: &str) -> Result<String> {
     validate_url(url)?;
     let response = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(20))
         .redirects(3)
         .build()
         .get(url)
@@ -78,6 +33,10 @@ pub fn download(url: &str, user_agent: &str) -> Result<String> {
         })?;
     validate_redirect(url, response.get_url())?;
     bounded(response.into_reader())
+}
+#[cfg(not(feature = "download"))]
+pub fn download(_url: &str, _user_agent: &str) -> Result<String> {
+    anyhow::bail!("network downloading is disabled; supply content or a download callback")
 }
 fn bounded(reader: impl Read) -> Result<String> {
     let mut data = Vec::new();
@@ -494,7 +453,7 @@ pub fn prepare_groups(document: &mut toml::Table) -> Result<()> {
             let mut name = stem.clone();
             let mut index = 1;
             while name == "PROXY"
-                || astra_ipc::groups::builtin(&name)
+                || astra_model::groups::builtin(&name)
                 || nodes.contains(&name)
                 || groups.contains_key(&name)
             {
@@ -570,7 +529,7 @@ pub fn merge_named(
             .into(),
     );
     prepare_groups(&mut document)?;
-    let groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> =
+    let groups: std::collections::BTreeMap<String, astra_model::groups::Group> =
         document["proxy_groups"].clone().try_into()?;
     let nodes = document
         .get("outbounds")
@@ -579,11 +538,11 @@ pub fn merge_named(
         .flatten()
         .filter_map(|v| v.get("tag")?.as_str().map(str::to_owned))
         .collect();
-    let expanded = astra_ipc::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)?;
+    let expanded = astra_model::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)?;
     for (name, group) in &expanded {
         if group.selected.as_ref().is_some_and(|tag| {
-            astra_ipc::groups::member_path(&expanded, name, tag).is_none()
-                && !astra_ipc::groups::pending_subscription_selection(&expanded, name)
+            astra_model::groups::member_path(&expanded, name, tag).is_none()
+                && !astra_model::groups::pending_subscription_selection(&expanded, name)
         }) {
             document["proxy_groups"][name]
                 .as_table_mut()

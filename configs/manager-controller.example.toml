@@ -1,0 +1,29 @@
+# Copy this file, supply your TLS certificate/key, then provision each agent.
+role = "controller"
+
+[storage]
+state_dir = "../state/controller"
+config_dir = "../config/controller"
+bin_dir = "../bin"
+runtime_dir = "../runtime/controller"
+
+[controller]
+listen = "0.0.0.0:9443"
+tls_cert = "../secrets/controller.crt"
+tls_key = "../secrets/controller.key"
+
+# provision-agent / rotate-agent / revoke-agent maintain this table.
+# Store only SHA-256 digests here; no agent credential is supplied by default.
+[controller.agent_token_hashes]
+
+[local_ipc]
+endpoint = "../runtime/controller/management.sock"
+
+[web]
+enabled = false
+
+[limits]
+concurrent_tasks = 16
+event_buffer = 1024
+upload_bytes = 268435456
+ipc_connections = 64

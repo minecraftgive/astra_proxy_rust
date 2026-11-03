@@ -9,7 +9,8 @@ from pathlib import Path
 import subprocess
 import time
 import traceback
-from windows_modes_regression import Core, base, upstream, free_port, powershell
+from astra_tools.windows import Core, base, upstream, powershell
+from astra_tools.net import free_port
 
 
 def run(args, directory):

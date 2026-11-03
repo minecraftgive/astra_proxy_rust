@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Reference-server mux tests with concurrent streams and physical-dial counting."""
+from astra_tools.workspace import resolve_binary_dir, reference_engine, reference_engine_dir
 import argparse
+from astra_tools.fixtures.meter import Meter
 import concurrent.futures
 import contextlib
 import pathlib
@@ -9,30 +11,14 @@ import socket
 import socketserver
 import tempfile
 import threading
-from protocol_matrix import ROOT, USER, EchoServer, Echo, UdpEchoServer, UdpEchoServer6, UdpEcho, exact, free_port, process, tls_material, udp_probe, wait_port, write_json, fixture
-from core_regression import socks, wait_socket
+from astra_tools.workspace import ROOT
+from astra_tools.fixtures.protocols import USER, tls_material, write_json, fixture
+from astra_tools.net import EchoServer, Echo, UdpEchoServer, UdpEchoServer6, UdpEcho, exact, free_port, udp_probe
+from astra_tools.processes import process, wait_port
+from astra_tools.net import socks
+from astra_tools.processes import wait_socket
 
 
-class Meter(socketserver.BaseRequestHandler):
-    def handle(self):
-        with self.server.lock:
-            self.server.connections += 1
-        try:
-            with socket.create_connection(('127.0.0.1', self.server.destination), timeout=15) as upstream:
-                self.request.settimeout(15)
-                readers = [self.request, upstream]
-                while readers:
-                    ready, _, _ = select.select(readers, [], [], 1)
-                    for source in ready:
-                        target = upstream if source is self.request else self.request
-                        data = source.recv(65536)
-                        if data:
-                            target.sendall(data)
-                        else:
-                            readers.remove(source)
-                            target.shutdown(socket.SHUT_WR)
-        except (OSError, ValueError):
-            pass
 
 
 def echo_stream(proxy, target, identity):
@@ -67,7 +53,7 @@ def check(protocol, mux, binaries, engines):
                 'tls': {'enabled': True, 'certificate_path': str(cert), 'key_path': str(key)},
                 'multiplex': {'enabled': True}}], 'outbounds': [{'type': 'direct'}]}
         server_path = write_json(directory/'server.json', config)
-        binary = engines/('xray' if engine == 'xray' else 'sing-box')
+        binary = reference_engine('xray' if engine == 'xray' else 'sing-box', engines)
         peer, peer_log = stack.enter_context(process([str(binary), 'run', '-config' if engine == 'xray' else '-c', str(server_path)], directory, 'peer'))
         wait_port(peer_port, peer, peer_log)
         meter = stack.enter_context(EchoServer(('127.0.0.1', 0), Meter))
@@ -78,9 +64,9 @@ def check(protocol, mux, binaries, engines):
         stack.callback(meter.shutdown)
         rules = directory/'rules.toml'
         uds = directory/'rules.sock'
-        rules.write_text(f'socket="{uds}"\ndefault_action="proxy:edge"\n')
+        rules.write_text(f'socket="{uds.as_posix()}"\ndirect_local=false\ndefault_action="proxy:edge"\n')
         proxy = directory/'proxy.toml'
-        proxy.write_text(f'''rule_socket="{uds}"
+        proxy.write_text(f'''rule_socket="{uds.as_posix()}"
 socks5_listen="127.0.0.1:{proxy_port}"
 shutdown_timeout_secs=1
 [[outbounds]]
@@ -94,7 +80,7 @@ uuid="{USER}"
 mux="{mux}"
 [outbounds.config.tls]
 server_name="localhost"
-ca_file="{directory/'ca.pem'}"
+ca_file="{(directory/'ca.pem').as_posix()}"
 ''')
         rule, rule_log = stack.enter_context(process([str(binaries/'astra-rule'), str(rules)], directory, 'rules'))
         wait_socket(uds, rule, rule_log)
@@ -122,16 +108,16 @@ ca_file="{directory/'ca.pem'}"
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/release')
-    parser.add_argument('--engine-dir', type=pathlib.Path, default=ROOT/'.test-tools/bin')
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    parser.add_argument('--engine-dir', '--engines-dir', dest='engine_dir', type=pathlib.Path, default=None)
     parser.add_argument('--protocol', action='append', choices=['vless', 'vmess'])
     parser.add_argument('--mux', action='append', choices=['smux', 'yamux', 'h2mux', 'muxcool'])
-    args = parser.parse_args()
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='release')
     failures = []
     for protocol in args.protocol or ['vless', 'vmess']:
         for mux in args.mux or ['smux', 'yamux', 'h2mux', 'muxcool']:
             try:
-                check(protocol, mux, args.bin_dir.resolve(), args.engine_dir.resolve())
+                check(protocol, mux, args.bin_dir.resolve(), reference_engine_dir(args.engine_dir))
             except Exception as error:
                 failures.append((protocol, mux))
                 print(f'FAIL {protocol}/{mux}: {error}', flush=True)

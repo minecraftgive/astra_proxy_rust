@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Standalone TCP/HTTP/UDP must use the selected upstream without any rule IPC."""
+from astra_tools.workspace import resolve_binary_dir, reference_engine
 import argparse
 import contextlib
 import pathlib
@@ -8,15 +9,18 @@ import subprocess
 import sys
 import tempfile
 import threading
-from protocol_matrix import ROOT, Echo, EchoServer, UdpEcho, UdpEchoServer, free_port, process, wait_port, fixture, write_json, exact, udp_probe
-from core_regression import socks
-from mux_regression import Meter
+from astra_tools.workspace import ROOT
+from astra_tools.net import Echo, EchoServer, UdpEcho, UdpEchoServer, free_port, exact, udp_probe
+from astra_tools.processes import process, wait_port
+from astra_tools.fixtures.protocols import fixture, write_json
+from astra_tools.net import socks
+from astra_tools.fixtures.meter import Meter
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug')
-    args=parser.parse_args()
+    parser.add_argument('--bin-dir',type=pathlib.Path,default=None)
+    args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug')
     binaries=args.bin_dir.resolve()
     with tempfile.TemporaryDirectory(prefix='astra-standalone-') as td,contextlib.ExitStack() as stack:
         d=pathlib.Path(td)
@@ -33,7 +37,7 @@ def main():
         watcher=threading.Thread(target=observe,daemon=True);watcher.start()
         peer_port=free_port()
         _,server,_=fixture('socks-plain',peer_port,None,None)
-        peer,peer_log=stack.enter_context(process([str(ROOT/'.test-tools/bin/xray'),'run','-config',str(write_json(d/'peer.json',server))],d,'peer'))
+        peer,peer_log=stack.enter_context(process([str(reference_engine('xray')),'run','-config',str(write_json(d/'peer.json',server))],d,'peer'))
         wait_port(peer_port,peer,peer_log)
         meter=stack.enter_context(EchoServer(('127.0.0.1',0),Meter))
         meter.destination=peer_port;meter.connections=0;meter.lock=threading.Lock()

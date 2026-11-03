@@ -1,6 +1,6 @@
 use crate::{i18n, manager, protocol, ui, windows};
 use anyhow::{Context, Result};
-use astra_ipc::platform::OpenOptionsExt;
+use astra_platform::platform::OpenOptionsExt;
 use std::{
     fs::OpenOptions,
     path::{Path, PathBuf},
@@ -39,7 +39,7 @@ fn selected_startup_release(home: &Path, explicit_bin: bool) -> Result<Option<(P
     };
     let host = release
         .directory
-        .join(astra_ipc::platform::executable("astra-host"));
+        .join(astra_platform::platform::executable("astra-host"));
     anyhow::ensure!(release.manifest.components.contains_key("astra-host") && host.is_file(),
         "The selected release has no versioned astra-host; choose a complete client package or use an explicit --bin-dir for maintenance");
     Ok(Some((release.directory, host)))
@@ -71,7 +71,7 @@ fn selected_frontend(
     if !selected || explicit_bin {
         return Ok(None);
     }
-    let frontend = bin.join(astra_ipc::platform::executable("astra-tui"));
+    let frontend = bin.join(astra_platform::platform::executable("astra-tui"));
     if std::fs::canonicalize(&frontend)? == std::fs::canonicalize(executable)? {
         Ok(None)
     } else {
@@ -85,11 +85,11 @@ fn set_operation(operation: &mut Option<protocol::Action>, next: protocol::Actio
     Ok(())
 }
 
-pub(crate) async fn run() -> Result<()> {
+pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
     i18n::init()?;
     let executable = std::env::current_exe()?;
-    let mut home = astra_ipc::platform::home_dir()?.join(".astra/tui");
-    let mut config_home = astra_ipc::platform::home_dir()?.join(".astra/config");
+    let mut home = astra_platform::platform::home_dir()?.join(".astra/tui");
+    let mut config_home = astra_platform::platform::home_dir()?.join(".astra/config");
     let mut bin = executable
         .parent()
         .context("Missing executable directory")?
@@ -97,12 +97,32 @@ pub(crate) async fn run() -> Result<()> {
     let mut explicit_bin = false;
     let mut daemon = is_host_binary(&executable);
     let mut shutdown = false;
+    let mut endpoint = None;
+    let mut agent_id = None;
     let mut operation = None;
-    let mut launch = windows::Launch::default();
+    let mut launch = windows::Launch {
+        kind: default_kind,
+        ..Default::default()
+    };
+    if default_kind == Some(protocol::Kind::Server) {
+        launch.view = Some(windows::View::Profiles);
+    }
     let mut native_console = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--endpoint" => {
+                endpoint = Some(PathBuf::from(
+                    args.next()
+                        .context("--endpoint requires a trusted local IPC path")?,
+                ))
+            }
+            "--agent" => {
+                agent_id = Some(
+                    args.next()
+                        .context("--agent requires a registered agent ID")?,
+                )
+            }
             "--lang" => {
                 args.next().context("--lang requires en, zh-CN or zh-TW")?;
             }
@@ -133,7 +153,8 @@ pub(crate) async fn run() -> Result<()> {
                     {
                         "proxy" => protocol::Kind::Proxy,
                         "rule" => protocol::Kind::Rule,
-                        _ => anyhow::bail!("--core requires proxy or rule"),
+                        "server" => protocol::Kind::Server,
+                        _ => anyhow::bail!("--core requires proxy, rule or server"),
                     },
                 )
             }
@@ -162,6 +183,7 @@ pub(crate) async fn run() -> Result<()> {
                 };
                 println!("{program} [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
                 println!("update PATH: apply a local update package\nupdate-status: show release and drain status\nrollback: return new sessions to the previous release\nastra-host runs the background manager by default; host updates take effect after an intentional restart");
+                println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
                 println!("--view overview|proxies|connections|rules|logs|profiles|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–6: page in a new window");
                 return Ok(());
             }
@@ -189,12 +211,54 @@ pub(crate) async fn run() -> Result<()> {
     }
     #[cfg(not(windows))]
     let _ = native_console;
-    if launch.view.is_some() && launch.window_id.is_none() {
-        launch.window_id =
-            windows::Launch::detached(launch.view.unwrap(), None, protocol::Kind::Proxy).window_id;
+    if let (Some(view), None) = (launch.view, &launch.window_id) {
+        launch.window_id = windows::Launch::detached(view, None, protocol::Kind::Proxy).window_id;
     }
     manager::private_dir(&home)?;
     home = std::fs::canonicalize(home)?;
+    anyhow::ensure!(
+        agent_id.is_none() || endpoint.is_some(),
+        "--agent requires --endpoint"
+    );
+    if let Some(endpoint) = endpoint {
+        anyhow::ensure!(!daemon, "--endpoint cannot start a manager");
+        let endpoint = std::fs::canonicalize(endpoint).context(
+            "Manager/controller endpoint does not exist; start its independent service first",
+        )?;
+        protocol::configure(endpoint.clone(), agent_id);
+        let hello = protocol::request(
+            &endpoint,
+            astra_management::v2::RequestBody::Query(astra_management::v2::Query::Hello),
+        )
+        .await?;
+        if let astra_management::v2::ResponseBody::Hello(hello) = hello {
+            anyhow::ensure!(
+                hello.role == "agent",
+                "Select a registered node with --agent ID when connecting to a controller"
+            );
+        }
+        if shutdown {
+            println!(
+                "{}",
+                protocol::call(&endpoint, protocol::Action::Shutdown)
+                    .await?
+                    .text
+            );
+            return Ok(());
+        }
+        if let Some(action) = operation {
+            println!("{}", protocol::call(&endpoint, action).await?.text);
+            return Ok(());
+        }
+        let context = windows::Context {
+            executable,
+            home,
+            config: config_home,
+            bin,
+            language: i18n::language(),
+        };
+        return ui::run(endpoint, context, launch).await;
+    }
     manager::private_dir(&config_home)?;
     config_home = std::fs::canonicalize(config_home)?;
     anyhow::ensure!(
@@ -215,8 +279,8 @@ pub(crate) async fn run() -> Result<()> {
         manager_executable(&executable)
     };
     bin = std::fs::canonicalize(bin)?;
-    let socket = home.join("manager.sock");
-    astra_ipc::platform::validate_state_directory(&home)?;
+    let socket = home.join("management.sock");
+    astra_platform::platform::validate_state_directory(&home)?;
     if !daemon && !shutdown && operation.is_none() {
         if let Some(frontend) =
             selected_frontend(&executable, &bin, has_selected_release, explicit_bin)?
@@ -262,7 +326,23 @@ pub(crate) async fn run() -> Result<()> {
             );
             return Ok(());
         }
-        return manager::serve_with_config(home, config_home, bin).await;
+        anyhow::ensure!(
+            manager_binary != executable,
+            "The separate astra-host executable is required; install a complete package"
+        );
+        let status = tokio::process::Command::new(&manager_binary)
+            .arg("--manager")
+            .arg("--state-dir")
+            .arg(&home)
+            .arg("--config-dir")
+            .arg(&config_home)
+            .arg("--bin-dir")
+            .arg(&bin)
+            .status()
+            .await
+            .context("Start the independent manager")?;
+        anyhow::ensure!(status.success(), "Manager exited with {status}");
+        return Ok(());
     }
     if shutdown {
         let reply = protocol::call(&socket, protocol::Action::Shutdown).await?;
@@ -274,7 +354,7 @@ pub(crate) async fn run() -> Result<()> {
         .is_err()
     {
         if socket.exists() {
-            astra_ipc::platform::recover_stale_manager_endpoint(&socket)
+            astra_platform::platform::recover_stale_manager_endpoint(&socket)
                 .with_context(|| format!("Manager endpoint is unavailable and could not be safely recovered: {}. Inspect {} and running cores", socket.display(), home.join("manager.log").display()))?;
         }
         anyhow::ensure!(!socket.exists(), "Manager socket is present but unavailable. Inspect manager.log and running cores before removing a stale socket.");
@@ -295,7 +375,7 @@ pub(crate) async fn run() -> Result<()> {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        astra_ipc::platform::background_command(&mut command, true);
+        astra_platform::platform::background_command(&mut command, true);
         let mut child = command.spawn()?;
         let mut ready = false;
         // Poll quickly at first: the manager normally binds within a few ms.
@@ -359,7 +439,10 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = parent.join(format!("astra-entry-{}-{nonce}-{sequence}", std::process::id()));
+            let path = parent.join(format!(
+                "astra-entry-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
             std::fs::create_dir(&path).unwrap();
             Self { path, parent }
         }
@@ -368,6 +451,7 @@ mod tests {
             std::fs::create_dir(&source).unwrap();
             let mut manifest = ReleaseManifest {
                 schema_version: 1,
+                role: Default::default(),
                 release_id: "selected".into(),
                 target: TARGET.into(),
                 host_protocol: ProtocolRange {
@@ -382,7 +466,7 @@ mod tests {
                 components.push("astra-host");
             }
             for component in components {
-                let name = astra_ipc::platform::executable(component);
+                let name = astra_platform::platform::executable(component);
                 std::fs::write(source.join(&name), b"fixture").unwrap();
                 manifest.components.insert(component.into(), "0.1.0".into());
                 manifest.files.push(ReleaseFile {
@@ -420,7 +504,7 @@ mod tests {
         assert_eq!(directory, store.release_dir("selected").unwrap());
         assert_eq!(
             host,
-            directory.join(astra_ipc::platform::executable("astra-host"))
+            directory.join(astra_platform::platform::executable("astra-host"))
         );
         std::fs::write(store.root().join("current.json"), b"invalid").unwrap();
         assert!(selected_startup_release(&home, true).unwrap().is_none());
@@ -432,7 +516,8 @@ mod tests {
         let fixture = Directory::new();
         let (store, home) = fixture.install(true);
         let manifest_path = store.release_dir("selected").unwrap().join("manifest.json");
-        let mut manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut manifest: ReleaseManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest.components.remove("astra-host");
         std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(selected_startup_release(&home, false)
@@ -466,7 +551,7 @@ mod tests {
         let original = fixture.path.join("old-tui");
         std::fs::write(&original, b"old").unwrap();
         std::fs::write(home.join("manager.sock"), b"live manager marker").unwrap();
-        let selected = bin.join(astra_ipc::platform::executable("astra-tui"));
+        let selected = bin.join(astra_platform::platform::executable("astra-tui"));
         assert_eq!(
             selected_frontend(&original, &bin, true, false).unwrap(),
             Some(selected.clone())

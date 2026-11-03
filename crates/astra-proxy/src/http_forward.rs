@@ -1,7 +1,9 @@
 //! Streaming HTTP/1 forward proxy for all supported platforms.
 //! CONNECT is handled by the existing bounded tunnel implementation.
 use crate::App;
-use astra_ipc::{Inbound, RouteAction, Target};
+use astra_model::Inbound;
+use astra_model::RouteAction;
+use astra_model::Target;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
@@ -139,7 +141,7 @@ async fn forward(
         .route_connection(
             &target,
             Inbound::HttpConnect,
-            astra_ipc::Network::Tcp,
+            astra_model::Network::Tcp,
             source,
             destination,
         )

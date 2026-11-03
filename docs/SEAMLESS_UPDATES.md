@@ -4,12 +4,18 @@
 
 这里的无缝更新目标是：新连接交给新 worker，已经建立的连接继续由原 worker 服务，直到正常关闭或命中原有连接策略。它不迁移正在使用的 TLS、QUIC、TCP 或 UDP 会话状态。此处“保持连接”描述兼容版本切换时的设计和已验证场景，不承诺零延迟、UDP 零丢包或所有模式均已实测；进程崩溃、主动断开、网络变化及远端断连不在该目标范围内。
 
+## 分布式管理与组件边界
+
+版本包的校验、落盘、候选准备及激活由目标 Agent 执行。Controller 只路由请求与记录任务身份，不运行 Core、不自行解包执行用户提供的程序。远程中断不会自动重放激活；结果不确定时先查询原 operation_id 和目标运行状态。
+
+本文的多代 worker 机制适用于客户端 Proxy/Rule 协作。Server Core 仍遵循其重载/重启边界；Controller、Agent 管理程序和独立 astra-web 需要各自的维护重启，不能据此声称所有组件更新都保留现有会话。Web 的停止或重启不等于停止 Core。注册/凭据、独立部署及备份见 [MANAGEMENT.md](MANAGEMENT.md)。
+
 ## 进程分工与切换
 
 ```text
 astra-tui：可退出、重开的界面
     │ 管理 IPC
-astra-host：常驻实例管理器、更新事务与版本选择
+astra-manager Agent（astra-host 兼容入口）：本地主机更新事务与版本选择
     ├─ astra-rule：按依赖共享的规则进程及待排空规则代
     └─ astra-proxy：每个实例的常驻网络宿主
          ├─ 公共 TCP/UDP/DNS 监听、TUN/smoltcp、系统设置、DNS 地址映射
@@ -17,7 +23,7 @@ astra-host：常驻实例管理器、更新事务与版本选择
          └─ worker B：接收新连接
 ```
 
-`astra-host` 与 `astra-proxy` 网络宿主承担不同职责。关闭 TUI 不会结束它们。实验模式下，网络宿主持有不能随普通升级丢失的公共监听器、TUN 栈和系统资源；版本 worker 是同一 `astra-proxy` 可执行文件的内部工作模式，承担入站协议处理、DNS 解析、路由与出站协议会话。SOCKS5 UDP 关联的中继 socket 由对应 worker 持有。当前 TCP 通过每流独立的本地数据通道桥接，带有界 DATA、FIN、RESET 帧；因此存在额外 IPC 和复制成本。规则通道仍只传路由元数据。
+`astra-manager` 的 Agent / `astra-host` 兼容入口与 `astra-proxy` 网络宿主承担不同职责。关闭 TUI 不会结束它们。实验模式下，网络宿主持有不能随普通升级丢失的公共监听器、TUN 栈和系统资源；版本 worker 是同一 `astra-proxy` 可执行文件的内部工作模式，承担入站协议处理、DNS 解析、路由与出站协议会话。SOCKS5 UDP 关联的中继 socket 由对应 worker 持有。当前 TCP 通过每流独立的本地数据通道桥接，带有界 DATA、FIN、RESET 帧；因此存在额外 IPC 和复制成本。规则通道仍只传路由元数据。
 
 更新先校验并准备全部候选 worker 和依赖规则，再短暂停止新流分配，切换各实例的活动 generation，随后恢复分配；既有流继续运行。准备失败会撤销已准备的候选。多个代理共享同一规则依赖时，更新事务只准备一份对应的新规则进程。
 
@@ -31,7 +37,7 @@ TCP 按连接固定 generation；SOCKS5 UDP 按控制关联固定，关联内后
 
 ## 本地包与命令
 
-客户端打包脚本会包含 `astra-tui`、`astra-host`、`astra-proxy`、`astra-rule`、转换工具和 `manifest.json`。导入器要求前述四个核心的可执行文件和版本声明齐全，缺少 `astra-host` 的旧三核心包不能作为更新包导入。清单记录目标平台、组件版本、宿主协议范围、文件大小和 SHA-256；SHA-256 用于检查包内容完整性，不表示发布者签名认证。支持解压后的版本目录、ZIP、`.tar.gz` 和 `.tgz`，不自动从网络下载版本。
+客户端打包脚本会包含 `astra-tui`、`astra-manager`、`astra-host`、`astra-proxy`、`astra-rule`、转换工具和 `manifest.json`。导入器要求前述四个核心的可执行文件和版本声明齐全，缺少 `astra-host` 的旧三核心包不能作为更新包导入。清单记录目标平台、组件版本、宿主协议范围、文件大小和 SHA-256；SHA-256 用于检查包内容完整性，不表示发布者签名认证。支持解压后的版本目录、ZIP、`.tar.gz` 和 `.tgz`，不自动从网络下载版本。
 
 ```powershell
 # 默认行为：校验并暂存，不切换运行实例。
@@ -88,10 +94,10 @@ Windows 已加入使用 filtered UAC token 启动普通权限 worker 的代码�
 可复现事务回归需要先构建当前四个程序；测试缺少程序会明确失败：
 
 ```sh
-cargo build -p astra-proxy -p astra-rule -p astra-tui --bins
+cargo build -p astra-proxy -p astra-rule -p astra-tui -p astra-manager --bins
 cargo check --workspace --all-targets
 cargo test -p astra-proxy --test hosted_lifecycle
-cargo test -p astra-tui --bin astra-tui manager::updates::tests::real_update_transaction_preserves_live_connections -- --nocapture
+cargo test -p astra-manager --lib real_update_transaction_preserves_live_connections -- --nocapture
 ```
 
 测试通过单独子进程隔离实验环境变量，使用临时配置和本机 TCP，Windows 下要求普通用户执行，不请求 UAC。

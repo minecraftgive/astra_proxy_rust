@@ -732,7 +732,8 @@ mod tests {
     }
     #[test]
     fn connection_search_cycles_filtered_results_by_identity_and_wraps() {
-        use astra_ipc::runtime::{Connection, Snapshot};
+        use astra_model::runtime::Connection;
+        use astra_model::runtime::Snapshot;
         let mut ui = Ui::new(Session::default());
         ui.page = shell::CONNECTIONS;
         ui.rows.push(Row {

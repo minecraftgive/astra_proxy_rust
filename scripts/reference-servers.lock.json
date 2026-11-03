@@ -17,6 +17,14 @@
       "linux-arm64": {
         "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-arm64.tar.gz",
         "sha256": "sha256:29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e"
+      },
+      "windows-amd64": {
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-windows-amd64.zip",
+        "sha256": "sha256:d8b86ef58936dba9230ec6a57ffa4243933f3c14ef4809828b6c553440ed1518"
+      },
+      "windows-arm64": {
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-windows-arm64.zip",
+        "sha256": "sha256:195b35424c6e3f5913954c7f08c5d8ba2d2199f6d18eb27a3972a5a29cdaa78c"
       }
     }
   },
@@ -38,6 +46,14 @@
       "linux-arm64": {
         "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip",
         "sha256": "sha256:4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
+      },
+      "windows-amd64": {
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip",
+        "sha256": "sha256:d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad"
+      },
+      "windows-arm64": {
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-arm64-v8a.zip",
+        "sha256": "sha256:35d4ed6ec21224fb22b07c2c3f672e2350cd536f2c74d309150175a76365ea88"
       }
     }
   }

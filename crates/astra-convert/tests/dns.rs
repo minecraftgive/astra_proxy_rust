@@ -9,7 +9,7 @@ const INPUT:&str="socks-port: 1080\nproxies:\n  - {name: node, type: socks5, ser
 fn mihomo_dns_and_fake_ip_convert_to_valid_native_settings() {
     let converted = convert(INPUT, &Options::default()).unwrap();
     let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
-    let config: astra_dns::Config = document["dns"].clone().try_into().unwrap();
+    let config: astra_model::config::dns::Config = document["dns"].clone().try_into().unwrap();
     config.validate().unwrap();
     assert!(config.fake_ip);
     assert_eq!(config.nameserver.len(), 2);

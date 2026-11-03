@@ -135,7 +135,7 @@ fn validate_unix_directory(directory: &Path, uid: u32) -> Result<()> {
 }
 
 pub enum WorkerChild {
-    Normal(tokio::process::Child),
+    Normal(Box<tokio::process::Child>),
     #[cfg(windows)]
     Windows(windows::Child),
 }
@@ -171,7 +171,7 @@ pub async fn spawn(binary: &Path, config: Vec<u8>, log: std::fs::File) -> Result
         "worker startup frame too large"
     );
     #[cfg(windows)]
-    if astra_ipc::elevation::is_elevated()? {
+    if astra_platform::elevation::is_elevated()? {
         let (child, stdin) = windows::spawn(binary, &log)?;
         let child = WorkerChild::Windows(child);
         let mut stdin = tokio::fs::File::from_std(stdin);
@@ -199,11 +199,11 @@ pub async fn spawn(binary: &Path, config: Vec<u8>, log: std::fs::File) -> Result
         .await
         .context("worker startup pipe timed out")??;
     drop(stdin);
-    Ok(WorkerChild::Normal(child))
+    Ok(WorkerChild::Normal(Box::new(child)))
 }
 
 fn command(binary: &Path) -> Result<tokio::process::Command> {
-    let mut command = astra_ipc::platform::background_core(binary);
+    let mut command = astra_platform::platform::background_core(binary);
     for name in REMOVED_ENV {
         command.env_remove(name);
     }

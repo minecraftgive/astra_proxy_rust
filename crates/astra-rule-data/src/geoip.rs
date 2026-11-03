@@ -31,18 +31,7 @@ pub struct Cidr {
     pub prefix: u32,
 }
 
-pub fn category(input: &str) -> Result<String> {
-    ensure!(
-        !input.is_empty()
-            && input.len() <= 128
-            && input
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
-        "invalid GEOIP category: {input}"
-    );
-    Ok(input.to_ascii_uppercase())
-}
-
+pub use astra_model::config::ruleset::geoip_category as category;
 #[derive(Debug)]
 pub struct Group {
     v4: Vec<(u8, HashSet<u32>)>,

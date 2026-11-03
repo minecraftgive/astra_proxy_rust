@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use astra_ipc::Inbound;
+use astra_model::Inbound;
 use std::{
     io,
     net::SocketAddr,
@@ -10,14 +10,11 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
-#[path = "inbound/shared_http.rs"]
 mod http;
-#[path = "inbound/shared_socks5.rs"]
 mod socks5;
 pub use http::handle_http;
 pub use socks5::handle_socks5;
 
-#[path = "inbound/shared_authentication.rs"]
 mod authentication;
 pub(crate) use authentication::{authorize_connect, http_authorized};
 /// Serve a trusted host-provided stream using the original TCP endpoints.
@@ -173,5 +170,4 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for BufferedStream<S> {
 }
 
 #[cfg(test)]
-#[path = "inbound/shared_tests.rs"]
 mod tests;

@@ -6,8 +6,7 @@ pub(super) async fn run_local(
     context: crate::windows::Context,
     launch: crate::windows::Launch,
 ) -> Result<()> {
-    let session_path =
-        launch.session_path(socket.parent().context("Manager socket has no directory")?)?;
+    let session_path = launch.session_path(&crate::protocol::session_home(&context.home)?)?;
     let mut ui = match Session::load(&session_path) {
         Ok(session) => Ui::new(session),
         Err(error) => {
@@ -29,14 +28,10 @@ pub(super) async fn run_local(
     }
     let mut initial = Some(launch);
     let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
-    enable_raw_mode()?;
-    let _screen = Screen;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+    let mut screen = TerminalSession::enter(TerminalOptions {
+        mouse: true,
+        bracketed_paste: true,
+    })?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut jobs = background::Jobs::new(&socket);
     let mut feeds = background::Feeds::new(&socket);
@@ -173,12 +168,14 @@ pub(super) async fn run_local(
                         name,
                         expected_pid,
                         &mut terminal,
+                        &mut screen,
                     )
                     .await;
+                    screen.resume()?;
                     events = Some(event::EventStream::new());
                     ui.animations.resize();
                 } else {
-                    jobs.start(&mut ui, action, origin);
+                    jobs.start(&mut ui, action, origin.map(|origin| *origin));
                 }
                 false
             }
@@ -198,36 +195,23 @@ pub(super) async fn run_local(
                 drop(events.take());
                 let result = (|| -> Result<()> {
                     let command = crate::external_editor::command()?;
-                    let (draft, directory) = ui.prepare_external(
-                        socket.parent().context("Manager socket has no directory")?,
-                    )?;
+                    let (draft, directory) =
+                        ui.prepare_external(&crate::protocol::session_home(&context.home)?)?;
                     anyhow::ensure!(
                         ui.checkpoint(&session_path),
                         t("Cannot open editor until the draft is checkpointed")
                     );
                     let launched = (|| -> Result<()> {
-                        disable_raw_mode()?;
-                        execute!(
-                            io::stdout(),
-                            DisableBracketedPaste,
-                            DisableMouseCapture,
-                            crossterm::cursor::Show,
-                            LeaveAlternateScreen
-                        )?;
+                        screen.suspend()?;
                         crate::external_editor::launch(&command, &draft, &directory)
                     })();
                     // Always restore the TUI, including when the executable cannot start.
-                    enable_raw_mode()?;
-                    execute!(
-                        io::stdout(),
-                        EnterAlternateScreen,
-                        EnableBracketedPaste,
-                        EnableMouseCapture
-                    )?;
+                    screen.resume()?;
                     terminal.clear()?;
                     launched?;
                     ui.read_external()
                 })();
+                screen.resume()?;
                 events = Some(event::EventStream::new());
                 ui.animations.resize();
                 if let Err(error) = result {

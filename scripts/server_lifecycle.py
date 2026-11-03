@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Transactional startup/reload and independent server control checks."""
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import contextlib
 import pathlib
@@ -9,9 +10,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable
-from protocol_matrix import Echo, exact, free_port, process
-from server_regression import ROOT, command
+from astra_tools.platform import executable
+from astra_tools.net import Echo, exact, free_port
+from astra_tools.processes import process
+from astra_tools.workspace import ROOT
+from astra_tools.fixtures.server import command
 
 def configuration(port,password,extra=''):
     return f'allow_private_targets=true\nshutdown_timeout_secs=0\n{extra}\n[[listeners]]\ntag="socks"\nprotocol="socks5"\nlisten="127.0.0.1:{port}"\n[[listeners.users]]\nname="test"\npassword="{password}"\n'
@@ -27,7 +30,7 @@ def authenticated(port,password,target):
     return s
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug');args=parser.parse_args();binary=args.bin_dir.resolve()/executable('astra-server-core')
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=None);args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug');binary=args.bin_dir.resolve()/executable('astra-server-core')
     with tempfile.TemporaryDirectory(prefix='astra-server-life-') as temp,contextlib.ExitStack() as stack:
         d=pathlib.Path(temp);path=d/'server.toml';control=d/'control.sock';port=free_port()
         # A failed second bind must release the already prepared first listener.

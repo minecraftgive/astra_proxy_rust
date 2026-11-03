@@ -1,6 +1,6 @@
 # Astra Dual Core
 
-原生 Rust 代理与规则双进程项目，当前版本为 0.1.0。流量处理由 `astra-proxy` 与 `astra-rule` 承担，可使用原生 `astra-tui` 管理；协议在代理进程内实现，不依赖 Xray/sing-box 等外部协议核心。Rust 协议库与 Quinn 直接链接；TLS 的 AWS-LC/BoringSSL 属于加密依赖，并非代理核心。
+原生 Rust 代理与规则双进程项目，当前版本为 0.1.0。流量处理由 `astra-proxy` 与 `astra-rule` 承担，可使用原生 `astra-tui` 或独立 Web 界面管理；协议在代理进程内实现，不依赖 Xray/sing-box 等外部协议核心。Rust 协议库与 Quinn 直接链接；TLS 的 AWS-LC/BoringSSL 属于加密依赖，并非代理核心。
 
 首版提供常见 TCP 代理、SOCKS5 UDP 入站及 SS/SS2022、VMess、Trojan、VLESS、Hysteria2、TUIC 原生出站。macOS arm64 release 的 24 组 TCP 矩阵、UDP、Vision、mux、认证失败与生命周期检查已通过，并提供可解压运行的安装包和本地性能基线。实际支持范围及已确认的服务端限制见 [兼容性说明](docs/COMPATIBILITY.md)，验证证据见 [验收记录](docs/V1_ACCEPTANCE.md)，节点字段见 [原生协议配置](docs/NATIVE_PROTOCOLS.md)。
 
@@ -8,11 +8,13 @@
 
 配套服务端已单独提供 `astra-server-core` 和 `astra-server-tui`，覆盖客户端全部协议类型（SS/SS2022、VMess、Trojan、VLESS、Hysteria2、TUIC，以及认证 SOCKS5/HTTP CONNECT）。服务端原生 Rust 实现，独立配置、管理接口和安装包，无需客户端规则核心；REALITY、Vision、VLESS 解密、Mux/XUDP 等入站扩展见 [服务器端扩展](docs/SERVER_EXTENSIONS.md)，启动与独立打包方法见 [服务端说明](docs/SERVER.md)。客户端使用出站配置，服务器端使用独立的入站配置，两端程序与安装包分开。
 
-- `astra-proxy`：入站握手、路由缓存、原生协议出站、TCP relay 与 UDP 会话管理。
-- `astra-rule`：启动时编译规则索引，按配置顺序返回第一条匹配规则。
-- `astra-ipc`：版本化请求与响应、bincode 长度帧，路由通道只传元数据；管理通道独立。
-- `astra-tui`：原生 Rust 终端界面，通过内部 IPC 连接后台实例管理服务。
-- `astra-host`：与界面生命周期分离的后台实例管理器；实验更新模式下协调常驻网络宿主及多代 worker。
+- `astra-proxy` / `astra-rule` / `astra-server-core`：流量、规则和认证服务端 Core。
+- `astra-manager`：配置选择 Controller 或 Agent；Agent 主动连接 Controller，同时保留私有本地管理。Controller 只路由管理请求，不运行 Core。
+- `astra-tui` / `astra-server-tui`：同一终端库的两个薄入口；`astra-host` 是独立管理程序的本地兼容入口。
+- `astra-web`：独立 HTTPS 网关与 React 界面，浏览器同页选择 Agent，无需每台 Agent 暴露公网管理端口。
+- `astra-model`、`astra-platform`、`astra-resource`、`astra-app`、`astra-management`、`astra-tui-kit`：分别承担公共数据、系统操作、资源缓存、文档算法、管理契约和终端组件，详见 [架构边界](docs/ARCHITECTURE.md)。
+
+多主机部署、Agent 注册/轮换/撤销、Web 单管理员初始化与纯本地模式见 [管理服务说明](docs/MANAGEMENT.md)。远程连接默认关闭；新拓扑的跨平台部署与系统接管须在目标机器验收。
 
 ```text
 客户端 -> SOCKS5 / HTTP CONNECT -> 决策缓存
@@ -75,7 +77,7 @@ XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确
 
 ## 安装包
 
-分发包的解压和启动步骤见 [安装说明](docs/INSTALL.md)。客户端与服务端分别打包为 `client/` 与 `server/`；每包仅包含自己的执行文件与一份完整示例配置。客户端还包含离线转换工具及可选 Wintun 运行库。本机初始性能数据见 [性能基线](docs/PERFORMANCE.md)。
+分发包的解压和启动步骤见 [安装说明](docs/INSTALL.md)。按 `client`、`server`、`controller`、`web` 分别打包。客户端与服务端包包含各自 Core、终端入口及独立管理程序；Controller/Web 可单独部署，运行包内容见 [安装说明](docs/INSTALL.md)。客户端另包含离线转换工具及可选 Wintun 运行库。本机初始性能数据见 [性能基线](docs/PERFORMANCE.md)。
 
 VLESS Encryption、Vision 与 XHTTP 的配置字段见 [原生协议说明](docs/NATIVE_PROTOCOLS.md)。私人节点配置及验证记录保存在 Git 忽略的 `Local/` 目录，不随项目发布。
 
@@ -116,7 +118,7 @@ python3 scripts/test.py        # 测试与构建分开运行
 
 Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；两者都转调 `python scripts/build.py`。构建后运行 `./target/x86_64-pc-windows-msvc/release/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
 
-加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--debug`、`--role client|server|all`、`--package`、`--label`、`--output-dir`；测试套件见 `scripts/test.py --help`，详见 [构建与打包说明](docs/INSTALL.md)。
+加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--debug`、`--role client|server|controller|web|all`、`--package`、`--label`、`--output-dir`；测试套件见 `scripts/test.py --help`，详见 [构建与打包说明](docs/INSTALL.md)。
 
 ```sh
 ./scripts/build.sh

@@ -3,7 +3,8 @@
 use crate::platform::worker::WorkerChild;
 use crate::{runtime::Current, App};
 use anyhow::{bail, ensure, Context, Result};
-use astra_ipc::{Inbound, Target};
+use astra_model::Inbound;
+use astra_model::Target;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -20,33 +21,17 @@ use tokio::{
     sync::Mutex,
 };
 
-#[path = "hosted_connection_ids.rs"]
 mod connection_ids;
-#[path = "hosted_dns.rs"]
 mod dns;
-#[path = "hosted_telemetry.rs"]
 mod telemetry;
 #[cfg(test)]
-#[path = "hosted_transition_tests.rs"]
 mod transition_tests;
-#[path = "hosted_udp.rs"]
 mod udp;
-/// Prepare the invoking Unix account before any runtime threads are created.
-///
-/// # Safety
-/// The executable must call this only during single-threaded startup.
-#[cfg(unix)]
-pub unsafe fn initialize_process() -> Result<()> {
-    unsafe { crate::platform::worker::initialize_owner() }
-}
-tokio::task_local! { pub(crate) static INGRESS_PROCESS: Option<astra_ipc::ProcessInfo>; }
-pub async fn send<T: Serialize, S: AsyncWrite + Unpin>(s: &mut S, body: T) -> Result<()> {
-    astra_ipc::host::send_control(s, &astra_ipc::host::ControlEnvelope::new(0, body)).await?;
-    Ok(())
-}
-pub async fn receive<T: serde::de::DeserializeOwned, S: AsyncRead + Unpin>(s: &mut S) -> Result<T> {
-    Ok(astra_ipc::host::receive_control(s).await?.message)
-}
+tokio::task_local! { pub(crate) static INGRESS_PROCESS: Option<astra_model::ProcessInfo>; }
+pub use astra_ipc::host::receive_message as receive;
+pub use astra_ipc::host::request_json_control as request;
+pub use astra_ipc::host::send_message as send;
+pub use astra_model::host_control::{endpoint, Command, GenerationStatus, Status};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Metadata {
@@ -56,13 +41,13 @@ pub struct Metadata {
     pub source: SocketAddr,
     pub local: SocketAddr,
     pub destination: Option<SocketAddr>,
-    pub process: Option<astra_ipc::ProcessInfo>,
+    pub process: Option<astra_model::ProcessInfo>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkerConfig {
     path: PathBuf,
     text: String,
-    overrides: astra_ipc::runtime::Overrides,
+    overrides: astra_model::runtime::Overrides,
     interface: Option<String>,
     host: PathBuf,
     token: String,
@@ -78,7 +63,7 @@ enum WorkerRequest {
     Snapshot,
     Disconnect(Option<u64>),
     Overrides {
-        value: astra_ipc::runtime::Overrides,
+        value: astra_model::runtime::Overrides,
         disconnect: Option<String>,
     },
     DisconnectGroup(String),
@@ -94,86 +79,6 @@ struct Auth<T> {
     token: String,
     command: T,
 }
-#[derive(Clone, Serialize, Deserialize)]
-pub enum Command {
-    Status,
-    Telemetry,
-    Prepare {
-        directory: PathBuf,
-        rule_socket: Option<String>,
-    },
-    Activate {
-        generation: u64,
-    },
-    Abort {
-        generation: u64,
-    },
-    Pause,
-    Resume,
-    SelectExisting {
-        generation: u64,
-    },
-    Reverse {
-        ip: std::net::IpAddr,
-        token: String,
-    },
-    Lookup {
-        host: String,
-        port: u16,
-        token: String,
-    },
-    UdpPermit {
-        token: String,
-    },
-    Mapping {
-        token: String,
-        operation: dns::MappingOperation,
-    },
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct GenerationStatus {
-    pub generation: u64,
-    pub directory: PathBuf,
-    pub pid: Option<u32>,
-    pub active: bool,
-    pub prepared: bool,
-    pub flows: usize,
-    pub rule_socket: String,
-    pub failed: bool,
-    pub log: PathBuf,
-}
-#[derive(Serialize, Deserialize)]
-pub struct Status {
-    pub active: u64,
-    pub generations: Vec<GenerationStatus>,
-    #[serde(default)]
-    pub boot_id: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub binary: Option<PathBuf>,
-    #[serde(default)]
-    pub paused: bool,
-    #[serde(default)]
-    pub busy: bool,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-}
-
-pub fn endpoint(control: &Path) -> PathBuf {
-    control.with_extension("host.sock")
-}
-pub async fn request(path: &Path, command: Command) -> Result<serde_json::Value> {
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(3),
-        astra_ipc::platform::connect_trusted(path),
-    )
-    .await??;
-    send(&mut stream, command).await?;
-    let result: std::result::Result<serde_json::Value, String> =
-        tokio::time::timeout(Duration::from_secs(30), receive(&mut stream)).await??;
-    result.map_err(anyhow::Error::msg)
-}
 
 struct Generation {
     id: u64,
@@ -184,7 +89,7 @@ struct Generation {
     child: Mutex<WorkerChild>,
     flows: AtomicUsize,
     rule_socket: String,
-    snapshot: std::sync::Mutex<astra_ipc::runtime::Snapshot>,
+    snapshot: std::sync::Mutex<astra_model::runtime::Snapshot>,
     failed: std::sync::atomic::AtomicBool,
     route_leases: std::sync::Mutex<Vec<Arc<crate::tun::OwnedRoute>>>,
 }
@@ -291,7 +196,7 @@ pub struct Host {
     admissions: tokio::sync::Notify,
     telemetry: std::sync::Mutex<telemetry::Store>,
     connection_ids: std::sync::Mutex<connection_ids::ConnectionIds>,
-    retired: std::sync::Mutex<astra_ipc::runtime::Snapshot>,
+    retired: std::sync::Mutex<astra_model::runtime::Snapshot>,
     tokens: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(crate) mappings: Arc<dyn astra_dns::MappingStore>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -301,7 +206,7 @@ impl Drop for Host {
         for task in self.tasks.get_mut().unwrap().drain(..) {
             task.abort();
         }
-        astra_ipc::platform::remove_socket(&self.endpoint);
+        astra_platform::platform::remove_socket(&self.endpoint);
     }
 }
 impl Host {
@@ -333,12 +238,15 @@ impl Host {
             .context("resident mode requires ASTRA_CONTROL_SOCKET")?;
         let endpoint = endpoint(Path::new(&control));
         crate::platform::worker::validate_endpoint_directory(
-            astra_ipc::platform::endpoint_path(&endpoint)
+            astra_platform::platform::endpoint_path(&endpoint)
                 .parent()
                 .context("resident endpoint requires a private state directory")?,
         )?;
-        let listener = astra_ipc::platform::bind_listener(&endpoint)?;
-        astra_ipc::platform::set_private(astra_ipc::platform::endpoint_path(&endpoint), 0o600)?;
+        let listener = astra_platform::platform::bind_listener(&endpoint)?;
+        astra_platform::platform::set_private(
+            astra_platform::platform::endpoint_path(&endpoint),
+            0o600,
+        )?;
         let host = Arc::new(Self {
             boot: uuid::Uuid::new_v4().to_string(),
             next_flow: AtomicU64::new(1),
@@ -469,7 +377,7 @@ impl Host {
             generation: id,
             boot: self.boot.clone(),
         };
-        let binary = directory.join(astra_ipc::platform::executable("astra-proxy"));
+        let binary = directory.join(astra_platform::platform::executable("astra-proxy"));
         let mut config_bytes = Vec::new();
         send(&mut config_bytes, config).await?;
         let log = self.endpoint.with_file_name(format!(
@@ -482,7 +390,7 @@ impl Host {
             .create_new(true)
             .open(&log)
             .with_context(|| format!("create worker log {}", log.display()))?;
-        astra_ipc::platform::set_private(&log, 0o600)?;
+        astra_platform::platform::set_private(&log, 0o600)?;
         let mut child = crate::platform::worker::spawn(&binary, config_bytes, output).await?;
         let pid = child.id().context("worker has no PID")?;
         crate::platform::process::register_worker(pid);
@@ -493,7 +401,9 @@ impl Host {
                     if let Some(status) = child.try_wait()? {
                         bail!("candidate exited: {status}");
                     }
-                    if let Ok(mut stream) = astra_ipc::platform::connect_trusted(&endpoint).await {
+                    if let Ok(mut stream) =
+                        astra_platform::platform::connect_trusted(&endpoint).await
+                    {
                         send(
                             &mut stream,
                             Auth {
@@ -505,7 +415,8 @@ impl Host {
                         let ready: std::result::Result<astra_ipc::host::Hello, String> =
                             receive(&mut stream).await?;
                         ready.map_err(anyhow::Error::msg)?.validate_worker()?;
-                        let mut probe = astra_ipc::platform::connect_trusted(&endpoint).await?;
+                        let mut probe =
+                            astra_platform::platform::connect_trusted(&endpoint).await?;
                         send(
                             &mut probe,
                             Auth {
@@ -535,7 +446,7 @@ impl Host {
             self.tokens.lock().unwrap().remove(&token);
             let _ = child.kill().await;
             crate::platform::process::unregister_worker(pid);
-            astra_ipc::platform::remove_socket(&endpoint);
+            astra_platform::platform::remove_socket(&endpoint);
             return Err(error);
         }
         let mut state = self.state.lock().await;
@@ -615,13 +526,13 @@ impl Host {
             .get(&state.active)
             .map(|g| (g.directory.clone(), g.rule_socket.clone()))
     }
-    pub fn merge_snapshot(&self, snapshot: &mut astra_ipc::runtime::Snapshot) {
+    pub fn merge_snapshot(&self, snapshot: &mut astra_model::runtime::Snapshot) {
         let store = self.telemetry.lock().unwrap();
         Self::merge_metrics(snapshot, &store.snapshot);
     }
     fn merge_metrics(
-        snapshot: &mut astra_ipc::runtime::Snapshot,
-        metrics: &astra_ipc::runtime::Snapshot,
+        snapshot: &mut astra_model::runtime::Snapshot,
+        metrics: &astra_model::runtime::Snapshot,
     ) {
         snapshot.upload += metrics.upload;
         snapshot.download += metrics.download;
@@ -644,7 +555,8 @@ impl Host {
         command: WorkerRequest,
     ) -> Result<T> {
         tokio::time::timeout(Duration::from_secs(3), async {
-            let mut stream = astra_ipc::platform::connect_trusted(&generation.endpoint).await?;
+            let mut stream =
+                astra_platform::platform::connect_trusted(&generation.endpoint).await?;
             send(
                 &mut stream,
                 Auth {
@@ -659,7 +571,7 @@ impl Host {
     }
     pub async fn overrides(
         &self,
-        value: astra_ipc::runtime::Overrides,
+        value: astra_model::runtime::Overrides,
         disconnect: Option<String>,
     ) -> Result<()> {
         let _transition = self.transition.lock().await;
@@ -763,7 +675,7 @@ impl Host {
         // A slow draining worker must not serialize every healthy worker's sample.
         let mut samples = stream::iter(generations.into_iter().map(|generation| async move {
             let result =
-                Self::rpc::<astra_ipc::runtime::Snapshot>(&generation, WorkerRequest::Snapshot)
+                Self::rpc::<astra_model::runtime::Snapshot>(&generation, WorkerRequest::Snapshot)
                     .await;
             (generation, result, std::time::Instant::now())
         }))
@@ -859,7 +771,7 @@ impl Host {
     ) -> Result<()> {
         let lease = self.lease().await?;
         let metadata = self.metadata(metadata, lease.0.id);
-        let mut remote = astra_ipc::platform::connect_trusted(&lease.0.endpoint).await?;
+        let mut remote = astra_platform::platform::connect_trusted(&lease.0.endpoint).await?;
         send(
             &mut remote,
             Auth {
@@ -887,12 +799,12 @@ impl Host {
                 snapshot.groups = app.groups.snapshot(&app);
                 let store = self.telemetry.lock().unwrap();
                 Self::merge_metrics(&mut snapshot, &store.snapshot);
-                Ok(serde_json::to_value(astra_ipc::host::RuntimeView {
+                Ok(serde_json::to_value(astra_model::runtime::RuntimeView {
                     snapshot,
                     telemetry: Some(store.metadata(&self.boot, state.active, state.paused)),
                 })?)
             }
-            Command::Mapping { token, operation } => self.mapping(&token, operation).await,
+            Command::Mapping { token, operation } => self.mapping(&token, *operation).await,
             Command::Status => {
                 let state = self.state.lock().await;
                 let mut generations = vec![];
@@ -1041,7 +953,7 @@ impl Host {
                 }
                 crate::platform::process::unregister_worker(pid);
             }
-            astra_ipc::platform::remove_socket(&g.endpoint);
+            astra_platform::platform::remove_socket(&g.endpoint);
         }
     }
 }
@@ -1075,8 +987,11 @@ pub async fn worker() -> Result<()> {
         rule.start_observer();
     }
     let app = Arc::new(app);
-    let listener = astra_ipc::platform::bind_listener(&config.endpoint)?;
-    astra_ipc::platform::set_private(astra_ipc::platform::endpoint_path(&config.endpoint), 0o600)?;
+    let listener = astra_platform::platform::bind_listener(&config.endpoint)?;
+    astra_platform::platform::set_private(
+        astra_platform::platform::endpoint_path(&config.endpoint),
+        0o600,
+    )?;
     let mut tasks = tokio::task::JoinSet::new();
     let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -1109,7 +1024,7 @@ pub async fn worker() -> Result<()> {
                             WorkerRequest::Ready => {
                                 let result = async {
                                     if app.rule_client.is_some() {
-                                        let mut rule = astra_ipc::platform::connect_trusted(&app.config.rule_socket).await?;
+                                        let mut rule = astra_platform::platform::connect_trusted(&app.config.rule_socket).await?;
                                         astra_ipc::exchange_core_info(&mut rule,env!("CARGO_PKG_VERSION")).await?;
                                     }
                                     Ok::<_,anyhow::Error>(astra_ipc::host::Hello::worker(env!("CARGO_PKG_VERSION")))
@@ -1194,7 +1109,7 @@ async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .route_with_context(
             &target,
             meta.inbound,
-            astra_ipc::Network::Tcp,
+            astra_model::Network::Tcp,
             meta.process,
             Some(destination.ip()).filter(|ip| !app.synthetic_ip(*ip)),
         )

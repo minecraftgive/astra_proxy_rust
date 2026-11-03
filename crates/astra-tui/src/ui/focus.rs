@@ -30,46 +30,17 @@ impl Region {
     }
 }
 impl Ui {
-    pub(super) fn focus_region(
-        &self,
-        f: &mut Frame<'_>,
-        area: ratatui::layout::Rect,
-        region: Region,
-    ) {
-        if self.focus.region == region
-            && self.palette.is_none()
-            && self.prompt.is_none()
-            && area.width > 2
-            && area.height > 2
-        {
-            // Recolor the existing border so titles, badges and footer text survive focus.
-            let buffer = f.buffer_mut();
-            for y in area.y..area.bottom() {
-                for x in area.x..area.right() {
-                    if x == area.x || x + 1 == area.right() || y == area.y || y + 1 == area.bottom()
-                    {
-                        if let Some(cell) = buffer.cell_mut((x, y)) {
-                            if matches!(
-                                cell.symbol(),
-                                "─" | "│"
-                                    | "╭"
-                                    | "╮"
-                                    | "╯"
-                                    | "╰"
-                                    | "┌"
-                                    | "┐"
-                                    | "└"
-                                    | "┘"
-                                    | "═"
-                                    | "║"
-                            ) {
-                                cell.set_fg(Color::Cyan);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    pub(super) fn focus_border(&self, region: Region, fallback: Color) -> Style {
+        Style::default().fg(
+            if self.focus.region == region && self.palette.is_none() && self.prompt.is_none() {
+                Color::Cyan
+            } else {
+                fallback
+            },
+        )
+    }
+    pub(super) fn focused_card<'a>(&self, title: &'a str, region: Region) -> Block<'a> {
+        super::dashboard::card(title).border_style(self.focus_border(region, Color::DarkGray))
     }
     pub(super) fn focus_key(&mut self, key: event::KeyEvent) -> Option<Input> {
         if self.live_detail_open()
@@ -151,7 +122,7 @@ impl Ui {
         let count = match self.focus.region {
             Region::Tabs => PAGES.len(),
             Region::Controls if self.editor.is_some() => 3,
-            Region::Controls if self.page == PROFILES => 2,
+            Region::Controls if self.page == PROFILES => 3,
             Region::Controls => 6,
             _ => 1,
         };
@@ -181,15 +152,14 @@ impl Ui {
                     })
                 }
                 Region::Controls if self.page == PROFILES => {
-                    self.switch_core(if self.focus.cursor == 0 {
-                        Kind::Proxy
-                    } else {
-                        Kind::Rule
-                    });
+                    self.switch_core(
+                        [Kind::Proxy, Kind::Rule, Kind::Server][self.focus.cursor.min(2)],
+                    );
                     Input::Idle
                 }
                 Region::Controls => {
-                    use astra_ipc::runtime::{Command, Mode};
+                    use astra_model::runtime::Command;
+                    use astra_model::runtime::Mode;
                     let snapshot = self.live()?;
                     let command = match self.focus.cursor {
                         0 => Command::SetMode(Mode::Rule),
@@ -216,12 +186,9 @@ impl Ui {
             Region::Controls if self.editor.is_some() => {
                 t(["Save draft", "Import", "Discard draft"][self.focus.cursor.min(2)]).into()
             }
-            Region::Controls if self.page == PROFILES => t(if self.focus.cursor == 0 {
-                "Proxy profiles"
-            } else {
-                "Rule cores"
-            })
-            .into(),
+            Region::Controls if self.page == PROFILES => {
+                t(["Proxy profiles", "Rule cores", "Servers"][self.focus.cursor.min(2)]).into()
+            }
             Region::Controls => t([
                 "Rule mode",
                 "Global mode",

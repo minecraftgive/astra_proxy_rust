@@ -8,8 +8,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable, process_flags
-from protocol_matrix import free_port
+from astra_tools.platform import executable, process_flags
+from astra_tools.net import free_port
 
 
 class Subscription(http.server.BaseHTTPRequestHandler):
@@ -34,7 +34,7 @@ def main():
         try:
             config = directory/'proxy.toml'
             control = directory/'proxy.ctl'
-            text = f"standalone=true\nsocks5_listen='127.0.0.1:{free_port()}'\nshutdown_timeout_secs=1\n[subscriptions.no]\nurl='http://127.0.0.1:{server.server_port}/private-secret?token=query-secret'\ninterval=60\n"
+            text = f"standalone=true\nsocks5_listen='127.0.0.1:{free_port()}'\nshutdown_timeout_secs=1\n[subscriptions.no]\nproxy='DIRECT'\nurl='http://127.0.0.1:{server.server_port}/private-secret?token=query-secret'\ninterval=60\n"
             config.write_text(text, encoding='utf-8')
             log_path = directory/'proxy.log'
             with log_path.open('w', encoding='utf-8') as log:

@@ -207,7 +207,7 @@ fn environment_from(values: impl IntoIterator<Item = (OsString, OsString)>) -> R
     values.sort_by_key(|(key, _)| key.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (key, value) in values {
-        let mut item = OsString::from(key);
+        let mut item = key;
         item.push("=");
         item.push(value);
         block.extend(wide(&item)?);
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn token_validation_agrees_with_current_elevation() {
         let current = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
-        if astra_ipc::elevation::is_elevated().unwrap() {
+        if astra_platform::elevation::is_elevated().unwrap() {
             assert!(ordinary(raw(&current)).is_err());
         } else {
             ordinary(raw(&current)).unwrap();

@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """Reproduce the first-release functional gate; record commands, status and output."""
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import hashlib
 import json
 import pathlib
+import platform
 import subprocess
 import sys
 import time
-from protocol_matrix import ROOT
+from astra_tools.workspace import ROOT
+from astra_tools.platform import executable
+from astra_tools.workspace import build_environment, host_target
+from astra_tools.runner import timestamped_report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/release')
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
     parser.add_argument('--tls-python', default=sys.executable, help='Python with TLS 1.3 for the Vision payload gate')
-    parser.add_argument('--output', type=pathlib.Path, default=ROOT/'docs/release-verification.json')
-    args = parser.parse_args()
+    parser.add_argument('--output', type=pathlib.Path, default=None, help='new JSON report (default: timestamped .test-tools/release-*.json)')
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='release')
+    args.output = args.output or timestamped_report('release')
     binaries = args.bin_dir.resolve()
+    env = build_environment()
+    env['ASTRA_UPDATE_TEST_BIN'] = str(binaries)
+    target = host_target(env)
     matrix = [sys.executable, 'scripts/protocol_matrix.py', '--bin-dir', str(binaries)]
     def cases(names):
         return [part for name in names for part in ('--case',name)]
     steps = [
-        ('workspace tests', ['cargo','test','--workspace']),
-        ('workspace lint', ['cargo','clippy','--workspace','--all-targets','--','-D','warnings']),
+        ('workspace tests', ['cargo','test','--workspace','--locked','--target',target]),
+        ('workspace lint', ['cargo','clippy','--workspace','--all-targets','--locked','--target',target,'--','-D','warnings']),
         ('VMess codec patches', ['cargo','test','--manifest-path','vendor/meow-proxy/Cargo.toml','--no-default-features','--features','vmess,mux','--lib','vmess::']),
         ('Hysteria2 codec patches', ['cargo','test','--manifest-path','vendor/meow-proxy/Cargo.toml','--no-default-features','--features','hysteria2','--lib','hysteria2::']),
         ('TCP matrix', matrix),
@@ -45,14 +54,15 @@ def main():
     ]
     for script in ('core_regression','udp_regression','tuic_regression','mux_regression'):
         steps.append((script,[sys.executable,f'scripts/{script}.py','--bin-dir',str(binaries)]))
-    report = {'scope':'macOS arm64 first-release functional gate; known peer/mode limitations documented separately',
-              'binary_sha256': {name:hashlib.sha256((binaries/name).read_bytes()).hexdigest() for name in ('astra-rule','astra-proxy','astra-tui')}, 'steps':[], 'passed':False}
+    report = {'scope':'Native release functional gate; known peer/mode limitations documented separately',
+              'target': target, 'platform': platform.platform(),
+              'binary_sha256': {name:hashlib.sha256((binaries/executable(name)).read_bytes()).hexdigest() for name in ('astra-rule','astra-proxy','astra-tui','astra-manager','astra-host')}, 'steps':[], 'passed':False}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     for label, command in steps:
         print('RUN',label,flush=True)
         start=time.monotonic()
         try:
-            result=subprocess.run(command,cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=300)
+            result=subprocess.run(command,cwd=ROOT,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=300)
             code, output=result.returncode,result.stdout
         except subprocess.TimeoutExpired as error:
             code, output=124,str(error)

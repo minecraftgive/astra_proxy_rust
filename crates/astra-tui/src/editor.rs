@@ -2,6 +2,7 @@
 use crate::protocol::Kind as CoreKind;
 use crate::{i18n::t, tr};
 use anyhow::{bail, Context, Result};
+use astra_app::edit::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,15 +12,13 @@ use ratatui::{
     Frame,
 };
 use serde::{Deserialize, Serialize};
-use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table, TableLike};
+#[cfg(test)]
+use toml_edit::ArrayOfTables;
+use toml_edit::{value, DocumentMut, Item, Table, TableLike};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum Part {
-    Key(String),
-    Index(usize),
-}
-type Path = Vec<Part>;
+use astra_model::document::{DocumentPath as Path, PathPart as Part};
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Form {
     path: Path,
     selected: usize,
@@ -78,129 +77,11 @@ enum Mode {
     },
     Search(TextInput),
 }
-#[derive(Default, Clone, Serialize, Deserialize)]
-struct TextInput {
-    text: String,
-    cursor: usize,
-    replace: bool,
-    #[serde(default)]
-    candidate: Option<String>,
-    #[serde(default)]
-    undo: Vec<(String, usize)>,
-    #[serde(default)]
-    redo: Vec<(String, usize)>,
-}
-impl TextInput {
-    fn new(text: String) -> Self {
-        let cursor = text.chars().count();
-        Self {
-            text,
-            cursor,
-            replace: true,
-            candidate: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-        }
-    }
-    fn byte(&self) -> usize {
-        self.text
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.text.len())
-    }
-    fn insert(&mut self, text: &str) {
-        self.remember();
-        self.candidate = None;
-        if self.replace {
-            self.text.clear();
-            self.cursor = 0;
-            self.replace = false;
-        }
-        for c in text.chars().filter(|c| !c.is_control()) {
-            let byte = self.byte();
-            self.text.insert(byte, c);
-            self.cursor += 1;
-        }
-    }
-    fn remember(&mut self) {
-        self.undo.push((self.text.clone(), self.cursor));
-        if self.undo.len() > 64 {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
-    }
-    fn key(&mut self, key: KeyEvent) {
-        self.candidate = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(key.code, KeyCode::Char('z' | 'y')) {
-                let redo = key.code == KeyCode::Char('y');
-                let previous = if redo {
-                    self.redo.pop()
-                } else {
-                    self.undo.pop()
-                };
-                if let Some((text, cursor)) = previous {
-                    let current = (self.text.clone(), self.cursor);
-                    if redo {
-                        self.undo.push(current);
-                    } else {
-                        self.redo.push(current);
-                    }
-                    self.text = text;
-                    self.cursor = cursor;
-                    self.replace = false;
-                }
-            } else if key.code == KeyCode::Char('u') {
-                self.remember();
-                self.text.clear();
-                self.cursor = 0;
-                self.replace = false;
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::Char(c) => self.insert(&c.to_string()),
-            KeyCode::Left => {
-                self.replace = false;
-                self.cursor = self.cursor.saturating_sub(1);
-            }
-            KeyCode::Right => {
-                self.replace = false;
-                self.cursor = (self.cursor + 1).min(self.text.chars().count());
-            }
-            KeyCode::Home => {
-                self.replace = false;
-                self.cursor = 0;
-            }
-            KeyCode::End => {
-                self.replace = false;
-                self.cursor = self.text.chars().count();
-            }
-            KeyCode::Backspace | KeyCode::Delete if self.replace => {
-                self.remember();
-                self.text.clear();
-                self.cursor = 0;
-                self.replace = false;
-            }
-            KeyCode::Backspace if self.cursor > 0 => {
-                self.remember();
-                self.cursor -= 1;
-                let byte = self.byte();
-                self.text.remove(byte);
-            }
-            KeyCode::Delete if self.cursor < self.text.chars().count() => {
-                self.remember();
-                let byte = self.byte();
-                self.text.remove(byte);
-            }
-            _ => {}
-        }
-    }
-}
+use astra_tui_kit::TextInput;
 
 // Keep the old draft representation so existing ui-session.json files migrate without loss.
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Editor {
     #[serde(skip)]
     interfaces: Vec<String>,
@@ -237,67 +118,7 @@ const PLACEHOLDERS: &[&str] = &[
     "example.com",
 ];
 
-#[derive(Clone)]
-enum Type {
-    Text,
-    Number(i64, i64),
-    Choice(&'static [&'static str]),
-    Boolean,
-    StringList,
-}
-#[derive(Clone)]
-struct Spec {
-    key: String,
-    label: String,
-    kind: Type,
-    default: String,
-    required: bool,
-    help: String,
-}
-impl Spec {
-    fn text(key: &str, label: &str, default: &str, required: bool) -> Self {
-        Self {
-            key: key.into(),
-            label: label.into(),
-            kind: Type::Text,
-            default: default.into(),
-            required,
-            help: String::new(),
-        }
-    }
-    fn number(key: &str, label: &str, default: i64, min: i64, max: i64) -> Self {
-        Self {
-            kind: Type::Number(min, max),
-            ..Self::text(key, label, &default.to_string(), false)
-        }
-    }
-    fn choice(
-        key: &str,
-        label: &str,
-        default: &str,
-        choices: &'static [&'static str],
-        required: bool,
-    ) -> Self {
-        Self {
-            kind: Type::Choice(choices),
-            ..Self::text(key, label, default, required)
-        }
-    }
-    fn secret(&self) -> bool {
-        let key = self.key.to_ascii_lowercase();
-        (key.contains("password") || key == "authentication")
-            || key == "uuid"
-            || key.contains("authorization")
-            || key.contains("token")
-            || key.contains("cookie")
-    }
-}
-#[derive(Clone)]
-enum Row {
-    Field(Spec),
-    Group { key: String, label: String },
-    Entry { index: usize },
-}
+use astra_app::schema::{Row, Spec, Type, OUTBOUND_KINDS};
 #[derive(Clone)]
 enum FlatRow {
     UpdateSubscriptions,
@@ -352,175 +173,12 @@ impl FlatRow {
         node_index(&self.path())
     }
 }
-fn node_index(path: &[Part]) -> Option<usize> {
-    match path {
-        [Part::Key(key), Part::Index(index), ..] if key == "outbounds" => Some(*index),
-        _ => None,
-    }
-}
-fn item_index(path: &[Part]) -> Option<(&str, usize)> {
-    match path {
-        [Part::Key(key), Part::Index(index), ..] if key == "outbounds" || key == "rules" => {
-            Some((key, *index))
-        }
-        _ => None,
-    }
-}
-const OUTBOUND_KINDS: &[&str] = &[
-    "SOCKS5",
-    "HTTP CONNECT",
-    "VLESS",
-    "VMess",
-    "Shadowsocks",
-    "Trojan",
-    "Hysteria2",
-    "TUIC",
-    "Trojan TLS (legacy)",
-    "VLESS TLS (legacy)",
-];
-const RULE_KINDS: &[&str] = &[
-    "domain_exact",
-    "domain_suffix",
-    "domain_subdomain",
-    "domain_pattern",
-    "ip_cidr",
-    "port",
-    "network",
-    "process_name",
-    "process_path",
-    "domain_keyword",
-    "geoip",
-    "geosite",
-    "domain_regex",
-    "rule_set",
-];
-const PROTOCOLS: &[&str] = &[
-    "vless",
-    "vmess",
-    "shadowsocks",
-    "trojan",
-    "hysteria2",
-    "tuic",
-];
-
-fn table_at<'a>(table: &'a dyn TableLike, path: &[Part]) -> Option<&'a dyn TableLike> {
-    if path.is_empty() {
-        return Some(table);
-    }
-    let Part::Key(key) = &path[0] else {
-        return None;
-    };
-    let item = table.get(key)?;
-    if let Some(Part::Index(index)) = path.get(1) {
-        table_at(item.as_array_of_tables()?.get(*index)?, &path[2..])
-    } else {
-        table_at(item.as_table_like()?, &path[1..])
-    }
-}
-fn table_at_mut<'a>(table: &'a mut dyn TableLike, path: &[Part]) -> Result<&'a mut dyn TableLike> {
-    if path.is_empty() {
-        return Ok(table);
-    }
-    let Part::Key(key) = &path[0] else {
-        bail!(t("无效的条目路径"));
-    };
-    if let Some(Part::Index(index)) = path.get(1) {
-        let child = table
-            .get_mut(key)
-            .and_then(Item::as_array_of_tables_mut)
-            .and_then(|a| a.get_mut(*index))
-            .context(t("条目已不存在，请返回上一级"))?;
-        table_at_mut(child, &path[2..])
-    } else {
-        if table.get(key).is_none() {
-            table.insert(key, Item::Table(Table::new()));
-        }
-        let child = table
-            .get_mut(key)
-            .and_then(Item::as_table_like_mut)
-            .context(t("该条目不是参数分组"))?;
-        table_at_mut(child, &path[1..])
-    }
-}
-fn scalar(item: &Item) -> String {
-    if let Some(s) = item.as_str() {
-        s.to_owned()
-    } else {
-        item.to_string().trim().to_owned()
-    }
-}
-fn replace_field(table: &mut dyn TableLike, key: &str, mut item: Item) {
-    if let Some(existing) = table.get_mut(key) {
-        if let (Some(old), Some(new)) = (existing.as_value(), item.as_value_mut()) {
-            *new.decor_mut() = old.decor().clone();
-        }
-        *existing = item;
-    } else {
-        table.insert(key, item);
-    }
-}
-// Encoding respects parsed source positions, which must follow the new logical order
-// after moving an array item (including all of that item's nested tables).
-pub(crate) fn position_tables(table: &mut Table, position: &mut isize) {
-    table.set_position(*position);
-    *position += 1;
-    for (_, item) in table.iter_mut() {
-        if let Some(child) = item.as_table_mut() {
-            position_tables(child, position);
-        } else if let Some(array) = item.as_array_of_tables_mut() {
-            for child in array.iter_mut() {
-                position_tables(child, position);
-            }
-        }
-    }
-}
-fn last_key(path: &[Part]) -> Option<&str> {
-    path.iter().rev().find_map(|p| {
-        if let Part::Key(k) = p {
-            Some(k.as_str())
-        } else {
-            None
-        }
-    })
-}
-fn rule_set_name(path: &[Part]) -> Option<&str> {
-    match path {
-        [Part::Key(root), Part::Key(name), ..] if root == "rule_sets" => Some(name),
-        _ => None,
-    }
-}
-fn proxy_group_name(path: &[Part]) -> Option<&str> {
-    match path {
-        [Part::Key(root), Part::Key(name), ..] if root == "proxy_groups" => Some(name),
-        _ => None,
-    }
-}
-fn proxy_targets(doc: &DocumentMut) -> Vec<String> {
-    let mut tags: Vec<String> = doc
-        .get("outbounds")
-        .and_then(Item::as_array_of_tables)
-        .into_iter()
-        .flat_map(|nodes| nodes.iter())
-        .filter_map(|node| node.get("tag").and_then(Item::as_str))
-        .map(str::to_owned)
-        .collect();
-    if let Some(groups) = doc.get("proxy_groups").and_then(Item::as_table_like) {
-        tags.extend(groups.iter().map(|(name, _)| name.to_owned()));
-    }
-    tags.sort();
-    if !tags.iter().any(|v| v == "PROXY") {
-        tags.push("PROXY".into());
-        tags.sort();
-    }
-    tags.dedup();
-    tags
-}
 fn expanded_proxy_groups(
     doc: &DocumentMut,
     snapshots: &std::collections::BTreeMap<String, crate::protocol::SubscriptionNodes>,
-) -> Result<std::collections::BTreeMap<String, astra_ipc::groups::Group>> {
+) -> Result<std::collections::BTreeMap<String, astra_model::groups::Group>> {
     let value: toml::Value = toml::from_str(&doc.to_string())?;
-    let mut groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> = value
+    let mut groups: std::collections::BTreeMap<String, astra_model::groups::Group> = value
         .get("proxy_groups")
         .cloned()
         .map(|g| g.try_into())
@@ -553,92 +211,8 @@ fn expanded_proxy_groups(
             nodes.extend(snapshot.tags.iter().cloned());
         }
     }
-    astra_ipc::groups::ensure_default(&mut groups, &nodes).map_err(anyhow::Error::msg)?;
-    astra_ipc::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)
-}
-fn proxy_references(doc: &DocumentMut, target: &str) -> bool {
-    doc.get("standalone_outbound").and_then(Item::as_str) == Some(target)
-        || doc
-            .get("proxy_groups")
-            .and_then(Item::as_table_like)
-            .is_some_and(|groups| {
-                groups.iter().any(|(_, group)| {
-                    group
-                        .as_table_like()
-                        .and_then(|g| g.get("selected"))
-                        .and_then(Item::as_str)
-                        == Some(target)
-                        || group
-                            .as_table_like()
-                            .and_then(|g| g.get("members"))
-                            .and_then(Item::as_array)
-                            .is_some_and(|a| a.iter().any(|m| m.as_str() == Some(target)))
-                })
-            })
-}
-fn rename_proxy_references(doc: &mut DocumentMut, previous: &str, next: &str) {
-    if doc.get("standalone_outbound").and_then(Item::as_str) == Some(previous) {
-        doc["standalone_outbound"] = value(next);
-    }
-    if let Some(groups) = doc
-        .get_mut("proxy_groups")
-        .and_then(Item::as_table_like_mut)
-    {
-        for (_, group) in groups.iter_mut() {
-            if let Some(group) = group.as_table_like_mut() {
-                if let Some(members) = group.get_mut("members").and_then(Item::as_array_mut) {
-                    for member in members.iter_mut() {
-                        if member.as_str() == Some(previous) {
-                            *member = toml_edit::Value::from(next);
-                        }
-                    }
-                }
-                if group.get("selected").and_then(Item::as_str) == Some(previous) {
-                    group.insert("selected", value(next));
-                }
-            }
-        }
-    }
-}
-fn rule_category(table: &Table) -> &'static str {
-    match table.get("kind").and_then(Item::as_str).unwrap_or("") {
-        "domain_exact" | "domain_suffix" | "domain_subdomain" | "domain_pattern"
-        | "domain_keyword" | "domain_regex" => "Domain rules",
-        "geosite" => "GEOSITE",
-        "ip_cidr" | "geoip" => "IP rules",
-        "process_name" | "process_path" => "Process rules",
-        "rule_set" => "Rule set references",
-        "port" | "network" => "Network / port rules",
-        _ => "Other rules",
-    }
-}
-fn rule_groups(array: &ArrayOfTables) -> Vec<(usize, usize, &'static str)> {
-    let mut groups: Vec<(usize, usize, &'static str)> = vec![];
-    for (index, table) in array.iter().enumerate() {
-        let category = rule_category(table);
-        if let Some(last) = groups.last_mut().filter(|last| last.2 == category) {
-            last.1 = index;
-        } else {
-            groups.push((index, index, category));
-        }
-    }
-    groups
-}
-fn rule_set_references(doc: &DocumentMut, name: Option<&str>) -> usize {
-    doc.get("rules")
-        .and_then(Item::as_array_of_tables)
-        .map(|rules| {
-            rules
-                .iter()
-                .filter(|rule| {
-                    rule.get("kind").and_then(Item::as_str) == Some("rule_set")
-                        && name.is_none_or(|name| {
-                            rule.get("value").and_then(Item::as_str) == Some(name)
-                        })
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    astra_model::groups::ensure_default(&mut groups, &nodes).map_err(anyhow::Error::msg)?;
+    astra_model::groups::expand(&groups, &nodes).map_err(anyhow::Error::msg)
 }
 fn rule_set_summary(doc: &DocumentMut, path: &[Part]) -> String {
     let Some(table) = table_at(doc.as_table(), path) else {
@@ -676,28 +250,6 @@ fn rule_set_summary(doc: &DocumentMut, path: &[Part]) -> String {
         rule_set_references(doc, rule_set_name(path))
     )
 }
-fn collection<'a>(doc: &'a DocumentMut, path: &[Part]) -> Option<&'a ArrayOfTables> {
-    let (Part::Key(key), parent) = path.split_last()? else {
-        return None;
-    };
-    table_at(doc.as_table(), parent)?
-        .get(key)?
-        .as_array_of_tables()
-}
-fn collection_mut<'a>(doc: &'a mut DocumentMut, path: &[Part]) -> Result<&'a mut ArrayOfTables> {
-    let (Part::Key(key), parent) = path.split_last().context(t("没有选择条目列表"))? else {
-        bail!(t("没有选择条目列表"));
-    };
-    let table = table_at_mut(doc.as_table_mut(), parent)?;
-    if table.get(key).is_none() {
-        table.insert(key, Item::ArrayOfTables(ArrayOfTables::new()));
-    }
-    table
-        .get_mut(key)
-        .and_then(Item::as_array_of_tables_mut)
-        .context(t("该分组不是条目列表"))
-}
-
 impl Editor {
     fn rename_rule_set(&mut self, previous: &str, name: &str) -> Result<()> {
         anyhow::ensure!(
@@ -765,7 +317,7 @@ impl Editor {
         if key == "selected" {
             if let Some(root) = proxy_group_name(&self.form.path) {
                 if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
-                    if let Some(path) = astra_ipc::groups::member_path(&groups, root, tag) {
+                    if let Some(path) = astra_model::groups::member_path(&groups, root, tag) {
                         return path.join(" › ");
                     }
                 }
@@ -773,12 +325,9 @@ impl Editor {
         }
         tag.to_owned()
     }
+    #[cfg(test)]
     pub fn subscription_page(&self) -> bool {
         self.document().ok().and_then(|doc|self.visible_rows(&doc).get(self.form.selected).map(FlatRow::path)).is_some_and(|path|matches!(path.first(),Some(Part::Key(key)) if matches!(key.as_str(),"subscription"|"subscriptions")))
-    }
-    pub(crate) fn merge_metadata(&mut self, other: &Self) {
-        self.set_subscription_nodes(other.subscription_nodes.clone());
-        self.set_node_tags(other.node_tags.clone());
     }
     pub fn set_node_tags(&mut self, tags: Vec<String>) {
         self.node_tags = tags;
@@ -816,7 +365,7 @@ impl Editor {
         if key == "selected" && proxy_group_name(&self.form.path).is_some() {
             if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
                 if groups.contains_key(proxy_group_name(&self.form.path).unwrap()) {
-                    return Some(astra_ipc::groups::member_choices(
+                    return Some(astra_model::groups::member_choices(
                         &groups,
                         proxy_group_name(&self.form.path).unwrap(),
                     ));
@@ -862,7 +411,7 @@ impl Editor {
             values.extend(
                 tags.into_iter()
                     // direct / block already stand for the built-in DIRECT / REJECT groups.
-                    .filter(|tag| !(action && astra_ipc::groups::builtin(tag)))
+                    .filter(|tag| !(action && astra_model::groups::builtin(tag)))
                     .map(|tag| if action { format!("proxy:{tag}") } else { tag }),
             );
             return Some(values);
@@ -937,61 +486,11 @@ impl Editor {
         })
     }
     fn document(&self) -> Result<DocumentMut> {
-        let mut doc: DocumentMut = self
-            .text()
+        let text = self.text();
+        let parsed: DocumentMut = text
             .parse()
             .context(t("配置格式无法解析。原草稿已保留，请修复配置后重新打开"))?;
-        // Both [[rules]] and rules = [{...}] are valid core configurations.
-        for key in ["rules", "outbounds"] {
-            if let Some(array) = doc.get(key).and_then(Item::as_array) {
-                let mut tables = ArrayOfTables::new();
-                for item in array.iter() {
-                    tables.push(
-                        item.as_inline_table()
-                            .context(t("列表中需要参数条目"))?
-                            .clone()
-                            .into_table(),
-                    );
-                }
-                doc[key] = Item::ArrayOfTables(tables);
-            }
-        }
-        if self.is_proxy(&doc) {
-            let groups = table_at_mut(doc.as_table_mut(), &[Part::Key("proxy_groups".into())])?;
-            if groups.get("PROXY").is_none() {
-                let mut group = Table::new();
-                group["mode"] = value("select");
-                group["include_all"] = value(true);
-                groups.insert("PROXY", Item::Table(group));
-            }
-            // DIRECT/REJECT are built-in groups whose own member is the terminal outbound.
-            for name in ["DIRECT", "REJECT"] {
-                if groups.get(name).is_none() {
-                    let mut group = Table::new();
-                    group["mode"] = value("select");
-                    group["members"] = value(toml_edit::Array::from_iter([name]));
-                    groups.insert(name, Item::Table(group));
-                }
-            }
-        }
-        if self.is_proxy(&doc) {
-            let mut data: toml::Table = toml::from_str(&doc.to_string())?;
-            astra_convert::subscription::prepare_groups(&mut data)?;
-            if let Some(groups) = data.get("proxy_groups").and_then(|v| v.as_table()) {
-                for (name, group) in groups
-                    .iter()
-                    .filter(|(_, g)| g.get("subscription").is_some())
-                {
-                    let snippet: DocumentMut = toml::to_string(group)?.parse()?;
-                    let table =
-                        table_at_mut(doc.as_table_mut(), &[Part::Key("proxy_groups".into())])?;
-                    if table.get(name).is_none() {
-                        table.insert(name, Item::Table(snippet.as_table().clone()));
-                    }
-                }
-            }
-        }
-        Ok(doc)
+        astra_app::edit::parse_editor_document(&text, self.is_proxy(&parsed), t)
     }
     fn update(&mut self, mut doc: DocumentMut) {
         self.form.marked_rules.clear();
@@ -1004,20 +503,14 @@ impl Editor {
         self.lines = text.split('\n').map(str::to_owned).collect();
     }
     fn remember(&mut self, previous: String) {
-        self.history.push(previous);
-        if self.history.len() > HISTORY_LIMIT {
-            self.history.remove(0);
-        }
-        self.future.clear();
+        astra_app::history::remember(&mut self.history, &mut self.future, previous, HISTORY_LIMIT);
     }
     /// Steps the draft back (or forward) one edit; fold state is clamped to what still exists.
     fn restore(&mut self, redo: bool) -> Result<()> {
-        let (from, to) = if redo {
-            (&mut self.future, &mut self.history)
-        } else {
-            (&mut self.history, &mut self.future)
-        };
-        let Some(text) = from.pop() else {
+        let previous = self.lines.join("\n");
+        let Some(text) =
+            astra_app::history::restore(&mut self.history, &mut self.future, previous, redo)
+        else {
             self.notice = Some(
                 t(if redo {
                     "Nothing to redo"
@@ -1028,7 +521,6 @@ impl Editor {
             );
             return Ok(());
         };
-        to.push(self.lines.join("\n"));
         self.lines = text.split('\n').map(str::to_owned).collect();
         self.form.marked_rules.clear();
         self.form.guide = None;
@@ -1278,762 +770,17 @@ impl Editor {
     }
 
     fn schema_rows(&self, doc: &DocumentMut, path: &[Part]) -> Vec<Row> {
-        if matches!(path.last(), Some(Part::Key(k)) if k == "rules" || k == "outbounds") {
-            return collection(doc, path)
-                .map(|a| {
-                    a.iter()
-                        .enumerate()
-                        .map(|(index, _)| Row::Entry { index })
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
-        let table = table_at(doc.as_table(), path);
-        let get = |key: &str| {
-            table
-                .and_then(|t| t.get(key))
-                .and_then(Item::as_str)
-                .unwrap_or("")
-        };
-        let text = Spec::text;
-        let number = Spec::number;
-        let choice = Spec::choice;
-        let max = u32::MAX as i64;
-        let mut fields = if path.is_empty() {
-            if self.is_proxy(doc) {
-                vec![
-                    Spec {
-                        kind: Type::Boolean,
-                        ..text(
-                            "standalone",
-                            t("独立代理模式（无需 Rule Core）"),
-                            "false",
-                            false,
-                        )
-                    },
-                    text("standalone_outbound", t("独立模式出站标签"), "", false),
-                    text(
-                        "rule_socket",
-                        t("规则 Core Socket"),
-                        "/tmp/astra-rule.sock",
-                        !doc.get("standalone")
-                            .and_then(Item::as_bool)
-                            .unwrap_or(false),
-                    ),
-                    text("socks5_listen", t("SOCKS5 监听地址（留空禁用）"), "", false),
-                    text("http_listen", t("HTTP 监听地址（留空禁用）"), "", false),
-                    text("mixed_listen", t("Mixed listener"), "", false),
-                    Spec {
-                        kind: Type::StringList,
-                        ..text("authentication", t("Inbound authentication"), "[]", false)
-                    },
-                    number("ipc_connections", t("IPC 连接数"), 8, 1, 128),
-                    number(
-                        "decision_timeout_ms",
-                        t("规则查询超时（毫秒）"),
-                        500,
-                        1,
-                        i64::MAX,
-                    ),
-                    number("connect_timeout_secs", t("连接超时（秒）"), 8, 1, i64::MAX),
-                    number(
-                        "shutdown_timeout_secs",
-                        t("停止等待时间（秒）"),
-                        2,
-                        0,
-                        i64::MAX,
-                    ),
-                    number("max_connections", t("最大连接数"), 4096, 1, max),
-                    number(
-                        "decision_cache_ttl_secs",
-                        t("决策缓存时间（秒，0 禁用）"),
-                        5,
-                        0,
-                        i64::MAX,
-                    ),
-                    number("max_udp_flows", t("最大 UDP 流数"), 512, 1, 65536),
-                    number(
-                        "udp_targets_per_association",
-                        t("每个 UDP 关联的目标数"),
-                        32,
-                        1,
-                        65536,
-                    ),
-                    Spec {
-                        kind: Type::Boolean,
-                        ..text(
-                            "watch_config",
-                            t("自动监测配置文件并热重载"),
-                            "false",
-                            false,
-                        )
-                    },
-                    number(
-                        "udp_idle_timeout_secs",
-                        t("UDP 空闲超时（秒）"),
-                        120,
-                        1,
-                        i64::MAX,
-                    ),
-                    Spec {
-                        kind: Type::StringList,
-                        ..text("lan_allowed_ips", t("Allowed source CIDRs"), "[]", false)
-                    },
-                    Spec {
-                        kind: Type::StringList,
-                        ..text("lan_disallowed_ips", t("Blocked source CIDRs"), "[]", false)
-                    },
-                    Spec {
-                        kind: Type::StringList,
-                        ..text(
-                            "skip_auth_prefixes",
-                            t("Skip authentication for CIDRs"),
-                            "[]",
-                            false,
-                        )
-                    },
-                ]
+        astra_app::schema::rows_for(
+            doc,
+            path,
+            self.kind.unwrap_or(if self.is_proxy(doc) {
+                CoreKind::Proxy
             } else {
-                vec![
-                    text("socket", t("规则监听 Socket"), "/tmp/astra-rule.sock", true),
-                    text("default_action", t("默认路由动作"), "direct", true),
-                    text("geosite_database", t("GeoSite 数据库"), "", false),
-                    text("geosite_url", t("GeoSite 下载地址"), "", false),
-                    number(
-                        "geosite_interval",
-                        t("GeoSite 更新间隔（秒）"),
-                        86400,
-                        1,
-                        31536000,
-                    ),
-                    text("geoip_database", t("GeoIP 数据库"), "", false),
-                    text("geoip_url", t("GeoIP 下载地址"), "", false),
-                    number(
-                        "geoip_interval",
-                        t("GeoIP 更新间隔（秒）"),
-                        86400,
-                        1,
-                        31536000,
-                    ),
-                    Spec {
-                        kind: Type::Boolean,
-                        ..text("direct_local", t("本地 IP 直连"), "true", false)
-                    },
-                    Spec {
-                        kind: Type::Boolean,
-                        ..text(
-                            "watch_config",
-                            t("自动监测配置文件并热重载"),
-                            "false",
-                            false,
-                        )
-                    },
-                ]
-            }
-        } else if last_key(path) == Some("subscription")
-            || (path.len() == 2 && path.first() == Some(&Part::Key("subscriptions".into())))
-        {
-            vec![
-                text("url", t("Subscription URL"), "", true),
-                number("interval", t("Update interval (seconds)"), 3600, 60, 604800),
-                text("user_agent", "User-Agent", "clash.meta/astra", false),
-                text(
-                    "proxy",
-                    t("Update proxy (group / node / DIRECT)"),
-                    "PROXY",
-                    false,
-                ),
-                Spec {
-                    kind: Type::Boolean,
-                    ..text(
-                        "import_groups",
-                        t("Import subscription groups"),
-                        "false",
-                        false,
-                    )
-                },
-            ]
-        } else if path.len() == 2 && proxy_group_name(path).is_some() {
-            let mut fields = vec![
-                text(
-                    "interface",
-                    t("Egress adapter (physical or virtual)"),
-                    "",
-                    false,
-                ),
-                choice(
-                    "mode",
-                    t("Group mode"),
-                    "select",
-                    &["select", "auto", "fallback", "load_balance"],
-                    true,
-                ),
-                Spec {
-                    kind: Type::StringList,
-                    ..text("members", t("Group members"), "[]", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("include_all", t("Include all nodes"), "false", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text(
-                        "include_all_groups",
-                        t("Include other groups"),
-                        "false",
-                        false,
-                    )
-                },
-                text("filter", t("Dynamic member filter"), "", false),
-                text("exclude_filter", t("Dynamic member exclusion"), "", false),
-            ];
-            if !get("subscription").is_empty() {
-                fields.insert(
-                    0,
-                    Spec {
-                        kind: Type::Boolean,
-                        ..text(
-                            "include_in_proxy",
-                            t("Include in Proxy group"),
-                            "true",
-                            false,
-                        )
-                    },
-                );
-            }
-            if matches!(get("mode"), "auto" | "fallback" | "load_balance") {
-                fields.extend([
-                    text(
-                        "url",
-                        t("Test URL"),
-                        "https://www.gstatic.com/generate_204",
-                        true,
-                    ),
-                    number("interval", t("Test interval (seconds)"), 300, 1, 86400),
-                    number("timeout_ms", t("Test timeout (ms)"), 5000, 100, 30000),
-                    number("tolerance_ms", t("Switch tolerance (ms)"), 50, 0, 10000),
-                ]);
-            } else {
-                fields.push(text("selected", t("Selected member"), "", false));
-            }
-            fields.extend(
-                [
-                    ("disconnect_on_manual", "Disconnect on manual switch"),
-                    ("disconnect_on_auto", "Disconnect on automatic improvement"),
-                    ("disconnect_on_failure", "Disconnect on member failure"),
-                    (
-                        "disconnect_on_recovery",
-                        "Disconnect on availability recovery",
-                    ),
-                    (
-                        "disconnect_on_config_change",
-                        "Disconnect on members or mode change",
-                    ),
-                ]
-                .into_iter()
-                .map(|(key, label)| Spec {
-                    kind: Type::Boolean,
-                    ..text(key, t(label), "false", false)
-                }),
-            );
-            fields
-        } else if path.len() == 2 && matches!(&path[0],Part::Key(key) if key=="rule_sets") {
-            vec![
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("enabled", t("Rule set enabled"), "true", false)
-                },
-                choice(
-                    "behavior",
-                    t("规则集类型"),
-                    "classical",
-                    &["classical", "domain", "ipcidr"],
-                    true,
-                ),
-                choice("format", t("文件格式"), "yaml", &["yaml", "text"], true),
-                text("path", t("规则集文件或缓存路径"), "", false),
-                text("url", t("规则集下载地址"), "", false),
-                number("interval", t("更新间隔（秒）"), 86400, 0, 31536000),
-                Spec {
-                    kind: Type::StringList,
-                    ..text("payload", t("内联规则列表"), "[]", false)
-                },
-            ]
-        } else if last_key(path) == Some("system_proxy") {
-            vec![Spec {
-                kind: Type::StringList,
-                ..text(
-                    "services",
-                    t("macOS 网络服务名称列表（空列表自动发现）"),
-                    "[]",
-                    false,
-                )
-            }]
-        } else if last_key(path) == Some("dns") {
-            vec![
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("enable", "启用 DNS 服务", "true", false)
-                },
-                Spec {
-                    kind: Type::StringList,
-                    ..text(
-                        "listen",
-                        "DNS 监听地址（UDP/TCP）",
-                        "[\"127.0.0.1:1053\"]",
-                        false,
-                    )
-                },
-                Spec {
-                    kind: Type::StringList,
-                    ..text(
-                        "nameserver",
-                        "DNS 上游（UDP/TCP/DoH/DoT）",
-                        "[\"udp://1.1.1.1:53\"]",
-                        false,
-                    )
-                },
-                Spec {
-                    kind: Type::StringList,
-                    ..text("fallback", "DNS 失败备用上游", "[]", false)
-                },
-                Spec {
-                    kind: Type::StringList,
-                    ..text(
-                        "bootstrap",
-                        "上游域名引导解析 IP",
-                        "[\"1.1.1.1\",\"8.8.8.8\"]",
-                        false,
-                    )
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("respect_rules", "DNS 上游连接遵循路由规则", "false", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("ipv6", "解析 IPv6 地址", "true", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("hijack", "接管 TUN 的 53 端口 DNS", "true", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("fake_ip", "启用 Fake IP", "false", false)
-                },
-                text("fake_ip_range", "Fake IPv4 地址池", "198.18.0.0/16", false),
-                text("fake_ip_range6", "Fake IPv6 地址池（可选 ULA）", "", false),
-                choice(
-                    "fake_ip_filter_mode",
-                    "Fake IP 过滤方式",
-                    "blacklist",
-                    &["blacklist", "whitelist"],
-                    false,
-                ),
-                Spec {
-                    kind: Type::StringList,
-                    ..text(
-                        "fake_ip_filter",
-                        "Fake IP 域名过滤列表",
-                        "[\"+.lan\",\"+.local\",\"localhost\"]",
-                        false,
-                    )
-                },
-                number("cache_capacity", "DNS 缓存条目上限", 4096, 0, 65536),
-                number(
-                    "cache_max_ttl_secs",
-                    "DNS 缓存最大 TTL（秒）",
-                    3600,
-                    1,
-                    86400,
-                ),
-                number("negative_ttl_secs", "DNS 负缓存最大 TTL（秒）", 60, 0, 3600),
-                number(
-                    "query_timeout_ms",
-                    "DNS 单个上游超时（毫秒）",
-                    3000,
-                    100,
-                    30000,
-                ),
-                number("max_concurrent", "DNS 并发查询上限", 128, 1, 1024),
-                number("mapping_capacity", "DNS 域名映射条目上限", 8192, 1, 65536),
-                number(
-                    "mapping_ttl_secs",
-                    "Fake IP 映射保留时间（秒）",
-                    86400,
-                    1,
-                    604800,
-                ),
-                number("fake_ip_ttl", "Fake IP 响应 TTL（秒）", 60, 1, 3600),
-            ]
-        } else if last_key(path) == Some("tun") {
-            vec![
-                Spec {
-                    kind: Type::Boolean,
-                    ..text(
-                        "auto_interface",
-                        "自动跟随出口网卡（运行时检测）",
-                        if get("interface").is_empty() {
-                            "true"
-                        } else {
-                            "false"
-                        },
-                        false,
-                    )
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text("auto_gateway", "自动跟随所选网卡的网关", "true", false)
-                },
-                Spec {
-                    kind: Type::Boolean,
-                    ..text(
-                        "sniff",
-                        "从 TLS/HTTP 识别域名以匹配规则（保留原始目标 IP）",
-                        "true",
-                        false,
-                    )
-                },
-                text("name", t("TUN 接口名（留空自动分配）"), "", false),
-                text("address", t("TUN IPv4 地址"), "198.18.0.1", false),
-                number("prefix", t("TUN 地址前缀"), 30, 0, 32),
-                text("ipv6_address", t("TUN IPv6 地址（可选）"), "", false),
-                number("ipv6_prefix", t("TUN IPv6 地址前缀"), 126, 0, 128),
-                number("mtu", "TUN MTU", 1500, 1280, 9000),
-                Spec {
-                    kind: Type::StringList,
-                    ..text("routes", t("接管的 CIDR 列表"), "[]", false)
-                },
-                Spec {
-                    kind: Type::StringList,
-                    ..text(
-                        "bypass",
-                        t("经原网关绕过的 CIDR 列表（含节点 IP 和 DNS）"),
-                        "[]",
-                        false,
-                    )
-                },
-                text("gateway", t("原出口网关"), "", false),
-                text("gateway6", t("原出口 IPv6 网关（可选）"), "", false),
-                text(
-                    "interface",
-                    t("Egress adapter (physical or virtual)"),
-                    "",
-                    false,
-                ),
-            ]
-        } else if matches!(last_key(path), Some("tproxy" | "redirect")) {
-            vec![text(
-                "listen",
-                t("Linux 透明代理监听地址"),
-                "0.0.0.0:7893",
-                true,
-            )]
-        } else if matches!(path.last(), Some(Part::Index(_))) && last_key(path) == Some("rules") {
-            vec![
-                choice("kind", t("匹配类型"), "domain_suffix", RULE_KINDS, true),
-                text("value", t("匹配内容"), "example.com", true),
-                text("action", t("路由动作"), "direct", true),
-            ]
-        } else if matches!(path.last(), Some(Part::Index(_))) && last_key(path) == Some("outbounds")
-        {
-            let mut f = vec![
-                choice(
-                    "kind",
-                    t("节点类型"),
-                    "socks5",
-                    &["socks5", "http", "native", "trojan_tls", "vless_tls"],
-                    true,
-                ),
-                text("tag", t("节点标签"), "edge", true),
-            ];
-            match get("kind") {
-                "native" => {}
-                "trojan_tls" | "vless_tls" => {
-                    f.extend([
-                        text(
-                            "server",
-                            t("服务器（主机:端口）"),
-                            "node.example.com:443",
-                            true,
-                        ),
-                        text("sni", t("TLS 服务器名"), "node.example.com", true),
-                    ]);
-                    f.push(if get("kind") == "trojan_tls" {
-                        text("password", t("密码"), "", true)
-                    } else {
-                        text("uuid", "UUID", "", true)
-                    });
-                }
-                _ => f.extend([
-                    text("server", t("服务器（主机:端口）"), "127.0.0.1:7890", true),
-                    text("username", t("用户名"), "", false),
-                    text("password", t("密码"), "", false),
-                ]),
-            }
-            f
-        } else if last_key(path) == Some("config") {
-            let protocol = get("protocol");
-            let mut f = vec![
-                choice("protocol", t("代理协议"), "vless", PROTOCOLS, true),
-                text("server", t("服务器主机"), "node.example.com", true),
-                number("port", t("服务器端口"), 443, 1, 65535),
-            ];
-            if matches!(protocol, "vless" | "vmess" | "tuic") {
-                f.push(text(
-                    "uuid",
-                    "UUID",
-                    "00000000-0000-0000-0000-000000000001",
-                    true,
-                ));
-            }
-            if matches!(protocol, "trojan" | "shadowsocks" | "hysteria2" | "tuic") {
-                f.push(text("password", t("密码"), "", true));
-            }
-            match protocol {
-                "vless" => f.extend([
-                    choice(
-                        "flow",
-                        t("Vision 流控"),
-                        "",
-                        &["", "xtls-rprx-vision"],
-                        false,
-                    ),
-                    text(
-                        "encryption",
-                        t("VLESS Encryption（完整字符串）"),
-                        "none",
-                        false,
-                    ),
-                ]),
-                "vmess" => f.push(choice(
-                    "cipher",
-                    t("加密方式"),
-                    "auto",
-                    &["auto", "aes-128-gcm", "chacha20-poly1305"],
-                    false,
-                )),
-                "shadowsocks" => f.push(text("cipher", t("加密方式"), "aes-128-gcm", true)),
-                "hysteria2" => f.extend([
-                    text("obfs_password", t("Salamander 混淆密码"), "", false),
-                    text("pin_sha256", t("证书 SHA-256 固定值"), "", false),
-                ]),
-                "tuic" => f.extend([
-                    choice(
-                        "tuic_udp_mode",
-                        t("UDP 模式"),
-                        "native",
-                        &["native", "quic"],
-                        false,
-                    ),
-                    number("tuic_idle_timeout_secs", t("空闲超时（秒）"), 15, 3, 3600),
-                    choice(
-                        "congestion_control",
-                        t("拥塞控制"),
-                        "cubic",
-                        &["cubic", "bbr", "new_reno"],
-                        false,
-                    ),
-                ]),
-                _ => {}
-            }
-            if matches!(protocol, "vless" | "vmess" | "shadowsocks") {
-                f.push(text("mux", t("多路复用协议（可选）"), "", false));
-            }
-            f
-        } else if last_key(path) == Some("tls") {
-            vec![
-                text("server_name", t("TLS 服务器名"), "node.example.com", true),
-                text("ca_file", t("自定义 CA 文件"), "", false),
-                choice(
-                    "fingerprint",
-                    t("客户端 TLS 指纹"),
-                    "",
-                    &[
-                        "",
-                        "chrome",
-                        "chrome120",
-                        "firefox",
-                        "firefox120",
-                        "safari",
-                        "safari16",
-                        "ios",
-                        "android",
-                        "edge",
-                        "random",
-                    ],
-                    false,
-                ),
-                text("cert_pin_sha256", t("服务端证书 SHA-256 指纹"), "", false),
-                text("reality_public_key", t("REALITY 公钥"), "", false),
-                text("reality_short_id", "REALITY Short ID", "", false),
-            ]
-        } else if last_key(path) == Some("transport") {
-            let mut f = vec![
-                choice(
-                    "kind",
-                    t("传输方式"),
-                    "tcp",
-                    &["tcp", "ws", "grpc", "http_upgrade", "xhttp"],
-                    false,
-                ),
-                text("path", t("请求路径"), "/", false),
-                text("host", "Host / Authority", "", false),
-                text("service_name", t("gRPC 服务名"), "GunService", false),
-            ];
-            if get("kind") == "xhttp" {
-                f.push(choice(
-                    "mode",
-                    t("XHTTP 模式"),
-                    "stream-one",
-                    &["stream-one", "stream-up", "packet-up", "auto"],
-                    false,
-                ));
-            }
-            f
-        } else {
-            vec![]
-        };
-        for field in &mut fields {
-            if field.key == "port" && last_key(path) == Some("config") {
-                field.required = true;
-            }
-            field.help = match field.key.as_str() {
-                "action" | "default_action" => {
-                    t("Select direct / block / a proxy node; manual proxy:tag is supported").into()
-                }
-                "kind" if last_key(path) == Some("rules") => {
-                    t("↑↓ 选择匹配类型；更改类型后请检查匹配内容；规则按列表顺序生效").into()
-                }
-                "kind" if last_key(path) == Some("transport") => {
-                    t("↑↓ 选择传输方式；切换方式会移除不适用的模式和请求头").into()
-                }
-                "kind" => t("↑↓ 选择；切换节点类型会重置专用字段并保留标签，保存前检查凭据").into(),
-                "protocol" => {
-                    t("↑↓ 选择；保留可复用参数，重置不适用的协议字段，保存前检查凭据").into()
-                }
-                "standalone" => t(
-                    "true：全部 TCP/UDP 入站使用固定出站，不连接 Rule Core；false：使用规则分流",
-                )
-                .into(),
-                "standalone_outbound" => {
-                    t("Select an existing node; leave empty to use the only node").into()
-                }
-                "port" => t("输入 1–65535 的整数").into(),
-                "encryption" => {
-                    t("填写完整 mlkem768x25519plus… 字符串；留空或 none 不启用；不是 cipher").into()
-                }
-                "fingerprint" => {
-                    t("客户端 ClientHello 样式，例如 chrome；不是服务端证书哈希").into()
-                }
-                "cert_pin_sha256" => t(
-                    "服务端证书 SHA-256：64 位十六进制；替代 CA 验证，不与自定义 CA / REALITY 合用",
-                )
-                .into(),
-                "mode" if last_key(path) == Some("transport") => t(
-                    "auto：普通 TLS 选择 packet-up，REALITY 选择 stream-one；省略默认 stream-one",
-                )
-                .into(),
-                _ if matches!(field.kind, Type::Boolean) => {
-                    t("Enter / Space toggle · d reset to default").into()
-                }
-                _ if field.required => t("Enter edit · required").into(),
-                _ => t("Enter edit · d reset to default").into(),
-            };
-        }
-        let platform = crate::availability::Platform::current();
-        let mut rows: Vec<Row> = fields
-            .into_iter()
-            .filter(|field| platform.option(last_key(path), &field.key))
-            .map(Row::Field)
-            .collect();
-        let groups: Vec<(&str, &str)> = if path.is_empty() {
-            if self.is_proxy(doc) {
-                vec![
-                    ("system_proxy", t("系统代理（SOCKS）")),
-                    ("tun", t("TUN 接管")),
-                    ("dns", "DNS / Fake IP"),
-                    ("tproxy", "TPROXY (TCP/UDP)"),
-                    ("redirect", "REDIRECT (TCP)"),
-                    ("outbounds", t("出站节点")),
-                    ("proxy_groups", t("Proxy groups")),
-                    ("subscriptions", t("Subscriptions")),
-                ]
-            } else {
-                vec![
-                    ("rules", t("路由规则（按顺序匹配）")),
-                    ("rule_sets", t("规则集")),
-                ]
-            }
-        } else if get("kind") == "native" && matches!(path.last(), Some(Part::Index(_))) {
-            vec![("config", t("协议参数"))]
-        } else if last_key(path) == Some("config") {
-            vec![("tls", "TLS / REALITY"), ("transport", t("传输参数"))]
-        } else if last_key(path) == Some("transport") {
-            vec![("headers", t("自定义请求头"))]
-        } else {
-            vec![]
-        };
-        rows.extend(
-            groups
-                .into_iter()
-                .filter(|(key, _)| platform.option(last_key(path), key))
-                .map(|(key, label)| Row::Group {
-                    key: key.into(),
-                    label: label.into(),
-                }),
-        );
-        if let Some(table) = table {
-            for (key, item) in table.iter() {
-                if path.is_empty() && self.is_proxy(doc) && key == "allow_lan" {
-                    continue;
-                }
-                if (last_key(path) == Some("subscription")
-                    || (path.len() == 2
-                        && path.first() == Some(&Part::Key("subscriptions".into()))))
-                    && matches!(key, "managed_nodes" | "managed_groups")
-                {
-                    continue;
-                }
-                if proxy_group_name(path).is_some()
-                    && ((matches!(get("mode"), "auto" | "fallback" | "load_balance")
-                        && key == "selected")
-                        || (!matches!(get("mode"), "auto" | "fallback" | "load_balance")
-                            && matches!(key, "url" | "interval" | "timeout_ms" | "tolerance_ms")))
-                {
-                    continue;
-                }
-                if !platform.option(last_key(path), key) {
-                    continue;
-                }
-                if rows.iter().any(|r| match r {
-                    Row::Field(s) => s.key == key,
-                    Row::Group { key: k, .. } => k == key,
-                    _ => false,
-                }) {
-                    continue;
-                }
-                if item.as_table_like().is_some() || item.as_array_of_tables().is_some() {
-                    rows.push(Row::Group {
-                        key: key.into(),
-                        label: key.into(),
-                    });
-                } else {
-                    let mut spec = text(key, key, "", false);
-                    if item.as_integer().is_some() {
-                        spec.kind = Type::Number(i64::MIN, i64::MAX);
-                    } else if item.as_array().is_some() {
-                        spec.kind = Type::StringList;
-                    } else if item.as_bool().is_some() {
-                        spec.kind = Type::Boolean;
-                    }
-                    rows.push(Row::Field(spec));
-                }
-            }
-        }
-        rows
+                CoreKind::Rule
+            }),
+            crate::availability::Platform::current(),
+            t,
+        )
     }
     fn rows(&self, doc: &DocumentMut) -> Vec<Row> {
         self.schema_rows(doc, &self.form.path)
@@ -2683,7 +1430,7 @@ impl Editor {
                     options.sort();
                     options.dedup();
                     // A built-in group keeps its own terminal outbound as a choice.
-                    options.retain(|v| v != name || astra_ipc::groups::builtin(name));
+                    options.retain(|v| v != name || astra_model::groups::builtin(name));
                     self.form.path = path;
                     self.form.mode = Mode::Members {
                         options,
@@ -3272,11 +2019,9 @@ impl Editor {
                 let name = proxy_group_name(&self.form.path).unwrap();
                 let groups = expanded_proxy_groups(&doc, &self.subscription_nodes)?;
                 if let Some(effective) = groups.get(name) {
-                    if effective
-                        .selected
-                        .as_ref()
-                        .is_some_and(|s| astra_ipc::groups::member_path(&groups, name, s).is_none())
-                    {
+                    if effective.selected.as_ref().is_some_and(|s| {
+                        astra_model::groups::member_path(&groups, name, s).is_none()
+                    }) {
                         let group = table_at_mut(doc.as_table_mut(), &self.form.path)?;
                         if let Some(first) = effective.members.first() {
                             group.insert("selected", value(first));
@@ -3393,7 +2138,7 @@ impl Editor {
                             !key.is_empty()
                                 && key.len() <= 64
                                 && !key.chars().any(char::is_control)
-                                && !astra_ipc::groups::reserved(&key),
+                                && !astra_model::groups::reserved(&key),
                             t("Enter a proxy group name")
                         );
                         let mut doc = self.document()?;
@@ -3528,7 +2273,7 @@ impl Editor {
                 {
                     self.form.path = vec![Part::Key("proxy_groups".into())];
                     anyhow::ensure!(
-                        !astra_ipc::groups::reserved(&name),
+                        !astra_model::groups::reserved(&name),
                         t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
                     );
                     self.form.rename_proxy_group = Some(name.clone());
@@ -3623,7 +2368,8 @@ impl Editor {
                         // DIRECT/REJECT have no dynamic members to fall back on.
                         anyhow::ensure!(
                             !(spec.key == "members"
-                                && proxy_group_name(&path).is_some_and(astra_ipc::groups::builtin)),
+                                && proxy_group_name(&path)
+                                    .is_some_and(astra_model::groups::builtin)),
                             t("Choose at least one group member")
                         );
                         self.form.path = path;
@@ -3658,7 +2404,7 @@ impl Editor {
                     ) => {
                         if let Some(name) = proxy_group_name(&path) {
                             anyhow::ensure!(
-                                !astra_ipc::groups::reserved(&name),
+                                !astra_model::groups::reserved(name),
                                 t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
                             );
                             anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
@@ -3762,7 +2508,7 @@ impl Editor {
     /// Reorder by original indices so non-adjacent selections keep their relative order.
     fn move_marked_rules(&mut self, target: Option<usize>, down: bool) -> Result<()> {
         let mut doc = self.document()?;
-        let array = collection_mut(&mut doc, &vec![Part::Key("rules".into())])?;
+        let array = collection_mut(&mut doc, &[Part::Key("rules".into())])?;
         let marked = self.form.marked_rules.clone();
         let mut order: Vec<usize> = (0..array.len()).collect();
         if let Some(target) = target {
@@ -4299,54 +3045,6 @@ impl Editor {
             }
         }
     }
-}
-
-fn native_config(protocol: &str) -> Table {
-    let mut table = Table::new();
-    table["protocol"] = value(protocol);
-    table["server"] = value("node.example.com");
-    table["port"] = value(443);
-    if matches!(protocol, "vless" | "vmess" | "tuic") {
-        table["uuid"] = value("00000000-0000-0000-0000-000000000001");
-    }
-    if matches!(protocol, "shadowsocks" | "trojan" | "hysteria2" | "tuic") {
-        table["password"] = value("change-me");
-    }
-    if protocol == "shadowsocks" {
-        table["cipher"] = value("aes-128-gcm");
-    }
-    if protocol != "shadowsocks" {
-        let mut tls = Table::new();
-        tls["server_name"] = value("node.example.com");
-        table["tls"] = Item::Table(tls);
-    }
-    table
-}
-fn outbound_template(kind: &str, tag: &str) -> Table {
-    let mut table = Table::new();
-    table["tag"] = value(tag);
-    if kind.starts_with("native") {
-        table["kind"] = value("native");
-        table["config"] = Item::Table(native_config(
-            kind.strip_prefix("native:").unwrap_or("vless"),
-        ));
-    } else {
-        table["kind"] = value(kind);
-        table["server"] = value(if matches!(kind, "socks5" | "http") {
-            "127.0.0.1:7890"
-        } else {
-            "node.example.com:443"
-        });
-        if kind == "trojan_tls" {
-            table["sni"] = value("node.example.com");
-            table["password"] = value("change-me");
-        }
-        if kind == "vless_tls" {
-            table["sni"] = value("node.example.com");
-            table["uuid"] = value("00000000-0000-0000-0000-000000000001");
-        }
-    }
-    table
 }
 
 #[cfg(test)]
@@ -5856,11 +4554,7 @@ mod tests {
         assert!(matches!(&e.form.mode,Mode::Field{input,..} if input.text == "hjklgg"));
         press(&mut e, KeyCode::Esc);
         assert_eq!(e.text(), original);
-        e.focus_field(
-            &doc,
-            &vec![Part::Key("rules".into()), Part::Index(1)],
-            "value",
-        );
+        e.focus_field(&doc, &[Part::Key("rules".into()), Part::Index(1)], "value");
         press(&mut e, KeyCode::Char('h'));
         assert!(matches!(
             e.visible_rows(&doc).get(e.form.selected),
@@ -5878,11 +4572,7 @@ mod tests {
         let mut editor = Editor::new("rules".into(), "socket='r'\ndefault_action='direct'\nrules=[{kind='domain_exact',value='first.test',action='block'},{kind='ip_cidr',value='10.0.0.0/8',action='direct'}]".into());
         let original = editor.text();
         let doc = editor.document().unwrap();
-        editor.focus_field(
-            &doc,
-            &vec![Part::Key("rules".into()), Part::Index(1)],
-            "value",
-        );
+        editor.focus_field(&doc, &[Part::Key("rules".into()), Part::Index(1)], "value");
         press(&mut editor, KeyCode::Esc);
         assert!(matches!(
             editor.visible_rows(&doc).get(editor.form.selected),
@@ -6023,14 +4713,9 @@ mod tests {
     async fn live_visual_outbound_templates_pass_core_validation() {
         let directory = std::env::temp_dir().join(format!("astra-form-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        astra_ipc::platform::set_private(&directory, 0o700).unwrap();
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(astra_ipc::platform::executable("astra-proxy"));
+        astra_platform::platform::set_private(&directory, 0o700).unwrap();
+        let bin = crate::manager::test_binaries()
+            .join(astra_platform::platform::executable("astra-proxy"));
         for (selected, kind) in OUTBOUND_KINDS.iter().enumerate() {
             let mut e = Editor::new(
                 "proxy".into(),
@@ -6275,7 +4960,7 @@ mod interaction_tests {
                             .collect::<Vec<_>>(),
                     )
                 })
-                .last()
+                .next_back()
                 .unwrap_or_else(|| panic!("{needle} not on screen"))
         };
         press(&mut e, KeyCode::Char('/'));

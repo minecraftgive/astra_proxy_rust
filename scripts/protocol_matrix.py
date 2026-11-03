@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Local payload interoperability tests using real protocol servers, without public nodes."""
+from astra_tools.processes import process, wait_port
+from astra_tools.workspace import resolve_binary_dir, reference_engine, reference_engine_dir
 import argparse
+from astra_tools.fixtures.protocols import USER, PASSWORD, write_json, tls_material, fixture, openssl_binary
+from astra_tools.net import TRAILER, Echo, TlsEcho, tls_probe, UdpEcho, UdpEchoServer, UdpEchoServer6, udp_probe, EchoServer, free_port, exact
 import base64
 import contextlib
 import json
@@ -15,250 +19,24 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import process_flags, interrupt
+from astra_tools.platform import process_flags, interrupt
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-USER = '00000000-0000-0000-0000-000000000001'
-PASSWORD = 'astra-local-test-password'
-TRAILER = b'astra-half-close-trailer'
 
-class Echo(socketserver.BaseRequestHandler):
-    def handle(self):
-        while True:
-            data = self.request.recv(65536)
-            if not data:
-                if getattr(self.server, "send_trailer", False):
-                    self.request.sendall(TRAILER)
-                return
-            self.request.sendall(data)
 
-class TlsEcho(socketserver.BaseRequestHandler):
-    def handle(self):
-        try:
-            with self.server.tls.wrap_socket(self.request, server_side=True) as stream:
-                while True:
-                    data = stream.recv(65536)
-                    if not data:
-                        stream.unwrap().close()
-                        return
-                    stream.sendall(data)
-        except Exception as error:
-            self.server.errors.append(error)
 
-def tls_probe(proxy_port, echo_port, payload_bytes, ca):
-    context = ssl.create_default_context(cafile=str(ca))
-    context.minimum_version = ssl.TLSVersion.TLSv1_3
-    with socket.create_connection(('127.0.0.1', proxy_port), timeout=20) as raw:
-        raw.sendall(b'\x05\x01\x00')
-        assert exact(raw, 2) == b'\x05\x00'
-        raw.sendall(b'\x05\x01\x00\x03\x09localhost' + echo_port.to_bytes(2, 'big'))
-        assert exact(raw, 10)[1] == 0
-        with context.wrap_socket(raw, server_hostname='localhost') as stream:
-            assert stream.version() == 'TLSv1.3'
-            # Alternate bounded writes/reads so Python's TLS object is never
-            # accessed concurrently by two threads. Large TLS records exercise
-            # the Vision switch beyond its initial padded handshake records.
-            remaining = payload_bytes
-            while remaining:
-                payload = bytes(i % 251 for i in range(min(32768, remaining)))
-                stream.sendall(payload)
-                assert exact(stream, len(payload)) == payload
-                remaining -= len(payload)
-            stream.unwrap().close()
 
-class UdpEcho(socketserver.BaseRequestHandler):
-    def handle(self):
-        data, sock = self.request
-        sock.sendto(data, self.client_address)
 
-class UdpEchoServer(socketserver.ThreadingUDPServer):
-    allow_reuse_address = True
-    daemon_threads = True
 
-class UdpEchoServer6(UdpEchoServer):
-    address_family = socket.AF_INET6
 
-def udp_probe(proxy_port, echo_port, edge=False, sizes=None, hosts=None):
-    with socket.create_connection(('127.0.0.1', proxy_port), timeout=15) as control, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-        udp.bind(('127.0.0.1', 0))
-        # First packet includes route lookup and the configured 10-second
-        # protocol handshake (REALITY can exceed five seconds locally).
-        udp.settimeout(15)
-        control.sendall(b'\x05\x01\x00')
-        assert exact(control, 2) == b'\x05\x00'
-        control.sendall(b'\x05\x03\x00\x01' + socket.inet_aton('127.0.0.1') + udp.getsockname()[1].to_bytes(2, 'big'))
-        reply = exact(control, 10)
-        assert reply[:4] == b'\x05\x00\x00\x01', reply
-        relay = (socket.inet_ntoa(reply[4:8]), int.from_bytes(reply[8:], 'big'))
-        for host in (hosts if hosts is not None else ('127.0.0.1', '::1', 'localhost')):
-            address = b'\x04' + socket.inet_pton(socket.AF_INET6, host) if ':' in host else (b'\x01' + socket.inet_aton(host) if host[0].isdigit() else b'\x03' + bytes([len(host)]) + host.encode())
-            header = b'\x00\x00\x00' + address + echo_port.to_bytes(2, 'big')
-            for length in (sizes if sizes is not None else ((1, 1200, 4096, 8192, 0, 64) if edge else (1, 1200, 4096, 64))):
-                payload = bytes(i % 251 for i in range(length))
-                udp.sendto(header + payload, relay)
-                try:
-                    data, _ = udp.recvfrom(65536)
-                except (socket.timeout, TimeoutError) as error:
-                    raise TimeoutError(f"UDP {host} payload={length} timed out") from error
-                assert data[:3] == b'\x00\x00\x00', data[:10]
-                at = {1: 8, 4: 20}.get(data[3], 5 + data[4])
-                assert int.from_bytes(data[at:at+2], 'big') == echo_port
-                assert data[at+2:] == payload, (host, length, len(data))
 
-class EchoServer(socketserver.ThreadingTCPServer):
-    request_queue_size = 128
-    allow_reuse_address = True
-    daemon_threads = True
 
-def free_port():
-    # Servers often listen on TCP and UDP with one port; Windows reserves different
-    # ranges per protocol (netsh int ipv4 show excludedportrange), so check both.
-    # Ports are drawn at random: the OS hands out ephemeral TCP ports in sequence and
-    # can sit inside a hundreds-wide UDP exclusion for many consecutive picks.
-    for _ in range(500):
-        port = random.randint(20000, 60999)
-        with socket.socket() as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-            try:
-                tcp.bind(('127.0.0.1', port))
-                udp.bind(('127.0.0.1', port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError('no port is free for both TCP and UDP')
 
-def exact(sock, count):
-    data = b''
-    while len(data) < count:
-        chunk = sock.recv(count - len(data))
-        if not chunk:
-            raise EOFError(f'unexpected EOF after {len(data)} of {count} bytes')
-        data += chunk
-    return data
 
-def wait_port(port, process, log):
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError('process exited: ' + log.read_text()[-5000:])
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=.1):
-                return
-        except OSError:
-            time.sleep(.05)
-    raise TimeoutError('listener startup timeout: ' + log.read_text()[-5000:])
 
-@contextlib.contextmanager
-def process(command, directory, name):
-    log_path = directory / (name + '.log')
-    with log_path.open('w') as log:
-        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
-                                 env=dict(os.environ, RUST_LOG=os.environ.get('RUST_LOG', 'info')), **process_flags())
-        try:
-            yield child, log_path
-        finally:
-            if child.poll() is None:
-                interrupt(child)
-                try:
-                    child.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
 
-def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2))
-    return path
 
-def tls_material(directory):
-    cert, key = directory / 'cert.pem', directory / 'key.pem'
-    ca, ca_key = directory / 'ca.pem', directory / 'ca-key.pem'
-    config = directory / 'openssl.cnf'
-    config.write_text('[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n[dn]\nCN=Astra Test CA\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n[server]\nsubjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
-    commands = [
-        ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-config', str(config), '-keyout', str(ca_key), '-out', str(ca)],
-        ['openssl', 'req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost', '-keyout', str(key), '-out', str(directory/'server.csr')],
-        ['openssl', 'x509', '-req', '-in', str(directory/'server.csr'), '-CA', str(ca), '-CAkey', str(ca_key), '-CAcreateserial', '-days', '2', '-extfile', str(config), '-extensions', 'server', '-out', str(cert)],
-    ]
-    for command in commands:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return cert, key
 
-def fixture(case, port, cert, key):
-    if case.startswith('sing-socks-'):
-        inbound = {'type': 'socks', 'listen': '127.0.0.1', 'listen_port': port}
-        if case.endswith('-auth'):
-            inbound['users'] = [{'username': 'astra', 'password': PASSWORD}]
-        return 'sing_box', {'log': {'level':'warn'}, 'inbounds':[inbound], 'outbounds':[{'type':'direct'}]}, None
-    if case.startswith(('socks-', 'http-')):
-        protocol, authentication = case.split('-', 1)
-        settings = {'udp': True, 'auth': 'password' if authentication == 'auth' else 'noauth'} if protocol == 'socks' else {}
-        if authentication == 'auth':
-            settings['accounts'] = [{'user': 'astra', 'pass': PASSWORD}]
-        return 'xray', {'log': {'loglevel': 'warning'}, 'inbounds': [{'listen': '127.0.0.1', 'port': port, 'protocol': protocol, 'settings': settings}], 'outbounds': [{'protocol': 'freedom'}]}, None
-    if case.startswith('sing-'):
-        protocol = case[5:].removesuffix('-aead')
-        if protocol == 'direct':
-            return 'sing_box', None, {'type': 'direct'}
-        server = {'type': protocol, 'listen': '127.0.0.1', 'listen_port': port}
-        client = {'type': protocol, 'server': '127.0.0.1', 'server_port': port}
-        tls_server = {'enabled': True, 'certificate_path': str(cert), 'key_path': str(key), 'alpn': ['h3']}
-        tls_client = {'enabled': True, 'server_name': 'localhost', 'certificate_path': str(cert), 'alpn': ['h3']}
-        if protocol == 'hysteria2':
-            server.update(users=[{'password': PASSWORD}], tls=tls_server)
-            client.update(password=PASSWORD, tls=tls_client)
-        elif protocol in ('vmess', 'vless'):
-            tls_server['alpn'] = ['http/1.1']
-            user = {'uuid': USER}
-            if protocol == 'vmess': user['alterId'] = 0
-            server.update(users=[user], tls=tls_server)
-        elif protocol == 'trojan':
-            tls_server['alpn'] = ['http/1.1']
-            server.update(users=[{'password': PASSWORD}], tls=tls_server)
-        elif protocol == 'tuic':
-            server.update(users=[{'uuid': USER, 'password': PASSWORD}], tls=tls_server, congestion_control='bbr')
-            client.update(uuid=USER, password=PASSWORD, tls=tls_client, congestion_control='bbr')
-        elif protocol == 'shadowsocks':
-            method, password = ('aes-128-gcm', PASSWORD) if case.endswith('-aead') else ('2022-blake3-aes-128-gcm', base64.b64encode(bytes(range(16))).decode())
-            server.update(method=method, password=password)
-            client.update(method=method, password=password)
-        return 'sing_box', {'log': {'level': 'warn'}, 'inbounds': [server], 'outbounds': [{'type': 'direct'}]}, client
-    if case == 'xray-direct':
-        return 'xray', None, {'protocol': 'freedom'}
-    protocol, transport = case.split('-', 1)
-    if transport.startswith('reality-'):
-        transport = transport[len('reality-'):]
-    protocol = {'ss': 'shadowsocks'}.get(protocol, protocol)
-    server = {'listen': '127.0.0.1', 'port': port, 'protocol': protocol}
-    client = {'protocol': protocol}
-    if protocol in ('vless', 'vmess'):
-        user = {'id': USER}
-        if protocol == 'vless':
-            user['encryption'] = 'none'
-        else:
-            user['security'] = 'auto'
-        server['settings'] = {'clients': [{'id': USER}], **({'decryption': 'none'} if protocol == 'vless' else {})}
-        client['settings'] = {'vnext': [{'address': '127.0.0.1', 'port': port, 'users': [user]}]}
-    elif protocol == 'trojan':
-        server['settings'] = {'clients': [{'password': PASSWORD}]}
-        client['settings'] = {'servers': [{'address': '127.0.0.1', 'port': port, 'password': PASSWORD}]}
-    elif protocol == 'shadowsocks':
-        server['settings'] = {'method': 'aes-128-gcm', 'password': PASSWORD, 'network': 'tcp,udp'}
-        client['settings'] = {'servers': [{'address': '127.0.0.1', 'port': port, 'method': 'aes-128-gcm', 'password': PASSWORD}]}
-    if transport != 'plain':
-        network = 'raw' if transport in ('tls','reality','vision') else transport.split(':')[0]
-        server_stream = {'network': network, 'security': 'tls', 'tlsSettings': {'certificates': [{'certificateFile': str(cert), 'keyFile': str(key)}]}}
-        client_stream = {'network': network, 'security': 'tls', 'tlsSettings': {'serverName': 'localhost', 'certificates': [{'certificateFile': str(cert), 'usage': 'verify'}]}}
-        if network == 'xhttp':
-            settings = {'path': '/astra-test', 'mode': transport.split(':')[1]}
-            server_stream['xhttpSettings'] = settings
-            client_stream['xhttpSettings'] = settings
-        elif network in ('ws', 'httpupgrade'):
-            server_stream[network + 'Settings'] = {'path': '/astra-test'}
-            client_stream[network + 'Settings'] = {'path': '/astra-test'}
-        elif network == 'grpc':
-            server_stream['grpcSettings'] = {'serviceName': 'astra-test'}
-            client_stream['grpcSettings'] = {'serviceName': 'astra-test'}
-        server['streamSettings'], client['streamSettings'] = server_stream, client_stream
-    return 'xray', {'log': {'loglevel': 'warning'}, 'inbounds': [server], 'outbounds': [{'protocol': 'freedom'}]}, client
 
 CASES = ['socks-plain', 'socks-auth', 'http-plain', 'http-auth', 'ss-plain', 'sing-shadowsocks', 'sing-vmess', 'vmess-tls', 'trojan-tls', 'vless-tls',
          'vless-ws', 'vless-grpc', 'vless-httpupgrade', 'vless-xhttp:packet-up', 'vless-xhttp:stream-up',
@@ -274,11 +52,11 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
             server_config['inbounds'][0]['obfs'] = {'type': 'salamander', 'password': PASSWORD}
         reality = case.startswith('vless-reality') or case == 'vless-vision'
         if reality:
-            keys=subprocess.check_output([str(engines/'xray'),'x25519'],text=True)
+            keys=subprocess.check_output([str(reference_engine('xray', engines)),'x25519'],text=True)
             private=next(line.split(': ',1)[1] for line in keys.splitlines() if line.startswith('PrivateKey:'))
             public=next(line.split(': ',1)[1] for line in keys.splitlines() if 'PublicKey' in line)
             if bad_reality:
-                other = subprocess.check_output([str(engines/'xray'), 'x25519'], text=True)
+                other = subprocess.check_output([str(reference_engine('xray', engines)), 'x25519'], text=True)
                 public = next(line.split(': ', 1)[1] for line in other.splitlines() if 'PublicKey' in line)
             cover_port=free_port()
             inbound=server_config['inbounds'][0]
@@ -287,7 +65,7 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
             if case=='vless-vision':inbound['settings']['clients'][0]['flow']='xtls-rprx-vision'
         proxy = d / 'proxy.toml' 
         rule = d / 'rule.toml'
-        rule.write_text(f'socket="{d}/rules.sock"\ndefault_action="proxy:edge"\n')
+        rule.write_text(f'socket="{d.as_posix()}/rules.sock"\ndirect_local=false\ndefault_action="proxy:edge"\n')
         if case in ('xray-direct','sing-direct'):
             raise ValueError('reference-engine client tests removed: Astra must be native Rust')
         if case.startswith('sing-'):
@@ -319,7 +97,7 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
         if proto not in ('shadowsocks',) and not case.endswith('-plain'):
             cfg+='[outbounds.config.tls]\nserver_name="localhost"\n'
             if reality:cfg+=f'reality_public_key="{public}"\nreality_short_id="0123456789abcdef"\nfingerprint="chrome"\n'
-            elif proto!='hysteria2':cfg+=f'ca_file="{d / "ca.pem"}"\n'
+            elif proto!='hysteria2':cfg+=f'ca_file="{(d / "ca.pem").as_posix()}"\n'
         if fault == 'credential':
             if proto in ('vless', 'vmess'):
                 cfg = cfg.replace(USER, '00000000-0000-0000-0000-000000000002')
@@ -331,23 +109,23 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
         elif fault == 'server-name':
             cfg = cfg.replace('server_name="localhost"', 'server_name="wrong.example"')
         elif fault == 'untrusted-ca':
-            cfg = cfg.replace(f'ca_file="{d / "ca.pem"}"\n', '')
+            cfg = cfg.replace(f'ca_file="{(d / "ca.pem").as_posix()}"\n', '')
         elif fault == 'pin':
             cfg = cfg.replace(hashlib.sha256(der).hexdigest(), '00'*32)
-        proxy.write_text(f'rule_socket="{d}/rules.sock"\nsocks5_listen="127.0.0.1:{proxy_port}"\nconnect_timeout_secs=10\nshutdown_timeout_secs=1\n[[outbounds]]\nkind="native"\ntag="edge"\n[outbounds.config]\n'+cfg)
+        proxy.write_text(f'rule_socket="{d.as_posix()}/rules.sock"\nsocks5_listen="127.0.0.1:{proxy_port}"\nconnect_timeout_secs=10\nshutdown_timeout_secs=1\n[[outbounds]]\nkind="native"\ntag="edge"\n[outbounds.config]\n'+cfg)
         if case.startswith(('socks-', 'http-', 'sing-socks-')):
             kind = 'socks5' if case.startswith(('socks-', 'sing-socks-')) else 'http'
             credentials = f'username="astra"\npassword="{PASSWORD}"\n' if case.endswith('-auth') else ''
             if bad_auth:
                 credentials = credentials.replace(PASSWORD, 'incorrect-password')
-            proxy.write_text(f'rule_socket="{d}/rules.sock"\nsocks5_listen="127.0.0.1:{proxy_port}"\nshutdown_timeout_secs=1\n[[outbounds]]\nkind="{kind}"\ntag="edge"\nserver="127.0.0.1:{peer_port}"\n'+credentials)
+            proxy.write_text(f'rule_socket="{d.as_posix()}/rules.sock"\nsocks5_listen="127.0.0.1:{proxy_port}"\nshutdown_timeout_secs=1\n[[outbounds]]\nkind="{kind}"\ntag="edge"\nserver="127.0.0.1:{peer_port}"\n'+credentials)
         with contextlib.ExitStack() as stack:
             if reality:
-                cover,cover_log=stack.enter_context(process(['openssl','s_server','-accept',f'127.0.0.1:{cover_port}','-cert',str(cert),'-key',str(key),'-www','-alpn','h2'],d,'cover'))
+                cover,cover_log=stack.enter_context(process([openssl_binary(),'s_server','-accept',f'127.0.0.1:{cover_port}','-cert',str(cert),'-key',str(key),'-www','-alpn','h2'],d,'cover'))
                 wait_port(cover_port,cover,cover_log)
             if server_config:
                 config_path = write_json(d / 'server.json', server_config)
-                binary = engines / ('xray' if engine == 'xray' else 'sing-box')
+                binary = reference_engine('xray' if engine == 'xray' else 'sing-box', engines)
                 command = [str(binary), 'run', '-config' if engine == 'xray' else '-c', str(config_path)]
                 peer, peer_log = stack.enter_context(process(command, d, 'server'))
                 if case in ('sing-hysteria2', 'sing-tuic'):
@@ -423,6 +201,7 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
                     raise RuntimeError(str(error) + "\n" + app_log.read_text()[-5000:] + "\n" + peer_log.read_text()[-3000:]) from error
                 print("PASS", case, "UDP IPv4/IPv6/domain, " + (str(udp_sizes) + " bytes" if udp_sizes is not None else ("0..8192 bytes" if udp_edge else "1..4096 bytes")), flush=True)
                 return
+            phase = 'connect'
             try:
                 with socket.create_connection(('127.0.0.1', proxy_port), timeout=15) as sock:
                     sock.sendall(b'\x05\x01\x00')
@@ -443,8 +222,10 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
                             send_errors.append(error)
                     sender = threading.Thread(target=upload, daemon=True)
                     sender.start()
+                    phase = 'payload echo'
                     assert exact(sock, len(payload)) == payload
                     if trailer:
+                        phase = 'response trailer after upload EOF'
                         assert exact(sock, len(TRAILER)) == TRAILER
                     sender.join(timeout=15)
                     assert not sender.is_alive(), 'upload did not finish'
@@ -452,15 +233,16 @@ def run_case(case, binaries, engines, echo_port, payload_bytes=65536, trailer=Fa
                         raise send_errors[0]
                     if not trailer:
                         sock.shutdown(socket.SHUT_WR)
+                    phase = 'read EOF after complete echo'
                     assert sock.recv(1) == b'', 'half-close did not complete'
             except Exception as error:
-                raise RuntimeError(str(error) + '\n' + app_log.read_text()[-5000:] + ('\n' + peer_log.read_text()[-3000:] if server_config else '')) from error
+                raise RuntimeError(phase + ': ' + str(error) + '\n' + app_log.read_text()[-5000:] + ('\n' + peer_log.read_text()[-3000:] if server_config else '')) from error
     print('PASS', case, f'{payload_bytes} bytes' + (' + early upload EOF + response trailer' if trailer else ' + close after echo'), flush=True)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT / 'target/debug')
-    parser.add_argument('--engine-dir', type=pathlib.Path, default=ROOT / '.test-tools/bin')
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    parser.add_argument('--engine-dir', '--engines-dir', dest='engine_dir', type=pathlib.Path, default=None)
     parser.add_argument('--case', action='append', choices=CASES + ['vless-plain', 'vmess-plain', 'sing-vless', 'sing-shadowsocks-aead', 'sing-trojan', 'sing-socks-plain', 'sing-socks-auth'])
     parser.add_argument('--payload-bytes', type=int, default=65536)
     parser.add_argument('--tuic-udp-mode', choices=['native', 'quic'], default='native')
@@ -473,7 +255,7 @@ def main():
     parser.add_argument('--udp', action='store_true')
     parser.add_argument('--tls-payload', action='store_true', help='verified inner TLS 1.3 echo; checks Vision raw switch (requires RUST_LOG=debug)')
     parser.add_argument('--trailer', action='store_true', help='require data sent by destination after client half-close')
-    args = parser.parse_args()
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     args.udp = args.udp or bool(args.udp_size)
     if args.udp_size is not None and any(n < 0 or n > 65000 for n in args.udp_size):
         parser.error("udp-size must be between 0 and 65000")
@@ -512,7 +294,7 @@ def main():
         failed = []
         for case in args.case or CASES:
             try:
-                run_case(case, args.bin_dir.resolve(), args.engine_dir.resolve(), echo.server_address[1], args.payload_bytes, args.trailer, args.udp, args.udp_edge, args.bad_auth, args.tuic_udp_mode, args.tls_payload, args.udp_size, args.bad_reality, args.fault, args.hy2_obfs)
+                run_case(case, args.bin_dir.resolve(), reference_engine_dir(args.engine_dir), echo.server_address[1], args.payload_bytes, args.trailer, args.udp, args.udp_edge, args.bad_auth, args.tuic_udp_mode, args.tls_payload, args.udp_size, args.bad_reality, args.fault, args.hy2_obfs)
             except Exception as error:
                 failed.append(case)
                 print('FAIL', case, str(error), flush=True)

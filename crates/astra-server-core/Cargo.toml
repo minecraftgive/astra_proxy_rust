@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-management = { path = "../astra-management" }
+astra-model = { path = "../astra-model" }
+astra-platform = { path = "../astra-platform" }
 astra-protocols = { path = "../astra-protocols" }
 astra-ipc = { path = "../astra-ipc" }
-astra-server-api = { path = "../astra-server-api" }
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -57,7 +57,7 @@ async fn scenario() -> Result<()> {
     let config = directory.join("proxy.toml");
     std::fs::write(&config,format!("standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:{proxy_port}'\n[proxy_groups.direct]\nmembers=['DIRECT']\n"))?;
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_astra-proxy"));
-    let mut child = astra_ipc::platform::background_core(&binary)
+    let mut child = astra_platform::platform::background_core(&binary)
         .arg(&config)
         .env("ASTRA_CONTROL_SOCKET", &control)
         .env("ASTRA_RUNTIME_DIR", directory.join("runtime"))
@@ -67,7 +67,7 @@ async fn scenario() -> Result<()> {
     let result = async {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if astra_ipc::control::request(&control, astra_ipc::control::Command::Status)
+                if astra_ipc::control::request(&control, astra_model::control::Command::Status)
                     .await
                     .is_ok()
                 {
@@ -128,7 +128,7 @@ async fn scenario() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let _ = astra_ipc::control::request(&control, astra_ipc::control::Command::Stop).await;
+    let _ = astra_ipc::control::request(&control, astra_model::control::Command::Stop).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     echo_task.abort();
     // Test-owned directory; never delete a caller-supplied path.
@@ -166,7 +166,7 @@ impl Resident {
         let config = directory.join("proxy.toml");
         std::fs::write(&config, format!("standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:{port}'\n{extra}\n[proxy_groups.direct]\n{group}\n"))?;
         let binary = PathBuf::from(env!("CARGO_BIN_EXE_astra-proxy"));
-        let child = astra_ipc::platform::background_core(&binary)
+        let child = astra_platform::platform::background_core(&binary)
             .arg(&config)
             .env("ASTRA_CONTROL_SOCKET", &control)
             .env("ASTRA_RUNTIME_DIR", directory.join("runtime"))
@@ -184,7 +184,7 @@ impl Resident {
             loop {
                 if astra_ipc::control::request(
                     &resident.control,
-                    astra_ipc::control::Command::Status,
+                    astra_model::control::Command::Status,
                 )
                 .await
                 .is_ok()
@@ -221,7 +221,8 @@ impl Resident {
         )?)
     }
     async fn stop(&mut self) {
-        let _ = astra_ipc::control::request(&self.control, astra_ipc::control::Command::Stop).await;
+        let _ =
+            astra_ipc::control::request(&self.control, astra_model::control::Command::Stop).await;
         if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
             .await
             .is_err()
@@ -263,7 +264,7 @@ async fn explicit_manual_group_change_disconnects_current_and_draining_generatio
         echo(&mut current, b'b').await?;
         astra_ipc::control::runtime(
             &core.control,
-            astra_ipc::runtime::Command::Select {
+            astra_model::runtime::Command::Select {
                 group: "direct".into(),
                 member: "second".into(),
             },
@@ -307,7 +308,7 @@ async fn previous_host_snapshot_id_cannot_disconnect_a_restarted_worker() -> Res
             loop {
                 let snapshot = astra_ipc::control::runtime(
                     &core.control,
-                    astra_ipc::runtime::Command::Snapshot,
+                    astra_model::runtime::Command::Snapshot,
                 )
                 .await?;
                 if let Some(connection) = snapshot.connections.first() {
@@ -339,7 +340,7 @@ async fn previous_host_snapshot_id_cannot_disconnect_a_restarted_worker() -> Res
         anyhow::ensure!(
             astra_ipc::control::runtime(
                 &restarted.control,
-                astra_ipc::runtime::Command::Disconnect(Some(previous))
+                astra_model::runtime::Command::Disconnect(Some(previous))
             )
             .await
             .is_err(),
@@ -348,7 +349,7 @@ async fn previous_host_snapshot_id_cannot_disconnect_a_restarted_worker() -> Res
         echo(&mut stream, b'c').await?;
         astra_ipc::control::runtime(
             &restarted.control,
-            astra_ipc::runtime::Command::Disconnect(Some(current)),
+            astra_model::runtime::Command::Disconnect(Some(current)),
         )
         .await?;
         let closed = tokio::time::timeout(Duration::from_secs(5), stream.read_u8()).await?;

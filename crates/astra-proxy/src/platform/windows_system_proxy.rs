@@ -50,7 +50,8 @@ fn matches_expected(actual: &Settings, expected: &Settings) -> bool {
     actual.flags == expected.flags
         && actual.server.as_deref().unwrap_or("") == expected.server.as_deref().unwrap_or("")
         && actual.bypass.as_deref().unwrap_or("") == expected.bypass.as_deref().unwrap_or("")
-        && actual.auto_config_url.as_deref().unwrap_or("") == expected.auto_config_url.as_deref().unwrap_or("")
+        && actual.auto_config_url.as_deref().unwrap_or("")
+            == expected.auto_config_url.as_deref().unwrap_or("")
 }
 fn monitor(expected: Settings) -> Result<Monitor> {
     let (stop, receiver) = std::sync::mpsc::channel();
@@ -74,7 +75,10 @@ fn monitor(expected: Settings) -> Result<Monitor> {
                 }
             }
         })?;
-    Ok(Monitor { stop, thread: Some(thread) })
+    Ok(Monitor {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 fn option(option: u32) -> INTERNET_PER_CONN_OPTIONW {
@@ -194,7 +198,7 @@ fn write(settings: &Settings) -> Result<()> {
 }
 
 fn lock(recovery: Option<&Path>) -> Result<File> {
-    let directory = astra_ipc::platform::home_dir()?.join(".astra");
+    let directory = astra_platform::platform::home_dir()?.join(".astra");
     std::fs::create_dir_all(&directory)?;
     // The file contains only a journal path, never credentials. Exclusive sharing
     // provides a kernel lock across processes and sessions of the current user.
@@ -254,7 +258,7 @@ impl Guard {
                 )
             })?;
         let saved = (|| -> Result<()> {
-            astra_ipc::platform::set_private(journal, 0o600)?;
+            astra_platform::platform::set_private(journal, 0o600)?;
             file.write_all(toml::to_string(&snapshot)?.as_bytes())?;
             file.sync_all()?;
             Ok(())

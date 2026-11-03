@@ -1,8 +1,14 @@
 //! Exercise real IPC, log formatting, provenance, rejection and generation changes.
-use astra_ipc::{
-    control, platform::LocalStream, Inbound, Network, ProcessInfo, RouteAction, RouteRequest,
-    RouteResponse, Target, API_VERSION,
-};
+use astra_ipc::control;
+use astra_ipc::API_VERSION;
+use astra_model::Inbound;
+use astra_model::Network;
+use astra_model::ProcessInfo;
+use astra_model::RouteAction;
+use astra_model::RouteRequest;
+use astra_model::RouteResponse;
+use astra_model::Target;
+use astra_platform::platform::LocalStream;
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 struct Temp(PathBuf);
@@ -67,19 +73,20 @@ async fn every_received_request_has_correlated_decision_or_rejection_and_respons
         let log = std::fs::File::create(&logfile).unwrap();
         #[cfg(windows)]
         {
-            let checked = astra_ipc::platform::background_core(env!("CARGO_BIN_EXE_astra-rule"))
-                .args(["--check".as_ref(), config.as_os_str()])
-                .env("ASTRA_CONTROL_SOCKET", &ctl)
-                .output()
-                .await
-                .unwrap();
+            let checked =
+                astra_platform::platform::background_core(env!("CARGO_BIN_EXE_astra-rule"))
+                    .args(["--check".as_ref(), config.as_os_str()])
+                    .env("ASTRA_CONTROL_SOCKET", &ctl)
+                    .output()
+                    .await
+                    .unwrap();
             assert!(checked.status.success());
             assert!(
                 route.exists() && ctl.exists(),
                 "--check must leave endpoints untouched"
             );
         }
-        let mut child = astra_ipc::platform::background_core(env!("CARGO_BIN_EXE_astra-rule"))
+        let mut child = astra_platform::platform::background_core(env!("CARGO_BIN_EXE_astra-rule"))
             .arg(&config)
             .env("ASTRA_CONTROL_SOCKET", &ctl)
             .env("ASTRA_LOG_LEVEL", level)
@@ -150,7 +157,7 @@ async fn every_received_request_has_correlated_decision_or_rejection_and_respons
             before_reload.default_action, "block",
             "query must use active configuration, not the edited file"
         );
-        control::request(&ctl, control::Command::Reload { path: None })
+        control::request(&ctl, astra_model::control::Command::Reload { path: None })
             .await
             .unwrap();
         let updated = query(&mut first, &request(5, "unmatched.test")).await;
@@ -200,7 +207,7 @@ async fn every_received_request_has_correlated_decision_or_rejection_and_respons
         drop(watcher);
         drop(first);
         drop(second);
-        control::request(&ctl, control::Command::Stop)
+        control::request(&ctl, astra_model::control::Command::Stop)
             .await
             .unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(5), child.wait())

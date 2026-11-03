@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """TUIC native QUIC reuse, restart and authentication/certificate regressions."""
+from astra_tools.workspace import resolve_binary_dir, reference_engine, reference_engine_dir
 import concurrent.futures
 import contextlib
 import argparse
@@ -10,16 +11,21 @@ import socket
 import tempfile
 import threading
 import time
-from protocol_matrix import ROOT, USER, PASSWORD, Echo, EchoServer, UdpEcho, UdpEchoServer, UdpEchoServer6, exact, fixture, free_port, process, tls_material, udp_probe, wait_port, write_json
-from core_regression import socks, wait_socket
+from astra_tools.workspace import ROOT
+from astra_tools.fixtures.protocols import USER, PASSWORD, fixture, tls_material, write_json
+from astra_tools.net import Echo, EchoServer, UdpEcho, UdpEchoServer, UdpEchoServer6, exact, free_port, udp_probe
+from astra_tools.processes import process, wait_port
+from astra_tools.net import socks
+from astra_tools.processes import wait_socket
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT / 'target/debug')
-    args = parser.parse_args()
+    parser.add_argument('--engine-dir', '--engines-dir', dest='engine_dir', type=pathlib.Path, default=None)
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
     binaries = args.bin_dir.resolve()
-    os.environ['RUST_LOG'] = 'astra_proxy=debug'
+    os.environ['RUST_LOG'] = 'astra_proxy=debug,astra_protocols=debug'
     with tempfile.TemporaryDirectory(prefix='astra-tuic-') as td, contextlib.ExitStack() as stack:
         directory = pathlib.Path(td)
         cert, key = tls_material(directory)
@@ -33,13 +39,13 @@ def main():
         _, server_config, _ = fixture('sing-tuic',peer_port,cert,key)
         server_config['log']['level'] = 'warn'
         server_path = write_json(directory/'server.json',server_config)
-        server_command = [str(ROOT/'.test-tools/bin/sing-box'),'run','-c',str(server_path)]
+        server_command = [str(reference_engine('sing-box', args.engine_dir)),'run','-c',str(server_path)]
         peer, peer_log = stack.enter_context(process(server_command,directory,'peer'))
         time.sleep(.3)
         assert peer.poll() is None
         rule_path, config_path = directory/'rule.toml',directory/'proxy.toml'
-        rule_path.write_text(f'socket="{directory}/rules.sock"\ndefault_action="proxy:edge"\n')
-        config = f'''rule_socket="{directory}/rules.sock"
+        rule_path.write_text(f'socket="{directory.as_posix()}/rules.sock"\ndirect_local=false\ndefault_action="proxy:edge"\n')
+        config = f'''rule_socket="{directory.as_posix()}/rules.sock"
 socks5_listen="127.0.0.1:{proxy_port}"
 connect_timeout_secs=6
 shutdown_timeout_secs=1
@@ -54,7 +60,7 @@ uuid="{USER}"
 password="{PASSWORD}"
 [outbounds.config.tls]
 server_name="localhost"
-ca_file="{directory}/ca.pem"
+ca_file="{directory.as_posix()}/ca.pem"
 '''
         config_path.write_text(config)
         rule, log = stack.enter_context(process([str(binaries/'astra-rule'),str(rule_path)],directory,'rule'))
@@ -96,7 +102,7 @@ ca_file="{directory}/ca.pem"
         for name, changed in [
             ('password',config.replace(PASSWORD,'wrong-password')),
             ('server-name',config.replace('server_name="localhost"','server_name="wrong.example"')),
-            ('untrusted-certificate',config.replace(f'ca_file="{directory}/ca.pem"','')),
+            ('untrusted-certificate',config.replace(f'ca_file="{directory.as_posix()}/ca.pem"','')),
         ]:
             config_path.write_text(changed)
             with process([str(binaries/'astra-proxy'),str(config_path)],directory,name) as (app,log):

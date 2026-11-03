@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-model = { path = "../astra-model" }
+astra-platform = { path = "../astra-platform" }
 astra-dns = { path = "../astra-dns" }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }

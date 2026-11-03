@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Local native server/client interoperability; never enables TUN or system proxy."""
+from astra_tools.workspace import resolve_binary_dir
 import argparse
+from astra_tools.fixtures.server import USER, PASSWORD, command, connect
 import base64
 import contextlib
 import hashlib
@@ -11,25 +13,15 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable
-from protocol_matrix import Echo, UdpEchoServer, UdpEchoServer6, UdpEcho, free_port, exact, process, wait_port, udp_probe
+from astra_tools.platform import executable
+from astra_tools.net import Echo, UdpEchoServer, UdpEchoServer6, UdpEcho, free_port, exact, udp_probe
+from astra_tools.processes import process, wait_port
 import socketserver
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-USER = '52ded580-44fd-4674-8fe3-957b28d66143'
-PASSWORD = 'astra-native-server-test'
 CASES = ['socks5', 'http', 'ss-aes128', 'ss-aes256', 'ss-chacha', 'ss2022-aes128', 'ss2022-aes256', 'ss2022-chacha', 'vmess', 'vmess-chacha', 'vless', 'trojan', 'hysteria2', 'tuic', 'tuic-quic', 'vless-ws', 'vless-http_upgrade', 'vless-grpc', 'vless-xhttp']
 
-def command(binary, control, action):
-    return subprocess.run([str(binary), '--control', str(control), action], capture_output=True, text=True, timeout=25)
 
-def connect(proxy_port, echo_port):
-    stream=socket.create_connection(('127.0.0.1',proxy_port),timeout=15)
-    stream.sendall(b'\x05\x01\x00')
-    assert exact(stream,2)==b'\x05\x00'
-    stream.sendall(b'\x05\x01\x00\x03\x09localhost'+echo_port.to_bytes(2,'big'))
-    response=exact(stream,10)
-    return stream,response[1]
 
 def run(case,bins,echo_port,udp_port,bad=False,private=False,hosts=None):
     with tempfile.TemporaryDirectory(prefix='astra-native-server-') as temp, contextlib.ExitStack() as stack:
@@ -105,7 +97,7 @@ def run(case,bins,echo_port,udp_port,bad=False,private=False,hosts=None):
         print('PASS',case,'bad credentials rejected' if bad else 'private target blocked' if private else ('TCP 1..1048576, reload/stop' if proto=='http' else 'TCP 1..1048576, UDP 0..8192, reload/stop'),flush=True)
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug');parser.add_argument('--case',action='append',choices=CASES);parser.add_argument('--bad-auth',action='store_true');parser.add_argument('--deny-private',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--bin-dir',type=pathlib.Path,default=None);parser.add_argument('--case',action='append',choices=CASES);parser.add_argument('--bad-auth',action='store_true');parser.add_argument('--deny-private',action='store_true');args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug')
     with socketserver.ThreadingTCPServer(('127.0.0.1',0),Echo) as tcp,UdpEchoServer(('127.0.0.1',0),UdpEcho) as udp:
         tcp.daemon_threads=True
         ipv6=None

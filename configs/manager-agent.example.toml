@@ -1,0 +1,29 @@
+# Local management works with upstream disabled. Paths are relative to this file.
+role = "agent"
+
+[storage]
+state_dir = "../state/agent"
+config_dir = "../config/agent"
+bin_dir = "../bin"
+runtime_dir = "../runtime/agent"
+
+[upstream]
+enabled = false
+agent_id = "node-a"
+name = "Node A"
+# Enable only after provisioning node-a at the controller and installing its token.
+# controller_url = "wss://controller.example.com:9443"
+# credential_file = "../secrets/node-a.token"
+# trust_root = "../secrets/controller-ca.crt"
+
+[local_ipc]
+endpoint = "../runtime/agent/management.sock"
+
+[web]
+enabled = false
+
+[limits]
+concurrent_tasks = 16
+event_buffer = 1024
+upload_bytes = 268435456
+ipc_connections = 64

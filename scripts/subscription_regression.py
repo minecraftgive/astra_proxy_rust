@@ -11,10 +11,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from platform_support import executable, process_flags
-from proxy_groups_regression import Upstream, Handler
-from protocol_matrix import free_port, wait_port
-from smoke_test import socks_connect
+from astra_tools.platform import executable, process_flags
+from astra_tools.fixtures.groups import Upstream, Handler
+from astra_tools.net import free_port
+from astra_tools.processes import wait_port
+from astra_tools.net import socks_connect
 
 
 class Subscription(http.server.BaseHTTPRequestHandler):
@@ -83,6 +84,12 @@ def main():
         # Keep the generated subscription ownership but isolate all listeners and routing.
         original = config.read_text(encoding='utf-8')
         import re
+        # The synthetic outbound returns markers, not a forwarded subscription.
+        # Download from this loopback fixture explicitly through DIRECT.
+        if re.search(r'(?m)^proxy\s*=', original):
+            original = re.sub(r'(?m)^proxy\s*=.*$', 'proxy = "DIRECT"', original)
+        else:
+            original = original.replace('[subscription]', '[subscription]\nproxy = "DIRECT"')
         original = re.sub(r'(?m)^socks5_listen\s*=.*$', f'socks5_listen = "127.0.0.1:{port}"', original)
         config.write_text('standalone=true\nstandalone_outbound="PROXY"\nshutdown_timeout_secs=1\n'+original, encoding='utf-8')
         saved = config.read_bytes()
@@ -138,7 +145,7 @@ def main():
                 child.wait(timeout=15)
                 # Core can bootstrap directly from its saved URL, with no converted nodes.
                 subscription.content = content(1)
-                config.write_text(f'standalone=true\nstandalone_outbound="PROXY"\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\n[subscription]\nurl={json.dumps(url)}\ninterval=60\n', encoding='utf-8')
+                config.write_text(f'standalone=true\nstandalone_outbound="PROXY"\nsocks5_listen="127.0.0.1:{port}"\nshutdown_timeout_secs=1\n[subscription]\nproxy="DIRECT"\nurl={json.dumps(url)}\ninterval=60\n', encoding='utf-8')
                 child = subprocess.Popen([str(binaries/executable('astra-proxy')), str(config)], stdout=log, stderr=subprocess.STDOUT,
                     env=env, **process_flags())
                 wait_port(port, child, log_path)

@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Result};
-use astra_ipc::Target;
+use astra_model::Target;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt};
 

@@ -1,48 +1,16 @@
 use anyhow::{bail, Context, Result};
-use astra_ipc::{Network, RouteAction, RouteRequest};
+use astra_model::Network;
+use astra_model::RouteAction;
+use astra_model::RouteRequest;
 use ipnet::IpNet;
-use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     net::IpAddr,
     path::Path,
 };
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleConfig {
-    pub socket: String,
-    #[serde(default)]
-    pub watch_config: bool,
-    pub default_action: String,
-    #[serde(default = "enabled")]
-    pub direct_local: bool,
-    #[serde(default)]
-    pub rules: Vec<RuleSpec>,
-    #[serde(default)]
-    pub rule_sets: BTreeMap<String, astra_rule_data::RuleSet>,
-    #[serde(default)]
-    pub geoip_database: Option<String>,
-    #[serde(default)]
-    pub geoip_url: Option<String>,
-    #[serde(default = "geoip_interval")]
-    pub geoip_interval: u64,
-    #[serde(default)]
-    pub geosite_database: Option<String>,
-    #[serde(default)]
-    pub geosite_url: Option<String>,
-    #[serde(default = "geoip_interval")]
-    pub geosite_interval: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleSpec {
-    pub kind: String,
-    pub value: String,
-    pub action: String,
-}
-
+pub use astra_model::config::rule::{RuleConfig, RuleSpec};
+use astra_rule_data::RuleSetExt;
 #[derive(Debug, Clone)]
 struct Entry {
     index: usize,
@@ -147,14 +115,6 @@ fn regex_set(regexes: &[(regex::Regex, Entry)]) -> Option<regex::RegexSet> {
         .ok()
 }
 
-fn geoip_interval() -> u64 {
-    86400
-}
-
-fn enabled() -> bool {
-    true
-}
-
 fn process_path(value: &str) -> String {
     if value.contains('\\') || value.as_bytes().get(1) == Some(&b':') {
         value.replace('\\', "/").to_lowercase()
@@ -174,6 +134,22 @@ fn local_ip(ip: IpAddr) -> bool {
 }
 
 fn resource_unavailable(error: &anyhow::Error) -> bool {
+    if error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| {
+            matches!(
+                cause.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+            )
+        })
+    {
+        return true;
+    }
+
     let text = format!("{error:#}").to_ascii_lowercase();
     (text.contains("resource download failed")
         || text.contains("no such file")
@@ -210,16 +186,7 @@ fn skip_unavailable_rules(
     *rules = retained;
 }
 
-fn parse_action(input: &str) -> Result<RouteAction> {
-    match input {
-        "direct" => Ok(RouteAction::Direct),
-        "block" => Ok(RouteAction::Block),
-        s if s.starts_with("proxy:") && s.len() > 6 && s.len() <= 70 => {
-            Ok(RouteAction::Proxy(s[6..].to_owned()))
-        }
-        _ => bail!("invalid action: {input} (expected direct, block, proxy:TAG)"),
-    }
-}
+use astra_model::config::rule::parse_action;
 
 fn consider<'a>(best: &mut Option<&'a Entry>, candidate: Option<&'a Entry>) {
     if let Some(entry) = candidate {
@@ -250,31 +217,19 @@ impl RuleEngine {
         Self::compile_at(config, Path::new("."))
     }
     pub fn compile_at(config: &RuleConfig, base: &Path) -> Result<Self> {
-        // Validate definitions without downloading unused or disabled resources.
-        let referenced: HashSet<&str> = config
-            .rules
-            .iter()
-            .filter(|r| r.kind == "rule_set")
-            .map(|r| r.value.as_str())
-            .collect();
-        for (name, source) in &config.rule_sets {
-            anyhow::ensure!(
-                !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control),
-                "invalid rule-set name: {name:?}"
-            );
-            source
-                .validate()
-                .with_context(|| format!("rule_sets[{name:?}]"))?;
-            if source.enabled && source.path.is_none() && !referenced.contains(name.as_str()) {
-                source
-                    .parse_entries(&source.payload)
-                    .with_context(|| format!("rule_sets[{name:?}]"))?;
-            }
-        }
+        Self::compile_with_loader(config, base, &astra_resource::ResourceLoader::default())
+    }
+    pub fn compile_with_loader(
+        config: &RuleConfig,
+        base: &Path,
+        loader: &astra_resource::ResourceLoader,
+    ) -> Result<Self> {
+        config.validate_structure()?;
         fn expand(
             spec: &RuleSpec,
             config: &RuleConfig,
             base: &Path,
+            loader: &astra_resource::ResourceLoader,
             active: &mut Vec<String>,
             cache: &mut HashMap<String, Vec<astra_rule_data::MatchSpec>>,
             output: &mut Vec<RuleSpec>,
@@ -301,7 +256,7 @@ impl RuleEngine {
                     return Ok(());
                 }
                 let loaded = source
-                    .load(base)
+                    .load_with(base, loader)
                     .with_context(|| format!("load rule-set {}", spec.value));
                 let loaded = match loaded {
                     Ok(value) => value,
@@ -324,6 +279,7 @@ impl RuleEngine {
                     },
                     config,
                     base,
+                    loader,
                     active,
                     cache,
                     output,
@@ -337,8 +293,16 @@ impl RuleEngine {
         let mut cache = HashMap::new();
         for (index, spec) in config.rules.iter().enumerate() {
             parse_action(&spec.action).with_context(|| format!("rules[{}] action", index + 1))?;
-            expand(spec, config, base, &mut Vec::new(), &mut cache, &mut rules)
-                .with_context(|| format!("rules[{}]", index + 1))?;
+            expand(
+                spec,
+                config,
+                base,
+                loader,
+                &mut Vec::new(),
+                &mut cache,
+                &mut rules,
+            )
+            .with_context(|| format!("rules[{}]", index + 1))?;
             sources.push(RuleSource {
                 index: index + 1,
                 end: rules.len(),
@@ -363,7 +327,7 @@ impl RuleEngine {
                     .filter(|r| r.kind == "geosite")
                     .map(|r| r.value.clone())
                     .collect();
-                let bytes = astra_rule_data::load_resource(
+                let bytes = loader.load_resource(
                     base,
                     path,
                     config.geosite_url.as_deref(),
@@ -449,7 +413,7 @@ impl RuleEngine {
         let geoip = if !geoip_categories.is_empty() {
             let path = config.geoip_database.as_deref();
             if let Some(path) = path {
-                match astra_rule_data::load_resource_with(
+                match loader.load_resource_with(
                     base,
                     path,
                     config.geoip_url.as_deref(),
@@ -815,23 +779,14 @@ impl RuleEngine {
     }
 }
 
-fn normalize_domain(s: &str) -> Result<String> {
-    let d = s.trim_end_matches('.').to_ascii_lowercase();
-    if d.is_empty()
-        || d.len() > 253
-        || d.chars().any(char::is_whitespace)
-        || d.contains([',', '/', '\\', '+', '\0'])
-        || d.split('.').any(str::is_empty)
-    {
-        bail!("invalid domain rule: {s}");
-    }
-    Ok(d)
-}
+use astra_model::config::rule::normalize_domain;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_ipc::{Inbound, Target, API_VERSION};
+    use astra_ipc::API_VERSION;
+    use astra_model::Inbound;
+    use astra_model::Target;
     fn decision(rules: &str, host: &str, port: u16) -> RouteAction {
         let config: RuleConfig = toml::from_str(&format!(
             "socket = '/tmp/test.sock'\ndefault_action = 'direct'\n{rules}"
@@ -851,7 +806,7 @@ mod tests {
             process: None,
         })
     }
-    fn request(host: &str, process: Option<astra_ipc::ProcessInfo>) -> RouteRequest {
+    fn request(host: &str, process: Option<astra_model::ProcessInfo>) -> RouteRequest {
         RouteRequest {
             destination_ip: None,
             api_version: API_VERSION,
@@ -926,7 +881,7 @@ mod tests {
     }
     #[test]
     fn process_rules_use_observed_identity_and_preserve_first_match_order() {
-        let process = astra_ipc::ProcessInfo {
+        let process = astra_model::ProcessInfo {
             pid: 42,
             name: "Browser.EXE".into(),
             path: r"C:\Apps\Browser.exe".into(),
@@ -955,7 +910,7 @@ mod tests {
             engine.decide(&request("8.8.8.8", None)),
             RouteAction::Proxy("edge".into())
         );
-        let unix = astra_ipc::ProcessInfo {
+        let unix = astra_model::ProcessInfo {
             pid: 7,
             name: "browser".into(),
             path: "/usr/bin/Browser".into(),
@@ -1188,7 +1143,7 @@ mod tests {
                 hit.network = Network::Udp;
             }
             if kind.starts_with("process_") {
-                hit.process = Some(astra_ipc::ProcessInfo {
+                hit.process = Some(astra_model::ProcessInfo {
                     pid: 1,
                     name: "Browser.EXE".into(),
                     path: r"c:\Program Files\Browser\browser.exe".into(),

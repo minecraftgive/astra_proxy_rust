@@ -136,6 +136,12 @@ impl Context {
             }
             .into(),
         ];
+        if let Some((endpoint, agent)) = crate::protocol::target() {
+            args.extend(["--endpoint".into(), endpoint.into_os_string()]);
+            if let Some(agent) = agent {
+                args.extend(["--agent".into(), agent.into()]);
+            }
+        }
         if let Some(view) = launch.view {
             args.extend(["--view".into(), view.name().into()]);
         }
@@ -145,7 +151,12 @@ impl Context {
         if let Some(kind) = launch.kind {
             args.extend([
                 "--core".into(),
-                if kind == Kind::Proxy { "proxy" } else { "rule" }.into(),
+                match kind {
+                    Kind::Proxy => "proxy",
+                    Kind::Rule => "rule",
+                    Kind::Server => "server",
+                }
+                .into(),
             ]);
         }
         if let Some(id) = &launch.window_id {

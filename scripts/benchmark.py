@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Local release baseline: SOCKS setup + 1 KiB echo, cold and warm route cache."""
+from astra_tools.workspace import resolve_binary_dir
 import argparse
 import asyncio
 import contextlib
@@ -12,8 +13,10 @@ import platform
 import statistics
 import tempfile
 import time
-from protocol_matrix import ROOT, free_port, process, wait_port
-from core_regression import wait_socket
+from astra_tools.workspace import ROOT
+from astra_tools.net import free_port
+from astra_tools.processes import process, wait_port
+from astra_tools.processes import wait_socket
 
 
 def digest(path):
@@ -128,13 +131,13 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=pathlib.Path, default=ROOT/'target/release')
+    parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
     parser.add_argument('--rules', nargs='+', type=int, default=[1000, 10000])
     parser.add_argument('--concurrency', nargs='+', type=int, default=[1, 32])
     parser.add_argument('--connections', type=int, default=300)
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--output', type=pathlib.Path, default=ROOT/'docs/performance-baseline.json')
-    args = parser.parse_args()
+    args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='release')
     if min(args.rules + args.concurrency + [args.connections, args.rounds]) <= 0:
         parser.error('counts must be positive')
     asyncio.run(run(args))

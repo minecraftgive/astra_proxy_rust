@@ -395,8 +395,10 @@ fn cli_never_overwrites_and_check_does_not_write() {
 #[test]
 fn rule_providers_geoip_and_processes_are_translated_in_source_order() {
     let source="rule-providers:\n  local: {type: file, behavior: domain, path: lists/local.yaml}\n  web: {type: http, behavior: ipcidr, format: text, url: 'https://example.com/ip.txt', interval: 600}\n  inline: {type: inline, behavior: classical, payload: ['DOMAIN-KEYWORD,ads','GEOIP,LAN']}\nrules:\n- PROCESS-NAME,browser.exe,DIRECT\n- RULE-SET,local,REJECT\n- RULE-SET,web,DIRECT,no-resolve\n- RULE-SET,inline,REJECT\n- GEOIP,CN,DIRECT,no-resolve\n- MATCH,REJECT\n";
-    let mut options = Options::default();
-    options.base_dir = std::env::current_dir().unwrap();
+    let options = Options {
+        base_dir: std::env::current_dir().unwrap(),
+        ..Default::default()
+    };
     let result = convert(source, &options).unwrap();
     let rules = toml(&result.rules);
     assert_eq!(result.rule_count, 5);
@@ -424,8 +426,10 @@ fn unsupported_or_missing_referenced_providers_never_leave_a_dangling_rule() {
     for source in ["rules: ['RULE-SET,missing,DIRECT']", "rule-providers: {a: {type: inline, behavior: domain, format: mrs, payload: ['a.test']}}\nrules: ['RULE-SET,a,DIRECT']"] {
         assert!(convert(source,&Options::default()).is_err());
     }
-    let mut options = Options::default();
-    options.strict_rules = true;
+    let options = Options {
+        strict_rules: true,
+        ..Default::default()
+    };
     assert!(convert("rules: ['MATCH,missing-policy']", &options).is_err());
     assert!(convert("rules: ['SRC-PORT,80,DIRECT','MATCH,DIRECT']", &options).is_err());
 }
@@ -449,8 +453,10 @@ fn geosite_rules_and_classical_providers_keep_resources_selectors_and_order() {
         rules["rule_sets"]["sites"]["payload"][0].as_str(),
         Some("GEOSITE,google@!cn")
     );
-    let mut options = Options::default();
-    options.geosite_database = Some("local.dat".into());
+    let options = Options {
+        geosite_database: Some("local.dat".into()),
+        ..Default::default()
+    };
     assert!(toml(&convert(source, &options).unwrap().rules)
         .get("geosite_url")
         .is_none());
@@ -570,14 +576,14 @@ fn select_and_url_test_groups_preserve_members_nesting_and_explicit_choice() {
         toml(&converted.rules)["default_action"].as_str(),
         Some("proxy:PROXY")
     );
-    let groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> =
+    let groups: std::collections::BTreeMap<String, astra_model::groups::Group> =
         proxy["proxy_groups"].clone().try_into().unwrap();
-    astra_ipc::groups::validate(
+    astra_model::groups::validate(
         &groups,
         &std::collections::HashSet::from(["a".into(), "b".into()]),
     )
     .unwrap();
-    assert_eq!(groups["speed"].mode, astra_ipc::groups::Mode::Auto);
+    assert_eq!(groups["speed"].mode, astra_model::groups::Mode::Auto);
     assert_eq!(groups["speed"].interval, 60);
     assert_eq!(groups["speed"].tolerance_ms, 25);
     assert_eq!(groups["choose"].members, ["speed", "DIRECT"]);
@@ -636,13 +642,13 @@ fn every_proxy_action_uses_default_proxy_while_direct_block_and_order_remain() {
 #[test]
 fn mihomo_dynamic_node_filters_survive_conversion() {
     let converted=convert("proxies: [{name: JP-a, type: socks5, server: localhost, port: 1081}]\nproxy-groups: [{name: region, type: select, include-all-proxies: true, filter: '^JP-', exclude-filter: 'expired'}]\nrules: ['MATCH,region']",&Options::default()).unwrap();
-    let groups: std::collections::BTreeMap<String, astra_ipc::groups::Group> =
+    let groups: std::collections::BTreeMap<String, astra_model::groups::Group> =
         toml(&converted.proxy)["proxy_groups"]
             .clone()
             .try_into()
             .unwrap();
     let expanded =
-        astra_ipc::groups::expand(&groups, &std::collections::HashSet::from(["JP-a".into()]))
+        astra_model::groups::expand(&groups, &std::collections::HashSet::from(["JP-a".into()]))
             .unwrap();
     assert_eq!(expanded["region"].members, ["JP-a"]);
 }

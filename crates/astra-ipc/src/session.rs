@@ -1,5 +1,6 @@
 //! Persistent framed RPC. A lost response is never automatically replayed.
-use crate::{platform::LocalStream, progress};
+use crate::progress;
+use astra_platform::platform::LocalStream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{io, path::PathBuf, time::Duration};
 use tokio::{
@@ -57,7 +58,7 @@ where
                 let result = tokio::time::timeout(call.timeout, async {
                     if connection.is_none() {
                         if let Some(progress) = &call.progress { progress.send_replace(Some(progress::Progress::new("Connecting", path.display().to_string()))); }
-                        let mut stream = tokio::time::timeout(Duration::from_secs(3), crate::platform::connect_trusted(&path)).await
+                        let mut stream = tokio::time::timeout(Duration::from_secs(3), astra_platform::platform::connect_trusted(&path)).await
                             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timeout"))??;
                         crate::send_management(&mut stream, &hello()).await?;
                         let event: Event<R> = tokio::time::timeout(Duration::from_secs(3), crate::receive_management(&mut stream)).await
@@ -106,7 +107,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::LocalListener;
+    use astra_platform::platform::LocalListener;
     #[tokio::test]
     async fn reuses_one_connection_and_does_not_replay_a_lost_mutation() {
         let path = std::env::temp_dir().join(format!("astra-peer-{}.sock", std::process::id()));
@@ -145,6 +146,6 @@ mod tests {
         assert_eq!(peer.request(2, Duration::from_secs(2)).await.unwrap(), 2);
         assert!(peer.request(3, Duration::from_secs(2)).await.is_err());
         server.await.unwrap();
-        crate::platform::remove_socket(&path);
+        astra_platform::platform::remove_socket(&path);
     }
 }

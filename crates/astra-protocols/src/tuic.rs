@@ -1,7 +1,7 @@
 //! Native TUIC v5 over QUIC. Wire specification: tuic-protocol/tuic SPEC.md.
 use crate::{native::NodeConfig, outbound::Stream};
 use anyhow::{bail, Context, Result};
-use astra_ipc::Target;
+use astra_model::Target;
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -672,6 +672,63 @@ fn decode_packet(packet: &[u8]) -> Result<Fragment> {
     })
 }
 
+use crate::accept::secret;
+use anyhow::ensure;
+use tokio::io::AsyncReadExt;
+pub async fn authenticate(conn: &quinn::Connection, users: &[crate::accept::User]) -> Result<()> {
+    let mut stream = conn.accept_uni().await?;
+    ensure!(
+        stream.read_u8().await? == 5 && stream.read_u8().await? == 0,
+        "TUIC authentication header"
+    );
+    let mut id = [0; 16];
+    let mut token = [0; 32];
+    stream.read_exact(&mut id).await?;
+    stream.read_exact(&mut token).await?;
+    let user = users
+        .iter()
+        .find(|u| u.uuid.is_some_and(|v| secret(v.as_bytes(), &id)))
+        .context("TUIC authentication failed")?;
+    let mut expected = [0; 32];
+    conn.export_keying_material(
+        &mut expected,
+        &id,
+        user.password.as_ref().unwrap().as_bytes(),
+    )
+    .map_err(|_| anyhow::anyhow!("TLS exporter"))?;
+    ensure!(secret(&expected, &token), "TUIC authentication failed");
+    Ok(())
+}
+
+pub async fn accept_tcp<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> Result<Target> {
+    use crate::wire;
+
+    ensure!(
+        recv.read_u8().await? == 5 && recv.read_u8().await? == 1,
+        "TUIC CONNECT header"
+    );
+    wire::address(recv, 2, false).await
+}
+
+pub(crate) async fn decode_datagram(
+    bytes: &[u8],
+    fragments: &mut crate::datagram::Fragments,
+) -> Result<Option<(u32, Target, Vec<u8>)>> {
+    if bytes.starts_with(&[5, 4]) {
+        return Ok(None);
+    }
+    let packet = decode_packet(bytes)?;
+    let association = u32::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+    fragments.insert(
+        association,
+        packet.id,
+        packet.count,
+        packet.index,
+        packet.target,
+        &packet.payload,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,61 +815,4 @@ mod tests {
             assert!(decode_packet(&malformed).is_err());
         }
     }
-}
-
-use crate::accept::secret;
-use anyhow::ensure;
-use tokio::io::AsyncReadExt;
-pub async fn authenticate(conn: &quinn::Connection, users: &[crate::accept::User]) -> Result<()> {
-    let mut stream = conn.accept_uni().await?;
-    ensure!(
-        stream.read_u8().await? == 5 && stream.read_u8().await? == 0,
-        "TUIC authentication header"
-    );
-    let mut id = [0; 16];
-    let mut token = [0; 32];
-    stream.read_exact(&mut id).await?;
-    stream.read_exact(&mut token).await?;
-    let user = users
-        .iter()
-        .find(|u| u.uuid.is_some_and(|v| secret(v.as_bytes(), &id)))
-        .context("TUIC authentication failed")?;
-    let mut expected = [0; 32];
-    conn.export_keying_material(
-        &mut expected,
-        &id,
-        user.password.as_ref().unwrap().as_bytes(),
-    )
-    .map_err(|_| anyhow::anyhow!("TLS exporter"))?;
-    ensure!(secret(&expected, &token), "TUIC authentication failed");
-    Ok(())
-}
-
-pub async fn accept_tcp<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> Result<Target> {
-    use crate::wire;
-
-    ensure!(
-        recv.read_u8().await? == 5 && recv.read_u8().await? == 1,
-        "TUIC CONNECT header"
-    );
-    wire::address(recv, 2, false).await
-}
-
-pub(crate) async fn decode_datagram(
-    bytes: &[u8],
-    fragments: &mut crate::datagram::Fragments,
-) -> Result<Option<(u32, Target, Vec<u8>)>> {
-    if bytes.starts_with(&[5, 4]) {
-        return Ok(None);
-    }
-    let packet = decode_packet(bytes)?;
-    let association = u32::from(u16::from_be_bytes([bytes[2], bytes[3]]));
-    fragments.insert(
-        association,
-        packet.id,
-        packet.count,
-        packet.index,
-        packet.target,
-        &packet.payload,
-    )
 }

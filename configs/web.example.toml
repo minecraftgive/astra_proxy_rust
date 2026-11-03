@@ -1,0 +1,14 @@
+# Independent astra-web process on the controller machine.
+manager_socket = "../runtime/controller/management.sock"
+state_dir = "../state/web"
+# credentials_file = "../secrets/web-administrator.phc"
+listen = "127.0.0.1:8787"
+public_origin = "https://astra.example.com:8787"
+dev_http = false
+
+[tls]
+certificate = "../secrets/web.crt"
+private_key = "../secrets/web.key"
+
+# There is no default administrator password. Initialize it through
+# astra-web --config web.toml --set-password --password-stdin

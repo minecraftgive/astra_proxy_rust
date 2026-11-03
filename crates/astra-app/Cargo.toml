@@ -1,0 +1,14 @@
+[package]
+name = "astra-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+[dependencies]
+astra-model = { path = "../astra-model" }
+astra-convert = { path = "../astra-convert", default-features = false }
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+toml_edit = "0.23"
+[dev-dependencies]
+tempfile = "3"

@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -16,11 +16,7 @@ pub struct ImportResult {
     pub compatible_host: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CurrentRelease {
-    pub release_id: String,
-    pub previous_release_id: Option<String>,
-}
+pub use astra_model::update::CurrentRelease;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -400,18 +396,15 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
             "Invalid release record"
         );
     }
-    let parent = path.parent().context("Record has no parent")?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.flush()?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
-    sync_directory(parent)
+    astra_platform::storage::atomic_write(
+        path,
+        &serde_json::to_vec(value)?,
+        astra_platform::storage::WritePolicy::default(),
+    )?;
+    Ok(())
 }
+
 fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
+    astra_platform::storage::sync_directory(path)?;
     Ok(())
 }

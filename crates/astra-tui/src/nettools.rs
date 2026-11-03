@@ -5,7 +5,13 @@ use crate::{
     protocol::{self, Action},
     tr,
 };
-use astra_ipc::nettool::{Attempt, Egress, Event, Probe, Request, Summary, MAX_COUNT};
+use astra_model::nettool::Attempt;
+use astra_model::nettool::Egress;
+use astra_model::nettool::Event;
+use astra_model::nettool::Probe;
+use astra_model::nettool::Request;
+use astra_model::nettool::Summary;
+use astra_model::nettool::MAX_COUNT;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -208,15 +214,7 @@ impl View {
         let (sender, receiver) = mpsc::channel(64);
         self.task = Some(tokio::spawn(async move {
             let result = async {
-                let mut stream = astra_ipc::platform::connect_trusted(&socket).await?;
-                astra_ipc::send_management(
-                    &mut stream,
-                    &protocol::Request {
-                        version: astra_ipc::API_VERSION,
-                        action,
-                    },
-                )
-                .await?;
+                let mut stream = crate::protocol::subscribe(&socket, action).await?;
                 loop {
                     let reply: protocol::Reply =
                         tokio::time::timeout(wait, astra_ipc::receive_management(&mut stream))
@@ -785,17 +783,11 @@ mod tests {
         });
         let home = Home(std::env::temp_dir().join(format!("astra-nettool-{}", std::process::id())));
         let state = home.0.join("state");
-        let socket = state.join("manager.sock");
+        let socket = state.join("management.sock");
         let config = home.0.join("proxy.toml");
         std::fs::create_dir_all(&home.0).unwrap();
         std::fs::write(&config, format!("standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='edge'\nserver='{server}'\n")).unwrap();
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned();
+        let bin = crate::manager::test_binaries();
         let manager = tokio::spawn(crate::manager::serve(state, bin));
         for _ in 0..100 {
             if socket.exists() {

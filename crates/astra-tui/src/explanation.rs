@@ -1,9 +1,13 @@
 use crate::{i18n::t, tr};
 use anyhow::{ensure, Context, Result};
-use astra_ipc::{
-    control::RouteExplanation, Inbound, Network, ProcessInfo, RouteAction, RouteRequest, Target,
-    API_VERSION,
-};
+use astra_ipc::API_VERSION;
+use astra_model::control::RouteExplanation;
+use astra_model::Inbound;
+use astra_model::Network;
+use astra_model::ProcessInfo;
+use astra_model::RouteAction;
+use astra_model::RouteRequest;
+use astra_model::Target;
 use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},

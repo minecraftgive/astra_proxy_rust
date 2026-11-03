@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Isolate server half-close behavior with a minimal VLESS client and no Astra."""
+import argparse
 import contextlib
 import pathlib
 import socket
 import tempfile
 import threading
 import uuid
-from protocol_matrix import ROOT, USER, TRAILER, EchoServer, Echo, exact, free_port, process, wait_port, write_json
+from astra_tools.workspace import reference_engine
+from astra_tools.fixtures.protocols import USER, write_json
+from astra_tools.net import TRAILER, EchoServer, Echo, exact, free_port
+from astra_tools.processes import process, wait_port
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--engine-dir', '--engines-dir', dest='engine_dir', type=pathlib.Path, default=None)
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='astra-halfclose-') as td, EchoServer(('127.0.0.1', 0), Echo) as echo:
         directory = pathlib.Path(td)
         echo.send_trailer = True
@@ -22,7 +29,7 @@ def main():
             else:
                 config = {'log': {'level':'warn'}, 'inbounds':[{'type':'vless','listen':'127.0.0.1','listen_port':port,'users':[{'uuid':USER}]}], 'outbounds':[{'type':'direct'}]}
             path = write_json(directory/(engine+'.json'), config)
-            with process([str(ROOT/'.test-tools/bin'/engine),'run','-config' if engine=='xray' else '-c',str(path)], directory, engine) as (server, log):
+            with process([str(reference_engine(engine, args.engine_dir)),'run','-config' if engine=='xray' else '-c',str(path)], directory, engine) as (server, log):
                 wait_port(port, server, log)
                 with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
                     # Version, UUID, empty addons, TCP, port, IPv4 address.

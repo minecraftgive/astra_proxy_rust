@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """VLESS Encryption + Vision + pinned TLS + XHTTP auto against a local Xray peer."""
+from astra_tools.workspace import resolve_binary_dir, reference_engine
 import argparse
 import contextlib
 import hashlib
@@ -9,15 +10,19 @@ import ssl
 import subprocess
 import tempfile
 import threading
-from protocol_matrix import ROOT, USER, Echo, EchoServer, exact, free_port, process, tls_material, tls_probe, TlsEcho, wait_port, write_json
-from core_regression import socks, wait_socket
+from astra_tools.workspace import ROOT
+from astra_tools.fixtures.protocols import USER, tls_material, write_json
+from astra_tools.net import Echo, EchoServer, exact, free_port, tls_probe, TlsEcho
+from astra_tools.processes import process, wait_port
+from astra_tools.net import socks
+from astra_tools.processes import wait_socket
 
 
 def check(binaries, wrong_pin=False, inner_tls=False):
     with tempfile.TemporaryDirectory(prefix='astra-vless-encryption-') as td, contextlib.ExitStack() as stack:
         d = pathlib.Path(td)
         cert, key = tls_material(d)
-        keys = subprocess.check_output([str(ROOT/'.test-tools/bin/xray'), 'x25519'], text=True)
+        keys = subprocess.check_output([str(reference_engine('xray')), 'x25519'], text=True)
         private = next(line.split(': ',1)[1] for line in keys.splitlines() if line.startswith('PrivateKey:'))
         public = next(line.split(': ',1)[1] for line in keys.splitlines() if 'PublicKey' in line)
         peer_port, proxy_port = free_port(), free_port()
@@ -26,7 +31,7 @@ def check(binaries, wrong_pin=False, inner_tls=False):
             'streamSettings':{'network':'xhttp','security':'tls','tlsSettings':{'certificates':[{'certificateFile':str(cert),'keyFile':str(key)}]},'xhttpSettings':{'path':'/astra-test','mode':'auto'}}}],
             'outbounds':[{'protocol':'freedom'}]}
         path = write_json(d/'server.json',server)
-        peer, peer_log = stack.enter_context(process([str(ROOT/'.test-tools/bin/xray'),'run','-config',str(path)],d,'peer'))
+        peer, peer_log = stack.enter_context(process([str(reference_engine('xray')),'run','-config',str(path)],d,'peer'))
         wait_port(peer_port,peer,peer_log)
         echo = stack.enter_context(EchoServer(('127.0.0.1',0),TlsEcho if inner_tls else Echo))
         if inner_tls:
@@ -98,8 +103,8 @@ mode="auto"
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inner-tls', action='store_true')
-    parser.add_argument('--bin-dir',type=pathlib.Path,default=ROOT/'target/debug')
-    args=parser.parse_args()
+    parser.add_argument('--bin-dir',type=pathlib.Path,default=None)
+    args=parser.parse_args();args.bin_dir=resolve_binary_dir(args.bin_dir, profile='debug')
     import os
     os.environ['RUST_LOG'] = 'astra_proxy=debug,meow_proxy=debug'
     if args.inner_tls and not ssl.HAS_TLSv1_3:

@@ -1,9 +1,6 @@
 mod config;
-#[path = "protocols/shared_mod.rs"]
 mod protocols;
-#[path = "proxy/shared_mod.rs"]
 mod proxy;
-#[path = "transports/shared_mod.rs"]
 mod transports;
 use anyhow::{Context, Result};
 use astra_protocols::wire;
@@ -27,11 +24,20 @@ pub async fn run() -> Result<()> {
     let mut control = default_control();
     let mut action = None;
     let mut check = false;
+    let mut check_stdin = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => config = args.next().context("--config requires path")?.into(),
             "--control" => control = args.next().context("--control requires path")?.into(),
             "--check" => check = true,
+            "--check-stdin" => {
+                config = args
+                    .next()
+                    .context("--check-stdin requires source configuration path")?
+                    .into();
+                check = true;
+                check_stdin = true;
+            }
             "--generate-reality-keys" => {
                 use base64::Engine;
                 let private = rand::random::<[u8; 32]>();
@@ -60,9 +66,9 @@ pub async fn run() -> Result<()> {
                 );
                 return Ok(());
             }
-            "--status" => action = Some(astra_server_api::Action::Status),
-            "--stop" => action = Some(astra_server_api::Action::Stop),
-            "--reload" => action = Some(astra_server_api::Action::Reload { path: None }),
+            "--status" => action = Some(astra_management::server::Action::Status),
+            "--stop" => action = Some(astra_management::server::Action::Stop),
+            "--reload" => action = Some(astra_management::server::Action::Reload { path: None }),
             "--generate-cert" => {
                 let dir = PathBuf::from(
                     args.next()
@@ -70,12 +76,12 @@ pub async fn run() -> Result<()> {
                 );
                 let name = args.next().unwrap_or_else(|| "localhost".into());
                 std::fs::create_dir(&dir)?;
-                astra_ipc::platform::set_private(&dir, 0o700)?;
+                astra_platform::platform::set_private(&dir, 0o700)?;
                 let rcgen::CertifiedKey { cert, signing_key } =
                     rcgen::generate_simple_self_signed(vec![name])?;
                 std::fs::write(dir.join("cert.pem"), cert.pem())?;
                 std::fs::write(dir.join("key.pem"), signing_key.serialize_pem())?;
-                astra_ipc::platform::set_private(&dir.join("key.pem"), 0o600)?;
+                astra_platform::platform::set_private(dir.join("key.pem"), 0o600)?;
                 println!("Certificate: {}", dir.join("cert.pem").display());
                 return Ok(());
             }
@@ -89,7 +95,7 @@ pub async fn run() -> Result<()> {
                     .write(true)
                     .create_new(true)
                     .open(&path)?;
-                astra_ipc::platform::set_private(&path, 0o600)?;
+                astra_platform::platform::set_private(&path, 0o600)?;
                 use std::io::Write;
                 write!(file,"# Bind to loopback until TLS and firewall settings are ready.\n[[listeners]]\ntag = \"vless\"\nprotocol = \"vless\"\nlisten = \"127.0.0.1:24443\"\nallow_plaintext = true\n[[listeners.users]]\nname = \"default\"\nuuid = \"{id}\"\n")?;
                 println!("Created {}", path.display());
@@ -103,7 +109,7 @@ pub async fn run() -> Result<()> {
         }
     }
     if let Some(action) = action {
-        let r = astra_server_api::call(&control, action).await?;
+        let r = astra_management::server::call(&control, action).await?;
         println!(
             "pid={} uptime={}s active={} accepted={} rejected={} upload={} download={}\n{}",
             r.pid,
@@ -117,8 +123,21 @@ pub async fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let config = std::fs::canonicalize(config)?;
-    let prepared = config::load(&config)?;
+    let config = if check_stdin {
+        std::path::absolute(config)?
+    } else {
+        std::fs::canonicalize(config)?
+    };
+    let prepared = if check_stdin {
+        use std::io::Read;
+        let mut text = String::new();
+        std::io::stdin()
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut text)?;
+        config::prepare_text(&config, &text)?
+    } else {
+        config::load(&config)?
+    };
     if check {
         println!("Valid: {} listeners", prepared.config.listeners.len());
         return Ok(());
@@ -126,7 +145,7 @@ pub async fn run() -> Result<()> {
     runtime::run(config, control, prepared).await
 }
 pub fn default_control() -> PathBuf {
-    astra_ipc::platform::home_dir()
+    astra_platform::platform::home_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".astra-server")
         .join("control.sock")
