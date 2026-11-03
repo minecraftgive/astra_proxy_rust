@@ -1873,6 +1873,23 @@ impl Ui {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
             .split(content_area);
+        self.render_content(f, chunks[0]);
+        self.render_detail(f, chunks[1], list_page);
+        self.render_import_confirmation(f);
+        self.render_update_confirmation(f);
+        if let Some(view) = &self.diagnostics {
+            view.render(f, f.area());
+        }
+        if let Some(view) = &self.explanation {
+            view.render(f, f.area());
+        }
+        self.render_selection_menu(f);
+        self.render_palette(f);
+        self.render_page_help(f);
+        self.render_background(f);
+    }
+
+    fn render_content(&self, f: &mut Frame<'_>, area: ratatui::layout::Rect) {
         if let Some(recovery) = &self.recovery {
             f.render_widget(
                 Paragraph::new(&*recovery.message)
@@ -1880,28 +1897,31 @@ impl Ui {
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(Color::Yellow))
                     .block(Block::default().title(t("Paused")).borders(Borders::ALL)),
-                chunks[0],
+                area,
             );
         } else if let Some(editor) = &self.editor {
             let before = f.buffer_mut().clone();
-            editor.render(f, chunks[0]);
+            editor.render(f, area);
             self.animations
-                .surface(f, animation::Kind::Accordion, chunks[0], &before);
+                .surface(f, animation::Kind::Accordion, area, &before);
         } else if self.page == LOGS {
-            self.render_logs_page(f, chunks[0]);
+            self.render_logs_page(f, area);
         } else if let Some(viewer) = &self.viewer {
-            viewer.render(f, chunks[0]);
+            viewer.render(f, area);
         } else if self.kind == Kind::Server && self.page != PROFILES {
-            self.render_server(f, chunks[0]);
+            self.render_server(f, area);
         } else {
             match self.page {
-                shell::OVERVIEW => self.render_overview(f, chunks[0]),
-                shell::PROXIES => self.render_live_groups(f, chunks[0]),
-                shell::CONNECTIONS => self.render_connections(f, chunks[0]),
-                shell::RULES => self.render_rules(f, chunks[0]),
-                _ => self.render_profiles(f, chunks[0]),
+                shell::OVERVIEW => self.render_overview(f, area),
+                shell::PROXIES => self.render_live_groups(f, area),
+                shell::CONNECTIONS => self.render_connections(f, area),
+                shell::RULES => self.render_rules(f, area),
+                _ => self.render_profiles(f, area),
             }
         }
+    }
+
+    fn render_detail(&self, f: &mut Frame<'_>, area: ratatui::layout::Rect, list_page: bool) {
         let detail: Text = if let Some(prompt) = &self.prompt {
             if prompt.confirmation() {
                 format!(
@@ -1942,8 +1962,11 @@ impl Ui {
                 } else {
                     Style::default()
                 }),
-            chunks[1],
+            area,
         );
+    }
+
+    fn render_import_confirmation(&self, f: &mut Frame<'_>) {
         if let Some(Prompt::ImportConfirm { notices, .. }) = &self.prompt {
             let popup = crate::help::popup(f.area(), notices);
             f.render_widget(Clear, popup);
@@ -1964,6 +1987,9 @@ impl Ui {
                 popup,
             );
         }
+    }
+
+    fn render_update_confirmation(&self, f: &mut Frame<'_>) {
         if let Some(Prompt::UpdateConfirm(request)) = &self.prompt {
             let target = match &request.intent {
                 crate::protocol::updates::UpdateIntent::Stage { package } => {
@@ -1999,12 +2025,9 @@ impl Ui {
                 popup,
             );
         }
-        if let Some(view) = &self.diagnostics {
-            view.render(f, f.area());
-        }
-        if let Some(view) = &self.explanation {
-            view.render(f, f.area());
-        }
+    }
+
+    fn render_selection_menu(&self, f: &mut Frame<'_>) {
         if self.menu.is_some() || self.binding_picker.is_some() {
             let height = if let Some(picker) = &self.binding_picker {
                 picker.choices.len() + 2
@@ -2081,7 +2104,9 @@ impl Ui {
             );
             self.menu_hits(popup, state.offset());
         }
-        self.render_palette(f);
+    }
+
+    fn render_page_help(&self, f: &mut Frame<'_>) {
         if let Some(scroll) = self.help_scroll {
             let text = self.command_help();
             let popup = crate::help::popup(f.area(), &text);
@@ -2099,7 +2124,6 @@ impl Ui {
                 self.help_override.is_none(),
             );
         }
-        self.render_background(f);
     }
 }
 
