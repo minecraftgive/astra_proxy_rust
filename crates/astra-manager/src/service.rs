@@ -279,3 +279,6 @@ impl Drop for Endpoint {
         astra_platform::platform::remove_socket(&self.0);
     }
 }
+
+#[cfg(test)]
+mod tests;
