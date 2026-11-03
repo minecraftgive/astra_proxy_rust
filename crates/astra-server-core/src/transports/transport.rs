@@ -350,7 +350,9 @@ mod tests {
                 assert_eq!(received, payload);
             };
             tokio::join!(write, read);
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -358,16 +360,24 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             for transport in [Transport::Xhttp, Transport::Grpc] {
                 let (client, server) = tokio::io::duplex(65536);
-                let (mut client, connection) =
-                    h2::client::handshake(client).await.unwrap();
+                let (mut client, connection) = h2::client::handshake(client).await.unwrap();
                 let driver = tokio::spawn(connection);
-                let path = if transport == Transport::Grpc { "/GunService/Tun" } else { "/" };
-                let (response, _request) = client.send_request(
-                    http::Request::post(format!("http://localhost{path}")).body(()).unwrap(),
-                    false,
-                ).unwrap();
+                let path = if transport == Transport::Grpc {
+                    "/GunService/Tun"
+                } else {
+                    "/"
+                };
+                let (response, _request) = client
+                    .send_request(
+                        http::Request::post(format!("http://localhost{path}"))
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .unwrap();
                 let listener = listener(transport);
-                let (server, response) = tokio::join!(accept(Box::new(server), &listener), response);
+                let (server, response) =
+                    tokio::join!(accept(Box::new(server), &listener), response);
                 let mut server = server.unwrap();
                 let mut body = response.unwrap().into_body();
                 let payload: Vec<u8> = (0..200_003).map(|i| (i % 251) as u8).collect();
@@ -387,8 +397,10 @@ mod tests {
                         let mut decoded = Vec::new();
                         let mut remaining = received.as_slice();
                         while !remaining.is_empty() {
-                            let n = u32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
-                            let frame = meow_transport::grpc::decode_gun_frame(&remaining[..5 + n]).unwrap();
+                            let n =
+                                u32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+                            let frame = meow_transport::grpc::decode_gun_frame(&remaining[..5 + n])
+                                .unwrap();
                             assert!(frame.len() <= 16384);
                             decoded.extend_from_slice(frame);
                             remaining = &remaining[5 + n..];
@@ -401,6 +413,8 @@ mod tests {
                 tokio::join!(write, read);
                 driver.abort();
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

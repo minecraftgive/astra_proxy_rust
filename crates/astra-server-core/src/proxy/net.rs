@@ -134,7 +134,12 @@ impl App {
         s.connect(address).await?;
         Ok(s)
     }
-    pub fn packet(&self, association: u32, target: Target, payload: impl Into<Bytes>) -> Result<Packet> {
+    pub fn packet(
+        &self,
+        association: u32,
+        target: Target,
+        payload: impl Into<Bytes>,
+    ) -> Result<Packet> {
         let payload = payload.into();
         ensure!(payload.len() <= 65507, "UDP datagram exceeds 65507 bytes");
         let permit = self
@@ -268,7 +273,9 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
             }
             writer.flush().await?;
-            stats.download.fetch_add(unflushed as u64, Ordering::Relaxed);
+            stats
+                .download
+                .fetch_add(unflushed as u64, Ordering::Relaxed);
             activity.send_replace(tokio::time::Instant::now());
             unflushed = 0;
             deadline = None;
@@ -376,8 +383,14 @@ mod tests {
         bytes: usize,
     }
     impl AsyncWrite for SlowWriter {
-        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
-            let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let timer = self
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(250))));
             if timer.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
             }
@@ -397,7 +410,10 @@ mod tests {
     async fn download_batches_ready_blocks_and_flushes_at_eof() {
         for size in [16384usize, 16384 * 8, 16384 * 8 + 3] {
             let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
-            let mut writer = FlushWriter { max_write: Some(113), ..Default::default() };
+            let mut writer = FlushWriter {
+                max_write: Some(113),
+                ..Default::default()
+            };
             let stats = Stats::default();
             let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
             download(
@@ -418,12 +434,27 @@ mod tests {
     #[tokio::test]
     async fn download_does_not_count_a_batch_when_flush_fails() {
         let payload = vec![37; 16384 * 3];
-        let mut writer = FlushWriter { max_write: Some(113), fail_flush: true, ..Default::default() };
+        let mut writer = FlushWriter {
+            max_write: Some(113),
+            fail_flush: true,
+            ..Default::default()
+        };
         let stats = Stats::default();
         let initial = tokio::time::Instant::now();
         let (activity, updates) = tokio::sync::watch::channel(initial);
-        let error = download(&mut payload.as_slice(), &mut writer, &stats, &activity, Duration::from_secs(1)).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::BrokenPipe);
+        let error = download(
+            &mut payload.as_slice(),
+            &mut writer,
+            &stats,
+            &activity,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(writer.bytes, payload);
         assert_eq!(writer.flushes, 1);
         assert_eq!(stats.download.load(Ordering::Relaxed), 0);
@@ -434,11 +465,22 @@ mod tests {
     #[tokio::test]
     async fn download_keeps_the_first_write_deadline_for_a_batch() {
         let payload = vec![37; 16384 * 3];
-        let mut writer = SlowWriter { timer: None, bytes: 0 };
+        let mut writer = SlowWriter {
+            timer: None,
+            bytes: 0,
+        };
         let stats = Stats::default();
         let initial = tokio::time::Instant::now();
         let (activity, updates) = tokio::sync::watch::channel(initial);
-        let error = download(&mut payload.as_slice(), &mut writer, &stats, &activity, Duration::from_millis(400)).await.unwrap_err();
+        let error = download(
+            &mut payload.as_slice(),
+            &mut writer,
+            &stats,
+            &activity,
+            Duration::from_millis(400),
+        )
+        .await
+        .unwrap_err();
         assert!(error.is::<tokio::time::error::Elapsed>());
         assert!(writer.bytes >= 16384 && writer.bytes < payload.len());
         assert_eq!(stats.download.load(Ordering::Relaxed), 0);

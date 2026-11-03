@@ -531,7 +531,10 @@ mod tests {
                 },
                 async { read.read_exact(&mut received).await.map(|_| ()) },
             )
-        }).await.unwrap().unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(received, payload);
         write.shutdown().await.unwrap();
         drop((read, write));

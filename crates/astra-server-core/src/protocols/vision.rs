@@ -153,7 +153,12 @@ mod tests {
             let mut stream = wrap(Box::new(server), uuid, Some(raw.clone()));
             let mut wire = uuid.to_vec();
             let mut expected = Vec::new();
-            for (command, size, padding) in [(0, 65535usize, 65535usize), (0, 1, 0), (0, 0, 517), (end, 33, 1)] {
+            for (command, size, padding) in [
+                (0, 65535usize, 65535usize),
+                (0, 1, 0),
+                (0, 0, 517),
+                (end, 33, 1),
+            ] {
                 let content: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
                 wire.push(command);
                 wire.extend((size as u16).to_be_bytes());
@@ -175,7 +180,10 @@ mod tests {
                     },
                     async { stream.read_to_end(&mut received).await.map(|_| ()) },
                 )
-            }).await.unwrap().unwrap();
+            })
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(received, expected);
             assert_eq!(raw.read.load(Ordering::Acquire), end == 2);
             assert!(!raw.write.load(Ordering::Acquire));

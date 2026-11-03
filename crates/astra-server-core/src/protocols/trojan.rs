@@ -16,7 +16,8 @@ pub async fn trojan_udp(stream: Stream, app: Arc<App>) -> Result<()> {
             wire::crlf(&mut rd).await?;
             payload.resize(n, 0);
             rd.read_exact(&mut payload).await?;
-            send.send(app.packet(0, target, payload.split_to(n).freeze())?).await?;
+            send.send(app.packet(0, target, payload.split_to(n).freeze())?)
+                .await?;
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
