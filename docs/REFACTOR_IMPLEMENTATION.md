@@ -29,28 +29,31 @@
 | 网页单元与组件 | Rust Web 认证/Origin/会话/权限边界 3 项通过；TypeScript 检查、生产资源构建和 7 项 API/组件测试通过。 |
 | 公共工具 | Python 15 项测试与依赖架构检查通过。 |
 | Linux | WSL2 中全 workspace/all-targets check 通过；8 个库共 112 通过，7 个原有 ignored，1 个需完整 Linux 程序的升级测试明确过滤。详见 [Linux 记录](LINUX_REFACTOR_VERIFICATION.md)。 |
+| Linux GitHub Actions | 第三轮完整 workspace unit/integration 通过，含真实在线更新和 ICMP loopback；严格 workspace/all-targets Clippy、真实管理 17 项、浏览器与四包验收通过。此项为新增证据，不覆盖上面的 WSL 历史结果。 |
+| macOS | 第三轮原生 macOS 15 ARM64 与 Intel 全部通过：四包构建、完整 workspace 检查/测试（含真实在线更新）、IPC 20 项、TUI 6 项 live、manager 7 项 live、客户端 7 组、服务端 19 种协议及生命周期、17 项管理与浏览器场景和四包验收。每架构核心 runner 14 步、管理/包 runner 5 步全部通过；详见 [macOS 记录](MACOS_REFACTOR_VERIFICATION.md)。 |
 | 额外参考协议矩阵 | 21 组中 20 组通过。TCP 矩阵保留 Xray Windows EOF 超时限制，未改为成功；见下文。 |
 
 管理联测包含：Controller 同时连接两个真实 Agent；客户端与服务端分别运行；中央/本地编辑冲突；断开 Controller 时核心继续传输且本地可管理；重连恢复任务；重复请求与实际 Agent 重启保持幂等；凭据在线轮换/撤销；网页崩溃独立重启；关闭 Web 不产生子进程；真实版本包断点分块上传、校验、暂存且不隐式激活。
 
-最终浏览器截图保存在本机 `C:/Users/minecraftgive/AppData/Local/Temp/astra-management-dydp_h8i/browser/`。测试中的进程均已清理，临时工具和报告保留供复核。
+最终 Windows 四包及浏览器复验报告为 `.test-tools/final-windows-post-ci.json`（5 步全部通过）和 `.test-tools/final-windows-post-ci-management.json`（17 项全部通过）。浏览器截图保存在本机 `C:/Users/minecraftgive/AppData/Local/Temp/astra-management-xutxmcji/browser/`。测试中的进程均已清理，临时工具和报告保留供复核；早期截图和报告继续保留。
+
+源码 `1e3be94cdd470fa460800472cdc0da69c135effd` 的 [第三轮 CI 41567249779](https://github.com/minecraftgive/astra_proxy_rust/actions/runs/41567249779) 最终为 `completed / success`，10 个 job 全部通过；三平台工具/架构、Linux/Windows 编译、Web 和上述原生 macOS/Linux 验收均包含在内。证据已下载至 `.test-tools/github/41567249779/`，macOS 两份 ZIP 摘要已核验，核心/包报告及双 macOS、Linux 的 17 项管理场景 JSON 均为 `passed=true`。前两轮的路径断言与 IPC 取消失败及修复记录保留在 [macOS 记录](MACOS_REFACTOR_VERIFICATION.md)。
 
 ## 本次验证安装包
 
-Windows x86_64 MSVC **Debug 验证包**位于 `dist/2026-11-03_08-40-08_678845/`，索引为 `artifacts.json`。该索引记录的 source_revision 是本次重构的基线；实际包含当前工作区的新实现，应按下列归档摘要识别本次产物。
+最终 Windows x86_64 MSVC **Debug 验证包**位于 `dist/2026-11-03_11-19-12_403702/`，索引为 `artifacts.json`，`source_revision` 为已通过 CI 的 `1e3be94cdd470fa460800472cdc0da69c135effd`。这批包包含最终 IPC 取消修复，已按该索引独立解压并完成真实浏览器管理复验。早期 `dist/2026-11-03_08-40-08_678845/` 仅作为历史验证产物保留，不代表最终代码。
 
 | 角色 | tar.gz SHA-256 |
 | --- | --- |
-| client | `ec9f4ead9563ba776f9ef82bc1b7d111b784457c7964c1ba5d857bb12238aac6` |
-| server | `588d445ee7742746b2027609a3860e1e0fcc45bd919ff7dde2657fcce6ee52be` |
-| controller | `915df74852d17b631655958565f4b99fbae067a06a02c09eb3ce146385931ca2` |
-| web | `c75d3559206bce7a89050167ca3dcd2c2ed54f60b964c5adf5251b74f3e1c4ea` |
+| client | `a095986db3bf683e4fe9750a2a1ccf9a07a7e4f64f4c8865c4907a5930dd7a8b` |
+| server | `bf9074553284f05631d22be1eaaf13985875b20032910d35f5edcd725d8f6ecb` |
+| controller | `73770c0c9db444d0a18f0ac9668fcdfd6b689265a899f6201b5a38470bbe1ab7` |
+| web | `a2977c467dc6e7b9be6af0f9e1aed5c5cbf7a7c2b0e2daeb9e6e146cb1bba684` |
 
 四包均独立解压启动验收通过；服务器包不含 Proxy/Rule 客户端核心。更新库接受新清单的 client role 和未带 role 的旧客户端包；其他服务包明确要求相应服务的维护重启，不冒充 worker 热更新。
 
 ## 尚未关闭的验收边界
 
-- **macOS 本轮未实际构建或运行。** 已配置三平台 CI，但配置 CI 不等于已取得 macOS 验证结果。
 - **未执行真实系统代理变更、TUN/默认路由接管或交互提权。** Linux WSL 验证也不替代原生平台网络接管验收。
 - **Windows Xray 参考端关闭限制仍保留失败。** 原始 TCP 矩阵 24 例中 4 例在完整回显后等待 EOF 超时；部分复跑通过。无 Astra 的 Python TLS/VLESS/HTTPUpgrade 对照，在精确 close_notify + TCP FIN 后仍复现 4/8 次 EOF 超时，全部 8 次完整回显成功。UDP、认证/TLS/Reality 拒绝、Vision 8 MiB、sing-box 严格半关闭、TUIC 640 并发复用和 Mux 均通过。完整证据见 `.test-tools/final-protocol/report.json` 与 `reference-tls-fin.json`；总报告保持 `all_passed=false`。
 - 此处没有声称已完成优化 Release 包、跨真实主机部署或所有平台生产验收，也没有扩大既有历史报告的结论。
