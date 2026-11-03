@@ -385,47 +385,103 @@ mod linux {
             u16::from_str_radix(port, 16).ok()?,
         ))
     }
-    pub(super) fn resolve(
-        network: Network,
-        source: SocketAddr,
-        destination: SocketAddr,
-    ) -> Option<ProcessInfo> {
-        let source = SocketAddr::new(source.ip().to_canonical(), source.port());
-        let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
-        let base = match network {
-            Network::Tcp => "tcp",
-            Network::Udp => "udp",
+    const SNAPSHOT_TTL: Duration = Duration::from_millis(100);
+    const OWNER_LIMIT: usize = 65_536;
+    #[derive(Clone)]
+    struct Socket {
+        local: SocketAddr,
+        remote: SocketAddr,
+        inode: u64,
+    }
+    type SocketTable = std::collections::HashMap<u16, Vec<Socket>>;
+    type SocketSnapshot = (std::time::Instant, Arc<SocketTable>);
+    static TABLES: std::sync::Mutex<[Option<SocketSnapshot>; 2]> =
+        std::sync::Mutex::new([None, None]);
+
+    fn parse_socket(line: &str) -> Option<Socket> {
+        let mut fields = line.split_whitespace();
+        let local = address(fields.nth(1)?)?;
+        let remote = address(fields.next()?)?;
+        let inode = fields.nth(6)?.parse().ok()?;
+        (inode != 0).then_some(Socket {
+            local,
+            remote,
+            inode,
+        })
+    }
+    fn socket_table(network: Network, fresh: bool) -> Option<Arc<SocketTable>> {
+        let index = usize::from(network == Network::Udp);
+        let mut tables = TABLES.lock().ok()?;
+        if !fresh {
+            if let Some((at, table)) = &tables[index] {
+                if at.elapsed() < SNAPSHOT_TTL {
+                    return Some(table.clone());
+                }
+            }
+        }
+        let base = if network == Network::Tcp {
+            "tcp"
+        } else {
+            "udp"
         };
-        let mut inodes = HashSet::new();
+        let mut table = SocketTable::new();
         for suffix in ["", "6"] {
             let Ok(text) = fs::read_to_string(format!("/proc/net/{base}{suffix}")) else {
                 continue;
             };
-            for line in text.lines().skip(1) {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                if fields.len() < 10 {
-                    continue;
+            for socket in text.lines().skip(1).filter_map(parse_socket) {
+                table.entry(socket.local.port()).or_default().push(socket);
+            }
+        }
+        let table = Arc::new(table);
+        tables[index] = Some((std::time::Instant::now(), table.clone()));
+        Some(table)
+    }
+    fn matching_inodes(
+        table: &SocketTable,
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> HashSet<u64> {
+        table
+            .get(&source.port())
+            .into_iter()
+            .flatten()
+            .filter(|socket| {
+                (socket.local == source
+                    || (network == Network::Udp && socket.local.ip().is_unspecified()))
+                    && (socket.remote == destination
+                        || (network == Network::Udp && socket.remote.ip().is_unspecified()))
+            })
+            .map(|socket| socket.inode)
+            .collect()
+    }
+    // A snapshot maps every visible socket inode to its unique owner. Scanning
+    // once per short window also amortizes bursts of different new connections.
+    // None records ambiguity (forked/shared descriptors), never a first-owner win.
+    type Owners = std::collections::HashMap<u64, Option<u32>>;
+    type OwnerSnapshot = (std::time::Instant, Arc<Owners>);
+    static OWNERS: std::sync::Mutex<Option<OwnerSnapshot>> = std::sync::Mutex::new(None);
+    fn add_owner(owners: &mut Owners, inode: u64, pid: u32) {
+        owners
+            .entry(inode)
+            .and_modify(|owner| {
+                if *owner != Some(pid) {
+                    *owner = None;
                 }
-                let (Some(local), Some(remote)) = (address(fields[1]), address(fields[2])) else {
-                    continue;
-                };
-                let local_matches = local == source
-                    || (network == Network::Udp
-                        && local.ip().is_unspecified()
-                        && local.port() == source.port());
-                if local_matches
-                    && (remote == destination
-                        || (network == Network::Udp && remote.ip().is_unspecified()))
-                    && fields[9] != "0"
-                {
-                    inodes.insert(format!("socket:[{}]", fields[9]));
+            })
+            .or_insert(Some(pid));
+    }
+    fn owner_table(fresh: bool) -> Option<Arc<Owners>> {
+        let mut snapshot = OWNERS.lock().ok()?;
+        if !fresh {
+            if let Some((at, owners)) = &*snapshot {
+                if at.elapsed() < SNAPSHOT_TTL {
+                    return Some(owners.clone());
                 }
             }
         }
-        if inodes.is_empty() {
-            return None;
-        }
-        let mut owner = None;
+        let mut owners = Owners::new();
         for entry in fs::read_dir("/proc").ok()?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -437,19 +493,75 @@ mod linux {
             let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
                 continue;
             };
-            let owns = fds.flatten().any(|fd| {
-                fs::read_link(fd.path())
-                    .ok()
-                    .is_some_and(|path| inodes.contains(path.to_string_lossy().as_ref()))
-            });
-            if owns {
+            for fd in fds.flatten() {
+                let Ok(path) = fs::read_link(fd.path()) else {
+                    continue;
+                };
+                let Some(inode) = path
+                    .to_str()
+                    .and_then(|path| path.strip_prefix("socket:["))
+                    .and_then(|path| path.strip_suffix(']'))
+                    .and_then(|inode| inode.parse().ok())
+                else {
+                    continue;
+                };
+                add_owner(&mut owners, inode, pid);
+                if owners.len() > OWNER_LIMIT {
+                    // Do not return a partially scanned ownership table: a later
+                    // process could share an inode already seen above.
+                    return None;
+                }
+            }
+        }
+        let owners = Arc::new(owners);
+        *snapshot = Some((std::time::Instant::now(), owners.clone()));
+        Some(owners)
+    }
+    fn unique_owner(owners: &Owners, inodes: &HashSet<u64>) -> Option<u32> {
+        let mut owner = None;
+        for inode in inodes {
+            // An unowned/inaccessible inode contributes no visible owner, as
+            // before; an explicitly ambiguous inode must fail closed.
+            if let Some(pid) = owners.get(inode) {
+                let pid = (*pid)?;
                 if owner.is_some_and(|other| other != pid) {
                     return None;
                 }
                 owner = Some(pid);
             }
         }
-        let pid = owner?;
+        owner
+    }
+    pub(super) fn resolve(
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> Option<ProcessInfo> {
+        let source = SocketAddr::new(source.ip().to_canonical(), source.port());
+        let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
+        let mut inodes = matching_inodes(
+            socket_table(network, false)?.as_ref(),
+            network,
+            source,
+            destination,
+        );
+        if inodes.is_empty() {
+            // Fresh sockets must not wait for the snapshot to expire.
+            inodes = matching_inodes(
+                socket_table(network, true)?.as_ref(),
+                network,
+                source,
+                destination,
+            );
+        }
+        if inodes.is_empty() {
+            return None;
+        }
+        let mut owners = owner_table(false)?;
+        if inodes.iter().any(|inode| !owners.contains_key(inode)) {
+            owners = owner_table(true)?;
+        }
+        let pid = unique_owner(&owners, &inodes)?;
         info(
             pid,
             fs::read_link(format!("/proc/{pid}/exe"))
@@ -457,6 +569,45 @@ mod linux {
                 .to_str()?
                 .to_owned(),
         )
+    }
+    #[cfg(test)]
+    mod cache_tests {
+        use super::*;
+        #[test]
+        fn parse_proc_columns_without_allocating_fields() {
+            let socket = parse_socket(" 0: 0100007F:1234 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 42 2").unwrap();
+            assert_eq!(socket.local, "127.0.0.1:4660".parse().unwrap());
+            assert_eq!(socket.inode, 42);
+            assert!(parse_socket("short row").is_none());
+        }
+        #[test]
+        fn shared_inodes_and_multiple_owners_remain_ambiguous() {
+            let mut owners = Owners::new();
+            add_owner(&mut owners, 1, 10);
+            add_owner(&mut owners, 1, 10);
+            assert_eq!(unique_owner(&owners, &HashSet::from([1])), Some(10));
+            add_owner(&mut owners, 2, 20);
+            assert_eq!(unique_owner(&owners, &HashSet::from([1, 2])), None);
+            add_owner(&mut owners, 1, 20);
+            add_owner(&mut owners, 1, 10);
+            assert_eq!(unique_owner(&owners, &HashSet::from([1])), None);
+        }
+        #[test]
+        fn wildcard_udp_matching_keeps_remote_semantics() {
+            let socket = Socket {
+                local: "0.0.0.0:1234".parse().unwrap(),
+                remote: "0.0.0.0:0".parse().unwrap(),
+                inode: 42,
+            };
+            let table = SocketTable::from([(1234, vec![socket])]);
+            let source = "127.0.0.1:1234".parse().unwrap();
+            let destination = "203.0.113.1:443".parse().unwrap();
+            assert_eq!(
+                matching_inodes(&table, Network::Udp, source, destination),
+                HashSet::from([42])
+            );
+            assert!(matching_inodes(&table, Network::Tcp, source, destination).is_empty());
+        }
     }
 }
 
