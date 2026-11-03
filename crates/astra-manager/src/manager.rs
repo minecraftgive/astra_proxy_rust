@@ -2438,10 +2438,10 @@ mod tests {
             .unwrap()
             .unwrap();
         second.abort();
-        let _ = second.await;
+        assert!(second.await.unwrap_err().is_cancelled());
         timeout(Duration::from_secs(3), fake)
             .await
-            .unwrap()
+            .expect("cancelling the diagnostic call must close the child's outbound connection")
             .unwrap();
         call(&socket, Action::Shutdown).await.unwrap();
         manager.await.unwrap().unwrap();
