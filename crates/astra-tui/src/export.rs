@@ -3,6 +3,7 @@
 //! The functions in this module only parse and format text. In particular,
 //! shell snippets are returned as data and are never passed to a shell.
 
+use crate::shell::{fish_quote, shell_quote};
 use anyhow::{bail, ensure, Context, Result};
 use astra_platform::platform::OpenOptionsExt;
 use std::{
@@ -411,14 +412,6 @@ fn normalize_listener(value: &str) -> Result<String> {
     } else {
         Ok(format!("{host}:{port}"))
     }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn fish_quote(value: &str) -> String {
-    shell_quote(value)
 }
 
 fn powershell_quote(value: &str) -> String {

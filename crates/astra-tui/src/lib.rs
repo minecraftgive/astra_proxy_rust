@@ -15,6 +15,7 @@ mod manager;
 mod nettools;
 mod network_interfaces;
 mod protocol;
+mod shell;
 mod subscription_view;
 mod theme;
 mod tui_log;

@@ -262,9 +262,7 @@ pub fn attach_console_io() -> Result<()> {
     Ok(())
 }
 #[cfg(any(target_os = "macos", test))]
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
+use crate::shell::shell_quote;
 #[cfg(any(target_os = "macos", test))]
 fn apple_quote(value: &str) -> String {
     format!(
