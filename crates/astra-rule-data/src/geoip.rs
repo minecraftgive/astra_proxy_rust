@@ -5,7 +5,7 @@ use prost::{
     Message,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
@@ -34,8 +34,8 @@ pub struct Cidr {
 pub use astra_model::config::ruleset::geoip_category as category;
 #[derive(Debug)]
 pub struct Group {
-    v4: Vec<(u8, HashSet<u32>)>,
-    v6: Vec<(u8, HashSet<u128>)>,
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
     inverse: bool,
 }
 fn mask4(bits: u8) -> u32 {
@@ -52,17 +52,41 @@ fn mask6(bits: u8) -> u128 {
         u128::MAX << (128 - bits)
     }
 }
+fn merge_ranges<T: Copy + Ord>(mut ranges: Vec<(T, T)>, next: impl Fn(T) -> T) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= next(last.1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged.shrink_to_fit();
+    merged
+}
+fn contains<T: Copy + Ord>(ranges: &[(T, T)], ip: T) -> bool {
+    let Some(&(last_start, last_end)) = ranges.last() else {
+        return false;
+    };
+    // Most unrelated destinations lie outside a category's bounds. Avoid
+    // searching the whole index for those, or for its final interval.
+    if ip >= last_start {
+        return ip <= last_end;
+    }
+    if ip < ranges[0].0 {
+        return false;
+    }
+    let after = ranges.partition_point(|(start, _)| *start <= ip);
+    ip <= ranges[after - 1].1
+}
 impl Group {
     pub fn contains(&self, ip: IpAddr) -> bool {
         let found = match ip.to_canonical() {
-            IpAddr::V4(ip) => self
-                .v4
-                .iter()
-                .any(|(bits, nets)| nets.contains(&(u32::from(ip) & mask4(*bits)))),
-            IpAddr::V6(ip) => self
-                .v6
-                .iter()
-                .any(|(bits, nets)| nets.contains(&(u128::from(ip) & mask6(*bits)))),
+            IpAddr::V4(ip) => contains(&self.v4, u32::from(ip)),
+            IpAddr::V6(ip) => contains(&self.v6, u128::from(ip)),
         };
         found != self.inverse
     }
@@ -134,8 +158,8 @@ impl Database {
             let key = category(&group.country_code)?;
             ensure!(seen.insert(key.clone()), "duplicate GEOIP category");
             let retain = selected.is_none_or(|names| names.contains(&key));
-            let mut v4: BTreeMap<u8, HashSet<u32>> = BTreeMap::new();
-            let mut v6: BTreeMap<u8, HashSet<u128>> = BTreeMap::new();
+            let mut v4 = Vec::new();
+            let mut v6 = Vec::new();
             visit_messages(bytes, 2, |bytes| {
                 count += 1;
                 ensure!(count <= 5_000_000, "geoip.dat exceeds CIDR limit");
@@ -147,9 +171,8 @@ impl Database {
                         if retain {
                             let ip = Ipv4Addr::from(<[u8; 4]>::try_from(cidr.ip.as_slice())?);
                             let bits = cidr.prefix as u8;
-                            v4.entry(bits)
-                                .or_default()
-                                .insert(u32::from(ip) & mask4(bits));
+                            let start = u32::from(ip) & mask4(bits);
+                            v4.push((start, start | !mask4(bits)));
                         }
                     }
                     16 => {
@@ -157,9 +180,8 @@ impl Database {
                         if retain {
                             let ip = Ipv6Addr::from(<[u8; 16]>::try_from(cidr.ip.as_slice())?);
                             let bits = cidr.prefix as u8;
-                            v6.entry(bits)
-                                .or_default()
-                                .insert(u128::from(ip) & mask6(bits));
+                            let start = u128::from(ip) & mask6(bits);
+                            v6.push((start, start | !mask6(bits)));
                         }
                     }
                     _ => anyhow::bail!("invalid IP bytes in GEOIP {key}"),
@@ -170,8 +192,8 @@ impl Database {
                 groups.insert(
                     key,
                     Group {
-                        v4: v4.into_iter().collect(),
-                        v6: v6.into_iter().collect(),
+                        v4: merge_ranges(v4, |end| end.saturating_add(1)),
+                        v6: merge_ranges(v6, |end| end.saturating_add(1)),
                         inverse: group.inverse_match,
                     },
                 );
@@ -217,6 +239,95 @@ mod tests {
         }
         .encode_to_vec()
     }
+    #[test]
+    fn intervals_merge_duplicates_overlap_adjacency_and_maximum_values() {
+        assert_eq!(
+            merge_ranges(
+                vec![
+                    (10u32, 20),
+                    (0, 5),
+                    (6, 9),
+                    (12, 13),
+                    (10, 20),
+                    (u32::MAX, u32::MAX)
+                ],
+                |n| n.saturating_add(1)
+            ),
+            vec![(0, 20), (u32::MAX, u32::MAX)]
+        );
+        assert_eq!(
+            merge_ranges(vec![(0u128, u128::MAX), (u128::MAX, u128::MAX)], |n| n
+                .saturating_add(1)),
+            vec![(0, u128::MAX)]
+        );
+        let ranges = [(0u32, 20), (u32::MAX, u32::MAX)];
+        for (ip, expected) in [
+            (0, true),
+            (20, true),
+            (21, false),
+            (u32::MAX - 1, false),
+            (u32::MAX, true),
+        ] {
+            assert_eq!(contains(&ranges, ip), expected);
+        }
+        assert!(!contains::<u32>(&[], 0));
+    }
+
+    #[test]
+    fn interval_index_agrees_with_prefix_matching_in_both_families() {
+        for inverse in [false, true] {
+            let cidrs: Vec<_> = (0..129u32)
+                .map(|prefix| Cidr {
+                    ip: (u128::MAX - (1u128 << (prefix % 128)))
+                        .to_be_bytes()
+                        .to_vec(),
+                    prefix,
+                })
+                .chain((1..33u32).map(|prefix| {
+                    Cidr {
+                        ip: (0x80ffffffu32 ^ (1 << (prefix % 32)))
+                            .to_be_bytes()
+                            .to_vec(),
+                        prefix,
+                    }
+                }))
+                .collect();
+            let db = Database::decode(
+                &GeoIpList {
+                    entry: vec![GeoIp {
+                        country_code: "test".into(),
+                        cidr: cidrs.clone(),
+                        inverse_match: inverse,
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+            for i in 0..1000u128 {
+                for ip in [
+                    IpAddr::V4(Ipv4Addr::from((i as u32).wrapping_mul(2654435761))),
+                    IpAddr::V6(Ipv6Addr::from(i.wrapping_mul(u128::MAX / 997))),
+                ] {
+                    let canonical = ip.to_canonical();
+                    let matched = cidrs.iter().any(|cidr| match canonical {
+                        IpAddr::V4(ip) if cidr.ip.len() == 4 => {
+                            u32::from(ip) & mask4(cidr.prefix as u8)
+                                == u32::from_be_bytes(cidr.ip.clone().try_into().unwrap())
+                                    & mask4(cidr.prefix as u8)
+                        }
+                        IpAddr::V6(ip) if cidr.ip.len() == 16 => {
+                            u128::from(ip) & mask6(cidr.prefix as u8)
+                                == u128::from_be_bytes(cidr.ip.clone().try_into().unwrap())
+                                    & mask6(cidr.prefix as u8)
+                        }
+                        _ => false,
+                    });
+                    assert_eq!(db.matches("TEST", ip), matched != inverse, "{ip}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn categories_match_v4_v6_mapped_and_inverse() {
         for inverse in [false, true] {

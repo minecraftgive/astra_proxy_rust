@@ -4,6 +4,7 @@ use astra_model::RouteAction;
 use astra_model::RouteRequest;
 use ipnet::IpNet;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     net::IpAddr,
     path::Path,
@@ -71,6 +72,8 @@ impl GeoDatabase {
     }
 }
 
+type CompiledPattern = (Box<[String]>, Entry);
+
 #[derive(Debug)]
 pub struct RuleEngine {
     sources: Vec<RuleSource>,
@@ -79,11 +82,12 @@ pub struct RuleEngine {
     geoip: Option<GeoDatabase>,
     countries: HashMap<String, Entry>,
     keywords: Vec<(String, Entry)>,
+    keyword_matcher: Option<aho_corasick::AhoCorasick>,
     regexes: Vec<(regex::Regex, Entry)>,
     /// All `regexes` in one automaton: a lookup scans the domain once instead
     /// of once per pattern. `None` only if the combined set exceeds its limits.
     regex_set: Option<regex::RegexSet>,
-    patterns: Vec<(String, Entry)>,
+    patterns: HashMap<usize, Vec<CompiledPattern>>,
     subdomains: HashMap<String, Entry>,
     process_name: HashMap<String, Entry>,
     process_path: HashMap<String, Entry>,
@@ -115,11 +119,20 @@ fn regex_set(regexes: &[(regex::Regex, Entry)]) -> Option<regex::RegexSet> {
         .ok()
 }
 
-fn process_path(value: &str) -> String {
-    if value.contains('\\') || value.as_bytes().get(1) == Some(&b':') {
-        value.replace('\\', "/").to_lowercase()
+fn lowercase(value: &str) -> Cow<'_, str> {
+    if value.is_ascii() && !value.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Borrowed(value)
     } else {
-        value.to_owned()
+        Cow::Owned(value.to_lowercase())
+    }
+}
+fn process_path(value: &str) -> Cow<'_, str> {
+    if value.contains('\\') {
+        Cow::Owned(value.replace('\\', "/").to_lowercase())
+    } else if value.as_bytes().get(1) == Some(&b':') {
+        lowercase(value)
+    } else {
+        Cow::Borrowed(value)
     }
 }
 
@@ -448,9 +461,10 @@ impl RuleEngine {
             geoip,
             countries: HashMap::new(),
             keywords: Vec::new(),
+            keyword_matcher: None,
             regexes: Vec::new(),
             regex_set: None,
-            patterns: Vec::new(),
+            patterns: HashMap::new(),
             subdomains: HashMap::new(),
             process_name: HashMap::new(),
             process_path: HashMap::new(),
@@ -497,7 +511,11 @@ impl RuleEngine {
                             .all(|part| !part.is_empty() && (!part.contains('*') || part == "*")),
                         "invalid domain pattern"
                     );
-                    out.patterns.push((key, entry));
+                    let labels: Box<[String]> = key.split('.').map(str::to_owned).collect();
+                    out.patterns
+                        .entry(labels.len())
+                        .or_default()
+                        .push((labels, entry));
                 }
                 "process_name" | "process_path" => {
                     if r.value.trim().is_empty() || r.value.len() > 4096 || r.value.contains('\0') {
@@ -519,7 +537,7 @@ impl RuleEngine {
                             bail!("process_path expects an absolute executable path");
                         }
                         out.process_path
-                            .entry(process_path(&r.value))
+                            .entry(process_path(&r.value).into_owned())
                             .or_insert(entry);
                     }
                 }
@@ -575,6 +593,14 @@ impl RuleEngine {
         out.v4 = v4.into_iter().collect();
         out.v6 = v6.into_iter().collect();
         out.regex_set = regex_set(&out.regexes);
+        if !out.keywords.is_empty() {
+            out.keyword_matcher = Some(
+                aho_corasick::AhoCorasick::new(
+                    out.keywords.iter().map(|(keyword, _)| keyword.as_str()),
+                )
+                .context("compile domain keyword matcher")?,
+            );
+        }
         Ok(out)
     }
 
@@ -588,11 +614,11 @@ impl RuleEngine {
         if let Some(process) = &req.process {
             consider(
                 &mut best,
-                self.process_name.get(&process.name.to_lowercase()),
+                self.process_name.get(lowercase(&process.name).as_ref()),
             );
             consider(
                 &mut best,
-                self.process_path.get(&process_path(&process.path)),
+                self.process_path.get(process_path(&process.path).as_ref()),
             );
         }
 
@@ -603,9 +629,8 @@ impl RuleEngine {
         };
         consider(&mut best, self.network.get(&netkey));
 
-        let destination_ip = req
-            .destination_ip
-            .or_else(|| req.target.host.parse::<IpAddr>().ok());
+        let host_ip = req.target.host.parse::<IpAddr>().ok();
+        let destination_ip = req.destination_ip.or(host_ip);
         if let Some(ip) = destination_ip {
             if local_ip(ip) {
                 consider(&mut best, self.countries.get("LAN"));
@@ -651,7 +676,7 @@ impl RuleEngine {
                 }
             }
         }
-        if req.target.host.parse::<IpAddr>().is_err() {
+        if host_ip.is_none() {
             let domain = req.target.host.trim_end_matches('.').to_ascii_lowercase();
             consider(&mut best, self.exact.get(&domain));
             match &self.regex_set {
@@ -668,21 +693,28 @@ impl RuleEngine {
                     }
                 }
             }
-            for (keyword, entry) in &self.keywords {
-                if domain.contains(keyword) {
-                    consider(&mut best, Some(entry));
+            if let Some(matcher) = &self.keyword_matcher {
+                // Overlapping matches preserve earliest-rule precedence even
+                // when an earlier keyword is contained in a later one.
+                for matched in matcher.find_overlapping_iter(domain.as_bytes()) {
+                    consider(
+                        &mut best,
+                        Some(&self.keywords[matched.pattern().as_usize()].1),
+                    );
                 }
             }
-            for (pattern, entry) in &self.patterns {
+            if !self.patterns.is_empty() {
                 let labels: Vec<_> = domain.split('.').collect();
-                let expected: Vec<_> = pattern.split('.').collect();
-                if labels.len() == expected.len()
-                    && labels
-                        .iter()
-                        .zip(expected)
-                        .all(|(label, expected)| expected == "*" || *label == expected)
-                {
-                    consider(&mut best, Some(entry));
+                if let Some(patterns) = self.patterns.get(&labels.len()) {
+                    for (expected, entry) in patterns {
+                        if labels
+                            .iter()
+                            .zip(expected.iter())
+                            .all(|(label, expected)| expected == "*" || *label == expected)
+                        {
+                            consider(&mut best, Some(entry));
+                        }
+                    }
                 }
             }
             let mut segment = domain.as_str();
@@ -739,12 +771,12 @@ impl RuleEngine {
                 return Some((kind.into(), value.clone()));
             }
         }
-        for (kind, entries) in [
-            ("domain_keyword", &self.keywords),
-            ("domain_pattern", &self.patterns),
-        ] {
-            if let Some((value, _)) = entries.iter().find(|(_, entry)| entry.index == index) {
-                return Some((kind.into(), value.clone()));
+        if let Some((value, _)) = self.keywords.iter().find(|(_, entry)| entry.index == index) {
+            return Some(("domain_keyword".into(), value.clone()));
+        }
+        for patterns in self.patterns.values() {
+            if let Some((labels, _)) = patterns.iter().find(|(_, entry)| entry.index == index) {
+                return Some(("domain_pattern".into(), labels.join(".")));
             }
         }
         if let Some((regex, _)) = self.regexes.iter().find(|(_, entry)| entry.index == index) {
@@ -1235,6 +1267,47 @@ mod tests {
             assert!(RuleEngine::compile(&config).is_err(), "{extra}");
         }
     }
+    #[test]
+    fn overlapping_keywords_and_pattern_groups_keep_original_precedence() {
+        let engine = compile("[[rules]]\nkind='domain_keyword'\nvalue='bc'\naction='block'\n[[rules]]\nkind='domain_keyword'\nvalue='abc'\naction='direct'\n[[rules]]\nkind='domain_pattern'\nvalue='*.test'\naction='direct'\n[[rules]]\nkind='domain_keyword'\nvalue='bc'\naction='proxy:later'");
+        assert_eq!(
+            engine.decide(&request("ABC.test", None)),
+            RouteAction::Block
+        );
+        assert_eq!(engine.decide(&request("x.test", None)), RouteAction::Direct);
+        let patterns = compile("[[rules]]\nkind='domain_pattern'\nvalue='*.test'\naction='block'\n[[rules]]\nkind='domain_pattern'\nvalue='*.*.test'\naction='direct'");
+        let req = request("a.b.test", None);
+        let decision = patterns.decision(&req);
+        assert_eq!(decision.action, RouteAction::Direct);
+        assert_eq!(
+            patterns.matched_condition(&decision.path),
+            Some(("domain_pattern".into(), "*.*.test".into()))
+        );
+        assert_eq!(
+            patterns.decide(&request("a.test", None)),
+            RouteAction::Block
+        );
+        assert_eq!(
+            patterns.decide(&request("test", None)),
+            RouteAction::Proxy("edge".into())
+        );
+    }
+
+    #[test]
+    fn process_normalization_preserves_unicode_and_posix_case() {
+        assert_eq!(lowercase("BROWSER.exe"), "browser.exe");
+        assert_eq!(lowercase("İΣ.EXE"), "İΣ.EXE".to_lowercase());
+        assert!(matches!(lowercase("browser.exe"), Cow::Borrowed(_)));
+        assert!(matches!(
+            process_path("/usr/Browser"),
+            Cow::Borrowed("/usr/Browser")
+        ));
+        assert_eq!(
+            process_path("C:/Apps/İ.exe"),
+            "c:/apps/İ.exe".to_lowercase()
+        );
+    }
+
     #[test]
     fn regex_set_keeps_first_matching_rule_and_case_insensitivity() {
         let engine = compile(
