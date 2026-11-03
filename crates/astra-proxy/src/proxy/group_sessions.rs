@@ -12,6 +12,8 @@ use tokio::{
     sync::watch,
 };
 
+pub(crate) const COPY_BUFFER_SIZE: usize = 64 * 1024;
+
 #[derive(Default)]
 pub(crate) struct Sessions(Mutex<HashMap<String, watch::Sender<u64>>>);
 pub(crate) struct Lease(Vec<(watch::Receiver<u64>, u64)>, pub Option<String>);
@@ -76,7 +78,7 @@ impl Lease {
             tokio::select! {
                 biased;
                 _ = self.cancelled() => {},
-                _ = tokio::io::copy_bidirectional(&mut upstream, &mut relay) => {},
+                _ = tokio::io::copy_bidirectional_with_sizes(&mut upstream, &mut relay, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE) => {},
             }
         });
         Box::new(Stream {

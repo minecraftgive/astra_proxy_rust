@@ -1,6 +1,7 @@
 //! Resident ingress and immutable worker generations. Public listeners never
 //! move during an update; each admitted flow owns a generation lease.
 use crate::platform::worker::WorkerChild;
+use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::{runtime::Current, App};
 use anyhow::{bail, ensure, Context, Result};
 use astra_model::Inbound;
@@ -783,7 +784,7 @@ impl Host {
         let ready: std::result::Result<(), String> = receive(&mut remote).await?;
         ready.map_err(anyhow::Error::msg)?;
         let mut remote = astra_ipc::host::HostStream::new(remote);
-        tokio::io::copy_bidirectional(&mut client, &mut remote).await?;
+        tokio::io::copy_bidirectional_with_sizes(&mut client, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
         Ok(())
     }
     async fn command(&self, command: Command) -> Result<serde_json::Value> {
@@ -1118,6 +1119,6 @@ async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .connect_tracked(&dial, &action, meta.inbound, Some(meta.source))
         .await?;
     remote.write_all(&prefix).await?;
-    tokio::io::copy_bidirectional(&mut stream, &mut remote).await?;
+    tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
     Ok(())
 }

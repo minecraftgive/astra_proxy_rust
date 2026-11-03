@@ -1,3 +1,4 @@
+use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::{mode_config::Tun, runtime::Current};
 use anyhow::{ensure, Context, Result};
 use astra_model::Inbound;
@@ -420,7 +421,7 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                         tracing::debug!(target:"astra_route",phase="destination",original=%target.host,host=%route.host,dial=%dial.host,%destination,"TUN routing name and dial address");
                         let mut remote = app.connect_tracked(&dial, &action, Inbound::Tun, Some(source)).await?;
                         tokio::io::AsyncWriteExt::write_all(&mut remote,&prefix).await?;
-                        tokio::io::copy_bidirectional(&mut stream, &mut remote).await?;
+                        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
                         Ok(())
                     };
                     let result:Result<()>=tokio::select! {

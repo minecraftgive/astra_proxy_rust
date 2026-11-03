@@ -1,3 +1,4 @@
+use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::App;
 use anyhow::{Context, Result};
 use astra_model::Inbound;
@@ -67,7 +68,7 @@ where
         }
     };
     reply_socks5(&mut client, 0).await?;
-    let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    let (up, down) = tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
     tracing::debug!(host = %target.host, port = target.port, up, down, "SOCKS5 stream complete");
     Ok(())
 }
