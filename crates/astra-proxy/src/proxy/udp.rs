@@ -5,6 +5,7 @@ use astra_model::Inbound;
 use astra_model::Network;
 use astra_model::RouteAction;
 use astra_model::Target;
+use bytes::{Bytes, BytesMut};
 use meow_common::ProxyPacketConn;
 use std::{
     collections::HashMap,
@@ -73,10 +74,12 @@ where
     let expiry = idle(activity.clone(), idle_time);
     tokio::pin!(expiry);
     let mut workers = JoinSet::new();
-    let mut flows: HashMap<Target, mpsc::Sender<Vec<u8>>> = HashMap::new();
-    let mut packet = vec![0; 65536];
+    let mut flows: HashMap<Target, mpsc::Sender<Bytes>> = HashMap::new();
+    let mut packet = BytesMut::with_capacity(65536);
     let mut control_byte = [0];
     loop {
+        packet.clear();
+        packet.reserve(65536);
         tokio::select! {
             // Terminating the control connection terminates every UDP task.
             _ = control.read(&mut control_byte) => break,
@@ -84,7 +87,7 @@ where
             Some(_) = workers.join_next(), if !workers.is_empty() => {
                 flows.retain(|_, sender| !sender.is_closed());
             }
-            received = socket.recv_from(&mut packet) => {
+            received = socket.recv_buf_from(&mut packet) => {
                 let (len, from) = received?;
                 if from.ip() != peer.ip() || source.is_some_and(|s| s != from) { continue; }
                 let Ok((target, body)) = decode(&packet[..len]) else { continue; };
@@ -122,7 +125,9 @@ where
                     });
                 }
                 // UDP overload drops packets instead of blocking all destinations.
-                let _ = flows[&target].try_send(body.to_vec());
+                let body_start = len - body.len();
+                let body = packet.split_to(len).freeze().slice(body_start..);
+                let _ = flows[&target].try_send(body);
             }
         }
     }
@@ -311,7 +316,7 @@ async fn flow(
     socket: Arc<UdpSocket>,
     client: SocketAddr,
     target: &Target,
-    mut requests: mpsc::Receiver<Vec<u8>>,
+    mut requests: mpsc::Receiver<Bytes>,
     association_activity: Activity,
 ) -> Result<()> {
     let connection = timeout(
@@ -375,6 +380,50 @@ use astra_protocols::socks5::udp::decode;
 #[cfg(test)]
 mod group_policy_tests {
     use super::*;
+    #[tokio::test]
+    async fn association_preserves_datagrams_across_receive_buffer_reuse() {
+        timeout(Duration::from_secs(5), async {
+            let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let destination = echo.local_addr().unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let source = socket.local_addr().unwrap();
+            let app = Arc::new(App::from_text(
+                std::path::Path::new("udp-buffers.toml"),
+                "standalone=true\nstandalone_outbound='DIRECT'\nsocks5_listen='127.0.0.1:1080'\n".into(),
+            ).unwrap());
+            let (mut control, server) = tokio::io::duplex(64);
+            let worker = tokio::spawn(associate_stream(
+                server,
+                Target { host: source.ip().to_string(), port: source.port() },
+                app,
+                source,
+                "127.0.0.1:1080".parse().unwrap(),
+            ));
+            let mut reply = [0; 10];
+            control.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply[..8], &[5, 0, 0, 1, 127, 0, 0, 1]);
+            let relay = SocketAddr::new(source.ip(), u16::from_be_bytes([reply[8], reply[9]]));
+            let target = Target { host: destination.ip().to_string(), port: destination.port() };
+            let mut received = vec![0; 65536];
+            for (sequence, size) in [0, 32, MAX_PACKET - 10, 7, 0, 16384, 1].into_iter().enumerate() {
+                let body = vec![sequence as u8; size];
+                let mut packet = vec![0, 0, 0];
+                crate::outbound::append_socks_address(&mut packet, &target).unwrap();
+                packet.extend_from_slice(&body);
+                socket.send_to(&packet, relay).await.unwrap();
+                let (count, peer) = echo.recv_from(&mut received).await.unwrap();
+                assert_eq!(&received[..count], body);
+                echo.send_to(&received[..count], peer).await.unwrap();
+                let (count, _) = socket.recv_from(&mut received).await.unwrap();
+                let (reply_target, reply_body) = decode(&received[..count]).unwrap();
+                assert_eq!(reply_target, target);
+                assert_eq!(reply_body, body);
+            }
+            drop(control);
+            worker.await.unwrap().unwrap();
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn configured_group_switch_cancels_idle_udp_receive_and_prevents_more_packets() {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
