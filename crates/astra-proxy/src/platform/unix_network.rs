@@ -80,7 +80,7 @@ pub(super) fn physical_egress(
                 }
             }
         }
-        return Ok(result);
+        Ok(result)
     }
     #[cfg(target_os = "macos")]
     {
@@ -128,7 +128,7 @@ pub(super) fn physical_egress(
             }
         }
         anyhow::ensure!(!result.interface.is_empty() && (result.gateway.is_some() || result.gateway6.is_some()),"no physical default route; specify tun.interface and disable auto_gateway for a static gateway");
-        return Ok(result);
+        Ok(result)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("automatic egress discovery unsupported on this OS")

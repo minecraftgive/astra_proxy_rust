@@ -346,7 +346,7 @@ mod linux {
             )),
             32 => {
                 let mut bytes = [0; 16];
-                for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                for (i, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     chunk.copy_from_slice(
                         &u32::from_str_radix(&ip[i * 8..i * 8 + 8], 16)
                             .ok()?

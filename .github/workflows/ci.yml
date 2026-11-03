@@ -34,6 +34,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: python scripts/build.py --role client --profile debug --non-interactive
       - run: python scripts/build.py --role server --profile debug --non-interactive
+      - name: Allow ICMP echo sockets for the test runner group
+        run: sudo sysctl -w net.ipv4.ping_group_range="$(id -g) $(id -g)"
       - run: python scripts/test.py unit --debug
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
   rust-platforms:

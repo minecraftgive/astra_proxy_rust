@@ -301,7 +301,7 @@ mod tests {
             else {Ok("Enabled: Yes".into())}
         }).unwrap();
         assert_eq!(plan.len(), 8);
-        for pair in plan[2..].chunks_exact(2) {
+        for pair in plan[2..].as_chunks::<2>().0 {
             assert_eq!(pair[0].apply.last().unwrap(), "7891");
             assert_eq!(&pair[1].restore[3..], &["original.example", "1234"]);
             assert_eq!(pair[0].restore.last().unwrap(), "off");
