@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-observe = { path = "../astra-observe" }
 astra-model = { path = "../astra-model" }
 astra-platform = { path = "../astra-platform" }
 astra-resource = { path = "../astra-resource" }

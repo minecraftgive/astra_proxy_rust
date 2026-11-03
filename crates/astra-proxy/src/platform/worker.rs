@@ -204,6 +204,7 @@ pub async fn spawn(binary: &Path, config: Vec<u8>, log: std::fs::File) -> Result
 
 fn command(binary: &Path) -> Result<tokio::process::Command> {
     let mut command = astra_platform::platform::background_core(binary);
+    command.env_remove("ASTRA_SERVICE_OWNER");
     for name in REMOVED_ENV {
         command.env_remove(name);
     }
@@ -230,6 +231,7 @@ fn command(binary: &Path) -> Result<tokio::process::Command> {
     Ok(command)
 }
 const REMOVED_ENV: &[&str] = &[
+    "ASTRA_SERVICE_OWNER",
     "ASTRA_CONTROL_SOCKET",
     "ASTRA_HOSTED",
     "ASTRA_HOSTED_EXPERIMENTAL",

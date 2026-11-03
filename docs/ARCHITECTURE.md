@@ -25,6 +25,7 @@ astra-tui ----------> Agent 私有 IPC
 | crate | 所有权与限制 |
 |---|---|
 | `astra-model` | CoreKind、路由/运行状态/管理业务 DTO、各类配置与默认值、纯字段/引用校验、文档 schema/编辑命令；可选 TS 绑定；无文件、进程或网络访问 |
+| `astra-observe` | 进程内固定名称原子指标、操作耗时与取消计数；不执行 I/O、不创建采样线程，通过管理接口按需导出 |
 | `astra-platform` | 私有 IPC 端点、权限、原子文件写入、运行目录、日志、进程标志、提权与 Unix handoff；不依赖 IPC/manager/UI |
 | `astra-resource` | 有大小、超时及重定向限制的资源加载和缓存；每个 ResourceLoader 独立选择 Refresh/PreferCache/ReadOnly；不使用全局可变策略 |
 | `astra-ipc` | bincode/控制帧、会话、Core 控制服务器、宿主/worker 数据通道及任务进度传输；不再作为平台/业务类型的转发集合 |

@@ -6,7 +6,15 @@ use std::{io, path::PathBuf, time::Instant};
 use tokio::time::{timeout, Duration};
 
 use astra_model::control::*;
-static APPLIED: std::sync::RwLock<Option<Applied>> = std::sync::RwLock::new(None);
+// Publish immutable complete snapshots. A panicking publisher cannot poison
+// status/identity requests or expose a path paired with a different digest.
+static APPLIED: std::sync::OnceLock<arc_swap::ArcSwapOption<Applied>> = std::sync::OnceLock::new();
+fn applied_state() -> &'static arc_swap::ArcSwapOption<Applied> {
+    APPLIED.get_or_init(arc_swap::ArcSwapOption::empty)
+}
+fn applied_snapshot() -> Option<Applied> {
+    applied_state().load_full().as_deref().cloned()
+}
 pub fn config_digest(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -14,16 +22,18 @@ pub fn config_digest(text: &str) -> u64 {
     hasher.finish()
 }
 pub fn applied(path: &std::path::Path, text: &str) {
-    *APPLIED.write().unwrap() = Some(Applied {
+    publish_applied(applied_state(), path, text);
+}
+fn publish_applied(state: &arc_swap::ArcSwapOption<Applied>, path: &std::path::Path, text: &str) {
+    state.store(Some(std::sync::Arc::new(Applied {
         path: path.to_owned(),
         digest: config_digest(text),
-    });
+    })));
 }
 
 pub struct Control {
+    candidate: astra_platform::lifecycle::Candidate,
     listener: Option<UnixListener>,
-    #[cfg_attr(windows, allow(dead_code))]
-    path: Option<PathBuf>,
     started: Instant,
 }
 
@@ -34,6 +44,7 @@ impl Control {
     }
 
     pub fn bind(path: Option<PathBuf>) -> io::Result<Self> {
+        let candidate = astra_platform::lifecycle::Candidate::from_env()?;
         let listener = match &path {
             Some(path) => {
                 let listener = astra_platform::platform::bind_listener(path)?;
@@ -41,7 +52,6 @@ impl Control {
                     astra_platform::platform::endpoint_path(path),
                     0o600,
                 ) {
-                    astra_platform::platform::remove_socket(path);
                     return Err(e);
                 }
                 Some(listener)
@@ -49,8 +59,8 @@ impl Control {
             None => None,
         };
         Ok(Self {
+            candidate,
             listener,
-            path,
             started: Instant::now(),
         })
     }
@@ -166,28 +176,31 @@ impl Control {
     }
 }
 
-impl Drop for Control {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            astra_platform::platform::remove_socket(path);
+type ControlPeer = crate::session::Peer<Request, Response>;
+type ControlPeers = std::collections::HashMap<(PathBuf, u8), ControlPeer>;
+static POOL: std::sync::OnceLock<std::sync::Mutex<ControlPeers>> = std::sync::OnceLock::new();
+fn peer_pool(pool: &std::sync::Mutex<ControlPeers>) -> std::sync::MutexGuard<'_, ControlPeers> {
+    match pool.lock() {
+        Ok(peers) => peers,
+        Err(poisoned) => {
+            // This is only a connection cache. Existing calls hold their own
+            // peer; clearing the cache neither cancels nor replays a mutation.
+            let mut peers = poisoned.into_inner();
+            peers.clear();
+            pool.clear_poison();
+            tracing::error!("Control connection cache was poisoned; discarded cached peers without replaying calls");
+            peers
         }
     }
 }
-
 async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Result<Response> {
-    use std::{
-        collections::HashMap,
-        sync::{Mutex, OnceLock},
-    };
-    type Peer = crate::session::Peer<Request, Response>;
-    static POOL: OnceLock<Mutex<HashMap<(PathBuf, u8), Peer>>> = OnceLock::new();
     let lane = match &command {
-        Command::Status | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
+        Command::Monitor | Command::Status | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
         Command::GetConfig | Command::ExplainRoute(_) => 2,
         _ => 1,
     };
     let peer = {
-        let mut pool = POOL.get_or_init(Default::default).lock().unwrap();
+        let mut pool = peer_pool(POOL.get_or_init(Default::default));
         pool.retain(|_, peer| !peer.is_closed());
         if pool.len() >= 128 {
             if let Some(key) = pool.keys().next().cloned() {
@@ -196,7 +209,7 @@ async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Resu
         }
         pool.entry((path.to_owned(), lane))
             .or_insert_with(|| {
-                Peer::new(path.to_owned(), || Request {
+                ControlPeer::new(path.to_owned(), || Request {
                     api_version: crate::API_VERSION,
                     command: Command::Session,
                 })
@@ -214,11 +227,7 @@ async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Resu
         )
         .await;
     if stopping && result.is_ok() {
-        POOL.get()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .retain(|(endpoint, _), _| endpoint != path);
+        peer_pool(POOL.get_or_init(Default::default)).retain(|(endpoint, _), _| endpoint != path);
     }
     result
 }
@@ -226,10 +235,35 @@ const MANAGEMENT_RELOAD_TIMEOUT_SECS: u64 = 65;
 const MANAGEMENT_UPDATE_TIMEOUT_SECS: u64 = 65;
 const MANAGEMENT_DEFAULT_TIMEOUT_SECS: u64 = 3;
 
+pub async fn identity(path: &std::path::Path) -> io::Result<Identity> {
+    timeout(Duration::from_secs(3), async {
+        let mut stream = astra_platform::platform::connect_trusted(path).await?;
+        let peer = astra_platform::platform::peer_process_id(&stream)?;
+        crate::send(
+            &mut stream,
+            &Request {
+                api_version: crate::API_VERSION,
+                command: Command::Identity,
+            },
+        )
+        .await?;
+        let identity: Identity = crate::receive_management(&mut stream).await.map_err(|error|io::Error::new(error.kind(),format!("Invalid lifecycle response; incompatible core protocol (expected {}): {error}",crate::API_VERSION)))?;
+        if identity.version != 1 || identity.process.pid != peer {
+            return Err(io::Error::other(
+                "lifecycle identity does not match IPC peer",
+            ));
+        }
+        Ok(identity)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Status> {
     if matches!(
         command,
-        Command::GetConfig
+        Command::Identity
+            | Command::GetConfig
             | Command::ExplainRoute(_)
             | Command::Runtime(_)
             | Command::Session
@@ -261,6 +295,13 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
             Ok(status)
         }
         _ => Err(io::Error::other("unexpected core response")),
+    }
+}
+/// Read process-local instrumentation without changing core state.
+pub async fn monitor(path: &std::path::Path) -> io::Result<astra_model::monitor::InternalSnapshot> {
+    match rpc(path, Command::Monitor, 4).await? {
+        Response::Monitor(result) => result.map_err(io::Error::other),
+        _ => Err(io::Error::other("internal monitoring is unavailable; update the core")),
     }
 }
 pub async fn config_snapshot(path: &std::path::Path) -> io::Result<ConfigSnapshot> {
@@ -316,6 +357,53 @@ pub async fn watch_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publisher_panic_cannot_poison_applied_snapshots() {
+        let state = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+        let publisher = state.clone();
+        assert!(std::thread::spawn(move || {
+            publish_applied(&publisher, std::path::Path::new("first.toml"), "first");
+            panic!("injected publisher failure");
+        })
+        .join()
+        .is_err());
+        let retained = state.load_full().unwrap();
+        assert_eq!(retained.path, PathBuf::from("first.toml"));
+        assert_eq!(retained.digest, config_digest("first"));
+        publish_applied(&state, std::path::Path::new("next.toml"), "next");
+        let next = state.load_full().unwrap();
+        assert_eq!(next.path, PathBuf::from("next.toml"));
+        assert_eq!(next.digest, config_digest("next"));
+        assert_eq!(retained.digest, config_digest("first"));
+    }
+    #[test]
+    fn poisoned_peer_cache_is_reset_before_reuse() {
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(ControlPeers::new()));
+        let writer = pool.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = writer.lock().unwrap();
+            panic!("injected cache writer failure");
+        })
+        .join()
+        .is_err());
+        assert!(peer_pool(&pool).is_empty());
+        assert!(!pool.is_poisoned());
+        assert!(peer_pool(&pool).is_empty());
+    }
+    #[tokio::test]
+    async fn monitor_reads_internal_counters_without_changing_status() {
+        let path = std::env::temp_dir().join(format!("astra-monitor-test-{}.sock", std::process::id()));
+        let control = Control::bind(Some(path.clone())).unwrap();
+        let task = tokio::spawn(async move { control.shutdown().await.unwrap(); });
+        astra_observe::counter!("test.monitor_requests", "测试请求").add(1);
+        let snapshot = monitor(&path).await.unwrap();
+        assert_eq!(snapshot.epoch, astra_platform::lifecycle::boot_id());
+        assert!(snapshot.metrics.iter().any(|m| m.name == "test.monitor_requests" && m.value == "1"));
+        assert!(snapshot.metrics.iter().any(|m| m.name == "runtime.control_queue"));
+        assert_eq!(request(&path, Command::Status).await.unwrap().pid, std::process::id());
+        request(&path, Command::Stop).await.unwrap();
+        task.await.unwrap();
+    }
     #[tokio::test]
     async fn snapshot_uses_bounded_management_frames_without_changing_status_replies() {
         let path =

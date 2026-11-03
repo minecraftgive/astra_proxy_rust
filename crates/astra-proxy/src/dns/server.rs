@@ -1,10 +1,11 @@
 use crate::{runtime::Current, App};
 use anyhow::{ensure, Context, Result};
+use astra_platform::supervision::{transient_io, Task};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
 };
 
 pub(crate) struct Prepared {
@@ -13,7 +14,17 @@ pub(crate) struct Prepared {
 pub(crate) struct Guard {
     sockets: Vec<(Arc<UdpSocket>, Arc<TcpListener>)>,
     pub addresses: Vec<SocketAddr>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<Task>,
+}
+impl Guard {
+    pub async fn failure(&mut self) -> Option<String> {
+        for task in &mut self.tasks {
+            if let Some(error) = task.check().await {
+                return Some(error);
+            }
+        }
+        None
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -59,12 +70,16 @@ impl Prepared {
         for (udp, tcp) in self.sockets {
             guard.addresses.push(tcp.local_addr().unwrap());
             let active = current.clone();
-            guard.tasks.push(tokio::spawn(async move {
+            guard.tasks.push(Task::spawn_result(format!("DNS UDP {}", tcp.local_addr().unwrap()), async move {
                 let mut jobs=JoinSet::new();let mut bytes=vec![0;65535];
                 loop {tokio::select! {
                     Some(_)=jobs.join_next(),if !jobs.is_empty()=>{},
                     packet=udp.recv_from(&mut bytes)=>{
-                        let Ok((size,peer))=packet else{break;};
+                        let (size,peer)=match packet {
+                            Ok(value)=>value,
+                            Err(error) if transient_io(&error)=>{tokio::time::sleep(Duration::from_millis(100)).await;continue;}
+                            Err(error)=>return Err::<(),_>(error),
+                        };
                         let app=active.load_full();
                         // DNS listeners follow the same LAN ACL as proxy inbounds;
                         // a non-loopback bind must never become an open resolver.
@@ -80,12 +95,16 @@ impl Prepared {
                 }}
             }));
             let active = current.clone();
-            guard.tasks.push(tokio::spawn(async move {
+            guard.tasks.push(Task::spawn_result(format!("DNS TCP {}", tcp.local_addr().unwrap()), async move {
                 let mut jobs=JoinSet::new();
                 loop {tokio::select! {
                     Some(_)=jobs.join_next(),if !jobs.is_empty()=>{},
                     accepted=tcp.accept()=>{
-                        let Ok((stream,peer))=accepted else{break;};let app=active.load_full();
+                        let (stream,peer)=match accepted {
+                            Ok(value)=>value,
+                            Err(error) if transient_io(&error)=>{tokio::time::sleep(Duration::from_millis(100)).await;continue;}
+                            Err(error)=>return Err::<(),_>(error),
+                        };let app=active.load_full();
                         if !app.inbound_allowed(peer.ip()){continue;}
                         let _=stream.set_nodelay(true);
                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
@@ -133,3 +152,32 @@ pub(crate) async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 pub(crate) use serve_tcp as tcp;
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dead_dns_listener_is_reported_with_transport_and_address() {
+        let app = App::from_text(&std::env::temp_dir().join("astra-dns-task-test.toml"),
+            "standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct]\nmembers=['DIRECT']\n".into()).unwrap();
+        let current = Arc::new(arc_swap::ArcSwap::from_pointee(app));
+        let prepared = Prepared::bind(&["127.0.0.1:0".parse().unwrap()], None)
+            .await
+            .unwrap();
+        let mut guard = prepared.start(current);
+        assert!(guard.failure().await.is_none());
+        guard.tasks[0].abort();
+        let failure = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(error) = guard.failure().await {
+                    break error;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(failure.contains("DNS UDP 127.0.0.1:"));
+        assert!(failure.contains("cancelled"));
+    }
+}

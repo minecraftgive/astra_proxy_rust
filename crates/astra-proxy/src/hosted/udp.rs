@@ -39,19 +39,19 @@ impl Host {
             timeout(Duration::from_secs(15), receive(&mut stream)).await??;
         ready.map_err(anyhow::Error::msg)?;
         let app = self.app()?;
-        let activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+        let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
         let (mut reader, mut writer) = tokio::io::split(stream);
         let upload = async {
             while let Some(packet) = requests.recv().await {
                 send_datagram(&mut writer, &packet).await?;
-                *activity.lock().unwrap() = tokio::time::Instant::now();
+                activity.send_replace(tokio::time::Instant::now());
             }
             Ok::<_, anyhow::Error>(())
         };
         let download = async {
             loop {
                 let (remote, packet) = receive_reply(&mut reader).await?;
-                *activity.lock().unwrap() = tokio::time::Instant::now();
+                activity.send_replace(tokio::time::Instant::now());
                 output
                     .send((packet, remote, source))
                     .await
@@ -65,9 +65,9 @@ impl Host {
         let expiry = async {
             let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
             loop {
-                let deadline = *activity.lock().unwrap() + duration;
+                let deadline = *activity.borrow() + duration;
                 tokio::time::sleep_until(deadline).await;
-                if activity.lock().unwrap().elapsed() >= duration {
+                if activity.borrow().elapsed() >= duration {
                     return;
                 }
             }
@@ -184,13 +184,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await?;
     let (destination, mapped, connection) = prepared?;
-    let activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let (mut reader, mut writer) = tokio::io::split(stream);
     let upload = async {
         loop {
             let packet = receive_datagram(&mut reader).await?;
             connection.send(&packet, destination).await?;
-            *activity.lock().unwrap() = tokio::time::Instant::now();
+            activity.send_replace(tokio::time::Instant::now());
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
@@ -205,7 +205,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 remote
             };
             send_reply(&mut writer, remote, &buffer[..size]).await?;
-            *activity.lock().unwrap() = tokio::time::Instant::now();
+            activity.send_replace(tokio::time::Instant::now());
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
@@ -213,9 +213,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let expiry = async {
         let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
         loop {
-            let deadline = *activity.lock().unwrap() + duration;
+            let deadline = *activity.borrow() + duration;
             tokio::time::sleep_until(deadline).await;
-            if activity.lock().unwrap().elapsed() >= duration {
+            if activity.borrow().elapsed() >= duration {
                 return;
             }
         }
@@ -334,6 +334,7 @@ mod tests {
             );
         }
         let host = Arc::new(Host {
+            consistency: Default::default(),
             boot: "quota-test".into(),
             next_flow: AtomicU64::new(1),
             endpoint: std::env::temp_dir()

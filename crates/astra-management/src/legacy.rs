@@ -42,6 +42,7 @@ pub struct Row {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstanceDetails {
+    pub network_recovery: Option<astra_model::recovery::Notice>,
     pub server_status: Option<crate::v2::ServerSnapshot>,
     pub modes: Vec<String>,
     pub listeners: Vec<String>,
@@ -176,6 +177,10 @@ pub enum Action {
     UpdateOperationStatus {
         operation_id: String,
     },
+    /// Read-only process and network diagnostics, JSON response.
+    Monitor {
+        name: String,
+    },
 }
 impl Action {
     /// Safe activity description: never includes configuration text, URLs or credentials.
@@ -194,6 +199,7 @@ impl Action {
             Self::Logs(_) | Self::FollowLogs { .. } => "Read logs",
             Self::Runtime { .. } => "Apply runtime command",
             Self::WatchRuntime { .. } => "Watch runtime",
+            Self::Monitor { .. } => "Read monitor",
             Self::UpdatePackage(_) | Self::UpdateTransaction { .. } => "Update release",
             Self::Rollback => "Roll back release",
             Self::RecoverUpdate { .. } => "Recover update",
@@ -269,6 +275,7 @@ pub async fn call(socket: &std::path::Path, action: Action) -> anyhow::Result<Re
     } else if matches!(
         action,
         Action::List
+            | Action::Monitor { .. }
             | Action::UpdateStatus
             | Action::UpdateOperationStatus { .. }
             | Action::StoragePaths

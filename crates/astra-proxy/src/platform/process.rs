@@ -7,18 +7,41 @@ use std::{
     time::Duration,
 };
 
-fn workers() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
-    static WORKERS: OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+#[derive(Default)]
+struct Workers(arc_swap::ArcSwap<std::collections::HashSet<u32>>);
+impl Workers {
+    fn register(&self, pid: u32) {
+        self.0.rcu(|previous| {
+            let mut next = (**previous).clone();
+            next.insert(pid);
+            Arc::new(next)
+        });
+    }
+    fn unregister(&self, pid: u32) {
+        self.0.rcu(|previous| {
+            let mut next = (**previous).clone();
+            next.remove(&pid);
+            Arc::new(next)
+        });
+    }
+    fn contains(&self, pid: u32) -> bool {
+        self.0.load().contains(&pid)
+    }
+}
+fn workers() -> &'static Workers {
+    // Publish whole exclusion sets. A panic while preparing an update must not
+    // erase existing workers and allow their traffic to be captured recursively.
+    static WORKERS: OnceLock<Workers> = OnceLock::new();
     WORKERS.get_or_init(Default::default)
 }
 pub(crate) fn register_worker(pid: u32) {
-    workers().lock().unwrap().insert(pid);
+    workers().register(pid);
 }
 pub(crate) fn unregister_worker(pid: u32) {
-    workers().lock().unwrap().remove(&pid);
+    workers().unregister(pid);
 }
 pub(crate) fn own_process(pid: u32) -> bool {
-    pid == std::process::id() || workers().lock().unwrap().contains(&pid)
+    pid == std::process::id() || workers().contains(pid)
 }
 
 pub(crate) async fn lookup(
@@ -440,6 +463,40 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_exclusions_survive_interrupted_update_and_unwind_cleanup() {
+        let workers = Workers::default();
+        workers.register(101);
+        workers.register(202);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workers
+                .0
+                .rcu(|previous| -> Arc<std::collections::HashSet<u32>> {
+                    let mut next = (**previous).clone();
+                    next.clear();
+                    panic!("interrupted worker exclusion update");
+                });
+        }))
+        .is_err());
+        assert!(workers.contains(101));
+        assert!(workers.contains(202));
+        struct Unregister<'a>(&'a Workers);
+        impl Drop for Unregister<'_> {
+            fn drop(&mut self) {
+                self.0.unregister(101);
+            }
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = Unregister(&workers);
+            panic!("preparation failed");
+        }))
+        .is_err());
+        assert!(!workers.contains(101));
+        assert!(workers.contains(202));
+        workers.register(303);
+        assert!(workers.contains(202));
+        assert!(workers.contains(303));
+    }
     #[tokio::test]
     async fn ipv6_tcp_and_udp_socket_owners_are_attributed() {
         if !cfg!(any(windows, target_os = "linux")) {

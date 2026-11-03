@@ -4,12 +4,12 @@ use anyhow::{bail, ensure, Context, Result};
 use astra_platform::platform::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Change {
     apply: Vec<String>,
     restore: Vec<String>,
@@ -18,16 +18,131 @@ struct Change {
 pub struct Guard {
     changes: Vec<Change>,
     journal: Option<PathBuf>,
+    checks: Vec<Check>,
+    lease: Option<super::network_recovery::Lease>,
+    lock: Option<std::fs::File>,
 }
-#[derive(Serialize, Deserialize)]
-struct Snapshot {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Snapshot {
     changes: Vec<Change>,
+    #[serde(default)]
+    checks: Vec<Check>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Check {
+    query: Vec<String>,
+    before: String,
+    expected: String,
+}
+fn checks(changes: &[Change]) -> Result<Vec<Check>> {
+    checks_with(changes, command)
+}
+fn checks_with(
+    changes: &[Change],
+    mut read: impl FnMut(&[String]) -> Result<String>,
+) -> Result<Vec<Check>> {
+    let mut checks: Vec<Check> = vec![];
+    for change in changes {
+        let a = &change.apply;
+        let query = if a.first().is_some_and(|v| v == "gsettings") {
+            vec![a[0].clone(), "get".into(), a[2].clone(), a[3].clone()]
+        } else {
+            let read = match a.get(1).map(String::as_str) {
+                Some("-setwebproxy" | "-setwebproxystate") => "-getwebproxy",
+                Some("-setsecurewebproxy" | "-setsecurewebproxystate") => "-getsecurewebproxy",
+                Some("-setsocksfirewallproxy" | "-setsocksfirewallproxystate") => {
+                    "-getsocksfirewallproxy"
+                }
+                Some("-setautoproxystate") => "-getautoproxyurl",
+                Some("-setproxyautodiscovery") => "-getproxyautodiscovery",
+                _ => bail!("unknown system proxy operation"),
+            };
+            vec!["/usr/sbin/networksetup".into(), read.into(), a[2].clone()]
+        };
+        let index = match checks.iter().position(|c| c.query == query) {
+            Some(index) => index,
+            None => {
+                let before = read(&query)?;
+                checks.push(Check {
+                    query,
+                    expected: before.clone(),
+                    before,
+                });
+                checks.len() - 1
+            }
+        };
+        let check = &mut checks[index];
+        if a[0] == "gsettings" {
+            check.expected = a[4].clone();
+            continue;
+        }
+        let mut values = vec![];
+        match a[1].as_str() {
+            "-setwebproxy" | "-setsecurewebproxy" | "-setsocksfirewallproxy" => {
+                values.push(("Enabled:", "Yes".to_owned()));
+                values.push(("Server:", a[3].clone()));
+                values.push(("Port:", a[4].clone()));
+            }
+            "-setproxyautodiscovery" => values.push((
+                "Auto Proxy Discovery:",
+                if a[3] == "on" { "On" } else { "Off" }.to_owned(),
+            )),
+            _ => values.push((
+                "Enabled:",
+                if a[3] == "on" { "Yes" } else { "No" }.to_owned(),
+            )),
+        }
+        for (key, value) in values {
+            ensure!(
+                check.expected.lines().any(|line| line.starts_with(key)),
+                "unexpected macOS proxy query format"
+            );
+            check.expected = check
+                .expected
+                .lines()
+                .map(|line| {
+                    if line.starts_with(key) {
+                        format!("{key} {value}")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    Ok(checks)
+}
+fn validate_check(check: &Check) -> Result<()> {
+    let q = &check.query;
+    let mac = q.len() == 3
+        && q[0] == "/usr/sbin/networksetup"
+        && matches!(
+            q[1].as_str(),
+            "-getwebproxy"
+                | "-getsecurewebproxy"
+                | "-getsocksfirewallproxy"
+                | "-getautoproxyurl"
+                | "-getproxyautodiscovery"
+        );
+    let gnome = q.len() == 4
+        && q[0] == "gsettings"
+        && q[1] == "get"
+        && matches!(
+            q[2].as_str(),
+            "org.gnome.system.proxy"
+                | "org.gnome.system.proxy.http"
+                | "org.gnome.system.proxy.https"
+                | "org.gnome.system.proxy.socks"
+                | "org.gnome.system.proxy.ftp"
+        )
+        && matches!(q[3].as_str(), "mode" | "use-same-proxy" | "host" | "port");
+    ensure!(mac || gnome, "unsupported proxy ownership query");
+    Ok(())
 }
 fn command(args: &[String]) -> Result<String> {
     let (program, args) = args.split_first().context("empty OS command")?;
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    let output = astra_platform::command::output(Command::new(program).args(args))
         .with_context(|| format!("Run {program}"))?;
     let stdout = String::from_utf8(output.stdout)?;
     ensure!(
@@ -201,13 +316,21 @@ fn plan(
 
 impl Guard {
     pub fn apply(config: &ProxyConfig, journal: &Path) -> Result<Self> {
+        if config.system_proxy.is_none() {
+            return Ok(Self::default());
+        }
+        super::network_recovery::ensure()?;
+        let lock = ownership_lock(None)?;
         let changes = plan(config, command)?;
         if changes.is_empty() {
             return Ok(Self::default());
         }
-        let text = toml::to_string(&Snapshot {
+        let checks = checks(&changes)?;
+        let snapshot = Snapshot {
             changes: changes.clone(),
-        })?;
+            checks: checks.clone(),
+        };
+        let text = toml::to_string(&snapshot)?;
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(journal)
             .with_context(|| format!("system proxy recovery file exists or cannot be created: {}; restore it using --restore-system-proxy before starting", journal.display()))?;
         if let Err(error) = astra_platform::platform::adopt_owner(journal) {
@@ -217,16 +340,45 @@ impl Guard {
         }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
+        astra_platform::storage::sync_directory(
+            journal.parent().context("proxy snapshot directory")?,
+        )?;
+        let lease = super::network_recovery::Lease::prepare(
+            super::network_recovery::Resource::SystemProxy {
+                path: std::fs::canonicalize(journal)?,
+                snapshot: Some(snapshot.clone()),
+            },
+        )?;
+        let mut lock = lock;
+        lock.set_len(0)?;
+        lock.write_all(
+            std::fs::canonicalize(journal)?
+                .as_os_str()
+                .as_encoded_bytes(),
+        )?;
+        lock.sync_all()?;
         let guard = Self {
             changes,
             journal: Some(journal.to_owned()),
+            checks,
+            lease: Some(lease),
+            lock: Some(lock),
         };
         for change in &guard.changes {
             command(&change.apply)?;
         }
+        guard.lease.as_ref().unwrap().commit()?;
         Ok(guard)
     }
     pub fn restore(&mut self) -> Result<()> {
+        for check in &self.checks {
+            validate_check(check)?;
+            let current = command(&check.query)?;
+            ensure!(
+                compatible(&current, &check.before, &check.expected),
+                "system proxy changed externally; recovery record retained"
+            );
+        }
         let mut error = None;
         for change in self.changes.iter().rev() {
             if let Err(e) = command(&change.restore) {
@@ -236,16 +388,34 @@ impl Guard {
         if let Some(error) = error {
             return Err(error);
         }
-        self.changes.clear();
-        if let Some(path) = self.journal.take() {
-            std::fs::remove_file(path)?;
+        if let Some(path) = &self.journal {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        if let Some(lease) = &self.lease {
+            lease.complete()?;
+        }
+        if let Some(lock) = &self.lock {
+            lock.set_len(0)?;
+            lock.sync_all()?;
+        }
+        self.lease = None;
+        self.journal = None;
+        self.changes.clear();
+        self.checks.clear();
+        self.lock = None;
         Ok(())
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Err(error) = self.restore() {
+            if let Some(lease) = &self.lease {
+                lease.failed(&error);
+            }
             tracing::error!(%error, "failed to restore system proxy settings");
         }
     }
@@ -254,7 +424,12 @@ impl Drop for Guard {
 /// Explicit recovery after SIGKILL/power loss; only expected OS setting commands
 /// are accepted, even if the recovery document was manually edited.
 pub fn recover(path: &Path) -> Result<()> {
-    let snapshot: Snapshot = toml::from_str(&std::fs::read_to_string(path)?)?;
+    let snapshot: Snapshot = toml::from_str(std::str::from_utf8(
+        &super::network_recovery::read_private(path, 1024 * 1024)?,
+    )?)?;
+    restore_snapshot(path, &snapshot)
+}
+fn restore_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
     for change in &snapshot.changes {
         let restore = &change.restore;
         let mac = restore
@@ -278,11 +453,42 @@ pub fn recover(path: &Path) -> Result<()> {
             && restore
                 .get(2)
                 .is_some_and(|v| v.starts_with("org.gnome.system.proxy"));
-        ensure!(mac || gnome, "unsupported command in recovery file");
+        let valid_arguments = if mac {
+            match restore.get(1).map(String::as_str) {
+                Some("-setwebproxy" | "-setsecurewebproxy" | "-setsocksfirewallproxy") => {
+                    restore.len() == 5
+                }
+                _ => restore.len() == 4 && matches!(restore[3].as_str(), "on" | "off"),
+            }
+        } else if gnome {
+            restore.len() == 5
+                && matches!(
+                    restore[2].as_str(),
+                    "org.gnome.system.proxy"
+                        | "org.gnome.system.proxy.http"
+                        | "org.gnome.system.proxy.https"
+                        | "org.gnome.system.proxy.socks"
+                        | "org.gnome.system.proxy.ftp"
+                )
+                && matches!(
+                    restore[3].as_str(),
+                    "mode" | "use-same-proxy" | "host" | "port"
+                )
+        } else {
+            false
+        };
+        ensure!(
+            (mac || gnome) && valid_arguments,
+            "unsupported command in recovery file"
+        );
     }
+    let lock = ownership_lock(Some(path))?;
     Guard {
-        changes: snapshot.changes,
+        changes: snapshot.changes.clone(),
         journal: Some(path.to_owned()),
+        checks: snapshot.checks.clone(),
+        lease: None,
+        lock: Some(lock),
     }
     .restore()
 }
@@ -310,6 +516,46 @@ mod tests {
             .iter()
             .all(|change| change.restore.last().unwrap() == "on"));
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_snapshot_captures_restored_values_and_expected_overrides() {
+        let config: ProxyConfig=toml::from_str("standalone=true\nmixed_listen='127.0.0.1:7891'\n[system_proxy]\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:7890'\n").unwrap();
+        let restored = |args: &[String]| -> Result<String> {
+            Ok(match args[3].as_str() {
+                "host" => "'original.proxy'",
+                "port" => "3128",
+                "mode" => "'auto'",
+                "use-same-proxy" => "true",
+                _ => panic!("unexpected key"),
+            }
+            .into())
+        };
+        let changes = plan(&config, restored).unwrap();
+        let snapshot = checks_with(&changes, restored).unwrap();
+        assert_eq!(snapshot.len(), 9);
+        let mode = snapshot.iter().find(|c| c.query[3] == "mode").unwrap();
+        assert_eq!(mode.before, "'auto'");
+        assert_eq!(mode.expected, "'manual'");
+        let http = snapshot
+            .iter()
+            .find(|c| c.query[2] == "org.gnome.system.proxy.http" && c.query[3] == "host")
+            .unwrap();
+        assert_eq!(http.before, "'original.proxy'");
+        assert_eq!(http.expected, "'127.0.0.1'");
+        for change in changes {
+            assert!(!change.restore.iter().any(|s| s.contains("7891")));
+        }
+        assert!(compatible(
+            "Enabled: Yes\nServer: original\nPort: 3128",
+            "Enabled: No\nServer: original\nPort: 3128",
+            "Enabled: Yes\nServer: localhost\nPort: 7891"
+        ));
+        assert!(!compatible(
+            "Enabled: Yes\nServer: external\nPort: 3128",
+            "Enabled: No\nServer: original\nPort: 3128",
+            "Enabled: Yes\nServer: localhost\nPort: 7891"
+        ));
+    }
     #[test]
     fn recovery_rejects_arbitrary_commands_before_execution() {
         let path =
@@ -322,4 +568,78 @@ mod tests {
         assert!(path.exists());
         std::fs::remove_file(path).unwrap();
     }
+}
+
+pub(super) fn recover_owned(path: &Path) -> Result<()> {
+    let bytes = super::network_recovery::read_private(path, 1024 * 1024)?;
+    let snapshot: Snapshot = toml::from_str(std::str::from_utf8(&bytes)?)?;
+    ensure!(
+        !snapshot.checks.is_empty(),
+        "legacy proxy snapshot requires explicit --restore-system-proxy"
+    );
+    for check in &snapshot.checks {
+        validate_check(check)?;
+    }
+    recover(path)
+}
+
+fn compatible(current: &str, before: &str, expected: &str) -> bool {
+    if current == before || current == expected {
+        return true;
+    }
+    let current: Vec<_> = current.lines().collect();
+    let before: Vec<_> = before.lines().collect();
+    let expected: Vec<_> = expected.lines().collect();
+    current.len() == before.len()
+        && current.len() == expected.len()
+        && current
+            .iter()
+            .zip(before)
+            .zip(expected)
+            .all(|((actual, before), expected)| *actual == before || *actual == expected)
+}
+fn ownership_lock(recovery: Option<&Path>) -> Result<std::fs::File> {
+    let path = astra_platform::platform::home_dir()?.join(".astra/system-proxy.lock");
+    astra_platform::storage::prepare_parent(&path)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "system proxy lock must be a regular file"
+        );
+    }
+    let mut lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    super::network_recovery::validate_file(&lock, &path)?;
+    lock.try_lock()
+        .context("another Astra instance owns system proxy settings")?;
+    let mut previous = String::new();
+    (&mut lock).take(32769).read_to_string(&mut previous)?;
+    ensure!(previous.len() <= 32768, "invalid system proxy owner record");
+    if !previous.is_empty() && Path::new(&previous).is_file() {
+        ensure!(
+            recovery.is_some_and(
+                |p| std::fs::canonicalize(p).ok() == std::fs::canonicalize(&previous).ok()
+            ),
+            "previous system proxy recovery remains pending: {previous}"
+        );
+    }
+    lock.rewind()?;
+    Ok(lock)
+}
+
+pub(super) fn recover_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
+    ensure!(
+        !snapshot.checks.is_empty(),
+        "legacy proxy snapshot requires explicit --restore-system-proxy"
+    );
+    for check in &snapshot.checks {
+        validate_check(check)?;
+    }
+    restore_snapshot(path, snapshot)
 }

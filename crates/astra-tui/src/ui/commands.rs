@@ -12,6 +12,7 @@ pub(super) enum Id {
     Save,
     Tasks,
     Logs,
+    Monitor,
     Window,
     Quit,
     Shutdown,
@@ -114,6 +115,13 @@ pub(super) const SPECS: &[Spec] = &[
         id: Id::Window,
         label: "Open page in new window",
         key: "F8",
+        scope: Scope::Global,
+        repeat: Repeat::Once,
+    },
+    Spec {
+        id: Id::Monitor,
+        label: "Performance / memory / network monitor",
+        key: "F9",
         scope: Scope::Global,
         repeat: Repeat::Once,
     },
@@ -223,6 +231,7 @@ fn shortcut(key: event::KeyEvent) -> Option<Id> {
         KeyCode::F(2) => Some(Id::Palette),
         KeyCode::F(6) => Some(Id::Tasks),
         KeyCode::F(7) => Some(Id::Logs),
+        KeyCode::F(9) => Some(Id::Monitor),
         KeyCode::Char('k') if ctrl => Some(Id::Palette),
         KeyCode::Char('p') if ctrl => Some(Id::Profiles),
         KeyCode::Char('f') if ctrl => Some(Id::Search),
@@ -259,6 +268,9 @@ impl Ui {
             || self.palette.is_some()
     }
     pub(super) fn repeat_text_input_active(&self) -> bool {
+        if self.monitor.is_some() {
+            return false;
+        }
         if self.tasks.showing_details() || self.help_scroll.is_some() || self.recovery.is_some() {
             return false;
         }
@@ -441,6 +453,24 @@ impl Ui {
                 }
             }
             Id::Window => self.window_key(plain(KeyCode::F(8))).unwrap_or(Input::Idle),
+            Id::Monitor => {
+                let was_open = self.monitor.is_some();
+                let name = if self.page == PROFILES || self.kind == Kind::Server {
+                    self.selected()
+                } else {
+                    self.active_proxy().or_else(|| self.selected())
+                }
+                .map(|row| row.instance.name.clone());
+                self.close_replaceable_overlays();
+                if !was_open {
+                    if let Some(name) = name {
+                        self.monitor = Some(monitor::View::new(name));
+                    } else {
+                        self.message = t("Select an instance to monitor").into();
+                    }
+                }
+                Input::Idle
+            }
             Id::Quit => {
                 self.remember_draft();
                 Input::Quit
@@ -526,14 +556,16 @@ impl Ui {
             self.background_key(event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         }
         self.tui_viewer = None;
+        self.monitor = None;
     }
     pub(super) fn command_key(&mut self, key: event::KeyEvent) -> Option<Input> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Some(self.run_command(Id::Quit));
         }
-        if let Some(id @ (Id::Help | Id::Palette | Id::Profiles | Id::Tasks | Id::Logs)) =
-            shortcut(key)
+        if let Some(
+            id @ (Id::Help | Id::Palette | Id::Profiles | Id::Tasks | Id::Logs | Id::Monitor),
+        ) = shortcut(key)
         {
             return Some(self.run_command(id));
         }
@@ -543,6 +575,7 @@ impl Ui {
             || self.help_scroll.is_some()
             || self.tasks.showing_details()
             || self.tui_viewer.is_some()
+            || self.monitor.is_some()
         {
             return None;
         }

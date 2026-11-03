@@ -32,6 +32,8 @@
 
 ## 日常代理与运行时面板
 
+内置性能、内存、网络和程序内部统计监视器：Web 打开「监视器」，TUI 按 `F9`。支持 CPU/RSS 与流量趋势、路由和 DNS 缓存、规则 IPC 耗时/错误、连接配额、宿主/worker 状态，以及 Web JSON 调试导出。统计范围和操作说明见 [调试监视器](docs/MONITORING.md)。
+
 支持混合 SOCKS5/HTTP 入站、用户名/密码认证和来源网段控制；TUI 提供规则/全局/直连切换、实时选点和后台测速、fallback 与轮询负载均衡、实际上传/下载趋势及 TCP/UDP 连接关闭。模式、选择与开关独立持久化，不写回原配置。范围、快捷键、JSON 控制命令和未实现项见 [功能对照](docs/MIHOMO_FEATURES.md)。这不是 Mihomo 外部 API 的完整兼容实现。
 
 ## 系统接管与热重载
@@ -39,6 +41,8 @@
 提供 macOS/Linux 原生 TUN、Windows Wintun、Linux TPROXY TCP/UDP 和 REDIRECT TCP，以及 macOS/GNOME 系统 SOCKS 代理和 Windows 当前用户 HTTP/HTTPS 系统代理。Windows 系统代理和 Wintun 已通过本机有限范围集成验证，见 [验证记录](docs/WINDOWS_MODES_VERIFICATION.md)。系统代理/TUN/LAN 启停只保存在独立运行状态，默认关闭，使用 TUI S/T/A 切换；配置仅保留监听、节点、规则和固定网络参数，添加参数表不会隐式启用。TUI 保存/切换配置时可热应用，`R` 手动热重载，顶层 `watch_config = true` 开启文件监测。候选失败保留旧配置；节点切换默认保留既有连接，代理组可按手动、自动优选、故障、恢复和成员/模式变更分别配置是否断开旧连接，见 [代理组设置](docs/TUI.md#配置可选项与切换后的连接)。
 
 精简配置见 [configs/modes.toml](configs/modes.toml)，平台权限、TUN 防自环、透明代理路由、设置恢复及实测边界见 [模式与热重载说明](docs/PROXY_MODES.md)。设备和防火墙权限相关路径尚需目标机器验收，不能仅凭配置校验视为已接管系统流量。
+
+崩溃后的网络恢复助手、管理器重新接管、操作结果不确定和手动恢复入口见 [异常退出与恢复](docs/ERROR_RECOVERY.md)。关闭界面保留后台实例；核心故障后清理并报告，不自动重启。
 
 ## 独立代理模式
 

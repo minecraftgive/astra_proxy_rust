@@ -209,6 +209,10 @@ impl Manager {
                 .is_none_or(|op| op.phase.terminal()),
             "An earlier update requires recovery; query update status first"
         );
+        anyhow::ensure!(
+            self.blocked.is_empty() || matches!(&request.intent, UpdateIntent::Stage { .. }),
+            "Unverified managed processes prevent online activation; existing generations retained"
+        );
         let target = match &request.intent {
             UpdateIntent::Stage { .. } => None,
             UpdateIntent::Activate { release_id } => {
@@ -391,6 +395,10 @@ impl Manager {
         self.update_checkpoint(UpdatePhase::Complete, |op| op.error = None)
     }
     pub(in crate::manager) async fn recover_update(&mut self, id: &str) -> Result<Reply> {
+        anyhow::ensure!(
+            self.blocked.is_empty(),
+            "Unverified managed processes prevent update recovery; existing generations retained"
+        );
         operation_path(&self.home, id)?;
         let current = self
             .updates

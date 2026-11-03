@@ -13,9 +13,9 @@ pub(super) fn physical_egress(
     {
         let mut defaults = vec![];
         for family in ["-4", "-6"] {
-            let output = Command::new("ip")
-                .args(["-j", family, "route", "show", "default"])
-                .output()?;
+            let output = astra_platform::command::output(
+                Command::new("ip").args(["-j", family, "route", "show", "default"]),
+            )?;
             anyhow::ensure!(
                 output.status.success(),
                 "read physical default routes failed"
@@ -90,9 +90,9 @@ pub(super) fn physical_egress(
             gateway6: None,
         };
         for family in ["-inet", "-inet6"] {
-            let output = Command::new("/sbin/route")
-                .args(["-n", "get", family, "default"])
-                .output()?;
+            let output = astra_platform::command::output(
+                Command::new("/sbin/route").args(["-n", "get", family, "default"]),
+            )?;
             if !output.status.success() {
                 continue;
             }

@@ -37,16 +37,59 @@ struct Session {
     connection: quinn::Connection,
     _endpoint: quinn::Endpoint,
     active: AtomicUsize,
-    udp: std::sync::Mutex<std::collections::HashMap<u16, tokio::sync::mpsc::Sender<QueuedPacket>>>,
+    udp: Associations,
     next_association: std::sync::atomic::AtomicU16,
     udp_budget: Arc<tokio::sync::Semaphore>,
-    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    tasks: std::sync::OnceLock<[JoinHandle<()>; 2]>,
+}
+type AssociationMap = std::collections::HashMap<u16, tokio::sync::mpsc::Sender<QueuedPacket>>;
+#[derive(Default)]
+struct Associations {
+    entries: std::sync::Mutex<AssociationMap>,
+    failed: std::sync::atomic::AtomicBool,
+}
+impl Associations {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, AssociationMap>> {
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "TUIC association state failed"
+        );
+        match self.entries.lock() {
+            Ok(entries) => {
+                ensure!(
+                    !self.failed.load(Ordering::Acquire),
+                    "TUIC association state failed"
+                );
+                Ok(entries)
+            }
+            Err(poisoned) => {
+                let mut entries = poisoned.into_inner();
+                // No association may reuse partially updated IDs. Dropping the
+                // senders wakes every reader, and the session is closed below.
+                entries.clear();
+                self.failed.store(true, Ordering::Release);
+                self.entries.clear_poison();
+                tracing::error!("TUIC association update panicked; closing affected QUIC session");
+                bail!("TUIC association state failed")
+            }
+        }
+    }
+}
+impl Session {
+    fn associations(&self) -> Result<std::sync::MutexGuard<'_, AssociationMap>> {
+        self.udp.lock().inspect_err(|_| {
+            self.connection
+                .close(1u32.into(), b"association state failed");
+        })
+    }
 }
 impl Drop for Session {
     fn drop(&mut self) {
         self.connection.close(0u32.into(), b"client closed");
-        for task in self.tasks.get_mut().unwrap() {
-            task.abort();
+        if let Some(tasks) = self.tasks.get_mut() {
+            for task in tasks {
+                task.abort();
+            }
         }
     }
 }
@@ -206,10 +249,10 @@ impl Client {
                 connection,
                 _endpoint: endpoint,
                 active: AtomicUsize::new(0),
-                udp: std::sync::Mutex::new(std::collections::HashMap::new()),
+                udp: Associations::default(),
                 next_association: std::sync::atomic::AtomicU16::new(0),
                 udp_budget: Arc::new(tokio::sync::Semaphore::new(2 * 1024 * 1024)),
-                tasks: std::sync::Mutex::new(Vec::new()),
+                tasks: std::sync::OnceLock::new(),
             });
             let weak = Arc::downgrade(&session);
             let heartbeat_period = self.heartbeat;
@@ -230,12 +273,16 @@ impl Client {
                     }
                 }
             });
-            session.tasks.lock().unwrap().push(heartbeat);
             let dispatcher = tokio::spawn(dispatch(
                 session.connection.clone(),
                 Arc::downgrade(&session),
             ));
-            session.tasks.lock().unwrap().push(dispatcher);
+            if let Err(tasks) = session.tasks.set([heartbeat, dispatcher]) {
+                for task in tasks {
+                    task.abort();
+                }
+                bail!("TUIC session tasks already initialized");
+            }
             tracing::debug!(server = %self.server, port = self.port, "TUIC QUIC session established");
             *cached = Some(session.clone());
             return Ok(session);
@@ -315,7 +362,7 @@ impl Client {
         let session = self.session().await?;
         let (send, receive) = tokio::sync::mpsc::channel(256);
         let id = {
-            let mut udp = session.udp.lock().unwrap();
+            let mut udp = session.associations()?;
             if udp.len() >= 4096 {
                 bail!("TUIC association limit reached");
             }
@@ -349,7 +396,10 @@ fn deliver(weak: &std::sync::Weak<Session>, packet: bytes::Bytes) {
     }
     let id = u16::from_be_bytes([packet[2], packet[3]]);
     if let Some(session) = weak.upgrade() {
-        if let Some(send) = session.udp.lock().unwrap().get(&id) {
+        let Ok(associations) = session.associations() else {
+            return;
+        };
+        if let Some(send) = associations.get(&id) {
             if let Ok(permit) = session
                 .udp_budget
                 .clone()
@@ -392,7 +442,9 @@ async fn dispatch(connection: quinn::Connection, session: std::sync::Weak<Sessio
     }
     // Wake every pending UDP reader when the QUIC connection dies.
     if let Some(session) = session.upgrade() {
-        session.udp.lock().unwrap().clear();
+        if let Ok(mut associations) = session.associations() {
+            associations.clear();
+        }
     }
 }
 
@@ -410,7 +462,9 @@ impl PacketConnection {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
-        self.session.udp.lock().unwrap().remove(&self.id);
+        if let Ok(mut associations) = self.session.associations() {
+            associations.remove(&self.id);
+        }
         self.session.active.fetch_sub(1, Ordering::Relaxed);
         let connection = self.session.connection.clone();
         let id = self.id;
@@ -732,6 +786,25 @@ pub(crate) async fn decode_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn poisoned_associations_wake_readers_and_cannot_reuse_partial_state() {
+        let associations = Associations::default();
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        associations.lock().unwrap().insert(1, send);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = associations.entries.lock().unwrap();
+            panic!("injected association update panic");
+        }))
+        .is_err());
+        assert!(associations.lock().is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), receive.recv())
+            .await
+            .unwrap()
+            .is_none());
+        // Clearing the poisoned mutex does not make this failed session reusable.
+        assert!(!associations.entries.is_poisoned());
+        assert!(associations.lock().is_err());
+    }
 
     fn fragment(id: u16, count: u8, index: u8, target: Option<&Target>, payload: &[u8]) -> Vec<u8> {
         let mut frame = vec![5, 2, 0, 0];

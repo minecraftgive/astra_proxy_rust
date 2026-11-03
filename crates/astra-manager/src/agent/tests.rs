@@ -1,4 +1,136 @@
 use super::*;
+#[tokio::test]
+async fn monitor_queries_resolve_instance_ids_and_are_readonly_for_rule_and_server() {
+    let root = tempfile::tempdir().unwrap();
+    let config = ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().into(),
+        runtime_dir: Some(root.path().join("runtime")),
+        ..Default::default()
+    };
+    let agent = AgentService::new(config.clone()).unwrap();
+    let rule_path = config.config_dir.join("rule-monitor.toml");
+    std::fs::write(
+        &rule_path,
+        astra_app::Document::template(astra_model::CoreKind::Rule),
+    )
+    .unwrap();
+    #[derive(serde::Serialize)]
+    struct RegistryFixture {
+        instances: Vec<old::Instance>,
+    }
+    std::fs::write(
+        config.config_dir.join("instances.toml"),
+        toml::to_string(&RegistryFixture {
+            instances: vec![old::Instance {
+                name: "rule-monitor".into(),
+                kind: old::Kind::Rule,
+                config: rule_path,
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let native = agent.start_native().await.unwrap();
+    let server_path = config.config_dir.join("server-monitor.toml");
+    std::fs::create_dir_all(&config.config_dir).unwrap();
+    std::fs::write(&server_path, "# monitor fixture").unwrap();
+    agent
+        .store
+        .add_server("server-monitor", &server_path)
+        .await
+        .unwrap();
+    let instances = agent.instances().await.unwrap();
+    assert_eq!(instances.len(), 2);
+    for instance in instances {
+        assert_ne!(
+            instance.id, instance.name,
+            "Fixture must exercise durable UUID addressing"
+        );
+        assert!(instance.capabilities.iter().any(|c| c == "monitor"));
+        let response = agent
+            .handle_remote(Request::new(
+                "monitor",
+                RequestBody::Query(Query::Monitor {
+                    instance: instance.id.clone(),
+                }),
+            ))
+            .await;
+        let ResponseBody::Monitor(sample) = response.result.unwrap() else {
+            panic!("Expected monitor response");
+        };
+        assert_eq!(sample.instance, instance.id);
+        assert_eq!(sample.pid, None);
+        assert_eq!(sample.cpu_percent, None);
+        assert_eq!(sample.upload_bytes, None);
+        assert_eq!(sample.error, None);
+    }
+    assert!(
+        matches!(agent.query(Query::Tasks { limit: None }).await.unwrap(), ResponseBody::Tasks(tasks) if tasks.is_empty())
+    );
+    assert!(agent
+        .query(Query::Monitor {
+            instance: "unknown-monitor".into()
+        })
+        .await
+        .is_err());
+    agent.call(old::Action::Shutdown).await.unwrap();
+    native.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn failed_final_checkpoint_is_queryable_as_unknown_and_never_replayed() {
+    let root = tempfile::tempdir().unwrap();
+    let config = ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().into(),
+        ..Default::default()
+    };
+    let agent = AgentService::new(config.clone()).unwrap();
+    let command = Command::Shutdown;
+    let fingerprint = store::revision(&serde_json::to_string(&command).unwrap());
+    agent.store.begin("once", &fingerprint).await.unwrap();
+    let connection =
+        rusqlite::Connection::open(config.state_dir.join("management.sqlite")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_finish BEFORE UPDATE ON operations BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;").unwrap();
+    let result = Ok(ResponseBody::Done {
+        message: "side effect completed".into(),
+    });
+    assert!(agent
+        .finish_operation("once", &result)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("outcome unknown for operation once"));
+    let response = agent
+        .handle(Request::new(
+            "query",
+            RequestBody::Query(Query::Task {
+                operation_id: "once".into(),
+            }),
+        ))
+        .await;
+    assert!(matches!(
+        response.result,
+        Ok(ResponseBody::Task(Task {
+            state: TaskState::OutcomeUnknown,
+            ..
+        }))
+    ));
+    // No native actor exists: replaying Shutdown would fail instead of returning the original uncertainty.
+    assert!(matches!(
+        agent.execute("once".into(), command).await.unwrap(),
+        ResponseBody::Task(Task {
+            state: TaskState::OutcomeUnknown,
+            ..
+        })
+    ));
+    connection
+        .execute_batch("DROP TRIGGER fail_finish;")
+        .unwrap();
+}
 #[test]
 fn established_identity_database_cannot_be_silently_recreated() {
     let root = tempfile::tempdir().unwrap();

@@ -18,6 +18,7 @@ export class ApiError extends Error {
     public code: string,
     message: string,
     public details?: SaveOutcome,
+    public operationId?: string,
   ) {
     super(message);
   }
@@ -34,12 +35,19 @@ export async function login(password: string) {
     body: JSON.stringify({ password }),
     cache: "no-store",
   });
-  const data = await r.json();
+  let data;
+  try {
+    data = await r.json();
+  } catch {
+    throw new ApiError("login_failed", "登录响应不完整，请重新登录。");
+  }
   if (!r.ok)
     throw new ApiError(
-      data.error?.code ?? "login_failed",
-      data.error?.message ?? "登录失败",
+      data?.error?.code ?? "login_failed",
+      data?.error?.message ?? "登录失败",
     );
+  if (typeof data?.token !== "string" || !data.token)
+    throw new ApiError("login_failed", "登录响应缺少有效会话，请重新登录。");
   session = data.token;
 }
 export async function logout() {
@@ -58,6 +66,22 @@ export async function request<T = unknown>(
   signal?: AbortSignal,
 ): Promise<{ type: string; data: T }> {
   const id = crypto.randomUUID();
+  const command = object(body.data);
+  const input = body.type === "execute" ? command : object(command?.data);
+  const operationId =
+    typeof input?.operation_id === "string" ? input.operation_id : undefined;
+  const mutation =
+    body.type !== "query" &&
+    !(body.type === "drafts" && command?.type === "read");
+  const uncertain = () =>
+    new ApiError(
+      mutation ? "outcome_unknown" : "connection_failed",
+      mutation
+        ? `无法确认操作结果。请查询原任务或草稿，勿重复提交。${operationId ? `任务 ${operationId}` : ""}`
+        : "无法读取完整的管理响应，请重新查询。",
+      undefined,
+      operationId,
+    );
   let r: Response;
   try {
     r = await fetch("/api/v2/request", {
@@ -71,28 +95,134 @@ export async function request<T = unknown>(
       cache: "no-store",
     });
   } catch (e) {
-    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    if (!mutation && e instanceof DOMException && e.name === "AbortError")
+      throw e;
+    throw uncertain();
+  }
+  if (r.status === 401) {
+    session = null;
+    throw new ApiError("unauthorized", "登录已失效，请重新登录。");
+  }
+  // A gateway/server failure cannot prove that an accepted mutation rolled back.
+  if (mutation && r.status >= 500) throw uncertain();
+  let data: Record<string, any>;
+  try {
+    const parsed: unknown = await r.json();
+    const value = object(parsed);
+    if (!value) throw new Error("invalid response");
+    data = value;
+  } catch (error) {
+    if (
+      !mutation &&
+      error instanceof DOMException &&
+      error.name === "AbortError"
+    )
+      throw error;
+    throw uncertain();
+  }
+  if (!r.ok)
+    if (
+      typeof data.error?.code === "string" &&
+      typeof data.error?.message === "string"
+    )
+      throw new ApiError(
+        data.error.code,
+        data.error.message,
+        undefined,
+        operationId,
+      );
+    else throw uncertain();
+  if (data.version !== 2 || data.id !== id)
+    throw mutation
+      ? uncertain()
+      : new ApiError("version_mismatch", "管理接口版本或请求身份不一致");
+  const result = object(data.result);
+  if (!result) throw uncertain();
+  const success = "Ok" in result;
+  const failure = "Err" in result;
+  if (success === failure) throw uncertain();
+  if ("Err" in result) {
+    if (
+      typeof result.Err?.code !== "string" ||
+      typeof result.Err?.message !== "string"
+    )
+      throw uncertain();
     throw new ApiError(
-      "outcome_unknown",
-      "连接中断。操作可能已执行，请查询原任务，勿重复提交。",
+      result.Err.code,
+      result.Err.message,
+      result.Err.details,
+      operationId,
     );
   }
-  const data = await r.json();
-  if (r.status === 401) session = null;
-  if (!r.ok)
-    throw new ApiError(
-      data.error?.code ?? "request_failed",
-      data.error?.message ?? "请求失败",
-    );
-  if (data.version !== 2 || data.id !== id)
-    throw new ApiError("version_mismatch", "管理接口版本或请求身份不一致");
-  if (data.result.Err)
-    throw new ApiError(
-      data.result.Err.code,
-      data.result.Err.message,
-      data.result.Err.details,
-    );
-  return data.result.Ok;
+  const reply = object(result.Ok);
+  if (!reply || typeof reply.type !== "string" || !("data" in reply))
+    throw uncertain();
+  if (operationId && reply.data == null) throw uncertain();
+  if (reply.type === "task") {
+    const task = object(reply.data);
+    if (
+      !task ||
+      !["id", "state", "message", "started_ms"].every(
+        (key) => typeof task[key] === "string",
+      ) ||
+      ![
+        "running",
+        "complete",
+        "failed",
+        "outcome_unknown",
+        "needs_recovery",
+      ].includes(task.state) ||
+      (operationId && task.id !== operationId)
+    )
+      throw uncertain();
+  }
+  if (
+    body.type === "drafts" &&
+    ["open", "read", "edit", "save", "apply"].includes(command?.type) &&
+    reply.type !== "draft"
+  )
+    throw uncertain();
+  if (reply.type === "draft") {
+    const draft = object(reply.data);
+    if (
+      !draft ||
+      ![
+        "id",
+        "instance",
+        "path",
+        "original",
+        "text",
+        "revision",
+        "source_revision",
+        "kind",
+      ].every((key) => typeof draft[key] === "string") ||
+      (input?.draft_id && draft.id !== input.draft_id)
+    )
+      throw uncertain();
+    if (command?.type === "save") {
+      const outcome = object(draft.last_save);
+      if (
+        !outcome ||
+        outcome.operation_id !== operationId ||
+        typeof outcome.message !== "string" ||
+        ![
+          "applied",
+          "next_start",
+          "rejected",
+          "restored",
+          "recovery_failed",
+          "outcome_unknown",
+        ].includes(outcome.state)
+      )
+        throw uncertain();
+    }
+  }
+  return result.Ok;
+}
+function object(value: unknown): Record<string, any> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : undefined;
 }
 export const query = <T>(
   agent: string | null,

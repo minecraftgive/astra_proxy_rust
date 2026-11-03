@@ -19,6 +19,7 @@ use tokio::{
 pub struct RuleClient {
     socket_path: String,
     idle: Mutex<Vec<Option<UnixStream>>>,
+    capacity: usize,
     available: Arc<Semaphore>,
     next_id: AtomicU64,
     deadline: Duration,
@@ -34,11 +35,29 @@ struct Lease<'a> {
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        self.owner.idle.lock().unwrap().push(self.stream.take());
+        let mut idle = self.owner.idle();
+        if idle.len() < self.owner.capacity {
+            idle.push(self.stream.take());
+        }
     }
 }
 
 impl RuleClient {
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<Option<UnixStream>>> {
+        match self.idle.lock() {
+            Ok(idle) => idle,
+            Err(poisoned) => {
+                // Only idle transport resources live here; discard their frames.
+                // Semaphore permits independently bound in-flight requests, so a
+                // missing cached channel can simply be reconnected when needed.
+                let mut idle = poisoned.into_inner();
+                idle.clear();
+                self.idle.clear_poison();
+                tracing::error!("rule IPC idle pool update panicked; discarded cached channels");
+                idle
+            }
+        }
+    }
     pub fn new(socket_path: String, pool_size: usize, timeout_ms: u64) -> Self {
         let revision = Arc::new(AtomicU64::new(0));
         let observer = None;
@@ -47,6 +66,7 @@ impl RuleClient {
             observer,
             socket_path,
             idle: Mutex::new((0..pool_size).map(|_| None).collect()),
+            capacity: pool_size,
             available: Arc::new(Semaphore::new(pool_size)),
             next_id: AtomicU64::new(1),
             deadline: Duration::from_millis(timeout_ms),
@@ -66,27 +86,47 @@ impl RuleClient {
         self.revision.load(Ordering::Acquire)
     }
 
-    pub async fn decide(&self, mut req: RouteRequest) -> Result<RouteResponse> {
+    pub async fn decide(&self, req: RouteRequest) -> Result<RouteResponse> {
+        let operation = astra_observe::operation!("rule_ipc", "规则 IPC 决策（含排队与重试）");
+        let result = self.decide_inner(req).await;
+        operation.finish(result.is_ok());
+        result
+    }
+
+    async fn decide_inner(&self, mut req: RouteRequest) -> Result<RouteResponse> {
         req.api_version = API_VERSION;
         req.id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        timeout(self.deadline, async {
-            let permit = self.available.clone().acquire_owned().await?;
+        let result = timeout(self.deadline, async {
+            let queue = astra_observe::operation!("rule_ipc.queue", "规则 IPC 连接池排队");
+            let permit = self.available.clone().acquire_owned().await;
+            queue.finish(permit.is_ok());
+            let permit = permit?;
             let mut lease = Lease {
                 owner: self,
-                stream: self
-                    .idle
-                    .lock()
-                    .unwrap()
-                    .pop()
-                    .expect("permit owns a channel"),
+                stream: self.idle().pop().flatten(),
                 _permit: permit,
             };
-            for _ in 0..2 {
+            for attempt in 0..2 {
+                if attempt > 0 {
+                    astra_observe::counter!("rule_ipc.retries", "规则 IPC：重试").add(1);
+                }
                 // The stream is not returned to the pool until a full valid reply arrives.
                 // Cancellation, partial I/O and timeouts therefore always close it.
                 let mut stream = match lease.stream.take() {
                     Some(stream) => stream,
                     None => {
+                        astra_observe::counter!(
+                            "rule_ipc.connect_attempts",
+                            "规则 IPC：新连接尝试"
+                        )
+                        .add(1);
+                        if attempt > 0 {
+                            astra_observe::counter!(
+                                "rule_ipc.reconnects",
+                                "规则 IPC：I/O 失败后重连尝试"
+                            )
+                            .add(1);
+                        }
                         let mut stream =
                             astra_platform::platform::connect_trusted(&self.socket_path)
                                 .await
@@ -109,13 +149,19 @@ impl RuleClient {
                         return Ok(response);
                     }
                     Ok(_) => bail!("Rule Core response ID or protocol version mismatch"),
-                    Err(err) => tracing::debug!(error = %err, "IPC error; reconnecting"),
+                    Err(err) => {
+                        astra_observe::counter!("rule_ipc.io_errors", "规则 IPC：读写错误").add(1);
+                        tracing::debug!(error = %err, "IPC error; reconnecting");
+                    }
                 }
             }
             bail!("Rule Core unavailable: fail closed")
         })
-        .await
-        .context("IPC decision deadline exceeded")?
+        .await;
+        if result.is_err() {
+            astra_observe::counter!("rule_ipc.timeouts", "规则 IPC：决策超时（含排队）").add(1);
+        }
+        result.context("IPC decision deadline exceeded")?
     }
 }
 
@@ -184,6 +230,48 @@ mod tests {
             inbound: Inbound::Socks5,
             process: None,
         }
+    }
+
+    #[tokio::test]
+    async fn poisoned_idle_pool_discards_channels_without_panicking_during_lease_drop() {
+        let client = RuleClient::new("/nonexistent/astra-poison-test.sock".into(), 2, 100);
+        let (cached, mut peer) = astra_platform::platform::stream_pair().await.unwrap();
+        *client.idle() = vec![Some(cached)];
+        let lease = Lease {
+            owner: &client,
+            stream: None, // a request owns its stream outside the idle lease
+            _permit: client.available.clone().acquire_owned().await.unwrap(),
+        };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _idle = client.idle.lock().unwrap();
+            panic!("injected idle pool update panic");
+        }))
+        .is_err());
+        let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = lease;
+            panic!("original request panic");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            original.downcast_ref::<&str>(),
+            Some(&"original request panic")
+        );
+        use tokio::io::AsyncReadExt;
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(!client.idle.is_poisoned());
+        assert_eq!(client.available.available_permits(), 2);
+        // The cache can have fewer entries than permits after repair. A cache
+        // miss must reconnect/fail closed, never panic or invent a direct route.
+        let (first, second) = tokio::join!(client.decide(request()), client.decide(request()));
+        assert!(first.is_err() && second.is_err());
+        assert_eq!(client.available.available_permits(), 2);
+        assert!(client.idle().len() <= client.capacity);
     }
 
     #[tokio::test]

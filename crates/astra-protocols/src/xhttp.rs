@@ -241,7 +241,10 @@ impl PacketStream {
         if let Some(error) = &self.failed {
             return Err(io::Error::other(error.clone()));
         }
-        let jobs = self.jobs.get_mut().unwrap();
+        let jobs = self
+            .jobs
+            .get_mut()
+            .map_err(|_| io::Error::other("XHTTP upload state poisoned"))?;
         let mut index = 0;
         while index < jobs.len() {
             match jobs[index].as_mut().poll(cx) {
@@ -272,10 +275,13 @@ impl PacketStream {
         Ok(())
     }
 
-    fn queue_staged(&mut self) {
-        let jobs = self.jobs.get_mut().unwrap();
+    fn queue_staged(&mut self) -> io::Result<()> {
+        let jobs = self
+            .jobs
+            .get_mut()
+            .map_err(|_| io::Error::other("XHTTP upload state poisoned"))?;
         if self.staged.is_empty() || jobs.len() >= POST_WINDOW {
-            return;
+            return Ok(());
         }
         let body = bytes::Bytes::from(std::mem::take(&mut self.staged));
         let request = self
@@ -330,13 +336,21 @@ impl PacketStream {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP POST timed out"))?
         }));
+        Ok(())
     }
 
     fn drive_uploads(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         loop {
             self.poll_jobs(cx)?;
-            if !self.staged.is_empty() && self.jobs.get_mut().unwrap().len() < POST_WINDOW {
-                self.queue_staged();
+            if !self.staged.is_empty()
+                && self
+                    .jobs
+                    .get_mut()
+                    .map_err(|_| io::Error::other("XHTTP upload state poisoned"))?
+                    .len()
+                    < POST_WINDOW
+            {
+                self.queue_staged()?;
             } else {
                 return Ok(());
             }
@@ -346,7 +360,13 @@ impl PacketStream {
     fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.writer_waker = Some(cx.waker().clone());
         self.drive_uploads(cx)?;
-        if self.staged.is_empty() && self.jobs.get_mut().unwrap().is_empty() {
+        if self.staged.is_empty()
+            && self
+                .jobs
+                .get_mut()
+                .map_err(|_| io::Error::other("XHTTP upload state poisoned"))?
+                .is_empty()
+        {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -381,7 +401,7 @@ impl AsyncWrite for PacketStream {
             return Poll::Ready(Ok(0));
         }
         if self.staged.len() == POST_BYTES {
-            self.queue_staged();
+            self.queue_staged()?;
         }
         if self.staged.len() == POST_BYTES {
             return Poll::Pending;
@@ -389,7 +409,7 @@ impl AsyncWrite for PacketStream {
         let count = bytes.len().min(POST_BYTES - self.staged.len());
         self.staged.extend_from_slice(&bytes[..count]);
         if self.staged.len() == POST_BYTES {
-            self.queue_staged();
+            self.queue_staged()?;
         }
         self.poll_jobs(cx)?;
         Poll::Ready(Ok(count))

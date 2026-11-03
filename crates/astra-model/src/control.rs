@@ -13,6 +13,10 @@ pub enum Command {
     Runtime(crate::runtime::Command),
     Session,
     WatchRuntime { interval_ms: u64 },
+    Identity,
+    CommitService { boot_id: String },
+    StopIdentified { boot_id: String, force: bool },
+    Monitor,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,6 +25,22 @@ pub enum Response {
     Config(Result<ConfigSnapshot, String>),
     Explanation(Result<RouteExplanation, String>),
     Runtime(Result<crate::runtime::Snapshot, String>),
+    Identity(Identity),
+    Monitor(Result<crate::monitor::InternalSnapshot, String>),
+}
+
+/// A process number alone is never a durable process identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub started: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Identity {
+    pub version: u16,
+    pub boot_id: String,
+    pub process: ProcessIdentity,
+    pub applied: Option<Applied>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +79,7 @@ pub struct Status {
     pub applied: Option<Applied>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {
     pub path: PathBuf,
     pub digest: u64,

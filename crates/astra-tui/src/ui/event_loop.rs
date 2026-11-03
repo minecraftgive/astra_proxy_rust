@@ -47,7 +47,11 @@ pub(super) async fn run_local(
     let mut last_notice = (ui.message.clone(), false);
     let mut last_health = (ui.runtime_health(), ui.runtime_rates_available());
     let mut checkpoint_at: Option<Instant> = None;
-    loop {
+    let shutdown = astra_platform::platform::shutdown_signal();
+    tokio::pin!(shutdown);
+    // Keep errors as loop outcomes so every exit reaches checkpoint and terminal restore.
+    // Avoid wrapping this large event loop in another async future (Windows stack budget).
+    let outcome = 'ui: loop {
         if refresh {
             let previous = MotionState::of(&ui);
             redraw |= feeds.poll(&mut ui).await;
@@ -78,11 +82,14 @@ pub(super) async fn run_local(
             if changed || quit {
                 checkpoint_at.get_or_insert(Instant::now() + Duration::from_millis(250));
                 if quit && ui.checkpoint(&session_path) {
-                    break;
+                    break Ok(());
                 }
             }
             if let Some(view) = &mut ui.diagnostics {
                 redraw |= view.poll();
+            }
+            if let Some(view) = &mut ui.monitor {
+                redraw |= view.poll(&socket).await;
             }
             for viewer in [&mut ui.viewer, &mut ui.tui_viewer].into_iter().flatten() {
                 let revision = viewer.revision();
@@ -100,7 +107,9 @@ pub(super) async fn run_local(
             refresh = false;
         }
         if redraw && last_frame.elapsed() >= ui.animations.frame_interval() {
-            ui.draw(&mut terminal)?;
+            if let Err(error) = ui.draw(&mut terminal) {
+                break Err(error);
+            }
             last_frame = Instant::now();
             redraw = false;
         }
@@ -117,8 +126,13 @@ pub(super) async fn run_local(
             checkpoint_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
         );
         let event = tokio::select! {
+            result = &mut shutdown => break 'ui result.map_err(Into::into),
             event = events.as_mut().expect("terminal input is attached").next() => {
-                match event { Some(event) => event?, None => break }
+                match event {
+                    Some(Ok(event)) => event,
+                    Some(Err(error)) => break 'ui Err(error.into()),
+                    None => break 'ui Ok(()),
+                }
             }
             _ = animation::notify().notified() => { refresh = true; continue; }
             _ = maintenance.tick() => { refresh = true; continue; }
@@ -171,7 +185,9 @@ pub(super) async fn run_local(
                         &mut screen,
                     )
                     .await;
-                    screen.resume()?;
+                    if let Err(error) = screen.resume() {
+                        break Err(error.into());
+                    }
                     events = Some(event::EventStream::new());
                     ui.animations.resize();
                 } else {
@@ -211,7 +227,9 @@ pub(super) async fn run_local(
                     launched?;
                     ui.read_external()
                 })();
-                screen.resume()?;
+                if let Err(error) = screen.resume() {
+                    break Err(error.into());
+                }
                 events = Some(event::EventStream::new());
                 ui.animations.resize();
                 if let Err(error) = result {
@@ -226,14 +244,89 @@ pub(super) async fn run_local(
             checkpoint_at = None;
             // Failed persistence leaves the in-memory draft open and recoverable.
             if ui.checkpoint(&session_path) && quit {
-                break;
+                break Ok(());
             }
         } else {
             // Coalesce fast typing without extending the loss window on every key.
             checkpoint_at.get_or_insert(Instant::now() + Duration::from_millis(250));
         }
+    };
+    drop(events.take());
+    finish_session(
+        outcome,
+        || {
+            anyhow::ensure!(
+                ui.checkpoint(&session_path),
+                "Cannot save final UI session: {}",
+                session_path.display()
+            );
+            Ok(())
+        },
+        || screen.suspend().map_err(Into::into),
+    )
+}
+
+fn finish_session(
+    outcome: Result<()>,
+    checkpoint: impl FnOnce() -> Result<()>,
+    restore: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(error) = outcome {
+        errors.push(format!("{error:#}"));
     }
+    if let Err(error) = checkpoint() {
+        errors.push(format!("checkpoint: {error:#}"));
+    }
+    if let Err(error) = restore() {
+        errors.push(format!("terminal restore: {error:#}"));
+    }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    #[test]
+    fn error_exit_attempts_both_cleanup_steps_and_preserves_original_failure() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = finish_session(
+            Err(anyhow::anyhow!("draw failed")),
+            || {
+                calls.borrow_mut().push("checkpoint");
+                anyhow::bail!("disk full")
+            },
+            || {
+                calls.borrow_mut().push("restore");
+                anyhow::bail!("terminal closed")
+            },
+        );
+        assert_eq!(*calls.borrow(), ["checkpoint", "restore"]);
+        let text = result.unwrap_err().to_string();
+        assert!(
+            text.contains("draw failed")
+                && text.contains("disk full")
+                && text.contains("terminal closed")
+        );
+    }
+    #[test]
+    fn clean_exit_checkpoints_before_restoring_terminal() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_session(
+            Ok(()),
+            || {
+                calls.borrow_mut().push("checkpoint");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("restore");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["checkpoint", "restore"]);
+    }
 }
 
 struct MotionState {

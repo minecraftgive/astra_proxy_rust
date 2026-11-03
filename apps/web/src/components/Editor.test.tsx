@@ -14,6 +14,7 @@ import { recover, retain } from "../recovery";
 vi.mock("../api", async (original) => ({
   ...(await original<typeof API>()),
   draftCommand: vi.fn(),
+  query: vi.fn(),
 }));
 vi.mock("../recovery", () => ({ recover: vi.fn(), retain: vi.fn() }));
 const instance: API.Instance = {
@@ -53,6 +54,150 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("document concurrency and recovery", () => {
+  it("journals the original save ID and queries it instead of resubmitting an uncertain save", async () => {
+    let operationId = "";
+    vi.mocked(API.draftCommand).mockImplementation(
+      async (_agent, command, data) => {
+        if (command === "save") {
+          operationId = (data as { operation_id: string }).operation_id;
+          expect(retain).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ saveOperationId: operationId }),
+          );
+          throw new API.ApiError(
+            "outcome_unknown",
+            "lost response",
+            undefined,
+            operationId,
+          );
+        }
+        return response(initial);
+      },
+    );
+    vi.mocked(API.query).mockImplementation(async () => ({
+      type: "task",
+      data: {
+        id: operationId,
+        state: "complete",
+        message: "Saved",
+        started_ms: "0",
+        finished_ms: "1",
+      },
+    }));
+    render(
+      <Editor
+        agent="agent-a"
+        instance={instance}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+    await screen.findByRole("textbox");
+    fireEvent.click(screen.getByRole("button", { name: "保存并应用" }));
+    const inspect = await screen.findByRole("button", {
+      name: "查询原保存任务",
+    });
+    await waitFor(() =>
+      expect((inspect as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(
+      (screen.getByRole("button", { name: "保存并应用" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.click(inspect);
+    await waitFor(() =>
+      expect(API.query).toHaveBeenCalledWith("agent-a", "task", {
+        operation_id: operationId,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "查询原保存任务" }),
+      ).toBeNull(),
+    );
+    expect(
+      vi
+        .mocked(API.draftCommand)
+        .mock.calls.filter(([, command]) => command === "save"),
+    ).toHaveLength(1);
+  });
+  it("does not send a save when its recovery identity cannot be persisted", async () => {
+    vi.mocked(API.draftCommand).mockResolvedValue(response(initial));
+    vi.mocked(retain).mockRejectedValue(new Error("disk full"));
+    render(
+      <Editor
+        agent="agent-a"
+        instance={instance}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+    await screen.findByRole("textbox");
+    fireEvent.click(screen.getByRole("button", { name: "保存并应用" }));
+    await waitFor(() =>
+      expect(API.draftCommand).toHaveBeenCalledWith(
+        "agent-a",
+        "edit",
+        expect.anything(),
+      ),
+    );
+    expect(
+      vi
+        .mocked(API.draftCommand)
+        .mock.calls.some(([, command]) => command === "save"),
+    ).toBe(false);
+  });
+  it("reopens an uncertain save with its original identity and keeps the unsynchronized recovery copy", async () => {
+    vi.mocked(recover).mockResolvedValue({
+      draftId: initial.id,
+      text: "# local edits",
+      revision: "1",
+      saveOperationId: "pending-save",
+    });
+    vi.mocked(API.draftCommand).mockResolvedValue(response(initial));
+    vi.mocked(API.query).mockResolvedValue({
+      type: "task",
+      data: {
+        id: "pending-save",
+        state: "outcome_unknown",
+        message: "Inspect runtime",
+        started_ms: "0",
+        finished_ms: null,
+      },
+    });
+    render(
+      <Editor
+        agent="agent-a"
+        instance={instance}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "查询原保存任务" }),
+    );
+    await waitFor(() =>
+      expect(retain).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          text: "# local edits",
+          saveOperationId: "pending-save",
+        }),
+      ),
+    );
+    expect(
+      (screen.getByRole("button", { name: "保存并应用" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      vi
+        .mocked(API.draftCommand)
+        .mock.calls.some(([, command]) => command === "save"),
+    ).toBe(false);
+  });
   it("preserves edits made while an earlier save is pending and advances only its source baseline", async () => {
     const pending = deferred<ReturnType<typeof response>>();
     vi.mocked(API.draftCommand).mockImplementation(

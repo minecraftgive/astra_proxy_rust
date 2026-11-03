@@ -18,8 +18,27 @@ pub(crate) const COPY_BUFFER_SIZE: usize = 64 * 1024;
 pub(crate) struct Sessions(Mutex<HashMap<String, watch::Sender<u64>>>);
 pub(crate) struct Lease(Vec<(watch::Receiver<u64>, u64)>, pub Option<String>);
 impl Sessions {
+    fn groups(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<u64>>> {
+        match self.0.lock() {
+            Ok(groups) => groups,
+            Err(poisoned) => {
+                // Epoch updates may have stopped partway through. Closing every
+                // sender invalidates the old leases before we accept new ones.
+                let mut groups = poisoned.into_inner();
+                groups.clear();
+                self.0.clear_poison();
+                tracing::error!(
+                    "proxy group session state panicked; cancelling existing group sessions"
+                );
+                groups
+            }
+        }
+    }
+    pub fn invalidate(&self) {
+        self.groups().clear();
+    }
     pub fn lease(&self, path: &[String]) -> Lease {
-        let mut groups = self.0.lock().unwrap();
+        let mut groups = self.groups();
         groups.retain(|_, sender| sender.receiver_count() > 0);
         Lease(
             path.iter()
@@ -36,7 +55,7 @@ impl Sessions {
         )
     }
     pub fn disconnect(&self, group: &str, reason: &str) {
-        let groups = self.0.lock().unwrap();
+        let groups = self.groups();
         if let Some(sender) = groups.get(group) {
             sender.send_modify(|v| *v = v.wrapping_add(1));
         }
@@ -61,7 +80,7 @@ impl Lease {
                             return;
                         }
                         if receiver.changed().await.is_err() {
-                            std::future::pending::<()>().await;
+                            return;
                         }
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
@@ -125,6 +144,26 @@ impl AsyncWrite for Stream {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn poisoned_epochs_cancel_existing_leases_before_accepting_new_ones() {
+        let sessions = Sessions::default();
+        let old = sessions.lease(&["main".into()]);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sessions.0.lock().unwrap();
+            panic!("injected epoch update panic");
+        }))
+        .is_err());
+        let next = sessions.lease(&["main".into()]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.cancelled())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), next.cancelled())
+                .await
+                .is_err()
+        );
+        assert!(!sessions.0.is_poisoned());
+    }
     #[tokio::test]
     async fn cancellation_is_scoped_wakes_idle_sockets_and_does_not_cancel_future_connections() {
         let sessions = Sessions::default();

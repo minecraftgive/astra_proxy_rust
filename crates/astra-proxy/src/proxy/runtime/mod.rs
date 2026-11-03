@@ -3,18 +3,19 @@ use crate::{inbound, system_proxy, transparent, tun, App};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use astra_model::Inbound;
+use astra_platform::supervision::Task;
 use meow_common::ErrorBackoff;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Mutex};
 
 pub type Current = Arc<ArcSwap<App>>;
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Key(Inbound, String);
 struct Listener {
-    task: JoinHandle<()>,
+    task: Task,
     socket: Arc<TcpListener>,
 }
-struct GroupWorker(JoinHandle<()>);
+struct GroupWorker(Task);
 impl Drop for GroupWorker {
     fn drop(&mut self) {
         self.0.abort();
@@ -26,6 +27,7 @@ impl Drop for Listener {
     }
 }
 pub struct State {
+    consistency: Arc<std::sync::OnceLock<String>>,
     hosted: Option<Arc<crate::hosted::Host>>,
     generation: u64,
     path: PathBuf,
@@ -41,7 +43,61 @@ pub struct State {
     outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
     elevated_tun: bool,
 }
+fn failed_system_proxy_switch(
+    original: anyhow::Error,
+    rollback: Result<system_proxy::Guard>,
+    system: &mut system_proxy::Guard,
+    consistency: &std::sync::OnceLock<String>,
+) -> anyhow::Error {
+    match rollback {
+        Ok(previous) => {
+            *system = previous;
+            original
+        }
+        Err(rollback) => {
+            let message = format!("System proxy switch failed: {original:#}; previous system proxy restoration also failed: {rollback:#}; outcome unknown; controlled shutdown required");
+            let _ = consistency.set(message.clone());
+            anyhow::anyhow!(message)
+        }
+    }
+}
 impl State {
+    async fn task_failure(&mut self) -> Option<String> {
+        if let Some(error) = self.consistency.get() {
+            return Some(error.clone());
+        }
+        for listener in self.listeners.values_mut() {
+            if let Some(error) = listener.task.check().await {
+                return Some(error);
+            }
+        }
+        if let Some(worker) = &mut self.group_worker {
+            if let Some(error) = worker.0.check().await {
+                return Some(error);
+            }
+        }
+        if let Some(dns) = &mut self.dns {
+            if let Some(error) = dns.failure().await {
+                return Some(error);
+            }
+        }
+        if let Some(host) = &self.hosted {
+            if let Some(error) = host.task_failure().await {
+                return Some(error);
+            }
+        }
+        if let Some(tunnel) = &mut self.tunnel {
+            if let Some(error) = tunnel.failure().await {
+                return Some(error);
+            }
+        }
+        if let Some(udp) = &mut self.tproxy_udp {
+            if let Some(error) = udp.failure().await {
+                return Some(error);
+            }
+        }
+        None
+    }
     async fn refresh_egress(
         &mut self,
         pending: &mut Option<crate::mode_config::Tun>,
@@ -76,8 +132,21 @@ impl State {
         }
         Ok(true)
     }
-    async fn apply(&mut self, path: PathBuf, mut candidate: App) -> Result<()> {
+    async fn apply(&mut self, path: PathBuf, candidate: App) -> Result<()> {
+        self.apply_overrides(path, candidate, None).await
+    }
+    async fn apply_overrides(
+        &mut self,
+        path: PathBuf,
+        mut candidate: App,
+        overrides: Option<astra_model::runtime::Overrides>,
+    ) -> Result<()> {
+        if let Some(error) = self.consistency.get() {
+            anyhow::bail!("{error}");
+        }
+        let override_checkpoint = overrides.clone();
         if let Some(host) = &self.hosted {
+            host.ensure_consistent()?;
             anyhow::ensure!(
                 !host.busy().await,
                 "an update is prepared; retry configuration changes after activation"
@@ -86,13 +155,15 @@ impl State {
         astra_ipc::progress::report("Prepare runtime", path.display().to_string());
         let old = self.current.load_full();
         candidate.metrics = old.metrics.clone();
-        candidate.overrides = if self.generation > 0 && path != self.path {
-            Arc::new(std::sync::RwLock::new(controls::load(&path)?))
+        candidate.overrides = if let Some(overrides) = overrides {
+            Arc::new(ArcSwap::from_pointee(overrides))
+        } else if self.generation > 0 && path != self.path {
+            Arc::new(ArcSwap::from_pointee(controls::load(&path)?))
         } else {
             old.overrides.clone()
         };
         {
-            let overrides = candidate.overrides.read().unwrap();
+            let overrides = candidate.overrides.load();
             crate::mode_config::runtime_modes(&mut candidate.config, &overrides);
         }
         let legacy_journal = path.with_extension("system-proxy-state.toml");
@@ -216,6 +287,29 @@ impl State {
             || (candidate.config.system_proxy.is_some()
                 && (self.listeners.is_empty() || system_listener_changed));
         let text = candidate.source_text.clone();
+        candidate.route_leases = if replace_tun {
+            tunnel
+                .as_ref()
+                .map(|prepared| prepared.bypass_leases())
+                .unwrap_or_default()
+        } else {
+            old.route_leases.clone()
+        };
+        // This is the last await before publishing live state. In particular,
+        // system settings, limits, session cancellation and group workers must
+        // remain unchanged while admission is held by another host operation.
+        let worker_commit = match worker_generation {
+            Some(generation) => Some(
+                generation
+                    .lock_commit(candidate.route_leases.clone())
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut override_checkpoint = override_checkpoint
+            .as_ref()
+            .map(|next| self.begin_override_checkpoint(&path, next))
+            .transpose()?;
         // This is the default binding; a group can override it per connection.
         // A rejected reload drops the new
         // owner and restores the previous owner; old sessions keep their sockets.
@@ -233,20 +327,15 @@ impl State {
             match system_proxy::Guard::apply(&candidate.config, &self.system_journal) {
                 Ok(guard) => self.system = guard,
                 Err(error) => {
-                    self.system = system_proxy::Guard::apply(&old.config, &self.system_journal)
-                        .context("restore old system proxy after failed switch")?;
-                    return Err(error);
+                    return Err(failed_system_proxy_switch(
+                        error,
+                        system_proxy::Guard::apply(&old.config, &self.system_journal),
+                        &mut self.system,
+                        &self.consistency,
+                    ));
                 }
             }
         }
-        candidate.route_leases = if replace_tun {
-            tunnel
-                .as_ref()
-                .map(|prepared| prepared.bypass_leases())
-                .unwrap_or_default()
-        } else {
-            old.route_leases.clone()
-        };
         candidate.permits = old.permits.clone();
         candidate.udp_permits = old.udp_permits.clone();
         candidate.permits.resize(candidate.config.max_connections);
@@ -271,12 +360,8 @@ impl State {
             old.egress_signal.send_replace(true);
         }
         let candidate = Arc::new(candidate);
-        if let Some(generation) = worker_generation {
-            generation
-                .commit(candidate.route_leases.clone(), || {
-                    self.current.store(candidate)
-                })
-                .await;
+        if let Some(generation) = worker_commit {
+            generation.commit(|| self.current.store(candidate));
         } else {
             self.current.store(candidate);
         }
@@ -294,15 +379,21 @@ impl State {
             .any(|g| g.mode == astra_model::groups::Mode::Auto)
         {
             let app = self.current.load_full();
-            self.group_worker = Some(GroupWorker(tokio::spawn(async move {
-                loop {
-                    app.groups.refresh_all(&app).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            })));
+            self.group_worker = Some(GroupWorker(Task::spawn(
+                "proxy group refresh",
+                async move {
+                    loop {
+                        app.groups.refresh_all(&app).await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
+            )));
         }
         for (key, listener) in prepared {
-            let task = tokio::spawn(accept(listener.clone(), key.0, self.current.clone()));
+            let task = Task::spawn_result(
+                format!("{:?} TCP listener {}", key.0, key.1),
+                accept(listener.clone(), key.0, self.current.clone()),
+            );
             self.listeners.insert(
                 key,
                 Listener {
@@ -328,6 +419,9 @@ impl State {
         self.text = text;
         self.generation = self.generation.wrapping_add(1);
         astra_ipc::control::applied(&self.path, &self.text);
+        if let Some(checkpoint) = &mut override_checkpoint {
+            checkpoint.commit();
+        }
         tracing::info!(config=%self.path.display(), "configuration committed; existing sessions retain their generation");
         Ok(())
     }
@@ -347,10 +441,8 @@ pub async fn run(path: PathBuf, app: App) -> Result<()> {
 }
 
 /// An elevated core is stopped through its lifeline to the unprivileged
-/// manager. The lifeline is watched outside this runtime (see
-/// `unix_elevated`), which fires `stop` on a graceful request or when the
-/// manager is gone, so the core removes its routes and listeners instead of
-/// lingering with administrator-granted permissions.
+/// manager. A committed core survives loss of the manager connection; only
+/// an authenticated explicit shutdown request fires this stop receiver.
 pub async fn run_with_lifeline(
     path: PathBuf,
     app: App,
@@ -361,9 +453,12 @@ pub async fn run_with_lifeline(
 
 async fn lifeline_closed(lifeline: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
     match lifeline {
-        // A dropped sender also means the watcher is gone.
         Some(stop) => {
-            let _ = stop.await;
+            if stop.await.is_err() {
+                // The committed core keeps serving when its manager detaches.
+                *lifeline = None;
+                std::future::pending::<()>().await;
+            }
         }
         None => std::future::pending().await,
     }
@@ -374,19 +469,23 @@ async fn run_inner(
     app: App,
     mut lifeline: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    crate::platform::network_recovery::set_profile(&path);
+    // Claim management ownership before preparing any OS takeover resources.
+    let control = astra_ipc::control::Control::from_env()?;
+    crate::platform::network_recovery::recover_abandoned()
+        .context("recover previous network settings before startup")?;
     let system_journal = if let Some(socket) = std::env::var_os("ASTRA_CONTROL_SOCKET") {
         PathBuf::from(socket).with_extension("system-proxy-state.toml")
     } else {
         astra_platform::storage::runtime_path(&path, "system-proxy")?
     };
     astra_platform::storage::prepare_parent(&system_journal)?;
-    *app.overrides.write().unwrap() = controls::load(&path)?;
+    let mut overrides = controls::load(&path)?;
     let elevated_tun = crate::ELEVATED_TUN.swap(false, std::sync::atomic::Ordering::SeqCst);
     if elevated_tun {
-        if let Ok(mut overrides) = app.overrides.write() {
-            overrides.tun = Some(true);
-        }
+        overrides.tun = Some(true);
     }
+    app.overrides.store(Arc::new(overrides));
     let current = Arc::new(ArcSwap::from_pointee(app));
     let hosted = if std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some() {
         Some(crate::hosted::Host::start(path.clone(), &current).await?)
@@ -394,6 +493,7 @@ async fn run_inner(
         None
     };
     let mut state = State {
+        consistency: Default::default(),
         hosted,
         generation: 0,
         system_journal,
@@ -413,11 +513,11 @@ async fn run_inner(
     state.apply(path, first).await?;
     let state = Arc::new(Mutex::new(state));
     let refresh = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let subscription_worker = {
+    let mut subscription_worker = {
         let refresh = refresh.clone();
         let state = state.clone();
         let current = current.clone();
-        tokio::spawn(async move {
+        Task::spawn("subscription refresh", async move {
             let mut generation = 0;
             let mut requested = 0;
             let mut effective = String::new();
@@ -576,11 +676,10 @@ async fn run_inner(
             }
         })
     };
-    let control = astra_ipc::control::Control::from_env()?;
     let (failures, mut fatal) = tokio::sync::mpsc::channel(1);
-    let watch = {
+    let mut watch = {
         let state = state.clone();
-        tokio::spawn(async move {
+        Task::spawn("runtime watchdog", async move {
             let mut previous_failure = String::new();
             let mut previous_egress_failure = String::new();
             let mut pending_egress = None;
@@ -588,13 +687,14 @@ async fn run_inner(
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut state = state.lock().await;
-                if state.tunnel.as_ref().is_some_and(tun::Guard::finished)
-                    || state
-                        .tproxy_udp
-                        .as_ref()
-                        .is_some_and(transparent::UdpGuard::finished)
-                {
-                    let _ = failures.send(()).await;
+                if let Err(error) = crate::platform::network_recovery::healthy() {
+                    let _ = failures
+                        .send(format!("network recovery assistant failed: {error:#}"))
+                        .await;
+                    break;
+                }
+                if let Some(error) = state.task_failure().await {
+                    let _ = failures.send(error).await;
                     break;
                 }
                 egress_tick = (egress_tick + 1) % 2;
@@ -690,10 +790,13 @@ async fn run_inner(
         },
     );
     let result = tokio::select! {
+        biased;
+        reason = fatal.recv() => Err(std::io::Error::other(reason.unwrap_or_else(|| "runtime watchdog channel closed".into()))),
         result = service => result,
-        _ = fatal.recv() => Err(std::io::Error::other("packet inbound stopped unexpectedly; see core log")),
+        reason = watch.failure() => Err(std::io::Error::other(reason)),
+        reason = subscription_worker.failure() => Err(std::io::Error::other(reason)),
         _ = lifeline_closed(&mut lifeline) => {
-            tracing::warn!("manager exited; stopping the elevated core");
+            tracing::info!("authenticated lifecycle stop requested");
             Ok(())
         }
     };
@@ -706,7 +809,7 @@ async fn run_inner(
     state.tunnel.take();
     state.tproxy_udp.take();
     state.dns.take();
-    state.system.restore()?;
+    let restore = state.system.restore();
     let app = current.load_full();
     // Existing sessions retain their own Arc; drain the current generation.
     let _ = tokio::time::timeout(
@@ -714,9 +817,22 @@ async fn run_inner(
         app.permits.idle(),
     )
     .await;
-    result.map_err(Into::into)
+    match (result, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error.into()),
+        (Ok(()), Err(error)) => {
+            Err(error.context("system proxy cleanup failed; recovery remains pending"))
+        }
+        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+            "{error}; system proxy cleanup also failed: {cleanup:#}"
+        )),
+    }
 }
-async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) {
+async fn accept(
+    listener: Arc<TcpListener>,
+    inbound: Inbound,
+    current: Current,
+) -> std::io::Result<()> {
     let mut backoff = ErrorBackoff::new();
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -725,6 +841,9 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
                 value
             }
             Err(error) => {
+                if !astra_platform::supervision::transient_io(&error) {
+                    return Err(error);
+                }
                 if backoff.failed(&error).await {
                     tracing::warn!(%error, ?inbound, "TCP accept error");
                 } else {
@@ -742,7 +861,7 @@ async fn accept(listener: Arc<TcpListener>, inbound: Inbound, current: Current) 
             continue;
         }
         let Ok(permit) = app.permits.clone().acquire_owned().await else {
-            return;
+            return Ok(());
         };
         let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
@@ -805,6 +924,88 @@ mod egress_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     fn app() -> App {
         App::from_text(&std::env::temp_dir().join("astra-egress-session.toml"),"standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct]\nmembers=['DIRECT']\n".into()).unwrap()
+    }
+    #[test]
+    fn failed_system_proxy_rollback_keeps_both_causes_and_requires_shutdown() {
+        let mut system = system_proxy::Guard::default();
+        let consistency = std::sync::OnceLock::new();
+        let error = failed_system_proxy_switch(
+            anyhow::anyhow!("candidate rejected"),
+            Ok(system_proxy::Guard::default()),
+            &mut system,
+            &consistency,
+        );
+        assert_eq!(error.to_string(), "candidate rejected");
+        assert!(consistency.get().is_none());
+        let error = failed_system_proxy_switch(
+            anyhow::anyhow!("candidate rejected"),
+            Err(anyhow::anyhow!("previous settings unavailable")),
+            &mut system,
+            &consistency,
+        );
+        let message = error.to_string();
+        assert!(message.contains("candidate rejected"));
+        assert!(message.contains("previous settings unavailable"));
+        assert!(message.contains("outcome unknown"));
+        assert_eq!(consistency.get(), Some(&message));
+    }
+    #[tokio::test]
+    async fn runtime_reports_a_panicked_listener_instead_of_healthy_state() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap().to_string();
+        let mut state = State {
+            consistency: Default::default(),
+            hosted: None,
+            generation: 1,
+            path: PathBuf::new(),
+            text: String::new(),
+            current: Arc::new(ArcSwap::from_pointee(app())),
+            listeners: HashMap::from([(
+                Key(Inbound::Socks5, address.clone()),
+                Listener {
+                    task: Task::spawn(format!("SOCKS5 {address}"), async {
+                        panic!("injected accept panic")
+                    }),
+                    socket: listener,
+                },
+            )]),
+            tunnel: None,
+            tproxy_udp: None,
+            dns: None,
+            system: Default::default(),
+            system_journal: PathBuf::new(),
+            group_worker: None,
+            outbound_interface: None,
+            elevated_tun: false,
+        };
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(error) = state.task_failure().await {
+                    break error;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(error.contains(&address) && error.contains("injected accept panic"));
+    }
+    #[tokio::test]
+    async fn manager_detachment_does_not_request_core_shutdown() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut receiver = Some(receiver);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lifeline_closed(&mut receiver))
+                .await
+                .is_err()
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut receiver = Some(receiver);
+        sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(20), lifeline_closed(&mut receiver))
+            .await
+            .unwrap();
     }
     async fn client(proxy: std::net::SocketAddr, target: u16) -> tokio::net::TcpStream {
         let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();

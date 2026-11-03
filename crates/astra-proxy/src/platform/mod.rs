@@ -1,5 +1,6 @@
 pub mod egress;
 pub mod mode_config;
+pub mod network_recovery;
 pub(crate) mod privilege;
 pub(crate) mod process;
 #[cfg(not(windows))]
@@ -33,6 +34,9 @@ pub(crate) mod icmp;
 mod unix_elevated;
 /// Perform privileged hand-offs before starting worker threads.
 pub fn entry() -> anyhow::Result<()> {
+    if let Some(result) = network_recovery::entry() {
+        return result;
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(result) = unix_elevated::entry() {
         return result;
@@ -42,8 +46,11 @@ pub fn entry() -> anyhow::Result<()> {
     unsafe {
         worker::initialize_owner()?;
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(crate::run())
+    let result = {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(crate::run())
+    };
+    network_recovery::finish(result)
 }

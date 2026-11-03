@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as API from "./api";
+import { readTheme, retainTheme } from "./resilience";
 import type { LogChunk, LogCursor } from "./generated/management";
 import Editor from "./components/Editor";
 import Login from "./components/Login";
 import Updates from "./components/Updates";
+import NetworkRecovery from "./components/NetworkRecovery";
+import Monitor from "./components/Monitor";
 import { Details, Empty, Table } from "./components/common";
 
 type Row = Record<string, unknown>;
@@ -14,6 +17,7 @@ const pages = [
   ["connections", "连接"],
   ["rules", "规则"],
   ["logs", "日志"],
+  ["monitor", "监视器"],
   ["tasks", "任务"],
   ["settings", "设置"],
 ] as const;
@@ -57,9 +61,7 @@ export default function App() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState<API.Instance["kind"]>("proxy");
   const [busy, setBusy] = useState(false);
-  const [theme, setTheme] = useState(
-    localStorage.getItem("astra-theme") ?? "system",
-  );
+  const [theme, setTheme] = useState(readTheme);
   const epoch = useRef(0);
   const scope = useRef("");
   scope.current = `${agent}/${selected}`;
@@ -248,7 +250,7 @@ export default function App() {
   }, [authenticated, agent, online, fail]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme === "system" ? "" : theme;
-    localStorage.setItem("astra-theme", theme);
+    retainTheme(theme);
   }, [theme]);
   const run = async (type: string, data?: unknown, danger?: string) => {
     if (!agent || !online) return;
@@ -477,14 +479,21 @@ export default function App() {
                   )}
                 </div>
               </div>
+              {current && <NetworkRecovery details={current.details} />}
+              {page === "monitor" && (
+                <Monitor agent={agent} instance={selected} online={online} onError={fail} />
+              )}
               {page === "overview" &&
                 (current ? (
                   <>
                     <div className="card card-pad">
                       <div className="state">
-                        <span className={`dot ${current.pid ? "ok" : ""}`} />
+                        <span
+                          className={`dot ${current.pid && current.state === "Running" ? "ok" : ""}`}
+                        />
                         <h2>{current.name}</h2>
                         <span className="pill">{kindName[current.kind]}</span>
+                        <span className="pill">{current.state}</span>
                       </div>
                       <p className="mono muted">{current.config}</p>
                       <div className="toolbar">

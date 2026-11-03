@@ -723,7 +723,13 @@ impl Viewer {
                 t(if self.settings.wrap { "On" } else { "Off" })
             ))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title_bottom(Line::from(crate::theme::key_hints(t(
+                        "End bottom / follow",
+                    )))),
+            ),
             parts[1],
         );
         match &self.settings.mode {

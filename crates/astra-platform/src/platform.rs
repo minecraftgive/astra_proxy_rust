@@ -2,7 +2,12 @@
 #[cfg(unix)]
 pub use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 #[cfg(unix)]
-pub use tokio::net::{UnixListener as LocalListener, UnixStream as LocalStream};
+pub use tokio::net::UnixStream as LocalStream;
+#[cfg(unix)]
+pub use unix_listener::LocalListener;
+#[cfg(unix)]
+#[path = "unix_listener.rs"]
+mod unix_listener;
 
 use std::{
     io,
@@ -42,7 +47,7 @@ pub fn background_core(path: impl AsRef<std::ffi::OsStr>) -> tokio::process::Com
 /// Named pipes are removed by their owning handle; Unix sockets need unlinking.
 pub fn remove_socket(path: &Path) {
     #[cfg(unix)]
-    let _ = std::fs::remove_file(path);
+    let _ = unix_listener::recover(path);
     #[cfg(not(unix))]
     let _ = path;
 }
@@ -53,11 +58,8 @@ pub fn remove_socket(path: &Path) {
 pub fn recover_stale_endpoint(path: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     return windows::recover_stale_manager_endpoint(path);
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Ok(false)
-    }
+    #[cfg(unix)]
+    return unix_listener::recover(path);
 }
 
 /// Compatibility alias for manager startup recovery.
@@ -226,6 +228,23 @@ pub async fn connect_trusted(path: impl AsRef<Path>) -> io::Result<LocalStream> 
         }
     }
     Ok(stream)
+}
+
+/// Kernel-reported process at the other end; never trust a PID in a reply alone.
+pub fn peer_process_id(stream: &LocalStream) -> io::Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let peer = crate::unix_handoff::peer_credentials(stream.as_raw_fd())?;
+        u32::try_from(peer.pid)
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| io::Error::other("IPC peer process identity unavailable"))
+    }
+    #[cfg(windows)]
+    {
+        stream.peer_process_id()
+    }
 }
 
 pub async fn stream_pair() -> io::Result<(LocalStream, LocalStream)> {
@@ -454,11 +473,44 @@ mod windows {
     pub struct LocalListener {
         server: Mutex<NamedPipeServer>,
         name: String,
-        marker: PathBuf,
+        marker: std::fs::File,
+    }
+    fn remove_marker(file: &std::fs::File) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        };
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn marker_options() -> std::fs::OpenOptions {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            },
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options
     }
     pub(super) fn recover_stale_manager_endpoint(path: &Path) -> io::Result<bool> {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
         let marker = endpoint_path(path);
         let metadata = match std::fs::symlink_metadata(&marker) {
             Ok(metadata) => metadata,
@@ -471,16 +523,33 @@ mod windows {
                 "IPC endpoint is not an empty regular marker file",
             ));
         }
-        // Serialize recoveries through the marker itself. Allow our unlink but
-        // deny other readers/writers until the pipe reservation is released.
-        let marker_handle = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_DELETE)
-            .open(&marker)?;
-        // Keep the reservation alive through removal. This also protects live
-        // servers from older versions that do not keep a marker handle open.
+        // Hold an exclusive deletion right so replacement/rename cannot race
+        // ownership checks, and remove the checked object through its handle.
+        let marker_handle = marker_options().open(&marker)?;
+        let checked = marker_handle.metadata()?;
+        if !checked.is_file() || checked.len() != 0 {
+            return Err(io::Error::other("IPC marker changed during recovery"));
+        }
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(marker_handle.as_raw_handle(), &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if information.nNumberOfLinks != 1
+            || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "IPC marker links are preserved",
+            ));
+        }
+        crate::elevation::validate_user_file(&marker_handle, &marker)?;
         let reservation = server(&pipe_name(&marker)?, true)?;
-        std::fs::remove_file(&marker)?;
+        remove_marker(&marker_handle)?;
         drop(reservation);
         drop(marker_handle);
         Ok(true)
@@ -490,20 +559,16 @@ mod windows {
             let marker = endpoint_path(path);
             let name = pipe_name(&marker)?;
             // Preserve Unix behavior: existing files/endpoints are never replaced.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)?;
+            let file = marker_options().create_new(true).open(&marker)?;
             let result = set_private(&marker).and_then(|()| server(&name, true));
-            drop(file);
             match result {
                 Ok(server) => Ok(Self {
                     server: Mutex::new(server),
                     name,
-                    marker,
+                    marker: file,
                 }),
                 Err(error) => {
-                    let _ = std::fs::remove_file(marker);
+                    let _ = remove_marker(&file);
                     Err(error)
                 }
             }
@@ -521,7 +586,7 @@ mod windows {
     }
     impl Drop for LocalListener {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.marker);
+            let _ = remove_marker(&self.marker);
         }
     }
     pub enum LocalStream {
@@ -529,6 +594,27 @@ mod windows {
         Server(NamedPipeServer),
     }
     impl LocalStream {
+        pub(super) fn peer_process_id(&self) -> io::Result<u32> {
+            use windows_sys::Win32::System::Pipes::{
+                GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+            };
+            let mut pid = 0;
+            let ok = unsafe {
+                match self {
+                    Self::Client(stream) => {
+                        GetNamedPipeServerProcessId(stream.as_raw_handle(), &mut pid)
+                    }
+                    Self::Server(stream) => {
+                        GetNamedPipeClientProcessId(stream.as_raw_handle(), &mut pid)
+                    }
+                }
+            };
+            if ok == 0 || pid == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(pid)
+            }
+        }
         pub async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
             let name = pipe_name(&endpoint_path(path))?;
             loop {
@@ -664,6 +750,13 @@ mod tests {
         assert!(recover_stale_manager_endpoint(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve this file");
         std::fs::remove_file(&path).unwrap();
+        let original = directory.join("original");
+        std::fs::write(&original, b"").unwrap();
+        std::fs::hard_link(&original, &path).unwrap();
+        assert!(recover_stale_manager_endpoint(&path).is_err());
+        assert!(path.exists() && original.exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&original).unwrap();
         let listener = LocalListener::bind(&path).unwrap();
         assert!(recover_stale_manager_endpoint(&path).is_err());
         assert!(path.exists());

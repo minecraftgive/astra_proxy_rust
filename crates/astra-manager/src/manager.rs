@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod elevation;
+mod recovery;
 mod server;
 mod updates;
 use crate::protocol::*;
@@ -45,16 +46,57 @@ struct Running {
     config: String,
     config_path: PathBuf,
 }
+struct OwnedChild {
+    child: Child,
+    committed: bool,
+}
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            committed: false,
+        }
+    }
+}
+impl std::ops::Deref for OwnedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.child.start_kill();
+        }
+    }
+}
 enum ManagedChild {
-    Normal(Box<Child>),
+    Reattached(recovery::Reattached),
+    Normal(Box<OwnedChild>),
     #[cfg(windows)]
     Elevated(astra_platform::elevation::ElevatedChild),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Adopted(elevation::AdoptedChild),
 }
 impl ManagedChild {
+    fn stop_command(&self) -> Command {
+        match self {
+            Self::Reattached(child) => Command::StopIdentified {
+                boot_id: child.identity.boot_id.clone(),
+                force: false,
+            },
+            _ => Command::Stop,
+        }
+    }
     fn id(&self) -> Option<u32> {
         match self {
+            Self::Reattached(child) => Some(child.identity.process.pid),
             Self::Normal(child) => child.id(),
             #[cfg(windows)]
             Self::Elevated(child) => child.id(),
@@ -64,6 +106,7 @@ impl ManagedChild {
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self {
+            Self::Reattached(child) => child.try_wait(),
             Self::Normal(child) => child.try_wait(),
             #[cfg(windows)]
             Self::Elevated(child) => child.try_wait(),
@@ -71,17 +114,9 @@ impl ManagedChild {
             Self::Adopted(child) => child.try_wait(),
         }
     }
-    fn start_kill(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Normal(child) => child.start_kill(),
-            #[cfg(windows)]
-            Self::Elevated(child) => child.start_kill(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Adopted(child) => child.start_kill(),
-        }
-    }
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         match self {
+            Self::Reattached(child) => child.wait().await,
             Self::Normal(child) => child.wait().await,
             #[cfg(windows)]
             Self::Elevated(child) => child.wait().await,
@@ -91,6 +126,7 @@ impl ManagedChild {
     }
     async fn kill(&mut self) -> std::io::Result<()> {
         match self {
+            Self::Reattached(child) => child.kill().await,
             Self::Normal(child) => child.kill().await,
             #[cfg(windows)]
             Self::Elevated(child) => child.kill().await,
@@ -109,6 +145,7 @@ pub struct Manager {
     bin: PathBuf,
     registry: Registry,
     running: HashMap<String, Running>,
+    blocked: HashMap<String, String>,
     exits: HashMap<String, String>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     elevations: HashMap<String, elevation::Pending>,
@@ -225,7 +262,6 @@ fn log_tail(path: &Path, limit: u64) -> String {
 }
 
 async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
-    #[cfg(windows)]
     if socket.exists() {
         match astra_platform::platform::recover_stale_endpoint(socket) {
             Ok(true) => eprintln!("Recovered stale control endpoint: {}", socket.display()),
@@ -662,6 +698,7 @@ impl Manager {
             bin,
             registry,
             running: HashMap::new(),
+            blocked: HashMap::new(),
             exits: HashMap::new(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             elevations: HashMap::new(),
@@ -687,6 +724,9 @@ impl Manager {
         )
     }
     fn instance(&self, name: &str) -> Result<Instance> {
+        if let Some(reason) = self.blocked.get(name) {
+            bail!("Instance {name} awaits identity verification: {reason}; its process and record were retained");
+        }
         self.registry
             .instances
             .iter()
@@ -709,9 +749,10 @@ impl Manager {
         }
         for (name, status) in exited {
             self.running.remove(&name);
+            self.forget_process(&name)?;
             self.exits.insert(name.clone(), format!("Exited: {status}"));
             // This socket belongs to the child we just reaped, never to an arbitrary PID.
-            let _ = fs::remove_file(self.socket(&name));
+            let _ = astra_platform::platform::recover_stale_endpoint(&self.socket(&name));
         }
         Ok(())
     }
@@ -956,7 +997,7 @@ impl Manager {
     async fn spawn_elevated(&self, name: &str, replaces: Option<u32>) -> Result<ManagedChild> {
         let instance = self.instance(name)?;
         let exe = self.bin.join(instance.kind.binary());
-        let args = astra_platform::elevation::core_arguments_in(
+        let mut args = astra_platform::elevation::core_arguments_in(
             &fs::canonicalize(&instance.config)?,
             Some(&self.socket(name)),
             &self.log(name),
@@ -964,6 +1005,9 @@ impl Manager {
             replaces,
             &self.runtime_dir,
         )?;
+        args.push(
+            serde_json::to_string(&astra_platform::lifecycle::capture(std::process::id())?)?.into(),
+        );
         astra_ipc::progress::report(
             "Waiting for administrator approval",
             format!("{name} · approve the Windows UAC prompt to run TUN"),
@@ -1019,17 +1063,23 @@ impl Manager {
         let child = if let Some(child) = elevated {
             child
         } else {
-            ManagedChild::Normal(Box::new(
+            ManagedChild::Normal(Box::new(OwnedChild::new(
                 core_process(self.bin.join(instance.kind.binary()), &self.runtime_dir)
                     .arg(&instance.config)
                     .env("ASTRA_CONTROL_SOCKET", &socket)
                     .env("ASTRA_LOG_LEVEL", self.level(name).as_str())
+                    .env(
+                        "ASTRA_SERVICE_OWNER",
+                        serde_json::to_string(&astra_platform::lifecycle::capture(
+                            std::process::id(),
+                        )?)?,
+                    )
                     .stdin(Stdio::null())
                     .stdout(log.try_clone()?)
                     .stderr(log)
-                    .kill_on_drop(true)
+                    .kill_on_drop(false)
                     .spawn()?,
-            ))
+            )))
         };
         self.running.insert(
             name.to_owned(),
@@ -1068,6 +1118,12 @@ impl Manager {
             };
             if let Ok(status) = control::request(&socket, Command::Status).await {
                 anyhow::ensure!(Some(status.pid) == run.child.id(), "Core PID mismatch");
+                if let Err(error) = self.commit_process(name).await {
+                    let cleanup = self.stop(name).await;
+                    return Err(error).context(format!(
+                        "Core readiness could not be committed; candidate cleanup: {cleanup:?}"
+                    ));
+                }
                 return Ok(());
             }
             sleep(Duration::from_millis(50)).await;
@@ -1096,6 +1152,7 @@ impl Manager {
         anyhow::ensure!(run.child.id() == Some(status.pid), "Core PID mismatch");
         run.config = read_config(path)?;
         run.config_path = path.to_owned();
+        self.commit_process(name).await?;
         Ok(())
     }
     async fn stop(&mut self, name: &str) -> Result<()> {
@@ -1112,11 +1169,12 @@ impl Manager {
             return Ok(());
         }
         // Acknowledged IPC stop uses the same drain path as SIGTERM.
-        let response = control::request(&self.socket(name), Command::Stop).await;
+        let command = self.running[name].child.stop_command();
+        let response = control::request(&self.socket(name), command).await;
         let run = self.running.get_mut(name).unwrap();
         if response.is_err() {
             // Only terminate an owned child, never a persisted PID.
-            run.child.start_kill()?;
+            run.child.kill().await?;
         }
         let state = match timeout(Duration::from_secs(30), run.child.wait()).await {
             Err(_) => {
@@ -1134,9 +1192,10 @@ impl Manager {
         };
         self.exits.insert(name.to_owned(), state.into());
         self.running.remove(name);
+        self.forget_process(name)?;
         self.notify();
         if release_endpoint {
-            let _ = fs::remove_file(self.socket(name));
+            let _ = astra_platform::platform::recover_stale_endpoint(&self.socket(name));
         }
         Ok(())
     }
@@ -1262,11 +1321,17 @@ impl Manager {
         }
         Ok(true)
     }
-    async fn stop_all(&mut self) {
-        let _ = self.reap();
-        // Drain proxies while their rule cores are still available. Instances
-        // of one kind stop concurrently, so shutdown costs one drain window
-        // rather than one per core.
+    async fn stop_all(&mut self) -> Result<()> {
+        let mut failures: Vec<_> = self
+            .blocked
+            .iter()
+            .map(|(name, reason)| {
+                format!("{name}: identity unverified ({reason}); retained without signalling")
+            })
+            .collect();
+        if let Err(error) = self.reap() {
+            failures.push(format!("observe cores: {error:#}"));
+        }
         for kind in [Kind::Proxy, Kind::Rule] {
             let names: Vec<_> = self
                 .registry
@@ -1275,45 +1340,64 @@ impl Manager {
                 .filter(|i| i.kind == kind && self.running.contains_key(&i.name))
                 .map(|i| i.name.clone())
                 .collect();
-            if names.is_empty() {
-                continue;
-            }
-            astra_ipc::progress::report("Drain and stop cores", names.join(", "));
-            let sockets: Vec<_> = names.iter().map(|name| self.socket(name)).collect();
-            let responses = futures_util::future::join_all(
-                sockets
-                    .iter()
-                    .map(|socket| control::request(socket, Command::Stop)),
-            )
-            .await;
+            let endpoints: Vec<_> = names
+                .iter()
+                .map(|name| (self.socket(name), self.running[name].child.stop_command()))
+                .collect();
+            let responses =
+                futures_util::future::join_all(endpoints.into_iter().map(
+                    |(socket, command)| async move { control::request(&socket, command).await },
+                ))
+                .await;
             let mut waits = Vec::new();
             for (name, response) in names.into_iter().zip(responses) {
                 let Some(mut run) = self.running.remove(&name) else {
                     continue;
                 };
-                let acknowledged = response.is_ok();
-                if !acknowledged {
-                    // Only terminate an owned child, never a persisted PID.
-                    let _ = run.child.start_kill();
-                }
                 waits.push(async move {
-                    let state = match timeout(Duration::from_secs(30), run.child.wait()).await {
-                        Err(_) => {
-                            let _ = run.child.kill().await;
-                            "Stopped (drain timeout; forced)"
+                    let outcome = async {
+                        if response.is_err() {
+                            run.child.kill().await?;
                         }
-                        Ok(_) if acknowledged => "Stopped",
-                        Ok(_) => "Stopped (IPC unavailable; forced)",
-                    };
-                    (name, state)
+                        match timeout(Duration::from_secs(30), run.child.wait()).await {
+                            Ok(result) => {
+                                result?;
+                            }
+                            Err(_) => run.child.kill().await?,
+                        }
+                        Ok::<(), std::io::Error>(())
+                    }
+                    .await;
+                    (name, run, outcome)
                 });
             }
-            for (name, state) in futures_util::future::join_all(waits).await {
-                let _ = fs::remove_file(self.socket(&name));
-                self.exits.insert(name, state.into());
+            for (name, run, outcome) in futures_util::future::join_all(waits).await {
+                match outcome {
+                    Ok(()) => {
+                        let _ =
+                            astra_platform::platform::recover_stale_endpoint(&self.socket(&name));
+                        if let Err(error) = self.forget_process(&name) {
+                            failures.push(format!("{name} identity cleanup: {error:#}"));
+                        }
+                        self.exits.insert(name, "Stopped".into());
+                    }
+                    Err(error) => {
+                        failures.push(format!("{name}: {error:#}"));
+                        self.running.insert(name, run);
+                    }
+                }
             }
             self.notify();
         }
+        if let Err(error) = self.stop_rule_generations().await {
+            failures.push(format!("rule generations: {error:#}"));
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "Shutdown incomplete: {}",
+            failures.join("; ")
+        );
+        Ok(())
     }
     fn level(&self, name: &str) -> LogLevel {
         self.runtime
@@ -1460,6 +1544,12 @@ impl Manager {
     async fn action(&mut self, action: Action) -> Result<Reply> {
         self.reap()?;
         match action {
+            Action::Monitor { name } => {
+                let kind = self.instance(&name)?.kind;
+                let pid = self.running.get(&name).and_then(|r| r.child.id());
+                let snapshot = crate::monitor::core(&name, kind, pid, &self.socket(&name)).await?;
+                Ok(Reply::text(serde_json::to_string(&snapshot)?))
+            }
             Action::UpdateTransaction { request } => self.update_transaction(request).await,
             Action::RecoverUpdate { operation_id } => self.recover_update(&operation_id).await,
             Action::WatchUpdates => bail!("Update subscriptions require a dedicated connection"),
@@ -1805,7 +1895,7 @@ impl Manager {
                 Ok(Reply::text(String::from_utf8_lossy(&bytes)))
             }
             Action::Shutdown => {
-                self.stop_all().await;
+                self.stop_all().await?;
                 Ok(Reply::text("Manager and all instances stopped"))
             }
         }
@@ -1831,6 +1921,18 @@ impl Manager {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let elevation_supported = false;
         let mut details = InstanceDetails {
+            network_recovery: match astra_platform::recovery::read(
+                &self.socket(&instance.name).with_extension("recovery.json"),
+            ) {
+                Ok(notice) => notice,
+                Err(error) => Some(astra_model::recovery::Notice {
+                    state: astra_model::recovery::RecoveryState::Pending,
+                    timestamp_ms: 0,
+                    message: format!("Recovery status could not be read: {error}"),
+                    journal: self.socket(&instance.name).with_extension("recovery.json"),
+                    boot_id: String::new(),
+                }),
+            },
             node_tags_supported: true,
             subscription_nodes_supported: true,
             diagnostics_supported: true,
@@ -1933,24 +2035,17 @@ impl Manager {
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
-struct SocketGuard(PathBuf);
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        astra_platform::platform::remove_socket(&self.0);
-    }
-}
-
 pub async fn serve(home: PathBuf, bin: PathBuf) -> Result<()> {
     serve_with_config(home.clone(), home.join("config"), bin).await
 }
 pub async fn serve_with_config(home: PathBuf, config_home: PathBuf, bin: PathBuf) -> Result<()> {
     private_dir(&home)?;
     let socket = home.join("manager.sock");
-    let listener = UnixListener::bind(&socket).context("Manager socket exists or path is too long; never remove a socket belonging to a running manager")?;
-    let _guard = SocketGuard(socket.clone());
+    let listener = astra_platform::platform::bind_listener(&socket)
+        .context("Manager endpoint is active or inaccessible")?;
     set_private(&socket, 0o600)?;
-    let manager = Manager::load_with_config(home, config_home, bin)?;
+    let mut manager = Manager::load_with_config(home, config_home, bin)?;
+    manager.recover_processes().await?;
     server::run(manager, Some(listener), None).await
 }
 pub(crate) use server::NativeClient;
@@ -1960,7 +2055,8 @@ pub(crate) async fn start_native(
     bin: PathBuf,
     runtime_dir: Option<PathBuf>,
 ) -> Result<(NativeClient, tokio::task::JoinHandle<Result<()>>)> {
-    let manager = Manager::load_with_runtime(home, config_home, bin, runtime_dir)?;
+    let mut manager = Manager::load_with_runtime(home, config_home, bin, runtime_dir)?;
+    manager.recover_processes().await?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let result = server::run(manager, None, Some(sender)).await;
@@ -2753,14 +2849,14 @@ mod tests {
                 .map(|name| manager.running[*name].child.id())
                 .collect::<Vec<_>>()
         );
-        manager.stop_all().await;
+        manager.stop_all().await.unwrap();
         #[cfg(windows)]
         for name in ["rules", "proxy", "proxy-two"] {
             fs::write(manager.socket(name), b"").unwrap();
         }
         manager.start("rules").await.unwrap();
         assert_eq!(manager.running.len(), 3);
-        manager.stop_all().await;
+        manager.stop_all().await.unwrap();
     }
     #[test]
     fn defaults_create_parents_are_private_and_preserve_existing_files() {

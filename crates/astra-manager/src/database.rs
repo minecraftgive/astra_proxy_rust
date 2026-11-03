@@ -2,32 +2,60 @@
 use crate::store::Store;
 use anyhow::Result;
 use astra_management::v2::*;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 type Job = Box<dyn FnOnce(&mut Store) + Send>;
 #[derive(Clone)]
 pub struct Database {
     sender: tokio::sync::mpsc::Sender<Job>,
+    failure: Arc<OnceLock<String>>,
 }
 impl Database {
+    pub async fn closed(&self) -> anyhow::Error {
+        self.sender.closed().await;
+        self.worker_error()
+    }
+    fn worker_error(&self) -> anyhow::Error {
+        anyhow::anyhow!("{}",self.failure.get().map(String::as_str).unwrap_or(
+            "Management SQLite worker stopped unexpectedly; pending write outcomes may be unknown; worker was not restarted"))
+    }
     pub fn open(path: PathBuf, event_limit: usize) -> Result<Self> {
         let (sender, mut jobs) = tokio::sync::mpsc::channel::<Job>(64);
         let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        let failure = Arc::new(OnceLock::new());
+        let worker_failure = failure.clone();
         std::thread::Builder::new()
             .name("astra-management-db".into())
-            .spawn(move || match Store::open(&path) {
-                Ok(mut store) => {
+            .spawn(move || {
+                let mut ready=Some(ready);
+                // Catch only to publish the fatal state and reject queued work.
+                // The connection and worker are never reused after a panic.
+                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let mut store=Store::open(&path)?;
                     store.set_event_limit(event_limit);
-                    let _ = ready.send(Ok(()));
-                    while let Some(job) = jobs.blocking_recv() {
-                        job(&mut store);
-                    }
+                    let _=ready.take().unwrap().send(Ok(()));
+                    while let Some(job)=jobs.blocking_recv() {job(&mut store);}
+                    Ok(())
+                }));
+                let error=match result {
+                    Ok(Err(error))=>Some(error),
+                    Err(_)=>Some(anyhow::anyhow!("Management SQLite worker panicked; it was not restarted. Pending write outcomes may be unknown. Retain the database with any -wal and -shm files; inspect the process panic log before restarting management")),
+                    Ok(Ok(()))=>None,
+                };
+                if let Some(error)=error {
+                    let _=worker_failure.set(format!("{error:#}"));
+                    if let Some(ready)=ready.take(){let _=ready.send(Err(error));}
                 }
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
+                // Publish the reason before closing so supervisor/callers do
+                // not replace a fatal failure with a generic channel error.
+                drop(jobs);
             })?;
-        wait.recv()??;
-        Ok(Self { sender })
+        wait.recv().map_err(|error| {
+            anyhow::anyhow!("Management SQLite worker exited before readiness: {error}")
+        })??;
+        Ok(Self { sender, failure })
     }
     async fn call<T: Send + 'static>(
         &self,
@@ -39,8 +67,11 @@ impl Database {
                 let _ = sender.send(work(store));
             }))
             .await
-            .map_err(|_| anyhow::anyhow!("database worker stopped"))?;
-        receiver.await?
+            .map_err(|_| self.worker_error())?;
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(self.closed().await),
+        }
     }
     pub async fn begin(&self, id: &str, fingerprint: &str) -> Result<Option<ResponseBody>> {
         let id = id.to_owned();
@@ -146,5 +177,81 @@ impl Database {
         let state = state.to_owned();
         self.call(move |s| s.route(&operation, &agent, &request, &state))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test]
+    async fn short_contention_recovers_without_blocking_the_async_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("management.sqlite");
+        let database = Database::open(path.clone(), 100).unwrap();
+        let blocker = rusqlite::Connection::open(path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started, worker_started) = tokio::sync::oneshot::channel();
+        let write = database.call(move |store| {
+            let _ = started.send(());
+            store.begin("wait-once", "input")
+        });
+        tokio::pin!(write);
+        tokio::select! {
+            result=&mut write=>panic!("write bypassed external lock: {result:?}"),
+            _=worker_started=>{},
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut write)
+            .await
+            .is_err());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            database.begin("wait-once", "input").await.unwrap(),
+            Some(ResponseBody::Task(_))
+        ));
+    }
+    #[tokio::test]
+    async fn worker_panic_is_fatal_and_pending_operation_is_never_replayed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("management.sqlite");
+        let database = Database::open(path.clone(), 100).unwrap();
+        database
+            .begin("accepted-before-panic", "input")
+            .await
+            .unwrap();
+        let error = database
+            .call::<()>(|_| panic!("injected SQLite worker failure"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("worker panicked"));
+        let closed = tokio::time::timeout(Duration::from_secs(1), database.closed())
+            .await
+            .unwrap();
+        assert!(closed.to_string().contains("not restarted"));
+        assert!(database
+            .begin("must-not-run", "input")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("worker panicked"));
+        drop(database);
+        // Only an explicit new management startup may open another worker.
+        let restarted = Database::open(path, 100).unwrap();
+        assert!(matches!(
+            restarted
+                .begin("accepted-before-panic", "input")
+                .await
+                .unwrap(),
+            Some(ResponseBody::Task(Task {
+                state: TaskState::OutcomeUnknown,
+                ..
+            }))
+        ));
+        assert!(restarted.task("must-not-run").await.is_err());
     }
 }

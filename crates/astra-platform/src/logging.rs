@@ -75,12 +75,19 @@ enum Message {
     Flush(std::sync::mpsc::SyncSender<()>),
 }
 static WRITER: OnceLock<std::sync::mpsc::SyncSender<Message>> = OnceLock::new();
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lines discarded because the output writer could not keep up.
+pub fn dropped_lines() -> u64 {
+    DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn enqueue(sender: &std::sync::mpsc::SyncSender<Message>, message: Message) -> bool {
+    sender.try_send(message).is_ok()
+}
 fn writer() -> &'static std::sync::mpsc::SyncSender<Message> {
     WRITER.get_or_init(|| {
-        // Bounded: a stalled disk eventually applies backpressure rather than
-        // growing memory without limit.
+        // A stalled disk must not block async workers or their Drop cleanup.
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Message>(16 * 1024);
-        std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("astra-log".into())
             .spawn(move || {
                 use std::io::Write;
@@ -94,15 +101,21 @@ fn writer() -> &'static std::sync::mpsc::SyncSender<Message> {
                         let _ = done.send(());
                     }
                 };
+                let mut reported = 0;
                 while let Ok(message) = receiver.recv() {
                     handle(message, &mut out);
+                    let total = dropped_lines();
+                    let dropped = total.saturating_sub(reported);
+                    if dropped != 0 {
+                        let _ = writeln!(out, "WARN astra_log: dropped {dropped} log lines while output was unavailable");
+                        reported = total;
+                    }
                     while let Ok(message) = receiver.try_recv() {
                         handle(message, &mut out);
                     }
                     let _ = out.flush();
                 }
-            })
-            .expect("spawn log writer thread");
+            });
         sender
     })
 }
@@ -120,15 +133,38 @@ impl io::Write for Line {
 impl Drop for Line {
     fn drop(&mut self) {
         if !self.0.is_empty() {
-            let _ = writer().send(Message::Line(std::mem::take(&mut self.0)));
+            if !enqueue(writer(), Message::Line(std::mem::take(&mut self.0))) {
+                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
 /// Wait until queued log lines reach stdout.
 pub fn flush() {
+    // Do not initialize a new writer while unwinding an initialization failure.
+    let Some(writer) = WRITER.get() else { return };
+    flush_writer(writer, std::time::Duration::from_secs(2));
+}
+fn flush_writer(writer: &std::sync::mpsc::SyncSender<Message>, budget: std::time::Duration) {
+    let deadline = std::time::Instant::now() + budget;
     let (done, wait) = std::sync::mpsc::sync_channel(1);
-    if writer().send(Message::Flush(done)).is_ok() {
-        let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+    let mut message = Message::Flush(done);
+    loop {
+        match writer.try_send(message) {
+            Ok(()) => {
+                let _ = wait
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+                break;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                message = pending;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 }
 /// Flushes queued log lines when the core's `main` returns.
@@ -177,6 +213,15 @@ pub fn set_level(level: LogLevel) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    #[test]
+    fn stalled_writer_cannot_block_enqueue_or_shutdown() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        assert!(enqueue(&sender, Message::Line(vec![1])));
+        let started = std::time::Instant::now();
+        assert!(!enqueue(&sender, Message::Line(vec![2])));
+        flush_writer(&sender, std::time::Duration::from_millis(30));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
     #[derive(Clone, Default)]
     struct Output(Arc<Mutex<Vec<u8>>>);
     impl io::Write for Output {

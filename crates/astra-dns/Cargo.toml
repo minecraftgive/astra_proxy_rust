@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 astra-model = { path = "../astra-model" }
+astra-observe = { path = "../astra-observe" }
 anyhow.workspace = true
 serde.workspace = true
 tokio.workspace = true

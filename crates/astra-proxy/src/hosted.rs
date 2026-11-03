@@ -74,6 +74,7 @@ enum WorkerRequest {
     Probe,
     Dns(Vec<u8>),
     DnsTcp,
+    Monitor,
 }
 #[derive(Serialize, Deserialize)]
 struct Auth<T> {
@@ -121,29 +122,48 @@ pub(crate) struct CandidateGuard {
     transition: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 impl CandidateGuard {
-    /// Readiness and Active(true) have already succeeded while the transition
-    /// guard was held. Publish runtime and generation under the admission lock;
-    /// nothing fallible remains in this commit.
-    pub async fn commit(
-        mut self,
+    /// Acquire admission before the caller changes live resources. Cancellation
+    /// here still drops only the prepared generation.
+    pub async fn lock_commit(
+        self,
         route_leases: Vec<Arc<crate::tun::OwnedRoute>>,
-        publish: impl FnOnce(),
-    ) {
+    ) -> Result<RuntimeCommit> {
+        let state = self.host.state.clone().lock_owned().await;
+        self.host.ensure_consistent()?;
+        self.host.check_generations(&state)?;
+        *self.host.checked_lock(
+            "candidate route ownership",
+            &state.generations[&self.id].route_leases,
+        )? = route_leases;
+        Ok(RuntimeCommit {
+            candidate: self,
+            state,
+        })
+    }
+}
+pub(crate) struct RuntimeCommit {
+    candidate: CandidateGuard,
+    state: tokio::sync::OwnedMutexGuard<State>,
+}
+impl RuntimeCommit {
+    /// All waits precede the live-state commit. Publishing the App and choosing
+    /// its worker cannot be interrupted by a timeout or shutdown cancellation.
+    pub fn commit(mut self, publish: impl FnOnce()) {
         let old = {
-            let mut state = self.host.state.lock().await;
-            debug_assert_eq!(state.prepared, Some(self.id));
-            debug_assert!(state.generations.contains_key(&self.id));
-            *state.generations[&self.id].route_leases.lock().unwrap() = route_leases;
+            let state = &mut self.state;
+            let id = self.candidate.id;
+            debug_assert_eq!(state.prepared, Some(id));
+            debug_assert!(state.generations.contains_key(&id));
             let old = state.generations.get(&state.active).cloned();
             publish();
             state.prepared = None;
-            state.active = self.id;
-            old.filter(|old| old.id != self.id)
+            state.active = id;
+            old.filter(|old| old.id != id)
         };
-        self.committed = true;
+        self.candidate.committed = true;
         // Keep ordering with subsequent rollback/activation, without delaying
         // the runtime commit on an old worker's response.
-        let transition = self.transition.take();
+        let transition = self.candidate.transition.take();
         tokio::spawn(async move {
             let _transition = transition;
             if let Some(old) = old {
@@ -159,9 +179,11 @@ impl Drop for CandidateGuard {
             self.transition.take();
             let host = self.host.clone();
             let generation = self.id;
-            tokio::spawn(async move {
-                let _ = host.command(Command::Abort { generation }).await;
-            });
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = host.command(Command::Abort { generation }).await;
+                });
+            }
         }
     }
 }
@@ -169,23 +191,42 @@ impl Drop for Preparation {
     fn drop(&mut self) {
         if !self.committed {
             if let Some(token) = &self.token {
-                self.tokens.lock().unwrap().remove(token);
+                self.tokens
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(token);
             }
             if let Some(pid) = self.pid {
                 crate::platform::process::unregister_worker(pid);
             }
             let state = self.state.clone();
             let id = self.id;
-            tokio::spawn(async move {
-                let mut state = state.lock().await;
-                if state.prepared == Some(id) {
-                    state.prepared = None;
-                }
-            });
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let mut state = state.lock().await;
+                    if state.prepared == Some(id) {
+                        state.prepared = None;
+                    }
+                });
+            }
+        }
+    }
+}
+struct OverrideAttempt<'a> {
+    host: &'a Host,
+    pending: bool,
+}
+impl Drop for OverrideAttempt<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            let _ = self.host.consistency.set(
+                "Runtime override acknowledgement lost; outcome unknown; controlled shutdown required".into(),
+            );
         }
     }
 }
 pub struct Host {
+    consistency: std::sync::OnceLock<String>,
     boot: String,
     next_flow: AtomicU64,
     endpoint: PathBuf,
@@ -200,19 +241,103 @@ pub struct Host {
     retired: std::sync::Mutex<astra_model::runtime::Snapshot>,
     tokens: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(crate) mappings: Arc<dyn astra_dns::MappingStore>,
-    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: std::sync::Mutex<Vec<astra_platform::supervision::Task>>,
 }
 impl Drop for Host {
     fn drop(&mut self) {
-        for task in self.tasks.get_mut().unwrap().drain(..) {
+        for task in self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
             task.abort();
         }
         astra_platform::platform::remove_socket(&self.endpoint);
     }
 }
 impl Host {
+    fn poisoned(&self, name: &str) -> anyhow::Error {
+        let message = format!("network host {name} lock poisoned; controlled shutdown required");
+        let _ = self.consistency.set(message.clone());
+        anyhow::anyhow!(message)
+    }
+    fn checked_lock<'a, T>(
+        &self,
+        name: &str,
+        lock: &'a std::sync::Mutex<T>,
+    ) -> Result<std::sync::MutexGuard<'a, T>> {
+        lock.lock().map_err(|_| self.poisoned(name))
+    }
+    fn check_generations(&self, state: &State) -> Result<()> {
+        for generation in state.generations.values() {
+            if generation.route_leases.is_poisoned() {
+                return Err(self.poisoned("generation route ownership"));
+            }
+            if generation.snapshot.is_poisoned() {
+                return Err(self.poisoned("generation telemetry"));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn ensure_consistent(&self) -> Result<()> {
+        for (name, poisoned) in [
+            ("tokens", self.tokens.is_poisoned()),
+            ("tasks", self.tasks.is_poisoned()),
+            ("telemetry", self.telemetry.is_poisoned()),
+            ("connection identities", self.connection_ids.is_poisoned()),
+            ("retired telemetry", self.retired.is_poisoned()),
+        ] {
+            if poisoned {
+                return Err(self.poisoned(name));
+            }
+        }
+        if let Some(error) = self.consistency.get() {
+            bail!("{error}");
+        }
+        Ok(())
+    }
+    pub(crate) async fn task_failure(&self) -> Option<String> {
+        if let Err(error) = self.ensure_consistent() {
+            return Some(error.to_string());
+        }
+        let finished = {
+            let mut tasks = match self.checked_lock("tasks", &self.tasks) {
+                Ok(tasks) => tasks,
+                Err(error) => return Some(error.to_string()),
+            };
+            tasks
+                .iter()
+                .position(|task| task.is_finished())
+                .map(|index| tasks.remove(index))
+        };
+        if let Some(mut task) = finished {
+            return Some(task.failure().await);
+        }
+        let active = {
+            let state = self.state.lock().await;
+            if let Err(error) = self.check_generations(&state) {
+                return Some(error.to_string());
+            }
+            state.generations.get(&state.active).cloned()
+        };
+        if let Some(active) = active {
+            match active.child.lock().await.try_wait() {
+                Ok(Some(status)) => {
+                    return Some(format!(
+                        "active proxy worker {} exited unexpectedly: {status}",
+                        active.id
+                    ))
+                }
+                Err(error) => return Some(format!("cannot observe active proxy worker: {error}")),
+                Ok(None) => {}
+            }
+        }
+        None
+    }
     pub(crate) async fn prepare_runtime(self: &Arc<Self>, app: &App) -> Result<CandidateGuard> {
         let transition = self.transition.clone().lock_owned().await;
+        self.ensure_consistent()?;
         let (directory, rule_socket) = match self.active_origin().await {
             Some((directory, socket)) => (directory, Some(socket)),
             None => (
@@ -249,6 +374,7 @@ impl Host {
             0o600,
         )?;
         let host = Arc::new(Self {
+            consistency: Default::default(),
             boot: uuid::Uuid::new_v4().to_string(),
             next_flow: AtomicU64::new(1),
             endpoint,
@@ -276,13 +402,17 @@ impl Host {
             tasks: Default::default(),
         });
         let weak = Arc::downgrade(&host);
-        host.tasks.lock().unwrap().push(tokio::spawn(async move {
+        host.checked_lock("tasks", &host.tasks)?.push(astra_platform::supervision::Task::spawn_result("network host control listener", async move {
             let mut clients = tokio::task::JoinSet::new();
             let permits = Arc::new(tokio::sync::Semaphore::new(128));
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let Ok((mut stream, _)) = result else { break };
+                        let (mut stream, _) = match result {
+                            Ok(value)=>value,
+                            Err(error) if astra_platform::supervision::transient_io(&error)=>{tokio::time::sleep(Duration::from_millis(100)).await;continue;},
+                            Err(error)=>return Err(error),
+                        };
                         let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                         let Some(host) = weak.upgrade() else { break };
                         clients.spawn(async move {
@@ -301,16 +431,21 @@ impl Host {
                     Some(_) = clients.join_next(), if !clients.is_empty() => {}
                 }
             }
+            Ok::<(),std::io::Error>(())
         }));
         let weak = Arc::downgrade(&host);
-        host.tasks.lock().unwrap().push(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let Some(host) = weak.upgrade() else { break };
-                host.refresh_telemetry().await;
-                host.reap().await;
-            }
-        }));
+        host.checked_lock("tasks", &host.tasks)?
+            .push(astra_platform::supervision::Task::spawn(
+                "network host telemetry/reaper",
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let Some(host) = weak.upgrade() else { break };
+                        host.refresh_telemetry().await;
+                        host.reap().await;
+                    }
+                },
+            ));
         Ok(host)
     }
     fn app(&self) -> Result<Arc<App>> {
@@ -326,6 +461,7 @@ impl Host {
         rule_socket: Option<String>,
     ) -> Result<u64> {
         let _transition = self.transition.lock().await;
+        self.ensure_consistent()?;
         self.prepare_inner(app, directory, rule_socket).await
     }
     async fn prepare_inner(
@@ -337,6 +473,7 @@ impl Host {
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
         {
             let mut state = self.state.lock().await;
+            self.check_generations(&state)?;
             ensure!(
                 state.prepared.is_none(),
                 "another update is already prepared"
@@ -359,7 +496,8 @@ impl Host {
             .endpoint
             .with_file_name(format!("w-{}-{id}.sock", std::process::id()));
         let token = uuid::Uuid::new_v4().to_string();
-        self.tokens.lock().unwrap().insert(token.clone());
+        self.checked_lock("tokens", &self.tokens)?
+            .insert(token.clone());
         preparation.token = Some(token.clone());
         let mut table: toml::Table = toml::from_str(&app.effective_text)?;
         if let Some(socket) = &rule_socket {
@@ -370,7 +508,7 @@ impl Host {
         let config = WorkerConfig {
             path: self.path.clone(),
             text: toml::to_string(&table)?,
-            overrides: app.overrides.read().unwrap().clone(),
+            overrides: (*app.overrides.load_full()).clone(),
             interface: app.config.tun.as_ref().and_then(|t| t.interface.clone()),
             host: self.endpoint.clone(),
             token: token.clone(),
@@ -444,7 +582,10 @@ impl Host {
         }
         .await;
         if let Err(error) = result {
-            self.tokens.lock().unwrap().remove(&token);
+            self.tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&token);
             let _ = child.kill().await;
             crate::platform::process::unregister_worker(pid);
             astra_platform::platform::remove_socket(&endpoint);
@@ -480,8 +621,10 @@ impl Host {
     }
     async fn select(&self, id: u64, prepared: bool) -> Result<()> {
         let _transition = self.transition.lock().await;
+        self.ensure_consistent()?;
         let (new, old, previous) = {
             let state = self.state.lock().await;
+            self.check_generations(&state)?;
             ensure!(
                 if prepared {
                     state.prepared == Some(id)
@@ -528,7 +671,10 @@ impl Host {
             .map(|g| (g.directory.clone(), g.rule_socket.clone()))
     }
     pub fn merge_snapshot(&self, snapshot: &mut astra_model::runtime::Snapshot) {
-        let store = self.telemetry.lock().unwrap();
+        let Ok(store) = self.checked_lock("telemetry", &self.telemetry) else {
+            snapshot.truncated = true;
+            return;
+        };
         Self::merge_metrics(snapshot, &store.snapshot);
     }
     fn merge_metrics(
@@ -571,13 +717,16 @@ impl Host {
         .await?
     }
     pub async fn overrides(
-        &self,
+        self: &Arc<Self>,
         value: astra_model::runtime::Overrides,
         disconnect: Option<String>,
+        publish: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let _transition = self.transition.lock().await;
+        let transition = self.transition.clone().lock_owned().await;
+        self.ensure_consistent()?;
         let (active, draining) = {
             let state = self.state.lock().await;
+            self.check_generations(&state)?;
             ensure!(
                 !state.paused,
                 "admission is paused; retry runtime changes after the update"
@@ -607,22 +756,44 @@ impl Host {
                 .collect::<Vec<_>>();
             (active, draining)
         };
-        let result: std::result::Result<(), String> = Self::rpc(
+        let mut attempt = OverrideAttempt {
+            host: self,
+            pending: true,
+        };
+        let result: Result<std::result::Result<(), String>> = Self::rpc(
             &active,
             WorkerRequest::Overrides {
                 value,
                 disconnect: disconnect.clone(),
             },
         )
-        .await?;
-        result.map_err(anyhow::Error::msg)?;
-        if let Some(group) = disconnect {
-            futures_util::future::join_all(draining.iter().map(|generation|async {
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                attempt.pending = false;
+                bail!("{error}");
+            }
+            Err(error) => {
+                return Err(error.context("Runtime override acknowledgement lost; outcome unknown"))
+            }
+        }
+        if let Err(error) = publish() {
+            let message = format!("Runtime override outcome unknown: host checkpoint failed after worker commit: {error:#}");
+            let _ = self.consistency.set(message.clone());
+            bail!("{message}");
+        }
+        attempt.pending = false;
+        tokio::spawn(async move {
+            let _transition = transition;
+            if let Some(group) = disconnect {
+                futures_util::future::join_all(draining.iter().map(|generation|async {
                 if let Err(error) = Self::rpc::<bool>(generation,WorkerRequest::DisconnectGroup(group.clone())).await {
                     tracing::warn!(generation=generation.id,%group,%error,"could not disconnect draining worker group");
                 }
-            })).await;
-        }
+                })).await;
+            }
+        });
         Ok(())
     }
     pub async fn test_group(&self, name: String) -> Result<()> {
@@ -633,7 +804,10 @@ impl Host {
     }
     pub async fn disconnect(&self, id: Option<u64>) -> Result<bool> {
         if let Some(id) = id {
-            let target = self.connection_ids.lock().unwrap().resolve(id).cloned();
+            let target = self
+                .checked_lock("connection identities", &self.connection_ids)?
+                .resolve(id)
+                .cloned();
             let Some(target) = target.filter(|target| target.boot == self.boot) else {
                 return Ok(false);
             };
@@ -672,7 +846,10 @@ impl Host {
                 state.generations.values().cloned().collect::<Vec<_>>(),
             )
         };
-        let mut combined = self.retired.lock().unwrap().clone();
+        let mut combined = match self.checked_lock("retired telemetry", &self.retired) {
+            Ok(snapshot) => snapshot.clone(),
+            Err(_) => return,
+        };
         // A slow draining worker must not serialize every healthy worker's sample.
         let mut samples = stream::iter(generations.into_iter().map(|generation| async move {
             let result =
@@ -688,15 +865,21 @@ impl Host {
         let mut health = BTreeMap::new();
         for (generation, result, sampled_at) in samples {
             health.insert(generation.id, result.is_ok().then_some(sampled_at));
+            let mut stored = match self.checked_lock("generation telemetry", &generation.snapshot) {
+                Ok(stored) => stored,
+                Err(_) => return,
+            };
             if let Ok(snapshot) = result {
-                *generation.snapshot.lock().unwrap() = snapshot;
+                *stored = snapshot;
             }
-            let mut snapshot = generation.snapshot.lock().unwrap().clone();
+            let mut snapshot = stored.clone();
             snapshot.truncated |= snapshot.connections.len() > 128;
             snapshot.connections.truncate(128);
             snapshots.push((generation.id, snapshot));
         }
-        let mut ids = self.connection_ids.lock().unwrap();
+        let Ok(mut ids) = self.checked_lock("connection identities", &self.connection_ids) else {
+            return;
+        };
         combined.truncated |= !ids.reconcile(
             &self.boot,
             snapshots.iter().flat_map(|(generation, snapshot)| {
@@ -732,13 +915,112 @@ impl Host {
                 combined.groups = snapshot.groups;
             }
         }
-        self.telemetry
-            .lock()
-            .unwrap()
-            .publish(combined, health, origins);
+        if let Ok(mut telemetry) = self.checked_lock("telemetry", &self.telemetry) {
+            telemetry.publish(combined, health, origins);
+        }
+    }
+    /// Diagnostics never hold admission/state locks while contacting workers.
+    /// Old workers may not support this additive request; omit their data and
+    /// report an unavailable count rather than reuse stale counters.
+    async fn monitor(&self) -> astra_model::monitor::InternalSnapshot {
+        use astra_model::monitor::{Metric, MetricKind};
+        use futures_util::{stream, StreamExt};
+        let (active, paused, generations) = {
+            let state = self.state.lock().await;
+            (
+                state.active,
+                state.paused,
+                state
+                    .generations
+                    .values()
+                    .take(16)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut snapshot = astra_observe::snapshot(self.boot.clone());
+        let mut gauge = |name: &str, description: &str, value: u64| {
+            snapshot.metrics.push(Metric {
+                sampled_at_ms: None,
+                name: name.into(),
+                description: description.into(),
+                value: value.to_string(),
+                unit: "count".into(),
+                kind: MetricKind::Gauge,
+            });
+        };
+        gauge(
+            "runtime.host.generations",
+            "宿主：存活代数（含准备及排空）",
+            generations.len() as u64,
+        );
+        gauge(
+            "runtime.host.active_generation",
+            "宿主：当前活动代号",
+            active,
+        );
+        gauge(
+            "runtime.host.paused",
+            "宿主：已暂停接纳（1 为暂停）",
+            u64::from(paused),
+        );
+        gauge(
+            "runtime.host.failed",
+            "宿主：已标记失败代数",
+            generations
+                .iter()
+                .filter(|g| g.failed.load(Ordering::Acquire))
+                .count() as u64,
+        );
+        gauge(
+            "runtime.host.flows",
+            "宿主：当前代流租约",
+            generations.iter().fold(0u64, |total, g| {
+                total.saturating_add(g.flows.load(Ordering::Acquire) as u64)
+            }),
+        );
+        let mut unavailable = generations.len() as u64;
+        let mut samples = stream::iter(generations.into_iter().map(|generation| async move {
+            let result = Self::rpc::<astra_model::monitor::InternalSnapshot>(
+                &generation,
+                WorkerRequest::Monitor,
+            )
+            .await;
+            (generation.id, result)
+        }))
+        .buffer_unordered(4);
+        // A diagnostic request must finish even when every worker is wedged.
+        // Dropping pending RPC futures closes their dedicated streams.
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => break,
+                sample = samples.next() => {
+                    let Some((generation, result)) = sample else { break };
+                    if let Ok(worker) = result {
+                        if append_worker_monitor(&mut snapshot, generation, worker) {
+                            unavailable -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        snapshot.metrics.push(Metric {
+            sampled_at_ms: None,
+            name: "runtime.host.unavailable_workers".into(),
+            description: "宿主：本次内部统计不可用的 worker 数".into(),
+            value: unavailable.to_string(),
+            unit: "count".into(),
+            kind: MetricKind::Gauge,
+        });
+        snapshot.metrics.sort_by(|a, b| a.name.cmp(&b.name));
+        snapshot
     }
     async fn lease(&self) -> Result<Lease> {
         loop {
+            self.ensure_consistent()?;
             let ready = self.admissions.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
@@ -784,21 +1066,34 @@ impl Host {
         let ready: std::result::Result<(), String> = receive(&mut remote).await?;
         ready.map_err(anyhow::Error::msg)?;
         let mut remote = astra_ipc::host::HostStream::new(remote);
-        tokio::io::copy_bidirectional_with_sizes(&mut client, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
+        tokio::io::copy_bidirectional_with_sizes(
+            &mut client,
+            &mut remote,
+            COPY_BUFFER_SIZE,
+            COPY_BUFFER_SIZE,
+        )
+        .await?;
         Ok(())
     }
     async fn command(&self, command: Command) -> Result<serde_json::Value> {
+        if !matches!(
+            &command,
+            Command::Status | Command::Telemetry | Command::Monitor | Command::Abort { .. }
+        ) {
+            self.ensure_consistent()?;
+        }
         match command {
+            Command::Monitor => Ok(serde_json::to_value(self.monitor().await)?),
             Command::Telemetry => {
                 let state = self.state.lock().await;
                 let app = self.app()?;
                 let mut snapshot = app.metrics.snapshot();
-                snapshot.mode = app.overrides.read().unwrap().mode;
+                snapshot.mode = app.overrides.load().mode;
                 snapshot.system_proxy = app.config.system_proxy.is_some();
                 snapshot.tun = app.config.tun.is_some();
                 snapshot.allow_lan = app.lan_enabled();
                 snapshot.groups = app.groups.snapshot(&app);
-                let store = self.telemetry.lock().unwrap();
+                let store = self.checked_lock("telemetry", &self.telemetry)?;
                 Self::merge_metrics(&mut snapshot, &store.snapshot);
                 Ok(serde_json::to_value(astra_model::runtime::RuntimeView {
                     snapshot,
@@ -830,7 +1125,7 @@ impl Host {
                     binary: std::env::current_exe().ok(),
                     paused: state.paused,
                     busy: state.prepared.is_some() || state.paused,
-                    capabilities: vec!["runtime_telemetry_v1".into()],
+                    capabilities: vec!["runtime_telemetry_v1".into(), "internal_monitor_v1".into()],
                 })?)
             }
             Command::Prepare {
@@ -891,7 +1186,7 @@ impl Host {
     }
     async fn authenticate(&self, token: &str) -> Result<()> {
         ensure!(
-            self.tokens.lock().unwrap().contains(token),
+            self.checked_lock("tokens", &self.tokens)?.contains(token),
             "unknown worker"
         );
         Ok(())
@@ -929,15 +1224,21 @@ impl Host {
         drop(state);
         drop(transition);
         for g in retired {
-            self.tokens.lock().unwrap().remove(&g.token);
+            self.tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&g.token);
             {
-                let last = g.snapshot.lock().unwrap();
-                let mut totals = self.retired.lock().unwrap();
-                totals.upload += last.upload;
-                totals.download += last.download;
-                totals.proxy_upload += last.proxy_upload;
-                totals.proxy_download += last.proxy_download;
-                totals.total += last.total;
+                if let (Ok(last), Ok(mut totals)) = (
+                    self.checked_lock("generation telemetry", &g.snapshot),
+                    self.checked_lock("retired telemetry", &self.retired),
+                ) {
+                    totals.upload += last.upload;
+                    totals.download += last.download;
+                    totals.proxy_upload += last.proxy_upload;
+                    totals.proxy_download += last.proxy_download;
+                    totals.total += last.total;
+                }
             }
             let mut child = g.child.lock().await;
             if let Some(pid) = child.id() {
@@ -965,10 +1266,64 @@ pub(crate) struct WorkerHost {
     token: String,
 }
 
+fn append_worker_monitor(
+    snapshot: &mut astra_model::monitor::InternalSnapshot,
+    generation: u64,
+    worker: astra_model::monitor::InternalSnapshot,
+) -> bool {
+    // A generation is never reused in a host boot. Preserve that identity in
+    // each metric name so updates cannot splice unrelated counter baselines.
+    if worker.epoch != format!("{}:{generation}", snapshot.epoch) {
+        return false;
+    }
+    snapshot
+        .metrics
+        .extend(worker.metrics.into_iter().map(|mut metric| {
+            metric.name = format!("workers.{generation}.{}", metric.name);
+            metric.description = format!("worker {generation} · {}", metric.description);
+            metric
+        }));
+    true
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::append_worker_monitor;
+    use astra_model::monitor::{InternalSnapshot, Metric, MetricKind};
+
+    #[test]
+    fn worker_generations_never_share_counter_names_or_accept_foreign_epochs() {
+        let mut host = InternalSnapshot {
+            epoch: "boot".into(),
+            metrics: vec![],
+        };
+        let worker = |epoch: &str| InternalSnapshot {
+            epoch: epoch.into(),
+            metrics: vec![Metric {
+                sampled_at_ms: None,
+                name: "routing.started".into(),
+                value: "9007199254740993".into(),
+                description: "路由请求".into(),
+                kind: MetricKind::Counter,
+                unit: "count".into(),
+            }],
+        };
+        assert!(append_worker_monitor(&mut host, 1, worker("boot:1")));
+        assert!(append_worker_monitor(&mut host, 2, worker("boot:2")));
+        assert!(!append_worker_monitor(&mut host, 3, worker("other-boot:3")));
+        assert!(!append_worker_monitor(&mut host, 4, worker("boot:3")));
+        assert_eq!(host.metrics.len(), 2);
+        assert_eq!(host.metrics[0].name, "workers.1.routing.started");
+        assert_eq!(host.metrics[1].name, "workers.2.routing.started");
+        assert_eq!(host.metrics[0].value, "9007199254740993");
+        assert_eq!(host.epoch, "boot");
+    }
+}
+
 pub async fn worker() -> Result<()> {
     let config: WorkerConfig = receive(&mut tokio::io::stdin()).await?;
     let mut app = App::from_text(&config.path, config.text)?;
-    *app.overrides.write().unwrap() = config.overrides;
+    app.overrides.store(Arc::new(config.overrides));
     if let Some(tun) = &mut app.config.tun {
         tun.interface = config.interface.clone();
     }
@@ -998,19 +1353,21 @@ pub async fn worker() -> Result<()> {
     let stop = Arc::new(tokio::sync::Notify::new());
     let refresh_app = app.clone();
     let refresh_enabled = enabled.clone();
-    tasks.spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if refresh_enabled.load(Ordering::Acquire) {
-                refresh_app.groups.refresh_all(&refresh_app).await;
+    let mut refresh =
+        astra_platform::supervision::Task::spawn("worker group refresh", async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if refresh_enabled.load(Ordering::Acquire) {
+                    refresh_app.groups.refresh_all(&refresh_app).await;
+                }
             }
-        }
-    });
-    loop {
+        });
+    let outcome = loop {
         tokio::select! {
-            _ = stop.notified() => break,
+            _ = stop.notified() => break Ok(()),
+            error = refresh.failure() => break Err(anyhow::anyhow!(error)),
             accepted = listener.accept() => {
-                let (mut stream,_) = accepted?;
+                let (mut stream,_) = match accepted { Ok(value)=>value,Err(error)=>break Err(error.into()) };
                 let app = app.clone(); let token = config.token.clone();
                 let boot = config.boot.clone(); let generation = config.generation;
                 let enabled = enabled.clone(); let stop = stop.clone();
@@ -1053,6 +1410,10 @@ pub async fn worker() -> Result<()> {
                                 let mut snapshot = app.metrics.snapshot(); snapshot.groups = app.groups.snapshot(&app);
                                 send(&mut stream,snapshot).await
                             }
+                            WorkerRequest::Monitor => {
+                                let snapshot = astra_observe::snapshot(format!("{boot}:{generation}"));
+                                send(&mut stream, snapshot).await
+                            }
                             WorkerRequest::Disconnect(id) => send(&mut stream, app.metrics.disconnect(id)).await,
                             WorkerRequest::Overrides {value,disconnect} => {
                                 app.groups.commit_overrides(&app,value,disconnect.as_deref());
@@ -1082,8 +1443,10 @@ pub async fn worker() -> Result<()> {
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
-    }
-    Ok(())
+    };
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    outcome
 }
 async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
@@ -1119,6 +1482,12 @@ async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .connect_tracked(&dial, &action, meta.inbound, Some(meta.source))
         .await?;
     remote.write_all(&prefix).await?;
-    tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut stream,
+        &mut remote,
+        COPY_BUFFER_SIZE,
+        COPY_BUFFER_SIZE,
+    )
+    .await?;
     Ok(())
 }

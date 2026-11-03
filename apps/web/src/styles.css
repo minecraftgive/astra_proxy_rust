@@ -1936,9 +1936,6 @@ tr:last-child td {
   user-select: text;
 }
 @media (max-width: 760px) {
-  .app {
-    grid-template-columns: 140px minmax(0, 1fr);
-  }
   .top {
     gap: 6px;
     flex-wrap: wrap;
@@ -1974,6 +1971,29 @@ tr:last-child td {
     font-size: 10px;
   }
 }
+/* Keep the React sidebar wide enough for text without overriding phone layout. */
+@media (min-width: 641px) and (max-width: 900px) {
+  .app { grid-template-columns: 140px minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) 34px calc(56px + env(safe-area-inset-bottom, 0px));
+  }
+  .app > .top { grid-column: 1; grid-row: 1; min-height: 56px; }
+  .app > main { grid-column: 1; grid-row: 2; min-height: 0; }
+  .app > .taskbar { grid-column: 1; grid-row: 3; overflow: hidden; }
+  .app > .side {
+    grid-column: 1; grid-row: 4;
+    min-width: 0; overflow-x: auto; overflow-y: hidden;
+    justify-content: flex-start; gap: 6px;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+  }
+  .side .brand, .side .node-label, .side .node-info, .side .spacer { display: none; }
+  .side .node-select { flex: 0 0 130px; width: 130px; margin: 0; }
+  .side .nav { flex: none; width: auto; white-space: nowrap; flex-direction: row; padding: 9px 12px; font-size: 12px; }
+  .top > strong { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -1989,3 +2009,43 @@ tr:last-child td {
 .schema-group { width: 100%; justify-content: space-between; margin: 8px 0; }
 .schema-entry { padding: 12px 0; border-bottom: 1px solid var(--border); }
 @media(max-width:800px){.schema-field { grid-template-columns:1fr; gap:8px; }}
+
+/* Monitor: three aligned traces share a time axis for correlating load and traffic. */
+.monitor { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.monitor-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.monitor-controls .toolbar { margin: 0; flex-wrap: wrap; }
+.monitor-state, .monitor-interval { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.monitor-caption { margin: 0; overflow-wrap: anywhere; }
+.monitor-panel { display: grid; grid-template-columns: minmax(220px, 30%) minmax(0, 1fr); overflow: hidden; }
+.monitor-metrics { padding: 18px 20px; border-right: 1px solid var(--border); }
+.monitor h2 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
+.monitor dl { display: flex; gap: 20px; flex-wrap: wrap; margin: 0; }
+.monitor dt { color: var(--muted); font-size: 12px; }
+.monitor dd { margin: 3px 0 0; font: 500 22px/1.3 var(--mono); font-variant-numeric: tabular-nums; }
+.monitor .monitor-secondary { font-size: 15px; padding-block: 4px; }
+.monitor-metrics p { font-size: 11px; margin: 12px 0 0; }
+.monitor-trace { position: relative; display: grid; grid-template-columns: 70px minmax(0, 1fr); grid-template-rows: 100px auto; align-content: center; gap: 8px 12px; padding: 22px 20px; min-width: 0; }
+.monitor-trace svg { width: 100%; height: 100px; overflow: visible; }
+.monitor-axis { display: flex; flex-direction: column; justify-content: space-between; text-align: right; }
+.monitor-axis, .monitor-time { font: 10px/1.2 var(--mono); color: var(--muted); }
+.monitor-gridline { stroke: var(--border); stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
+.monitor-time { grid-column: 2; display: flex; justify-content: space-between; }
+.monitor-no-samples { position: absolute; top: 50%; left: 55%; transform: translate(-50%, -50%); color: var(--muted); font-size: 12px; }
+.monitor .monitor-totals { grid-column: 1 / -1; padding: 14px 20px; border-top: 1px solid var(--border); justify-content: space-between; gap: 14px 24px; }
+.monitor-totals dd { font-size: 15px; overflow-wrap: anywhere; }
+.monitor .monitor-up { color: var(--up); }
+.monitor .monitor-down { color: var(--down); }
+.monitor-internal { min-width: 0; overflow: hidden; }
+.monitor-internal-group { border-top: 1px solid var(--border); }
+.monitor-internal-group h3 { padding: 12px 20px; margin: 0; font-size: 12px; color: var(--muted); background: var(--surface-2); }
+.monitor-internal table { width: 100%; }
+.monitor-internal small { display: block; font-size: 10px; margin-top: 2px; overflow-wrap: anywhere; }
+.monitor-internal td:first-child { min-width: 180px; white-space: normal; }
+.monitor-internal th:not(:first-child), .monitor-internal td:not(:first-child) { text-align: right; white-space: nowrap; }
+@media (max-width: 900px) {
+  .monitor-panel { grid-template-columns: minmax(0, 1fr); }
+  .monitor-metrics { border-right: 0; padding-bottom: 0; }
+  .monitor-trace { padding: 20px 14px; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+  .monitor dd { font-size: 20px; }
+  .monitor .monitor-totals { justify-content: start; }
+}

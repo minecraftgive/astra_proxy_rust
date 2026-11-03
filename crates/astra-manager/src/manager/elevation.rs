@@ -67,14 +67,6 @@ pub(super) fn supported() -> bool {
     unsafe { libc::geteuid() != 0 }
 }
 
-struct SocketGuard(PathBuf);
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 fn find_sudo() -> Result<PathBuf> {
     let executable = |path: &Path| {
         fs::metadata(path).is_ok_and(|metadata| {
@@ -179,11 +171,8 @@ pub(super) async fn prepare(
     // and Unix socket paths are limited (108 bytes on Linux), which custom
     // state directories can exceed.
     let socket_path = directory.join(format!("{}.sock", &ticket[..16]));
-    let _ = fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     set_private(&socket_path, 0o600)?;
-    // Owns the socket file until the spawned exchange task takes it over.
-    let guard = SocketGuard(socket_path.clone());
 
     rotate_log(&manager.log(&name));
     let offer = Offer {
@@ -209,6 +198,7 @@ pub(super) async fn prepare(
         },
     );
     let handoff = Handoff {
+        service_owner: astra_platform::lifecycle::capture(std::process::id())?,
         version: unix_handoff::PROTOCOL_VERSION,
         config: fs::canonicalize(&active.path)?,
         control: socket,
@@ -223,7 +213,7 @@ pub(super) async fn prepare(
     };
     tokio::spawn(async move {
         let result = tokio::select! {
-            result = exchange(listener, ticket.clone(), handoff, guard) => result,
+            result = exchange(listener, ticket.clone(), handoff) => result,
             _ = cancelled => Err(anyhow::anyhow!("Elevation cancelled")),
         };
         let event = match result {
@@ -249,7 +239,6 @@ async fn exchange(
     listener: UnixListener,
     ticket: String,
     handoff: Handoff,
-    _guard: SocketGuard,
 ) -> Result<(tokio::net::UnixStream, Prepared, u64)> {
     let (mut stream, _) = timeout(ACCEPT_TIMEOUT, listener.accept())
         .await
@@ -460,7 +449,7 @@ async fn commit(
         return fail(format!("Stopping the current core failed: {error:#}"));
     }
     let socket = manager.socket(name);
-    let _ = fs::remove_file(&socket);
+    let _ = astra_platform::platform::recover_stale_endpoint(&socket);
     let commit = Commit {
         version: unix_handoff::PROTOCOL_VERSION,
         digest: pending.digest,
@@ -511,6 +500,10 @@ async fn commit(
                             },
                         );
                         manager.exits.remove(name);
+                        if let Err(error) = manager.commit_process(name).await {
+                            let cleanup = manager.stop(name).await;
+                            return Outcome::Failed(format!("Could not persist elevated core identity: {error:#}; candidate cleanup: {cleanup:?}"));
+                        }
                         manager.notify();
                         return match serde_json::to_string(&snapshot) {
                             Ok(snapshot) => Outcome::Ready(snapshot),
@@ -628,9 +621,6 @@ impl AdoptedChild {
             self.lifeline = None;
         }
         Ok(std::process::ExitStatus::from_raw(0))
-    }
-    pub(super) fn start_kill(&mut self) -> std::io::Result<()> {
-        self.request_shutdown(libc::SIGTERM)
     }
     pub(super) async fn kill(&mut self) -> std::io::Result<()> {
         self.request_shutdown(libc::SIGKILL)?;

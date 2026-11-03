@@ -38,6 +38,8 @@ function DocumentEditor({
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<"source" | "fields">("source");
   const [notice, setNotice] = useState("");
+  const [pendingSave, setPendingSave] = useState<string>();
+  const pendingIdentity = useRef<string>();
   const [recovered, setRecovered] = useState<{
     text: string;
     revision: string;
@@ -85,6 +87,8 @@ function DocumentEditor({
         setDraft(r.data);
         setText(r.data.text);
         newest.current = r.data.text;
+        pendingIdentity.current = saved?.saveOperationId;
+        setPendingSave(saved?.saveOperationId);
         if (saved && saved.text !== r.data.text) setRecovered(saved);
         if (!saved)
           return retain(key, {
@@ -116,6 +120,7 @@ function DocumentEditor({
         draftId: draft.id,
         original: draft.original,
         sourceRevision: draft.source_revision,
+        saveOperationId: pendingIdentity.current,
       }).catch(() => setNotice("浏览器恢复副本未能保存，请保持此窗口打开。"));
   };
   const history = (back: boolean) => {
@@ -133,13 +138,16 @@ function DocumentEditor({
           draftId: draft.id,
           original: draft.original,
           sourceRevision: draft.source_revision,
+          saveOperationId: pendingIdentity.current,
         }).catch(onError);
     }
   };
   const save = async () => {
-    if (!draft || busy) return;
+    if (!draft || busy || pendingIdentity.current) return;
     setBusy(true);
     const submitted = newest.current;
+    let saveSent = false;
+    let baseline = draft;
     try {
       const updated = await API.draftCommand(agent, "edit", {
         draft_id: draft.id,
@@ -147,13 +155,37 @@ function DocumentEditor({
         text: submitted,
       });
       if (mounted.current) setDraft(updated.data);
+      baseline = updated.data;
+      const operationId = crypto.randomUUID();
+      pendingIdentity.current = operationId;
+      if (mounted.current) setPendingSave(operationId);
+      // Do not send a save until its identity can survive closing this page.
+      await retain(key, {
+        text: newest.current,
+        revision: updated.data.revision,
+        draftId: draft.id,
+        original: updated.data.original,
+        sourceRevision: updated.data.source_revision,
+        saveOperationId: operationId,
+      });
+      saveSent = true;
       const result = await API.draftCommand(agent, "save", {
         draft_id: draft.id,
         expected_revision: updated.data.revision,
         expected_source_revision: updated.data.source_revision,
-        operation_id: crypto.randomUUID(),
+        operation_id: operationId,
       });
       if (result.type === "draft") {
+        baseline = result.data;
+        if (
+          !result.data.last_save ||
+          !["outcome_unknown", "recovery_failed"].includes(
+            result.data.last_save.state,
+          )
+        ) {
+          pendingIdentity.current = undefined;
+          if (mounted.current) setPendingSave(undefined);
+        }
         if (mounted.current) setDraft(result.data);
         if (mounted.current && newest.current === submitted) {
           setText(result.data.text);
@@ -171,18 +203,90 @@ function DocumentEditor({
           draftId: result.data.id,
           original: result.data.original,
           sourceRevision: result.data.source_revision,
+          saveOperationId: pendingIdentity.current,
         });
       } else if (mounted.current) setNotice("保存请求已返回，请查看任务结果。");
       if (mounted.current) onSaved();
     } catch (e) {
+      if (!saveSent) {
+        pendingIdentity.current = undefined;
+        if (mounted.current) setPendingSave(undefined);
+      }
+      if (
+        e instanceof API.ApiError &&
+        e.code !== "outcome_unknown" &&
+        (!e.details ||
+          !["outcome_unknown", "recovery_failed"].includes(e.details.state))
+      ) {
+        pendingIdentity.current = undefined;
+        if (mounted.current) setPendingSave(undefined);
+      }
+      if (!pendingIdentity.current) {
+        await retain(key, {
+          text: newest.current,
+          revision: baseline.revision,
+          draftId: baseline.id,
+          original: baseline.original,
+          sourceRevision: baseline.source_revision,
+        }).catch(() => {}); // The original failure remains visible; no write operation is replayed.
+      }
       if (mounted.current) {
         onError(e);
         setNotice(
           e instanceof API.ApiError && e.details
             ? saveDescription(e.details)
-            : "草稿已保留。遇到版本冲突时，请先对照磁盘版本再保存。",
+            : pendingIdentity.current
+              ? `保存结果尚未确认。任务 ${pendingIdentity.current}，请查询原任务，勿重复提交。`
+              : "草稿已保留。遇到版本冲突时，请先对照磁盘版本再保存。",
         );
       }
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+  const inspectSave = async () => {
+    const operationId = pendingIdentity.current;
+    if (!operationId || !draft || busy) return;
+    setBusy(true);
+    try {
+      const task = await API.query<API.Task>(agent, "task", {
+        operation_id: operationId,
+      });
+      const current = await API.draftCommand(agent, "read", {
+        draft_id: draft.id,
+      });
+      if (current.data.instance !== instance.id)
+        throw new Error("原草稿的实例身份不一致。");
+      const unresolved =
+        current.data.last_save?.operation_id === operationId &&
+        ["outcome_unknown", "recovery_failed"].includes(
+          current.data.last_save.state,
+        );
+      const finished =
+        !unresolved &&
+        task.data.id === operationId &&
+        ["complete", "failed"].includes(task.data.state);
+      if (finished) pendingIdentity.current = undefined;
+      await retain(key, {
+        text: recovered?.text ?? newest.current,
+        revision: current.data.revision,
+        draftId: current.data.id,
+        original: current.data.original,
+        sourceRevision: current.data.source_revision,
+        saveOperationId: pendingIdentity.current,
+      });
+      if (mounted.current) {
+        setDraft(current.data);
+        setPendingSave(pendingIdentity.current);
+        setNotice(
+          current.data.last_save?.operation_id === operationId
+            ? saveDescription(current.data.last_save)
+            : `任务 ${operationId} · ${task.data.state} · ${task.data.message}`,
+        );
+        if (finished) onSaved();
+      }
+    } catch (e) {
+      if (mounted.current) onError(e);
     } finally {
       if (mounted.current) setBusy(false);
     }
@@ -200,7 +304,7 @@ function DocumentEditor({
     return updated.data;
   };
   const fields = async () => {
-    if (busy) return;
+    if (busy || pendingIdentity.current) return;
     setBusy(true);
     try {
       await syncDraft();
@@ -212,7 +316,7 @@ function DocumentEditor({
     }
   };
   const apply = async (command: EditCommand) => {
-    if (busy) return;
+    if (busy || pendingIdentity.current) return;
     setBusy(true);
     try {
       const current = await syncDraft();
@@ -254,6 +358,20 @@ function DocumentEditor({
           返回
         </button>
       </div>
+      {pendingSave && (
+        <div className="notice-bar" role="status">
+          <span>
+            待确认保存任务：{pendingSave}。草稿保留，确认结果后才能再次保存。
+          </span>
+          <button
+            className="btn sm"
+            disabled={busy}
+            onClick={() => void inspectSave()}
+          >
+            查询原保存任务
+          </button>
+        </div>
+      )}
       {recovered && (
         <div className="notice-bar">
           <span>此浏览器保留了尚未同步的编辑内容。</span>
@@ -282,14 +400,14 @@ function DocumentEditor({
         </button>
         <button
           className={`btn ${mode === "fields" ? "primary" : ""}`}
-          disabled={!draft || busy}
+          disabled={!draft || busy || !!pendingSave}
           onClick={() => void fields()}
         >
           字段编辑
         </button>
         <button
           className="btn"
-          disabled={!draft || busy}
+          disabled={!draft || busy || !!pendingSave}
           onClick={() => void save()}
         >
           保存并应用

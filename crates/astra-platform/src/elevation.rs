@@ -231,6 +231,45 @@ pub(crate) fn ensure_user_object(handle: &Handle, path: &Path) -> io::Result<()>
     }
     refuse("is not owned by the current user")
 }
+
+/// Validate an already-open file without taking ownership of its handle.
+pub fn validate_user_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let borrowed = std::mem::ManuallyDrop::new(Handle(file.as_raw_handle()));
+    ensure_user_object(&borrowed, path)
+}
+
+/// Create a private directory owned by the actual user, including under UAC.
+/// Existing objects are only validated; their ownership is never changed.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    let user = user_sid()?;
+    if path.try_exists()? {
+        let directory = open_object(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+        let info = file_information(directory.0)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || owner_sid(directory.0)? != user
+        {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "existing private directory must be a real directory owned by the user"));
+        }
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| io::Error::other("private directory has no parent"))?;
+    create_private_directory(parent)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return create_private_directory(path),
+        Err(error) => return Err(error),
+    }
+    let directory = open_user_object(path, WRITE_OWNER | FILE_READ_ATTRIBUTES)?;
+    let info = file_information(directory.0)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 { return Err(io::Error::other("new private directory was replaced")); }
+    let token = token_information(TokenUser)?;
+    let sid = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+    let error = unsafe { windows_sys::Win32::Security::Authorization::SetSecurityInfo(directory.0, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if error != 0 { return Err(io::Error::from_raw_os_error(error as i32)); }
+    crate::platform::set_private(path, 0o700)
+}
 /// Open an existing user object (see `ensure_user_object`) for `access`.
 pub(crate) fn open_user_object(path: &Path, access: u32) -> io::Result<Handle> {
     let handle = open_object(path, access | READ_CONTROL | FILE_READ_ATTRIBUTES)?;
@@ -387,8 +426,11 @@ fn quote(value: &OsStr) -> Vec<u16> {
 pub struct ElevatedChild {
     handle: Handle,
     exited: bool,
+    detached: bool,
 }
 impl ElevatedChild {
+    /// Successful readiness transfers lifecycle responsibility to the service.
+    pub fn detach(&mut self) { self.detached = true; }
     pub fn id(&self) -> Option<u32> {
         Some(unsafe { GetProcessId(self.handle.0) })
     }
@@ -428,7 +470,7 @@ impl ElevatedChild {
 }
 impl Drop for ElevatedChild {
     fn drop(&mut self) {
-        if !self.exited {
+        if !self.exited && !self.detached {
             let _ = self.start_kill();
         }
     }
@@ -562,6 +604,7 @@ pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
     Ok(ElevatedChild {
         handle: Handle(info.hProcess),
         exited: false,
+        detached: false,
     })
 }
 
@@ -593,13 +636,18 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     if args.first().is_none_or(|arg| arg != "--windows-elevated") {
         return Ok(None);
     }
-    if !matches!(args.len(), 10 | 11) || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
+    if !matches!(args.len(), 10..=12) || !is_elevated()? || args[7] != OsStr::new(&user_sid()?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "TUN elevation requires the original Windows account and an elevated token",
         ));
     }
     let hosted = hosted_argument(args.get(10))?;
+    if let Some(owner) = args.get(11) {
+        let text = owner.to_str().ok_or_else(|| io::Error::other("invalid startup owner"))?;
+        let _: astra_model::control::ProcessIdentity = serde_json::from_str(text).map_err(io::Error::other)?;
+        std::env::set_var("ASTRA_SERVICE_OWNER", text);
+    } else { std::env::remove_var("ASTRA_SERVICE_OWNER"); }
     // This core is driven by its non-elevated launcher (manager/TUI).
     crate::platform::allow_unelevated_clients();
     std::env::set_current_dir(&args[6])?;
@@ -705,6 +753,7 @@ mod tests {
             ElevatedChild {
                 handle: Handle(handle),
                 exited: false,
+                detached: false,
             },
         )
     }

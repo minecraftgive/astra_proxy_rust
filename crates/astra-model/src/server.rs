@@ -1,13 +1,17 @@
 //! Server control DTO shared by cores and management clients.
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 #[derive(Serialize, Deserialize)]
 pub enum Action {
     Status,
     Stop,
     Reload { path: Option<PathBuf> },
     Logs,
+    StopIdentified { boot_id: String, force: bool },
+    CommitService { boot_id: String },
+    /// Additive command; returns internal diagnostics as JSON in Reply.logs.
+    Monitor,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -28,4 +32,5 @@ pub struct Reply {
     pub config: PathBuf,
     pub listeners: Vec<String>,
     pub logs: String,
+    pub identity: Option<crate::control::Identity>,
 }

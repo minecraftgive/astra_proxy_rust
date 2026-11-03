@@ -21,8 +21,37 @@ pub struct AgentService {
     mutation: AsyncMutex<()>,
     capacity: tokio::sync::Semaphore,
     native: std::sync::OnceLock<crate::manager::NativeClient>,
+    uncertain: std::sync::Mutex<std::collections::HashMap<String, Task>>,
 }
+// A started server remains a transaction-owned candidate until readiness is
+// committed. Cancellation must not leave it alive while this manager survives.
+struct ServerCandidate(Option<std::process::Child>);
+impl std::ops::Deref for ServerCandidate {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for ServerCandidate {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for ServerCandidate {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
 impl AgentService {
+    pub(crate) async fn database_closed(&self) -> anyhow::Error {
+        self.store.closed().await
+    }
     pub fn new(config: ManagerConfig) -> Result<Arc<Self>> {
         crate::private_dir(&config.state_dir)?;
         crate::private_dir(&config.config_dir)?;
@@ -55,6 +84,7 @@ impl AgentService {
             mutation: AsyncMutex::new(()),
             capacity,
             native: std::sync::OnceLock::new(),
+            uncertain: Default::default(),
         }))
     }
     pub async fn start_native(&self) -> Result<tokio::task::JoinHandle<Result<()>>> {
@@ -234,6 +264,7 @@ impl AgentService {
     async fn query(&self, mut query: Query) -> Result<ResponseBody> {
         match &mut query {
             Query::Runtime { instance }
+            | Query::Monitor { instance }
             | Query::Document { instance }
             | Query::Capabilities { instance }
             | Query::NodeTags { instance }
@@ -259,6 +290,7 @@ impl AgentService {
                     "documents".into(),
                     "artifacts".into(),
                     "tasks".into(),
+                    "monitor".into(),
                 ],
             }),
             Query::Agents => ResponseBody::Agents(vec![Agent {
@@ -266,6 +298,17 @@ impl AgentService {
                 ..self.identity.clone()
             }]),
             Query::Instances => ResponseBody::Instances(self.instances().await?),
+            Query::Monitor { instance } => {
+                let mut sample: MonitorSnapshot = if self.server_path(&instance).await?.is_some() {
+                    crate::monitor::server(&instance, &self.server_endpoint(&instance)).await?
+                } else {
+                    serde_json::from_str(&self.call(old::Action::Monitor { name: instance.clone() }).await?.text)?
+                };
+                // Legacy management addresses instances by name. The v2 DTO
+                // must use the same durable identity returned by Instances.
+                sample.instance = self.store.identity(&instance).await?;
+                ResponseBody::Monitor(sample)
+            }
             Query::Document { instance } => ResponseBody::Document(self.document(&instance).await?),
             Query::Schema { kind, path } => {
                 let kind = model_kind(kind);
@@ -441,7 +484,12 @@ impl AgentService {
                 })
             }
             Query::Tasks { limit } => {
-                ResponseBody::Tasks(self.store.tasks(limit.unwrap_or(32)).await?)
+                let mut tasks = self.store.tasks(limit.unwrap_or(32)).await?;
+                for task in self.uncertain.lock().unwrap().values() {
+                    tasks.retain(|existing| existing.id != task.id);
+                    tasks.push(task.clone());
+                }
+                ResponseBody::Tasks(tasks)
             }
             Query::UpdateStatus => ResponseBody::UpdateStatus(serde_json::from_str(
                 &self.call(old::Action::UpdateStatus).await?.text,
@@ -455,7 +503,11 @@ impl AgentService {
                 )?)
             }
             Query::Task { operation_id } => {
-                ResponseBody::Task(self.store.task(&operation_id).await?)
+                let uncertain = self.uncertain.lock().unwrap().get(&operation_id).cloned();
+                ResponseBody::Task(match uncertain {
+                    Some(task) => task,
+                    None => self.store.task(&operation_id).await?,
+                })
             }
             Query::Events { after, limit } => ResponseBody::Events(
                 self.store
@@ -474,6 +526,7 @@ impl AgentService {
             .map(|r| {
                 let mut capabilities = vec![
                     "document".into(),
+                    "monitor".into(),
                     "start".into(),
                     "stop".into(),
                     "reload".into(),
@@ -564,6 +617,7 @@ impl AgentService {
                 uptime_secs: status.map_or(0, |s| s.uptime_secs).to_string(),
                 capabilities: vec![
                     "document".into(),
+                    "monitor".into(),
                     "start".into(),
                     "stop".into(),
                     "reload".into(),
@@ -617,7 +671,14 @@ impl AgentService {
     async fn execute(&self, id: String, command: Command) -> Result<ResponseBody> {
         let fingerprint = store::revision(&serde_json::to_string(&command)?);
         if let Some(result) = self.store.begin(&id, &fingerprint).await? {
-            return Ok(result);
+            return Ok(self
+                .uncertain
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .map(ResponseBody::Task)
+                .unwrap_or(result));
         }
         let (progress, mut updates) = tokio::sync::watch::channel(None);
         let operation = astra_ipc::progress::scope(progress, self.command(command, &id));
@@ -628,16 +689,35 @@ impl AgentService {
                 changed=updates.changed()=>{
                     if changed.is_ok(){
                         let event=updates.borrow_and_update().clone();
-                        if let Some(event)=event{self.store.event(Some(&id),&event.phase,&event.detail).await?;}
+                        if let Some(event)=event{if let Err(error)=self.store.event(Some(&id),&event.phase,&event.detail).await {eprintln!("Operation {id} progress persistence failed; execution continues: {error:#}");}}
                     }
                 }
             }
         };
-        let error = result.as_ref().err().map(|e| format!("{e:#}"));
-        self.store
-            .finish(&id, result.as_ref().ok(), error.as_deref())
-            .await?;
+        self.finish_operation(&id, &result).await?;
         result
+    }
+    async fn finish_operation(&self, id: &str, result: &Result<ResponseBody>) -> Result<()> {
+        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        if let Err(error) = self
+            .store
+            .finish(id, result.as_ref().ok(), error.as_deref())
+            .await
+        {
+            let message = format!("outcome unknown for operation {id}: final result could not be persisted ({error:#}); query this operation before retrying");
+            self.uncertain.lock().unwrap().insert(
+                id.into(),
+                Task {
+                    id: id.into(),
+                    state: TaskState::OutcomeUnknown,
+                    message: message.clone(),
+                    started_ms: store::now(),
+                    finished_ms: None,
+                },
+            );
+            anyhow::bail!(message);
+        }
+        Ok(())
     }
     async fn command(&self, mut command: Command, operation_id: &str) -> Result<ResponseBody> {
         match &mut command {
@@ -795,7 +875,7 @@ impl AgentService {
                         .diagnostics(&instance, targets, tx);
                     tokio::pin!(future);
                     let report = loop {
-                        tokio::select! {result=&mut future=>break result?,Some(event)=rx.recv()=>{self.store.event(Some(operation_id),"diagnostics_event",&serde_json::to_string(&browser_numbers(serde_json::to_value(event)?))?).await?;}}
+                        tokio::select! {result=&mut future=>break result?,Some(event)=rx.recv()=>{if let Err(error)=self.store.event(Some(operation_id),"diagnostics_event",&serde_json::to_string(&browser_numbers(serde_json::to_value(event)?))?).await {eprintln!("Diagnostic progress persistence failed; operation continues: {error:#}");}}}
                     };
                     while let Ok(event) = rx.try_recv() {
                         self.store
@@ -885,7 +965,7 @@ impl AgentService {
                     .nettool(&instance, request, tx);
                 tokio::pin!(future);
                 let events = loop {
-                    tokio::select! {result=&mut future=>break result?,Some(event)=rx.recv()=>{self.store.event(Some(operation_id),"nettool_event",&serde_json::to_string(&browser_numbers(serde_json::to_value(event)?))?).await?;}}
+                    tokio::select! {result=&mut future=>break result?,Some(event)=rx.recv()=>{if let Err(error)=self.store.event(Some(operation_id),"nettool_event",&serde_json::to_string(&browser_numbers(serde_json::to_value(event)?))?).await {eprintln!("Network tool progress persistence failed; operation continues: {error:#}");}}}
                 };
                 while let Ok(event) = rx.try_recv() {
                     self.store
@@ -924,17 +1004,22 @@ impl AgentService {
             }
             Command::RecoverUpdate { operation_id } => old::Action::RecoverUpdate { operation_id },
             Command::Shutdown => {
-                for (name, _) in self.servers().await? {
-                    let endpoint = self.server_endpoint(&name);
-                    if endpoint.exists() {
-                        astra_management::server::call(
-                            &endpoint,
-                            astra_management::server::Action::Stop,
-                        )
-                        .await?;
-                    }
+                let mut failures = Vec::new();
+                if let Err(error) = self.shutdown_servers().await {
+                    failures.push(format!("servers: {error:#}"));
                 }
-                old::Action::Shutdown
+                let native = self.call(old::Action::Shutdown).await;
+                if let Err(error) = native {
+                    failures.push(format!("native instances: {error:#}"));
+                }
+                anyhow::ensure!(
+                    failures.is_empty(),
+                    "Shutdown incomplete: {}",
+                    failures.join("; ")
+                );
+                return Ok(ResponseBody::Done {
+                    message: "All instances stopped".into(),
+                });
             }
         };
         let removed = if let old::Action::Remove(name) = &action {
@@ -979,28 +1064,22 @@ impl AgentService {
         path: &Path,
         command: Command,
     ) -> Result<ResponseBody> {
-        use astra_management::server::Action;
         let endpoint = self.server_endpoint(name);
+        if matches!(&command, Command::Remove { .. } | Command::SetConfig { .. })
+            && endpoint.exists()
+        {
+            astra_platform::platform::recover_stale_endpoint(&endpoint)?;
+        }
         match command {
             Command::Start { .. } => self.start_server(name, path).await?,
             Command::Stop { .. } => {
-                astra_management::server::call(&endpoint, Action::Stop).await?;
+                self.stop_server(name).await?;
             }
             Command::Reload { .. } => {
-                astra_management::server::call(&endpoint, Action::Reload { path: None }).await?;
+                self.reload_server(name).await?;
             }
             Command::Restart { .. } => {
-                if astra_management::server::call(&endpoint, Action::Status)
-                    .await
-                    .is_ok()
-                {
-                    astra_management::server::call(&endpoint, Action::Stop).await?;
-                }
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-                while endpoint.exists() && tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                anyhow::ensure!(!endpoint.exists(), "Server is still stopping; retry later");
+                self.stop_server(name).await?;
                 self.start_server(name, path).await?;
             }
             Command::Validate { .. } => self.validate_server(path, &bounded_text(path)?).await?,
@@ -1058,10 +1137,21 @@ impl AgentService {
     }
     async fn start_server(&self, name: &str, path: &Path) -> Result<()> {
         let endpoint = self.server_endpoint(name);
+        if endpoint.exists() {
+            astra_platform::platform::recover_stale_endpoint(&endpoint)?;
+        }
         anyhow::ensure!(
             !endpoint.exists(),
             "Server endpoint exists; inspect the running instance before starting"
         );
+        match astra_platform::storage::read_bounded(&self.server_record(name), 64 * 1024) {
+            Ok(bytes) => {
+                let identity: astra_model::control::Identity = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(!astra_platform::lifecycle::matches_live(&identity.process)?,"Recorded server is still alive; an unresponsive endpoint does not authorize a duplicate start");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         self.validate_server(path, &bounded_text(path)?).await?;
         use astra_platform::platform::OpenOptionsExt;
         let log = std::fs::OpenOptions::new()
@@ -1084,15 +1174,60 @@ impl AgentService {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        command.env(
+            "ASTRA_SERVICE_OWNER",
+            serde_json::to_string(&astra_platform::lifecycle::capture(std::process::id())?)?,
+        );
         astra_platform::platform::background_command(&mut command, true);
-        let mut child = command.spawn()?;
+        let mut child = ServerCandidate(Some(command.spawn()?));
         for _ in 0..100 {
-            if astra_management::server::call(&endpoint, astra_management::server::Action::Status)
-                .await
-                .is_ok()
+            if let Ok(status) =
+                astra_management::server::call(&endpoint, astra_management::server::Action::Status)
+                    .await
             {
-                std::thread::spawn(move || {
+                let ready = (|| -> Result<_> {
+                    let identity = status
+                        .identity
+                        .context("Server does not support lifecycle identity")?;
+                    anyhow::ensure!(
+                        identity.process.pid == child.id()
+                            && astra_platform::lifecycle::matches_live(&identity.process)?,
+                        "Server identity changed during readiness"
+                    );
+                    astra_platform::storage::write_json(&self.server_record(name), &identity)?;
+                    Ok(identity)
+                })();
+                let identity = match ready {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = astra_management::server::call(
+                    &endpoint,
+                    astra_management::server::Action::CommitService {
+                        boot_id: identity.boot_id.clone(),
+                    },
+                )
+                .await
+                {
+                    let _ = child.kill();
                     let _ = child.wait();
+                    return Err(error);
+                }
+                let exited = self
+                    .config
+                    .state_dir
+                    .join(format!("server-{name}.exit.json"));
+                let mut child = child.0.take().unwrap();
+                std::thread::spawn(move || {
+                    let result = child.wait();
+                    let _ = astra_platform::storage::write_json(
+                        &exited,
+                        &serde_json::json!({"boot_id":identity.boot_id,"exit":result.map(|status|status.to_string()).unwrap_or_else(|e|e.to_string()),"timestamp_ms":store::now()}),
+                    );
                 });
                 return Ok(());
             }
@@ -1101,11 +1236,149 @@ impl AgentService {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        // It may still be starting; keep ownership/reaping and report uncertainty, never spawn a replacement.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-        anyhow::bail!("Server startup outcome unknown; inspect status before retrying")
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!(
+            "Server did not confirm readiness; candidate stopped, inspect its retained log"
+        )
+    }
+    fn server_record(&self, name: &str) -> PathBuf {
+        self.config
+            .state_dir
+            .join(format!("server-{name}.process.json"))
+    }
+    async fn reload_server(&self, name: &str) -> Result<()> {
+        let previous = self.verify_server(name).await?;
+        let reply = astra_management::server::call(
+            &self.server_endpoint(name),
+            astra_management::server::Action::Reload { path: None },
+        )
+        .await?;
+        let identity = reply
+            .identity
+            .context("Reload response has no lifecycle identity")?;
+        anyhow::ensure!(
+            identity.boot_id == previous.boot_id && identity.process == previous.process,
+            "Outcome unknown: server identity changed during reload"
+        );
+        astra_platform::storage::write_json(&self.server_record(name), &identity)
+            .context("Outcome unknown: reload completed but process record checkpoint failed")?;
+        Ok(())
+    }
+    async fn verify_server(&self, name: &str) -> Result<astra_model::control::Identity> {
+        let recorded: astra_model::control::Identity = serde_json::from_slice(
+            &astra_platform::storage::read_bounded(&self.server_record(name), 64 * 1024)?,
+        )?;
+        anyhow::ensure!(
+            astra_platform::lifecycle::matches_live(&recorded.process)?,
+            "Recorded server process has exited"
+        );
+        let status = astra_management::server::call(
+            &self.server_endpoint(name),
+            astra_management::server::Action::Status,
+        )
+        .await?;
+        let actual = status
+            .identity
+            .context("Server lifecycle identity unavailable")?;
+        anyhow::ensure!(
+            actual.boot_id == recorded.boot_id && actual.process == recorded.process,
+            "Server boot identity mismatch; operation rejected"
+        );
+        let path = self
+            .server_path(name)
+            .await?
+            .context("Server registration missing")?;
+        anyhow::ensure!(
+            actual.applied.as_ref().is_some_and(
+                |a| std::fs::canonicalize(&a.path).ok() == std::fs::canonicalize(&path).ok()
+            ),
+            "Server configuration binding mismatch"
+        );
+        astra_platform::storage::write_json(&self.server_record(name), &actual)?;
+        Ok(actual)
+    }
+    async fn stop_server(&self, name: &str) -> Result<()> {
+        let endpoint = self.server_endpoint(name);
+        let record = self.server_record(name);
+        match astra_platform::storage::read_bounded(&record, 64 * 1024) {
+            Ok(bytes) => {
+                let identity: astra_model::control::Identity = serde_json::from_slice(&bytes)?;
+                if !astra_platform::lifecycle::matches_live(&identity.process)? {
+                    astra_platform::platform::recover_stale_endpoint(&endpoint)?;
+                    std::fs::remove_file(record)?;
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !endpoint.exists() => {
+                return Ok(())
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let identity = self.verify_server(name).await?;
+        astra_management::server::call(
+            &endpoint,
+            astra_management::server::Action::StopIdentified {
+                boot_id: identity.boot_id.clone(),
+                force: false,
+            },
+        )
+        .await?;
+        let wait = async {
+            while astra_platform::lifecycle::matches_live(&identity.process)? {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), wait).await;
+        if let Ok(result) = &stopped {
+            result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("Could not observe server exit: {error}"))?;
+        }
+        if stopped.is_err() {
+            astra_management::server::call(
+                &endpoint,
+                astra_management::server::Action::StopIdentified {
+                    boot_id: identity.boot_id,
+                    force: true,
+                },
+            )
+            .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while astra_platform::lifecycle::matches_live(&identity.process)? {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await??;
+        }
+        astra_platform::platform::recover_stale_endpoint(&endpoint)?;
+        match std::fs::remove_file(record) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+    pub(crate) async fn shutdown_servers(&self) -> Result<()> {
+        let names = self.servers().await?;
+        let results = futures_util::future::join_all(
+            names
+                .iter()
+                .map(|(name, _)| async move { (name, self.stop_server(name).await) }),
+        )
+        .await;
+        let errors: Vec<_> = results
+            .into_iter()
+            .filter_map(|(name, result)| result.err().map(|error| format!("{name}: {error:#}")))
+            .collect();
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Server shutdown incomplete: {}",
+            errors.join("; ")
+        );
+        Ok(())
     }
     async fn validate_server(&self, path: &Path, text: &str) -> Result<()> {
         let mut child = tokio::process::Command::new(self.server_binary())
@@ -1232,10 +1505,7 @@ impl AgentService {
                         *error = crate::save::SaveFailure { outcome }.into();
                     }
                 }
-                let error = result.as_ref().err().map(|e| format!("{e:#}"));
-                self.store
-                    .finish(&operation_id, result.as_ref().ok(), error.as_deref())
-                    .await?;
+                self.finish_operation(&operation_id, &result).await?;
                 result
             }
         }
@@ -1269,6 +1539,9 @@ impl AgentService {
                 store::revision(&bounded_text(&draft.path)?) == source,
                 "Conflict: source changed during validation"
             );
+            if self.server_endpoint(&instance_name).exists() {
+                self.verify_server(&instance_name).await?;
+            }
             let backups = self.config.state_dir.join("backups");
             crate::private_dir(&backups)?;
             crate::atomic_write(
@@ -1278,23 +1551,13 @@ impl AgentService {
             crate::atomic_write(&draft.path, draft.text.as_bytes())?;
             let endpoint = self.server_endpoint(&instance_name);
             if endpoint.exists() {
-                if let Err(error) = astra_management::server::call(
-                    &endpoint,
-                    astra_management::server::Action::Reload { path: None },
-                )
-                .await
-                {
+                if let Err(error) = self.reload_server(&instance_name).await {
                     if let Err(restore) =
                         crate::atomic_write(&draft.path, draft.original.as_bytes())
                     {
                         return Err(crate::save::failed(SaveState::RecoveryFailed,None,None,format!("Server reload failed: {error:#}; restoring source failed: {restore:#}; draft and backup retained")));
                     }
-                    if let Err(restore) = astra_management::server::call(
-                        &endpoint,
-                        astra_management::server::Action::Reload { path: None },
-                    )
-                    .await
-                    {
+                    if let Err(restore) = self.reload_server(&instance_name).await {
                         return Err(crate::save::failed(SaveState::OutcomeUnknown,Some(false),None,format!("Server reload failed: {error:#}; source restored but runtime could not be confirmed: {restore:#}; draft retained")));
                     }
                     return Err(crate::save::failed(SaveState::Restored,Some(false),Some(false),format!("Server reload failed: {error:#}; previous source and runtime restored; draft retained")));

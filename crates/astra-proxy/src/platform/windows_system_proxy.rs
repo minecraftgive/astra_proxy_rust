@@ -10,7 +10,7 @@ use std::{
 };
 use windows_sys::Win32::{Foundation::GlobalFree, Networking::WinInet::*};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
     flags: u32,
@@ -18,12 +18,14 @@ struct Settings {
     bypass: Option<String>,
     auto_config_url: Option<String>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Snapshot {
+pub(super) struct Snapshot {
     provider: String,
     version: u32,
     original: Settings,
+    #[serde(default)]
+    expected: Option<Settings>,
 }
 #[derive(Default)]
 pub struct Guard {
@@ -31,6 +33,8 @@ pub struct Guard {
     journal: Option<PathBuf>,
     lock: Option<File>,
     monitor: Option<Monitor>,
+    expected: Option<Settings>,
+    lease: Option<super::network_recovery::Lease>,
 }
 
 // Stop and join before restoring settings so a pending repair cannot undo restore.
@@ -64,14 +68,11 @@ fn monitor(expected: Settings) -> Result<Monitor> {
             ) {
                 match query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS)) {
                     Ok(actual) if matches_expected(&actual, &expected) => continue,
-                    Ok(_) => tracing::warn!("Windows system proxy settings changed or disabled; reapplying"),
+                    Ok(_) => { tracing::warn!("Windows system proxy settings changed externally; preserving the change"); break; },
                     Err(error) => {
                         tracing::warn!(%error, "failed to check Windows system proxy; retrying next interval");
                         continue;
                     }
-                }
-                if let Err(error) = write(&expected) {
-                    tracing::warn!(%error, "failed to reapply Windows system proxy; retrying next interval");
                 }
             }
         })?;
@@ -239,13 +240,21 @@ impl Guard {
             (None, Some(address)) => format!("socks={address}"),
             (None, None) => unreachable!("listener validated above"),
         };
+        super::network_recovery::ensure()?;
         let mut lock = lock(None)?;
         let original =
             query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;
+        let expected = Settings {
+            flags: PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
+            server: Some(server),
+            bypass: Some("<local>".into()),
+            auto_config_url: Some(String::new()),
+        };
         let snapshot = Snapshot {
             provider: "windows-wininet-lan".into(),
             version: 1,
             original: original.clone(),
+            expected: Some(expected.clone()),
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -268,11 +277,19 @@ impl Guard {
             let _ = std::fs::remove_file(journal);
             return Err(error);
         }
+        let lease = super::network_recovery::Lease::prepare(
+            super::network_recovery::Resource::SystemProxy {
+                path: std::fs::canonicalize(journal)?,
+                snapshot: Some(snapshot.clone()),
+            },
+        )?;
         let mut guard = Self {
             original: Some(original),
             journal: Some(journal.to_owned()),
             lock: None,
             monitor: None,
+            expected: Some(expected.clone()),
+            lease: Some(lease),
         };
         lock.set_len(0)?;
         lock.write_all(
@@ -283,21 +300,25 @@ impl Guard {
         )?;
         lock.sync_all()?;
         guard.lock = Some(lock);
-        // Only DIRECT + PROXY: temporarily suppress PAC and auto-detection.
-        let expected = Settings {
-            flags: PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
-            server: Some(server),
-            bypass: Some("<local>".into()),
-            auto_config_url: Some(String::new()),
-        };
         write(&expected)?;
+        guard.lease.as_ref().unwrap().commit()?;
         guard.monitor = Some(monitor(expected)?);
         Ok(guard)
     }
     pub fn restore(&mut self) -> Result<()> {
         drop(self.monitor.take());
         if let Some(original) = &self.original {
-            write(original)?;
+            let actual =
+                query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;
+            if !matches_expected(&actual, original) {
+                ensure!(
+                    self.expected
+                        .as_ref()
+                        .is_none_or(|expected| matches_expected(&actual, expected)),
+                    "Windows proxy changed externally; recovery record retained"
+                );
+                write(original)?;
+            }
             if let Some(lock) = &mut self.lock {
                 lock.set_len(0)?;
                 lock.sync_all()?;
@@ -309,6 +330,10 @@ impl Guard {
                     Err(error) => return Err(error.into()),
                 }
             }
+            if let Some(lease) = &self.lease {
+                lease.complete()?;
+            }
+            self.lease = None;
             self.original = None;
             self.journal = None;
             self.lock = None;
@@ -319,26 +344,73 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Err(error) = self.restore() {
+            if let Some(lease) = &self.lease {
+                lease.failed(&error);
+            }
             tracing::error!(%error, "Windows proxy recovery remains pending");
         }
     }
 }
 pub fn recover(path: &Path) -> Result<()> {
-    let lock = lock(Some(path))?;
-    let mut text = String::new();
-    File::open(path)?
-        .take(1024 * 1024)
-        .read_to_string(&mut text)?;
-    let snapshot: Snapshot = toml::from_str(&text)?;
+    let text = super::network_recovery::read_private(path, 1024 * 1024)?;
+    let snapshot: Snapshot = toml::from_str(std::str::from_utf8(&text)?)?;
+    restore_snapshot(path, &snapshot)
+}
+fn restore_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
     ensure!(
         snapshot.version == 1 && snapshot.provider == "windows-wininet-lan",
         "unsupported Windows proxy recovery document"
     );
+    let lock = lock(Some(path))?;
     Guard {
-        original: Some(snapshot.original),
+        original: Some(snapshot.original.clone()),
         journal: Some(path.to_owned()),
         lock: Some(lock),
         monitor: None,
+        expected: snapshot.expected.clone(),
+        lease: None,
     }
     .restore()
+}
+pub(super) fn recover_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
+    ensure!(
+        snapshot.expected.is_some(),
+        "legacy proxy snapshot requires explicit --restore-system-proxy"
+    );
+    restore_snapshot(path, snapshot)
+}
+/// Automatic recovery requires the expected value; legacy records stay manual.
+pub(super) fn recover_owned(path: &Path) -> Result<()> {
+    let bytes = super::network_recovery::read_private(path, 1024 * 1024)?;
+    let snapshot: Snapshot = toml::from_str(std::str::from_utf8(&bytes)?)?;
+    ensure!(
+        snapshot.expected.is_some(),
+        "legacy proxy snapshot requires explicit --restore-system-proxy"
+    );
+    recover(path)
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn matching_proxy_requires_all_managed_properties() {
+        let original = Settings {
+            flags: 3,
+            server: Some("127.0.0.1:8080".into()),
+            bypass: Some("<local>".into()),
+            auto_config_url: None,
+        };
+        let mut actual = original.clone();
+        actual.auto_config_url = Some(String::new());
+        assert!(matches_expected(&actual, &original));
+        actual.server = Some("another.proxy:3128".into());
+        assert!(!matches_expected(&actual, &original));
+        actual = original.clone();
+        actual.flags = 1;
+        assert!(!matches_expected(&actual, &original));
+        actual = original.clone();
+        actual.auto_config_url = Some("https://example.invalid/pac".into());
+        assert!(!matches_expected(&actual, &original));
+    }
 }

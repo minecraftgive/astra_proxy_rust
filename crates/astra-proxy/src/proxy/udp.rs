@@ -5,12 +5,12 @@ use astra_model::Inbound;
 use astra_model::Network;
 use astra_model::RouteAction;
 use astra_model::Target;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use meow_common::ProxyPacketConn;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -23,15 +23,15 @@ use tokio::{
 
 const MAX_PACKET: usize = 65507;
 const QUEUE_PACKETS: usize = 4;
-type Activity = Arc<Mutex<Instant>>;
+type Activity = tokio::sync::watch::Sender<Instant>;
 fn touch(activity: &Activity) {
-    *activity.lock().unwrap() = Instant::now();
+    activity.send_replace(Instant::now());
 }
 async fn idle(activity: Activity, duration: Duration) {
     loop {
-        let deadline = *activity.lock().unwrap() + duration;
+        let deadline = *activity.borrow() + duration;
         tokio::time::sleep_until(deadline.into()).await;
-        if activity.lock().unwrap().elapsed() >= duration {
+        if activity.borrow().elapsed() >= duration {
             return;
         }
     }
@@ -69,17 +69,15 @@ where
     )?;
     control.write_all(&reply).await?;
     let mut source = (requested.port != 0).then(|| SocketAddr::new(peer.ip(), requested.port));
-    let activity = Arc::new(Mutex::new(Instant::now()));
+    let (activity, _) = tokio::sync::watch::channel(Instant::now());
     let idle_time = Duration::from_secs(app.config.udp_idle_timeout_secs);
     let expiry = idle(activity.clone(), idle_time);
     tokio::pin!(expiry);
     let mut workers = JoinSet::new();
     let mut flows: HashMap<Target, mpsc::Sender<Bytes>> = HashMap::new();
-    let mut packet = BytesMut::with_capacity(65536);
+    let mut packet = vec![0; 65536];
     let mut control_byte = [0];
     loop {
-        packet.clear();
-        packet.reserve(65536);
         tokio::select! {
             // Terminating the control connection terminates every UDP task.
             _ = control.read(&mut control_byte) => break,
@@ -87,7 +85,7 @@ where
             Some(_) = workers.join_next(), if !workers.is_empty() => {
                 flows.retain(|_, sender| !sender.is_closed());
             }
-            received = socket.recv_buf_from(&mut packet) => {
+            received = socket.recv_from(&mut packet) => {
                 let (len, from) = received?;
                 if from.ip() != peer.ip() || source.is_some_and(|s| s != from) { continue; }
                 let Ok((target, body)) = decode(&packet[..len]) else { continue; };
@@ -125,9 +123,8 @@ where
                     });
                 }
                 // UDP overload drops packets instead of blocking all destinations.
-                let body_start = len - body.len();
-                let body = packet.split_to(len).freeze().slice(body_start..);
-                let _ = flows[&target].try_send(body);
+                // Copy only the payload so a queued datagram never pins the receive buffer.
+                let _ = flows[&target].try_send(Bytes::copy_from_slice(body));
             }
         }
     }
@@ -333,7 +330,7 @@ async fn flow(
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
         target.port,
     );
-    let activity = Arc::new(Mutex::new(Instant::now()));
+    let (activity, _) = tokio::sync::watch::channel(Instant::now());
     let upload = async {
         while let Some(packet) = requests.recv().await {
             connection.send(&packet, destination).await?;

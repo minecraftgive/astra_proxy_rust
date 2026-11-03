@@ -291,11 +291,14 @@ pub struct Route {
 struct RouteOwner {
     row: MIB_IPFORWARD_ROW2,
     identity: RouteIdentity,
+    lease: super::network_recovery::Lease,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RouteIdentity {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct RouteIdentity {
     network: ipnet::IpNet,
+    luid: u64,
+    adapter: Option<[u8; 16]>,
     interface: u32,
     next_hop: IpAddr,
     scope: u32,
@@ -325,6 +328,8 @@ impl RouteIdentity {
             network: ipnet::IpNet::new(prefix, row.DestinationPrefix.PrefixLength)
                 .ok()?
                 .trunc(),
+            luid: unsafe { row.InterfaceLuid.Value },
+            adapter: adapter_guid(row.InterfaceIndex).ok(),
             interface: row.InterfaceIndex,
             next_hop,
             scope,
@@ -405,6 +410,7 @@ impl Route {
             InitializeIpForwardEntry(&mut row);
         }
         row.InterfaceIndex = index;
+        check(unsafe { ConvertInterfaceIndexToLuid(index, &mut row.InterfaceLuid) })?;
         row.DestinationPrefix.Prefix = sockaddr(network.network(), index);
         row.DestinationPrefix.PrefixLength = network.prefix_len();
         row.NextHop = sockaddr(next, index);
@@ -437,8 +443,16 @@ impl Route {
             return Ok(Self { _owner: owner });
         }
         reject_existing_prefix(network)?;
+        let lease = super::network_recovery::Lease::prepare(
+            super::network_recovery::Resource::WindowsRoute(identity.clone()),
+        )?;
         check(unsafe { CreateIpForwardEntry2(&row) }).with_context(|| format!("add Windows route {cidr} via interface {index} (requires administrator; existing routes are never overwritten)"))?;
-        let owner = std::sync::Arc::new(RouteOwner { row, identity });
+        let owner = std::sync::Arc::new(RouteOwner {
+            row,
+            identity,
+            lease,
+        });
+        owner.lease.commit()?;
         owners()
             .lock()
             .unwrap()
@@ -448,21 +462,377 @@ impl Route {
 }
 impl Drop for RouteOwner {
     fn drop(&mut self) {
-        let mut current = self.row;
-        let found = unsafe { GetIpForwardEntry2(&mut current) };
-        if found == 1168 {
-            return;
-        } // ERROR_NOT_FOUND: interface/route already removed.
-        if found != 0 || current.Metric != self.row.Metric || current.Protocol != self.row.Protocol
+        match recover_route(&self.identity, true) {
+            Ok(()) => {
+                if let Err(error) = self.lease.complete() {
+                    tracing::error!(%error, "route cleanup checkpoint failed");
+                }
+            }
+            Err(error) => {
+                self.lease.failed(&error);
+                tracing::error!(%error, "owned route recovery remains pending");
+            }
+        }
+    }
+}
+pub(super) fn recover_route(identity: &RouteIdentity, committed: bool) -> Result<()> {
+    ensure!(
+        identity.adapter.is_some(),
+        "route adapter identity was not recorded"
+    );
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+        row.InterfaceLuid.Value = identity.luid;
+    }
+    row.InterfaceIndex = identity.interface;
+    row.DestinationPrefix.Prefix = sockaddr(identity.network.network(), identity.interface);
+    row.DestinationPrefix.PrefixLength = identity.network.prefix_len();
+    row.NextHop = sockaddr(identity.next_hop, identity.scope);
+    let found = unsafe { GetIpForwardEntry2(&mut row) };
+    if found == 1168 || found == 2 {
+        return Ok(());
+    }
+    check(found)?;
+    ensure!(
+        committed,
+        "route creation outcome is unknown; refusing to remove an unconfirmed route"
+    );
+    ensure!(
+        RouteIdentity::from_row(&row).as_ref() == Some(identity),
+        "route changed externally; preserving it"
+    );
+    check(unsafe { DeleteIpForwardEntry2(&row) })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct InterfaceParameters {
+    family: u16,
+    mtu: u32,
+    metric: u32,
+    automatic: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AddressProperties {
+    valid_lifetime: u32,
+    preferred_lifetime: u32,
+    prefix_origin: i32,
+    suffix_origin: i32,
+    skip_as_source: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AdapterAddress {
+    address: IpAddr,
+    prefix: u8,
+    #[serde(default)]
+    properties: Option<AddressProperties>,
+}
+// Address lifetimes count down and DAD state changes without an external edit.
+// Existing matching addresses are left untouched; captured properties are used
+// only when recreating an original address removed by our IPv4 replacement.
+impl PartialEq for AdapterAddress {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address && self.prefix == other.prefix
+    }
+}
+impl Eq for AdapterAddress {}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AdapterValues {
+    parameters: Vec<InterfaceParameters>,
+    addresses: Vec<AdapterAddress>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct AdapterSnapshot {
+    index: u32,
+    guid: [u8; 16],
+    before: AdapterValues,
+    expected: AdapterValues,
+}
+fn adapter_guid(index: u32) -> Result<[u8; 16]> {
+    let mut row = MIB_IF_ROW2 {
+        InterfaceIndex: index,
+        ..Default::default()
+    };
+    check(unsafe { GetIfEntry2(&mut row) })?;
+    Ok(unsafe { std::mem::transmute::<windows_sys::core::GUID, [u8; 16]>(row.InterfaceGuid) })
+}
+fn adapter_values(index: u32) -> Result<AdapterValues> {
+    let mut parameters = vec![];
+    for family in [AF_INET, AF_INET6] {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceIndex: index,
+            ..Default::default()
+        };
+        check(unsafe { GetIpInterfaceEntry(&mut row) })?;
+        parameters.push(InterfaceParameters {
+            family,
+            mtu: row.NlMtu,
+            metric: row.Metric,
+            automatic: row.UseAutomaticMetric,
+        });
+    }
+    let mut table = std::ptr::null_mut();
+    check(unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut table) })?;
+    let mut addresses = vec![];
+    unsafe {
+        for row in std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
         {
-            tracing::warn!(
-                error = found,
-                "owned Windows route changed externally; preserving it"
-            );
-            return;
+            if row.InterfaceIndex == index {
+                if let Some((address, _)) = address(row.Address) {
+                    addresses.push(AdapterAddress {
+                        address,
+                        prefix: row.OnLinkPrefixLength,
+                        properties: Some(AddressProperties {
+                            valid_lifetime: row.ValidLifetime,
+                            preferred_lifetime: row.PreferredLifetime,
+                            prefix_origin: row.PrefixOrigin,
+                            suffix_origin: row.SuffixOrigin,
+                            skip_as_source: row.SkipAsSource,
+                        }),
+                    });
+                }
+            }
         }
-        if let Err(error) = check(unsafe { DeleteIpForwardEntry2(&self.row) }) {
-            tracing::error!(%error, "failed to remove owned Windows TUN route");
+        FreeMibTable(table.cast());
+    }
+    addresses.sort_by_key(|a| (a.address, a.prefix));
+    Ok(AdapterValues {
+        parameters,
+        addresses,
+    })
+}
+pub(super) struct AdapterGuard {
+    snapshot: AdapterSnapshot,
+    lease: super::network_recovery::Lease,
+}
+impl AdapterGuard {
+    pub fn prepare(index: u32, config: &super::mode_config::Tun) -> Result<Self> {
+        let guid = adapter_guid(index)?;
+        let before = adapter_values(index)?;
+        let mut expected = before.clone();
+        for p in &mut expected.parameters {
+            if p.family == AF_INET {
+                p.mtu = config.mtu.into();
+            }
+            p.metric = 5;
+            p.automatic = false;
         }
+        expected.addresses.retain(|a| a.address.is_ipv6());
+        expected.addresses.push(AdapterAddress {
+            address: config.address.into(),
+            prefix: config.prefix,
+            properties: None,
+        });
+        if let Some(address) = config.ipv6_address {
+            let value = AdapterAddress {
+                address: address.into(),
+                prefix: config.ipv6_prefix,
+                properties: None,
+            };
+            if !expected.addresses.contains(&value) {
+                expected.addresses.push(value);
+            }
+        }
+        expected.addresses.sort_by_key(|a| (a.address, a.prefix));
+        let snapshot = AdapterSnapshot {
+            index,
+            guid,
+            before,
+            expected,
+        };
+        let lease = super::network_recovery::Lease::prepare(
+            super::network_recovery::Resource::WindowsAdapter(snapshot.clone()),
+        )?;
+        Ok(Self { snapshot, lease })
+    }
+    pub fn commit(&self) -> Result<()> {
+        self.lease.commit()
+    }
+}
+impl Drop for AdapterGuard {
+    fn drop(&mut self) {
+        match recover_adapter(&self.snapshot, true) {
+            Ok(()) => {
+                if let Err(error) = self.lease.complete() {
+                    tracing::error!(%error, "adapter restoration checkpoint failed");
+                }
+            }
+            Err(error) => {
+                self.lease.failed(&error);
+                tracing::error!(%error, "adapter restoration remains pending");
+            }
+        }
+    }
+}
+fn validate_adapter_restoration(snapshot: &AdapterSnapshot, actual: &AdapterValues) -> Result<()> {
+    ensure!(
+        actual.parameters.len() == snapshot.before.parameters.len()
+            && actual.parameters.len() == snapshot.expected.parameters.len(),
+        "adapter address families changed externally"
+    );
+    // Compare each property independently so partial setup/restoration is retryable.
+    for ((actual, before), expected) in actual
+        .parameters
+        .iter()
+        .zip(&snapshot.before.parameters)
+        .zip(&snapshot.expected.parameters)
+    {
+        ensure!(
+            (actual.mtu == before.mtu || actual.mtu == expected.mtu)
+                && (actual.metric == before.metric || actual.metric == expected.metric)
+                && (actual.automatic == before.automatic || actual.automatic == expected.automatic),
+            "adapter parameters changed externally"
+        );
+    }
+    ensure!(
+        actual
+            .addresses
+            .iter()
+            .all(|a| snapshot.before.addresses.contains(a)
+                || snapshot.expected.addresses.contains(a)),
+        "adapter addresses changed externally"
+    );
+    ensure!(
+        snapshot
+            .before
+            .addresses
+            .iter()
+            .filter(|a| snapshot.expected.addresses.contains(a))
+            .all(|a| actual.addresses.contains(a)),
+        "unchanged adapter address removed externally"
+    );
+    Ok(())
+}
+pub(super) fn recover_adapter(snapshot: &AdapterSnapshot, _committed: bool) -> Result<()> {
+    let guid = match adapter_guid(snapshot.index) {
+        Ok(value) => value,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| matches!(e.raw_os_error(), Some(1168 | 2))) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    ensure!(
+        guid == snapshot.guid,
+        "adapter identity changed; preserving it"
+    );
+    let actual = adapter_values(snapshot.index)?;
+    if actual == snapshot.before {
+        return Ok(());
+    }
+    validate_adapter_restoration(snapshot, &actual)?;
+    for before in &snapshot.before.parameters {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: before.family,
+            InterfaceIndex: snapshot.index,
+            ..Default::default()
+        };
+        check(unsafe { GetIpInterfaceEntry(&mut row) })?;
+        row.NlMtu = before.mtu;
+        row.Metric = before.metric;
+        row.UseAutomaticMetric = before.automatic;
+        row.SitePrefixLength = 0;
+        check(unsafe { SetIpInterfaceEntry(&mut row) })?;
+    }
+    for current in actual
+        .addresses
+        .iter()
+        .filter(|a| !snapshot.before.addresses.contains(a))
+    {
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        unsafe {
+            InitializeUnicastIpAddressEntry(&mut row);
+        }
+        row.InterfaceIndex = snapshot.index;
+        row.Address = sockaddr(current.address, snapshot.index);
+        check(unsafe { DeleteUnicastIpAddressEntry(&row) })?;
+    }
+    for before in snapshot
+        .before
+        .addresses
+        .iter()
+        .filter(|a| !actual.addresses.contains(a))
+    {
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        unsafe {
+            InitializeUnicastIpAddressEntry(&mut row);
+        }
+        row.InterfaceIndex = snapshot.index;
+        row.Address = sockaddr(before.address, snapshot.index);
+        row.OnLinkPrefixLength = before.prefix;
+        row.PrefixOrigin = IpPrefixOriginManual;
+        row.SuffixOrigin = IpSuffixOriginManual;
+        row.DadState = IpDadStatePreferred;
+        if let Some(properties) = &before.properties {
+            row.ValidLifetime = properties.valid_lifetime;
+            row.PreferredLifetime = properties.preferred_lifetime;
+            row.PrefixOrigin = properties.prefix_origin;
+            row.SuffixOrigin = properties.suffix_origin;
+            row.SkipAsSource = properties.skip_as_source;
+        }
+        let result = unsafe { CreateUnicastIpAddressEntry(&row) };
+        if result != 5010 {
+            check(result)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn partial_adapter_setup_is_recoverable_but_external_changes_are_preserved() {
+        let before = AdapterValues {
+            parameters: vec![InterfaceParameters {
+                family: AF_INET,
+                mtu: 1500,
+                metric: 25,
+                automatic: true,
+            }],
+            addresses: vec![AdapterAddress {
+                address: "192.0.2.1".parse().unwrap(),
+                prefix: 24,
+                properties: None,
+            }],
+        };
+        let expected = AdapterValues {
+            parameters: vec![InterfaceParameters {
+                family: AF_INET,
+                mtu: 1400,
+                metric: 5,
+                automatic: false,
+            }],
+            addresses: vec![AdapterAddress {
+                address: "198.18.0.1".parse().unwrap(),
+                prefix: 30,
+                properties: None,
+            }],
+        };
+        let snapshot = AdapterSnapshot {
+            index: 1,
+            guid: [0; 16],
+            before: before.clone(),
+            expected: expected.clone(),
+        };
+        let mut partial = before.clone();
+        partial.parameters[0].mtu = 1400;
+        validate_adapter_restoration(&snapshot, &partial).unwrap();
+        partial.addresses.clear();
+        validate_adapter_restoration(&snapshot, &partial).unwrap();
+        validate_adapter_restoration(&snapshot, &expected).unwrap();
+        partial.parameters[0].metric = 17;
+        assert!(validate_adapter_restoration(&snapshot, &partial).is_err());
+        partial = before.clone();
+        partial.addresses.push(AdapterAddress {
+            address: "203.0.113.9".parse().unwrap(),
+            prefix: 24,
+            properties: None,
+        });
+        assert!(validate_adapter_restoration(&snapshot, &partial).is_err());
     }
 }

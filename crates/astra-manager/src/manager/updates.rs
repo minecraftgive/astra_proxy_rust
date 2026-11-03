@@ -19,7 +19,15 @@ pub(super) struct Updates {
     tracking: bool,
 }
 struct RuleGeneration {
-    child: Child,
+    child: ManagedChild,
+    socket: String,
+    control: PathBuf,
+    log: PathBuf,
+}
+#[derive(Serialize, Deserialize)]
+struct RuleRecord {
+    version: u16,
+    identity: astra_model::control::Identity,
     socket: String,
     control: PathBuf,
     log: PathBuf,
@@ -85,6 +93,67 @@ struct SourceSnapshot {
 }
 
 impl Manager {
+    pub(super) async fn stop_rule_generations(&mut self) -> Result<()> {
+        let mut failed = Vec::new();
+        let mut errors = Vec::new();
+        for mut generation in self.updates.rule_generations.drain(..) {
+            if let Err(error) = stop_rule(&mut generation).await {
+                errors.push(format!("{}: {error:#}", generation.control.display()));
+                failed.push(generation);
+            }
+        }
+        self.updates.rule_generations = failed;
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Rule generation shutdown incomplete: {}",
+            errors.join("; ")
+        );
+        Ok(())
+    }
+    pub(super) async fn recover_rule_generations(&mut self) -> Result<()> {
+        for entry in fs::read_dir(&self.home)? {
+            let path = entry?.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.starts_with("uc-") || !name.ends_with(".process.json") {
+                continue;
+            }
+            let result = async {
+                let record: RuleRecord = serde_json::from_slice(
+                    &astra_platform::storage::read_bounded(&path, 64 * 1024)?)?;
+                anyhow::ensure!(record.version == 1
+                    && record.control.parent() == Some(&self.home)
+                    && record.control.with_extension("process.json") == path
+                    && Path::new(&record.socket).parent() == Some(&self.home),
+                    "Rule generation record binding mismatch");
+                if !recovery::possibly_live(&record.identity.process)? {
+                    fs::remove_file(&path)?;
+                    return Ok(None);
+                }
+                let actual = control::identity(&record.control).await
+                    .context("Live rule generation identity could not be verified; retained without adoption")?;
+                anyhow::ensure!(actual.boot_id == record.identity.boot_id
+                    && actual.process == record.identity.process
+                    && actual.applied == record.identity.applied,
+                    "Rule generation identity or configuration changed");
+                Ok::<_,anyhow::Error>(Some(RuleGeneration {
+                    child: ManagedChild::Reattached(recovery::Reattached {
+                        identity: record.identity, endpoint: record.control.clone(),
+                    }), socket: record.socket, control: record.control, log: record.log,
+                }))
+            }.await;
+            match result {
+                Ok(Some(generation)) => self.updates.rule_generations.push(generation),
+                Ok(None) => {}
+                Err(error) => {
+                    self.blocked.insert(
+                        name.into_owned(),
+                        format!("Unverified rule generation: {error:#}"),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
     async fn source_rule_revisions(&self) -> Result<HashMap<String, u64>> {
         let queries = self
             .registry
@@ -566,18 +635,26 @@ impl Manager {
         let mut command = astra_platform::platform::background_core(
             directory.join(astra_platform::platform::executable("astra-rule")),
         );
-        let mut child = command
-            .arg("--host-worker")
-            .arg(&instance.config)
-            .env("ASTRA_CONTROL_SOCKET", &control)
-            .env("ASTRA_RUNTIME_DIR", &self.runtime_dir)
-            .env("ASTRA_LOG_LEVEL", self.level(&instance.name).as_str())
-            .stdin(Stdio::piped())
-            .stdout(output.try_clone()?)
-            .stderr(output)
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("Start rule generation; log: {}", log.display()))?;
+        let mut child = OwnedChild::new(
+            command
+                .arg("--host-worker")
+                .arg(&instance.config)
+                .env("ASTRA_CONTROL_SOCKET", &control)
+                .env("ASTRA_RUNTIME_DIR", &self.runtime_dir)
+                .env("ASTRA_LOG_LEVEL", self.level(&instance.name).as_str())
+                .env(
+                    "ASTRA_SERVICE_OWNER",
+                    serde_json::to_string(
+                        &astra_platform::lifecycle::capture(std::process::id())?,
+                    )?,
+                )
+                .stdin(Stdio::piped())
+                .stdout(output.try_clone()?)
+                .stderr(output)
+                .kill_on_drop(false)
+                .spawn()
+                .with_context(|| format!("Start rule generation; log: {}", log.display()))?,
+        );
         let ready = async {
             let mut stdin = child
                 .stdin
@@ -606,7 +683,7 @@ impl Manager {
         }
         .await;
         let mut generation = RuleGeneration {
-            child,
+            child: ManagedChild::Normal(Box::new(child)),
             socket: route.to_string_lossy().into_owned(),
             control,
             log,
@@ -620,6 +697,26 @@ impl Manager {
                 )
             });
         }
+        let identity = control::identity(&generation.control).await?;
+        let record = RuleRecord {
+            version: 1,
+            identity,
+            socket: generation.socket.clone(),
+            control: generation.control.clone(),
+            log: generation.log.clone(),
+        };
+        astra_platform::storage::write_json(
+            &generation.control.with_extension("process.json"),
+            &record,
+        )?;
+        control::request(
+            &generation.control,
+            Command::CommitService {
+                boot_id: record.identity.boot_id.clone(),
+            },
+        )
+        .await?;
+        generation.child.detach();
         Ok(generation)
     }
 
@@ -632,7 +729,7 @@ impl Manager {
     ) {
         let mut hosts = serde_json::Map::new();
         let mut referenced = HashSet::new();
-        let mut all_observed = true;
+        let mut all_observed = self.blocked.is_empty();
         let reads = self
             .registry
             .instances
@@ -712,10 +809,17 @@ impl Manager {
 
 async fn stop_rule(rule: &mut RuleGeneration) -> Result<()> {
     if rule.child.try_wait()?.is_none() {
-        rule.child.kill().await?;
+        let _ = control::request(&rule.control, rule.child.stop_command()).await;
+        match timeout(Duration::from_secs(5), rule.child.wait()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => rule.child.kill().await?,
+        }
     }
-    astra_platform::platform::remove_socket(Path::new(&rule.socket));
-    astra_platform::platform::remove_socket(&rule.control);
+    astra_platform::platform::recover_stale_endpoint(Path::new(&rule.socket))?;
+    astra_platform::platform::recover_stale_endpoint(&rule.control)?;
+    let _ = fs::remove_file(rule.control.with_extension("process.json"));
     Ok(())
 }
 

@@ -5,11 +5,9 @@ use anyhow::bail;
 use anyhow::Result;
 use astra_model::Inbound;
 use astra_model::Target;
+use astra_platform::supervision::Task;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinHandle,
-};
+use tokio::net::{TcpListener, TcpStream};
 
 pub fn tcp_listener(address: &str, transparent: bool) -> Result<TcpListener> {
     #[cfg(target_os = "linux")]
@@ -62,16 +60,11 @@ pub struct PreparedUdp {
     socket: tokio::net::UdpSocket,
 }
 pub struct UdpGuard {
-    task: JoinHandle<()>,
+    task: Task,
 }
 impl UdpGuard {
-    pub fn finished(&self) -> bool {
-        self.task.is_finished()
-    }
-}
-impl Drop for UdpGuard {
-    fn drop(&mut self) {
-        self.task.abort();
+    pub async fn failure(&mut self) -> Option<String> {
+        self.task.check().await
     }
 }
 pub fn prepare_udp(address: SocketAddr) -> Result<PreparedUdp> {
@@ -90,14 +83,13 @@ pub fn prepare_udp(address: SocketAddr) -> Result<PreparedUdp> {
 impl PreparedUdp {
     pub fn start(self, current: Current) -> UdpGuard {
         UdpGuard {
-            task: tokio::spawn(async move {
+            task: Task::spawn_result("TPROXY UDP", async move {
                 #[cfg(target_os = "linux")]
-                if let Err(error) = linux::udp(self.socket, current).await {
-                    tracing::error!(%error, "TPROXY UDP failed");
-                }
+                return linux::udp(self.socket, current).await;
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = (self, current);
+                    Err::<(), _>(anyhow::anyhow!("TPROXY UDP requires Linux"))
                 }
             }),
         }

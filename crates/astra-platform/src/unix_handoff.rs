@@ -14,7 +14,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // v2 explicitly carries resident-host mode across sudo's environment cleanup.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_FRAME_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +36,7 @@ pub struct Hello {
 /// euid/gid after dropping privileges.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handoff {
+    pub service_owner: astra_model::control::ProcessIdentity,
     pub version: u16,
     pub config: PathBuf,
     pub control: PathBuf,
@@ -278,6 +279,7 @@ mod tests {
     fn handoff_preserves_explicit_resident_mode() {
         for hosted in [false, true] {
             let handoff = Handoff {
+                service_owner: crate::lifecycle::capture(std::process::id()).unwrap(),
                 version: PROTOCOL_VERSION,
                 config: "/private/config.toml".into(),
                 control: "/private/control.sock".into(),

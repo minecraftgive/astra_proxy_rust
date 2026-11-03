@@ -42,6 +42,9 @@ pub enum Query {
     Hello,
     Agents,
     Instances,
+    Monitor {
+        instance: String,
+    },
     Runtime {
         instance: String,
     },
@@ -347,6 +350,7 @@ pub enum ResponseBody {
     Hello(Hello),
     Agents(Vec<Agent>),
     Instances(Vec<Instance>),
+    Monitor(MonitorSnapshot),
     Runtime(RuntimeSnapshot),
     Document(Document),
     Schema(astra_model::document::Schema),
@@ -519,6 +523,26 @@ pub struct ServerSnapshot {
     pub upload: String,
     pub download: String,
     pub listeners: Vec<String>,
+}
+/// Process metrics cover only the managed PID, not child workers or the host OS.
+/// Network counters cover instance relay traffic, not physical network adapters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct MonitorSnapshot {
+    #[serde(default)]
+    pub internal: Option<astra_model::monitor::InternalSnapshot>,
+    pub sampled_at_ms: String,
+    pub instance: String,
+    pub pid: Option<u32>,
+    pub uptime_secs: String,
+    /// 100% means one logical CPU. None until a second process sample exists.
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<String>,
+    pub virtual_memory_bytes: Option<String>,
+    pub upload_bytes: Option<String>,
+    pub download_bytes: Option<String>,
+    pub active_connections: Option<u32>,
+    pub total_connections: Option<String>,
+    pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Document {

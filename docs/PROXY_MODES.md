@@ -42,7 +42,7 @@ http_listen = "127.0.0.1:8080"
 
 Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS 代理。普通 HTTP 请求由 Hyper 校验消息边界、移除逐跳头并流式转发，HTTPS 沿用 CONNECT 隧道；普通 HTTP 当前每条连接处理一个请求，`Upgrade` 需走独立 CONNECT（不支持明文 WebSocket 升级）。启用时记录手动代理地址、绕过列表、PAC URL 和自动检测标志，再设置 `回环地址:端口`（所有协议共用，与 Windows 设置界面写入的格式一致）、`<local>` 绕过并临时关闭 PAC/自动检测；正常关闭时恢复原值并通知应用。WinHTTP、VPN/RAS 连接、其他用户账户以及不遵循系统代理的应用不在该设置范围内。
 
-Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；发生崩溃时新实例会指出要恢复的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
+Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；新版本通过恢复助手及持久化网络记录处理崩溃，旧版记录或恢复冲突会指出需要处理的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
 
 写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则写入 `~/.astra/runtime/system-proxy/<源路径摘要>.cache`（`ASTRA_RUNTIME_DIR` 可自定义根目录）。旧配置旁若存在未恢复记录，会提示先用恢复命令处理，避免遗漏旧的系统设置快照。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
 
@@ -50,7 +50,7 @@ Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程�
 ./target/<本机 Rust target>/release/astra-proxy --restore-system-proxy /absolute/path/to/modes.system-proxy-state.toml
 ```
 
-恢复失败会保留文件供重试。正常退出后文件删除。不要删除尚未恢复的文件。
+恢复失败会保留文件供重试。正常退出后文件删除。新版本优先使用完整网络记录的 `--recover-network` 入口，见 [异常退出与恢复](ERROR_RECOVERY.md)；上面的命令保留用于旧版系统代理记录。不要删除尚未恢复的文件。
 
 Windows 使用相同入口，例如 `./target/debug/astra-proxy.exe --restore-system-proxy C:/Astra/state/proxy.system-proxy-state.toml`。此命令会实际改动系统设置，应在确认旧实例停止且需要恢复时执行。
 
@@ -96,7 +96,7 @@ Windows 配置模板见 `configs/windows.toml`，两项模式默认关闭。启�
 
 先安装 bypass，再安装接管路由；只添加自己拥有的路由，遇到已有冲突路由时拒绝并回滚新添加项，不覆盖外部路由。运行前检查被接管范围内的节点 IP 是否被 bypass 覆盖，防止节点连接回到 TUN。域名节点在准备时解析并检查所有结果；DNS 本身也应走原网关，节点 DNS 记录改变后需要更新 bypass。局域网 DNS 若已有比接管路由更具体的物理接口路由，则不会被接管，不需重复添加 bypass；不要重复添加原网关已有的主机路由。直连 TCP/UDP 绑定指定物理接口，避免直连规则形成循环。未接管的 IPv6 不会因上述 IPv4 配置而自动进入 TUN，IPv6 路由与 bypass 需要另行配置匹配的网关。
 
-关闭时删除本实例添加的路由并关闭设备。异常退出后系统通常会删除依赖设备的路由，但绕过路由可能保留；按配置中的 bypass 使用系统路由工具检查并清理，重启时遇到重复项会明确报错。不同实例使用不同设备名、地址段和不冲突的路由。
+关闭时删除本实例添加的路由并关闭设备。异常退出后由同二进制恢复助手按持久化记录恢复可确认归属的路由和复用 Wintun 的原设置；核心与助手同时退出时，下次接管前先处理遗留记录。外部修改或创建结果不确定的资源保留并报告，不按相同路由值猜测归属。手动恢复命令及验收边界见 [异常退出与恢复](ERROR_RECOVERY.md)。不同实例使用不同设备名、地址段和不冲突的路由。
 
 已有 TUN 设备的节点/规则切换及路由列表更新会保留协议栈和会话。修改 MTU、设备地址或更换设备名属于设备重建：旧设备的会话不能保留；修改 MTU 需要选择新设备名。把同一目标接管路由移至新设备时，旧路由仍占用会导致候选被拒绝；先热关闭旧 TUN，再开启新设备，或由外部管理路由。IP 分片重组、超 MTU UDP 的完整行为尚未验收，使用适当 MTU 和应用报文大小。
 

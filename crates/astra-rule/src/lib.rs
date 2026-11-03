@@ -18,21 +18,11 @@ struct Generation {
 }
 struct Bound {
     listener: UnixListener,
-    #[cfg_attr(windows, allow(dead_code))]
-    path: PathBuf,
-}
-impl Drop for Bound {
-    fn drop(&mut self) {
-        astra_platform::platform::remove_socket(&self.path);
-    }
 }
 fn bind(path: &str) -> Result<Bound> {
     let listener = astra_platform::platform::bind_listener(std::path::Path::new(path))
         .with_context(|| format!("bind Rule Core routing endpoint {path} (active endpoints and non-marker files are preserved)"))?;
-    let bound = Bound {
-        listener,
-        path: path.into(),
-    };
+    let bound = Bound { listener };
     astra_platform::platform::set_private(astra_platform::platform::endpoint_path(path), 0o600)?;
     Ok(bound)
 }
@@ -166,6 +156,12 @@ fn load_text_with(
 }
 impl State {
     async fn reload(&mut self, path: Option<PathBuf>) -> Result<()> {
+        let operation = astra_observe::operation!("rule.reload", "规则重载");
+        let result = self.reload_inner(path).await;
+        operation.finish(result.is_ok());
+        result
+    }
+    async fn reload_inner(&mut self, path: Option<PathBuf>) -> Result<()> {
         let path = std::fs::canonicalize(path.unwrap_or_else(|| self.path.clone()))?;
         let load_path = path.clone();
         let (text, config, rules) = tokio::task::spawn_blocking(move || load(&load_path)).await??;
@@ -188,6 +184,7 @@ impl State {
         self.watch_file = config.watch_config;
         self.resources = resources;
         self.revisions.send_replace(revision);
+        astra_observe::gauge!("rule.revision", "当前规则版本", "count").set(revision);
         tracing::info!(revision, config=%self.path.display(), "rule configuration committed");
         Ok(())
     }
@@ -272,6 +269,7 @@ pub async fn run() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
     let generation = Arc::new(ArcSwap::from_pointee(Generation { rules, revision }));
+    astra_observe::gauge!("rule.revision", "当前规则版本", "count").set(revision);
     let listener = Arc::new(ArcSwap::from_pointee(bind(&config.socket)?));
     astra_ipc::control::applied(&path, &text);
     let (revisions, mut changes) = watch::channel(revision);
@@ -345,57 +343,70 @@ pub async fn run() -> Result<()> {
         },
     );
     tokio::pin!(shutdown);
-    let watcher = {
+    let mut watcher = {
         let state = state.clone();
-        tokio::spawn(async move {
-            let mut failure = String::new();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if hosted_worker {
-                    continue;
-                }
-                let mut state = state.lock().await;
-                let resource_due = state.resources.due(state.watch_file);
-                if !state.watch_file && !resource_due {
-                    continue;
-                }
-                if let Ok(text) = tokio::fs::read_to_string(&state.path).await {
-                    if resource_due || (text != state.text && text != failure) {
-                        state.resources.attempted();
-                        if let Err(error) = state.reload(None).await {
-                            failure = text;
-                            tracing::warn!(%error, "rule automatic reload rejected; active generation retained");
-                        } else {
-                            failure.clear();
+        astra_platform::supervision::Task::spawn(
+            "rule configuration/resource watcher",
+            async move {
+                let mut failure = String::new();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if hosted_worker {
+                        continue;
+                    }
+                    let mut state = state.lock().await;
+                    let resource_due = state.resources.due(state.watch_file);
+                    if !state.watch_file && !resource_due {
+                        continue;
+                    }
+                    if let Ok(text) = tokio::fs::read_to_string(&state.path).await {
+                        if resource_due || (text != state.text && text != failure) {
+                            state.resources.attempted();
+                            if let Err(error) = state.reload(None).await {
+                                failure = text;
+                                tracing::warn!(%error, "rule automatic reload rejected; active generation retained");
+                            } else {
+                                failure.clear();
+                            }
                         }
                     }
                 }
-            }
-        })
+            },
+        )
     };
     tracing::info!("Rule Core ready");
-    loop {
+    let outcome = loop {
         let bound = listener.load_full();
         tokio::select! {
             connection = bound.listener.accept() => {
-                let (stream, _) = connection?;
+                let (stream, _) = match connection {
+                    Ok(connection) => connection,
+                    Err(error) if astra_platform::supervision::transient_io(&error) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(error) => break Err(error.into()),
+                };
                 let (rules, revisions) = (generation.clone(), changes.clone());
                 tokio::spawn(async move {
                     if let Err(error) = serve(stream, rules, revisions).await {tracing::debug!(%error, "IPC peer disconnected");}
                 });
             }
             _ = changes.changed() => {},
-            result = &mut shutdown => {result?; break;},
+            result = &mut shutdown => break result.map_err(Into::into),
+            error = watcher.failure() => break Err(anyhow::anyhow!(error)),
         }
-    }
+    };
     watcher.abort();
-    Ok(())
+    outcome
 }
 async fn serve(
     mut stream: UnixStream,
     current: Arc<ArcSwap<Generation>>,
     mut revisions: watch::Receiver<u64>,
 ) -> Result<()> {
+    let _channel =
+        astra_observe::gauge!("rule.ipc_channels", "规则 IPC 连接（含版本订阅）", "count").enter();
     static NEXT_PEER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let peer_id = NEXT_PEER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     loop {
@@ -405,6 +416,7 @@ async fn serve(
                 if error.kind() == std::io::ErrorKind::UnexpectedEof {
                     tracing::debug!(target: "astra_route", core="rule", phase="peer_closed", peer_id, "rule channel closed");
                 } else {
+                    astra_observe::counter!("rule.decode_errors", "规则请求解码错误").add(1);
                     tracing::debug!(target: "astra_route", core="rule", phase="decode_failed", peer_id, %error, "rule request could not be decoded");
                 }
                 return Err(error.into());
@@ -418,6 +430,7 @@ async fn serve(
         }
         if req.api_version != API_VERSION {
             tracing::debug!(target: "astra_route", core="rule", phase="rejected", peer_id, request_id=req.id, reason="unsupported IPC version", "rule request rejected");
+            astra_observe::counter!("rule.invalid_requests", "无效规则请求").add(1);
             anyhow::bail!("unsupported IPC version");
         }
         if req.id == u64::MAX
@@ -469,8 +482,10 @@ async fn serve(
         }
         if req.target.host.is_empty() || req.target.host.len() > 253 || req.target.port == 0 {
             tracing::debug!(target: "astra_route", core="rule", phase="rejected", peer_id, request_id=req.id, reason="invalid target", "rule request rejected");
+            astra_observe::counter!("rule.invalid_requests", "无效规则请求").add(1);
             anyhow::bail!("invalid target");
         }
+        let operation = astra_observe::operation!("rule.decision", "规则匹配与回复");
         let response = {
             let generation = current.load();
             let decision = generation.rules.decision(&req);
@@ -483,11 +498,18 @@ async fn serve(
                 action: decision.action,
             }
         };
+        match &response.action {
+            RouteAction::Direct => astra_observe::counter!("rule.direct", "规则结果：直连").add(1),
+            RouteAction::Block => astra_observe::counter!("rule.block", "规则结果：拦截").add(1),
+            RouteAction::Proxy(_) => astra_observe::counter!("rule.proxy", "规则结果：代理").add(1),
+        }
         if let Err(error) = astra_ipc::send(&mut stream, &response).await {
+            operation.finish(false);
             tracing::debug!(target: "astra_route", core="rule", phase="response_failed", peer_id, request_id=req.id, revision=response.revision,
                 action=?response.action, elapsed_us=started.elapsed().as_micros() as u64, %error, "rule response failed");
             return Err(error.into());
         }
+        operation.finish(true);
         tracing::debug!(target: "astra_route", core="rule", phase="responded", peer_id, request_id=req.id, revision=response.revision,
             action=?response.action, elapsed_us=started.elapsed().as_micros() as u64, "rule response sent");
     }

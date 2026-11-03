@@ -4,11 +4,11 @@ import argparse
 import os
 import pathlib
 import signal
-import shutil
 import subprocess
 import tempfile
 import time
 from astra_tools.platform import executable, process_flags
+from astra_tools.launcher import stop_children, finish_state
 from astra_tools.workspace import resolve_binary_dir
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -73,27 +73,14 @@ def main():
                     break
             time.sleep(.1)
     finally:
-        # Proxy drains first while the rule core remains available.
-        for child, command, control in reversed(list(zip(children, commands, controls))):
-            if child.poll() is None:
-                if os.name == 'nt':
-                    try:
-                        subprocess.run([command[0], '--stop', str(control)], check=True,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                    except (OSError, subprocess.SubprocessError):
-                        child.terminate()
-                else:
-                    child.terminate()
-                try:
-                    child.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
-        # A failed system-proxy restore must retain its durable recovery snapshot.
-        if any(state.glob('*.system-proxy-state.toml')):
-            print(f'System proxy recovery is pending in {state}; use --restore-system-proxy before restarting.')
-        else:
-            shutil.rmtree(state)
+        errors = stop_children(children, commands, controls)
+        for error in errors:
+            print(error)
+        retained = finish_state(state)
+        if retained:
+            print(retained)
+        if errors:
+            status = status or 1
     raise SystemExit(status)
 
 if __name__ == '__main__':

@@ -2,7 +2,34 @@
 use anyhow::{Context, Result};
 use astra_management::v2::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::{path::Path, time::Duration};
+
+// Pin rusqlite's current default rather than depend on a changeable library policy.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+// A clearly invalid nonempty header can be rejected without letting SQLite
+// reconstruct an existing WAL index. Empty/new databases and active WALs are
+// valid startup cases; deeper validation remains SQLite's responsibility.
+fn preflight_header(path: &Path) -> Result<()> {
+    use std::io::Read;
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut header = Vec::with_capacity(16);
+    file.take(16).read_to_end(&mut header)?;
+    if !header.is_empty() && header != b"SQLite format 3\0" {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("invalid or truncated SQLite database header; database and sidecars were not opened for writing".into()),
+        ).into());
+    }
+    Ok(())
+}
 
 pub struct Store {
     db: Connection,
@@ -13,7 +40,29 @@ impl Store {
         self.event_limit = limit.clamp(64, 100000);
     }
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path).map_err(|error| {
+            let code = error.chain().find_map(|cause|
+                cause.downcast_ref::<rusqlite::Error>().and_then(|error| error.sqlite_error_code()));
+            let guidance = match code {
+                Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) =>
+                    "SQLite reports a corrupt or invalid management database. Stop programs using this state directory, copy the database together with any -wal and -shm files, then inspect the copy or restore a verified matching backup. No automatic repair or replacement was attempted",
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+                    "Management database is locked after bounded lock waiting. Check for another process using this state directory; retry startup after its transaction ends. Do not delete the database, -wal or -shm files",
+                _ => "Management database startup failed. Retain the database and any -wal and -shm files together for inspection; no automatic repair or replacement was attempted",
+            };
+            error.context(format!("{guidance}: {}", path.display()))
+        })
+    }
+    fn open_inner(path: &Path) -> Result<Self> {
+        preflight_header(path)?;
         let db = Connection::open(path)?;
+        db.busy_timeout(BUSY_TIMEOUT)?;
+        // Failed startup must not checkpoint or remove recovery sidecars while
+        // unwinding. Restore normal close/checkpoint behavior only after ready.
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
             matches!(version, 0 | 2),
@@ -49,6 +98,10 @@ impl Store {
                 params![id, serde_json::to_string(&task)?],
             )?;
         }
+        store.db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        )?;
         Ok(store)
     }
     pub fn begin(&self, id: &str, fingerprint: &str) -> Result<Option<ResponseBody>> {
@@ -413,6 +466,110 @@ mod tests {
     use super::*;
     fn memory() -> Store {
         Store::open(Path::new(":memory:")).unwrap()
+    }
+    #[test]
+    fn contention_has_a_bounded_wait_and_does_not_accept_or_replay_the_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("management.sqlite");
+        let store = Store::open(&path).unwrap();
+        let timeout_ms: u64 = store
+            .db
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout_ms, BUSY_TIMEOUT.as_millis() as u64);
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let error = store.begin("blocked-operation", "input").unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert!(
+            elapsed >= BUSY_TIMEOUT && elapsed < BUSY_TIMEOUT + Duration::from_secs(5),
+            "busy wait was {elapsed:?}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(store.task("blocked-operation").is_err());
+        assert!(store.begin("blocked-operation", "input").unwrap().is_none());
+        assert!(matches!(
+            store.begin("blocked-operation", "input").unwrap(),
+            Some(ResponseBody::Task(_))
+        ));
+    }
+    #[test]
+    fn corrupt_startup_explains_recovery_and_preserves_database_and_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("management.sqlite");
+        let files = [
+            (path.clone(), b"not a SQLite database".as_slice()),
+            (
+                directory.path().join("management.sqlite-wal"),
+                b"retained WAL evidence".as_slice(),
+            ),
+            (
+                directory.path().join("management.sqlite-shm"),
+                b"retained SHM evidence".as_slice(),
+            ),
+        ];
+        for (file, bytes) in &files {
+            std::fs::write(file, bytes).unwrap();
+        }
+        let error = Store::open(&path).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("corrupt or invalid")
+                && message.contains("-wal")
+                && message.contains("-shm")
+                && message.contains("No automatic repair")
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::NotADatabase)
+        );
+        for (file, bytes) in files {
+            let actual = std::fs::read(&file).unwrap();
+            assert!(
+                actual == bytes,
+                "{} changed: expected {} bytes, found {} bytes",
+                file.display(),
+                bytes.len(),
+                actual.len()
+            );
+        }
+        std::fs::write(&path, b"SQLite format").unwrap();
+        assert!(
+            Store::open(&path).is_err(),
+            "truncated nonempty header was accepted"
+        );
+        assert!(std::fs::read(&path).unwrap() == b"SQLite format");
+    }
+    #[test]
+    fn header_preflight_accepts_new_empty_memory_and_active_wal_databases() {
+        let directory = tempfile::tempdir().unwrap();
+        let new = directory.path().join("new.sqlite");
+        drop(Store::open(&new).unwrap());
+        let empty = directory.path().join("empty.sqlite");
+        std::fs::write(&empty, b"").unwrap();
+        drop(Store::open(&empty).unwrap());
+        drop(memory());
+        let path = directory.path().join("active.sqlite");
+        let keeper = Connection::open(&path).unwrap();
+        keeper.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES('in active WAL');").unwrap();
+        assert!(directory.path().join("active.sqlite-wal").is_file());
+        let store = Store::open(&path).unwrap();
+        let value: String = store
+            .db
+            .query_row("SELECT value FROM retained", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "in active WAL");
     }
     #[test]
     fn failed_or_uncertain_updates_never_become_successful_tasks() {

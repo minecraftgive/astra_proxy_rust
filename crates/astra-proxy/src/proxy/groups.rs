@@ -23,6 +23,17 @@ struct Selection {
     initialized: bool,
     delays: Vec<(String, Option<u64>)>,
 }
+struct Testing<'a>(&'a Groups, tokio::task::Id);
+impl Drop for Testing<'_> {
+    fn drop(&mut self) {
+        // An aborted test may finish after a replacement started. Only the
+        // current task is allowed to clear the visible running flag.
+        let slot = self.0.test_slot();
+        if slot.as_ref().is_some_and(|task| task.id() == self.1) {
+            self.0.testing.store(false, Ordering::Release);
+        }
+    }
+}
 pub(crate) struct Groups {
     order: Vec<String>,
     locks: HashMap<String, Mutex<()>>,
@@ -57,6 +68,46 @@ pub(crate) fn test_uri(url: &str) -> Result<http::Uri> {
     Ok(uri)
 }
 impl Groups {
+    fn write_selections(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Selection>> {
+        match self.selections.write() {
+            Ok(selections) => selections,
+            Err(poisoned) => {
+                // Selection and cancellation epoch form one transaction. A
+                // poisoned transaction cannot be reused: cancel its leases and
+                // rebuild automatic selections from fresh probes.
+                let mut selections = poisoned.into_inner();
+                self.sessions.invalidate();
+                selections.clear();
+                self.selections.clear_poison();
+                tracing::error!("proxy group selection update panicked; cancelled sessions and reset cached selections");
+                selections
+            }
+        }
+    }
+    fn read_selections(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Selection>> {
+        loop {
+            match self.selections.read() {
+                Ok(selections) => return selections,
+                Err(poisoned) => drop(poisoned.into_inner()),
+            }
+            drop(self.write_selections());
+        }
+    }
+    fn test_slot(&self) -> std::sync::MutexGuard<'_, Option<tokio::task::JoinHandle<()>>> {
+        match self.test_task.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                if let Some(task) = slot.take() {
+                    task.abort();
+                }
+                self.testing.store(false, Ordering::Release);
+                self.test_task.clear_poison();
+                tracing::error!("proxy group test state panicked; cancelled pending test");
+                slot
+            }
+        }
+    }
     pub fn new(config: &crate::config::ProxyConfig) -> Result<Self> {
         let order = astra_model::groups::validate(
             &config.proxy_groups,
@@ -89,8 +140,7 @@ impl Groups {
     ) -> Result<String> {
         let override_target = app
             .overrides
-            .read()
-            .unwrap()
+            .load()
             .selected
             .get(name)
             .cloned()
@@ -144,7 +194,7 @@ impl Groups {
         mut path: Vec<String>,
     ) -> Result<(RouteAction, Vec<String>)> {
         let mut name = name.to_owned();
-        let selections = self.selections.read().unwrap();
+        let selections = self.read_selections();
         for _ in 0..=32 {
             if let Some(action) = Self::terminal(app, &name, path.last()) {
                 return Ok((action, path));
@@ -179,7 +229,7 @@ impl Groups {
         };
         // A switch cannot race subscription: refresh holds the selection write lock
         // while it advances the cancellation epoch.
-        let guard = self.selections.read().unwrap();
+        let guard = self.read_selections();
         let mut current = name;
         let mut path: Vec<String> = Vec::new();
         let resolved = loop {
@@ -211,8 +261,8 @@ impl Groups {
     }
     pub fn inherit(&mut self, old: &App, config: &crate::config::ProxyConfig) {
         self.sessions = old.groups.sessions.clone();
-        let previous = old.groups.selections.read().unwrap();
-        let mut next = self.selections.write().unwrap();
+        let previous = old.groups.read_selections();
+        let mut next = self.write_selections();
         for (name, group) in &config.proxy_groups {
             if old
                 .config
@@ -238,7 +288,7 @@ impl Groups {
         }
     }
     pub fn committed(&self, old: &App, config: &crate::config::ProxyConfig) {
-        let _guard = old.groups.selections.write().unwrap();
+        let _guard = old.groups.write_selections();
         old.groups.active.store(false, Ordering::Release);
         old.groups.stop_test();
         for (name, previous) in &old.config.proxy_groups {
@@ -289,9 +339,7 @@ impl Groups {
         for name in &self.order {
             if reachable.contains(name.as_str()) {
                 let usable = self
-                    .selections
-                    .read()
-                    .unwrap()
+                    .read_selections()
                     .get(name)
                     .is_some_and(|s| s.member.is_some());
                 // Keep forwarding through the last healthy selection during a background scan.
@@ -313,9 +361,7 @@ impl Groups {
         let _guard = self.locks[name].lock().await;
         if !force
             && self
-                .selections
-                .read()
-                .unwrap()
+                .read_selections()
                 .get(name)
                 .and_then(|s| s.checked)
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(group.interval))
@@ -344,7 +390,7 @@ impl Groups {
             .buffered(4)
             .collect()
             .await;
-        let mut selections = self.selections.write().unwrap();
+        let mut selections = self.write_selections();
         if !self.active.load(Ordering::Acquire) {
             return;
         }
@@ -431,14 +477,15 @@ impl Groups {
         disconnect: Option<&str>,
     ) {
         // The selected path and its cancellation epoch change as one operation.
-        let _guard = self.selections.write().unwrap();
-        *app.overrides.write().unwrap() = next;
+        let _guard = self.write_selections();
+        app.overrides.store(Arc::new(next));
         if let Some(group) = disconnect {
             self.sessions.disconnect(group, "manual");
         }
     }
     pub fn stop_test(&self) {
-        if let Some(task) = self.test_task.lock().unwrap().take() {
+        let mut slot = self.test_slot();
+        if let Some(task) = slot.take() {
             task.abort();
         }
         self.testing.store(false, Ordering::Release);
@@ -448,6 +495,8 @@ impl Groups {
             app.config.proxy_groups.contains_key(&name),
             "unknown proxy group"
         );
+        let owner = app.clone();
+        let mut slot = owner.groups.test_slot();
         ensure!(
             app.groups
                 .testing
@@ -455,8 +504,8 @@ impl Groups {
                 .is_ok(),
             "a group test is already running"
         );
-        let owner = app.clone();
         let task = tokio::spawn(async move {
+            let _testing = Testing(&app.groups, tokio::task::id());
             // Refresh dependencies first so nested automatic groups can be tested.
             for dependency in &app.groups.order {
                 if dependency == &name {
@@ -465,13 +514,12 @@ impl Groups {
                 app.groups.refresh(&app, dependency, false).await;
             }
             app.groups.refresh(&app, &name, true).await;
-            app.groups.testing.store(false, Ordering::Release);
         });
-        *owner.groups.test_task.lock().unwrap() = Some(task);
+        *slot = Some(task);
         Ok(())
     }
     pub fn snapshot(&self, app: &App) -> Vec<astra_model::runtime::Group> {
-        let selections = self.selections.read().unwrap();
+        let selections = self.read_selections();
         let mut budget = 2048usize;
         app.config
             .proxy_groups
@@ -591,6 +639,96 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn poisoned_selection_discards_partial_route_and_cancels_old_sessions() {
+        let app = App::from_text(std::path::Path::new("poisoned-groups.toml"),
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n[proxy_groups.main]\nmode='url-test'\nmembers=['node']\n".into()).unwrap();
+        let old = app.groups.sessions.lease(&["main".into()]);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut selections = app.groups.selections.write().unwrap();
+            selections.insert(
+                "main".into(),
+                Selection {
+                    member: Some("DIRECT".into()),
+                    ..Default::default()
+                },
+            );
+            panic!("injected partial selection update");
+        }));
+        assert!(panic.is_err());
+        assert!(app.groups.cached(&app, "main").is_err());
+        assert!(app.groups.read_selections().is_empty());
+        assert!(!app.groups.selections.is_poisoned());
+        tokio::time::timeout(Duration::from_secs(1), old.cancelled())
+            .await
+            .unwrap();
+        let fresh = app.groups.sessions.lease(&["main".into()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), fresh.cancelled())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn poisoned_group_test_slot_is_aborted_without_a_second_panic() {
+        let app = App::from_text(std::path::Path::new("test-slot.toml"),
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n".into()).unwrap();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let aborted = task.abort_handle();
+        *app.groups.test_slot() = Some(task);
+        app.groups.testing.store(true, Ordering::Release);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = app.groups.test_task.lock().unwrap();
+            panic!("injected task slot panic");
+        }))
+        .is_err());
+        app.groups.stop_test();
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished());
+        assert!(!app.groups.testing.load(Ordering::Acquire));
+        assert!(app.groups.test_slot().is_none());
+    }
+    #[tokio::test]
+    async fn cancelled_old_test_cannot_clear_replacement_running_flag() {
+        let app = Arc::new(App::from_text(std::path::Path::new("test-lifetime.toml"),
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1234'\n".into()).unwrap());
+        let spawn = |app: Arc<App>| {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _testing = Testing(&app.groups, tokio::task::id());
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+            (task, ready)
+        };
+        let (old, ready) = spawn(app.clone());
+        let old_abort = old.abort_handle();
+        *app.groups.test_slot() = Some(old);
+        app.groups.testing.store(true, Ordering::Release);
+        ready.await.unwrap();
+        let (next, ready) = spawn(app.clone());
+        let next_abort = next.abort_handle();
+        *app.groups.test_slot() = Some(next);
+        ready.await.unwrap();
+        old_abort.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !old_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.groups.testing.load(Ordering::Acquire));
+        next_abort.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !next_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!app.groups.testing.load(Ordering::Acquire));
+    }
     #[test]
     fn group_bindings_round_trip_and_reject_empty_names() {
         let group: astra_model::groups::Group =

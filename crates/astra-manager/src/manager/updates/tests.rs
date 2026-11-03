@@ -415,7 +415,7 @@ async fn update_transaction_child() {
     let result = AssertUnwindSafe(scenario(&mut manager, &root, &bin))
         .catch_unwind()
         .await;
-    manager.stop_all().await;
+    manager.stop_all().await.unwrap();
     drop(manager);
     match result {
         Ok(Ok(())) => {

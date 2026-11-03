@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use astra_management::server::{Action, Reply, Request, VERSION};
+use astra_platform::supervision::{transient_io, Task};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -15,9 +16,128 @@ use tokio::sync::Semaphore;
 struct Generation {
     app: Arc<App>,
     inbounds: Vec<Arc<Inbound>>,
+    digest: u64,
 }
 type Current = Arc<arc_swap::ArcSwap<Generation>>;
 type Logs = Arc<Mutex<VecDeque<String>>>;
+const BUFFER_BUDGET: usize = 16 * 1024 * 1024;
+
+fn internal_snapshot(
+    app: &App,
+    listeners: usize,
+    tasks: usize,
+    log_lines: usize,
+) -> astra_model::monitor::InternalSnapshot {
+    use astra_model::monitor::{
+        Metric,
+        MetricKind::{Counter, Gauge},
+    };
+    let mut result = astra_observe::snapshot(astra_platform::lifecycle::boot_id());
+    let sampled_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().to_string();
+    let mut metric = |name: &str, value: u64, kind, unit: &str, description: &str| {
+        result.metrics.push(Metric {
+            sampled_at_ms: Some(sampled_at_ms.clone()),
+            name: name.into(),
+            value: value.to_string(),
+            kind,
+            unit: unit.into(),
+            description: description.into(),
+        });
+    };
+    metric(
+        "server.sessions.accepted",
+        app.stats.accepted.load(Ordering::Relaxed),
+        Counter,
+        "count",
+        "服务端累计接受会话",
+    );
+    metric(
+        "server.sessions.rejected",
+        app.stats.rejected.load(Ordering::Relaxed),
+        Counter,
+        "count",
+        "服务端累计拒绝或出错的会话",
+    );
+    metric(
+        "server.sessions.active",
+        app.stats.active.load(Ordering::Relaxed),
+        Gauge,
+        "count",
+        "服务端当前活跃会话",
+    );
+    metric(
+        "server.sessions.available",
+        app.sessions.available_permits() as u64,
+        Gauge,
+        "count",
+        "可用会话许可",
+    );
+    metric(
+        "server.sessions.capacity",
+        app.config.max_connections as u64,
+        Gauge,
+        "count",
+        "会话许可上限",
+    );
+    metric(
+        "server.udp.available",
+        app.udp.available_permits() as u64,
+        Gauge,
+        "count",
+        "可用 UDP 流许可",
+    );
+    metric(
+        "server.udp.capacity",
+        app.config.max_udp_flows as u64,
+        Gauge,
+        "count",
+        "UDP 流许可上限",
+    );
+    let available = app.bytes.available_permits();
+    metric(
+        "server.udp.buffer_available",
+        available as u64,
+        Gauge,
+        "bytes",
+        "UDP 缓冲预算剩余额度",
+    );
+    metric(
+        "server.udp.buffer_used",
+        BUFFER_BUDGET.saturating_sub(available) as u64,
+        Gauge,
+        "bytes",
+        "UDP 包正在占用的缓冲预算（非堆内存统计）",
+    );
+    metric(
+        "server.udp.buffer_capacity",
+        BUFFER_BUDGET as u64,
+        Gauge,
+        "bytes",
+        "UDP 缓冲预算上限",
+    );
+    metric(
+        "server.listeners",
+        listeners as u64,
+        Gauge,
+        "count",
+        "已配置监听器数量",
+    );
+    metric(
+        "server.connection_tasks",
+        tasks as u64,
+        Gauge,
+        "count",
+        "尚未结束的 TCP / QUIC 连接任务",
+    );
+    metric(
+        "server.log_buffer_lines",
+        log_lines as u64,
+        Gauge,
+        "count",
+        "内存日志缓冲行数",
+    );
+    result
+}
 fn log(logs: &Logs, message: String) {
     eprintln!("{message}");
     let mut lines = logs.lock().unwrap();
@@ -52,9 +172,19 @@ fn generation(
     Ok(Arc::new(Generation {
         app: App::new(prepared.config, stats, sessions, udp, bytes),
         inbounds,
+        digest: prepared.digest,
     }))
 }
 pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Result<()> {
+    run_supervised(config, control, prepared, Vec::new()).await
+}
+async fn run_supervised(
+    config: PathBuf,
+    control: PathBuf,
+    prepared: Prepared,
+    mut listeners: Vec<Task>,
+) -> Result<()> {
+    let candidate = astra_platform::lifecycle::Candidate::from_env()?;
     let parent = control.parent().context("control directory")?;
     let new_directory = !parent.exists();
     std::fs::create_dir_all(parent)?;
@@ -62,19 +192,12 @@ pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Resul
         astra_platform::platform::set_private(parent, 0o700)?;
     }
     // The control endpoint is claimed before any public listener is opened.
-    let management = astra_platform::platform::LocalListener::bind(&control)?;
+    let management = astra_platform::platform::bind_listener(&control)?;
     astra_platform::platform::set_private(&control, 0o600)?;
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(control.clone());
     let stats = Arc::new(Stats::default());
     let sessions = Arc::new(Semaphore::new(prepared.config.max_connections));
     let udp = Arc::new(Semaphore::new(prepared.config.max_udp_flows));
-    let bytes = Arc::new(Semaphore::new(16 * 1024 * 1024));
+    let bytes = Arc::new(Semaphore::new(BUFFER_BUDGET));
     let first = generation(
         prepared,
         stats.clone(),
@@ -111,42 +234,49 @@ pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Resul
         }
     }
     let logs: Logs = Arc::new(Mutex::new(VecDeque::new()));
-    let mut listeners = tokio::task::JoinSet::new();
     let connections = Arc::new(Mutex::new(Vec::<tokio::task::AbortHandle>::new()));
     for (index, listener) in tcp {
         let current = current.clone();
         let logs = logs.clone();
         let connections = connections.clone();
-        listeners.spawn(async move {
-            loop {
-                let Ok((stream, peer)) = listener.accept().await else {
-                    break;
-                };
-                let g = current.load_full();
-                let inbound = g.inbounds[index].clone();
-                let app = g.app.clone();
-                let logs = logs.clone();
-                let tag = inbound.options.tag.clone();
-                let stats = app.stats.clone();
-                let task = tokio::spawn(async move {
-                    if let Err(error) =
-                        crate::protocol::serve(Box::new(stream), peer, inbound, app).await
-                    {
-                        stats.rejected.fetch_add(1, Ordering::Relaxed);
-                        if std::env::var_os("ASTRA_SERVER_DEBUG").is_some() {
-                            eprintln!("Server diagnostic: {error:#}");
+        listeners.push(Task::spawn_result(
+            format!("server TCP {}", first.inbounds[index].options.tag),
+            async move {
+                loop {
+                    let (stream, peer) = match listener.accept().await {
+                        Ok(value) => value,
+                        Err(error) if transient_io(&error) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
                         }
-                        log(
-                            &logs,
-                            format!("{tag}: connection closed or rejected ({peer})"),
-                        );
-                    }
-                });
-                let mut tasks = connections.lock().unwrap();
-                tasks.retain(|h| !h.is_finished());
-                tasks.push(task.abort_handle());
-            }
-        });
+                        Err(error) => return Err::<(), _>(error),
+                    };
+                    let g = current.load_full();
+                    let inbound = g.inbounds[index].clone();
+                    let app = g.app.clone();
+                    let logs = logs.clone();
+                    let tag = inbound.options.tag.clone();
+                    let stats = app.stats.clone();
+                    let task = tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::protocol::serve(Box::new(stream), peer, inbound, app).await
+                        {
+                            stats.rejected.fetch_add(1, Ordering::Relaxed);
+                            if std::env::var_os("ASTRA_SERVER_DEBUG").is_some() {
+                                eprintln!("Server diagnostic: {error:#}");
+                            }
+                            log(
+                                &logs,
+                                format!("{tag}: connection closed or rejected ({peer})"),
+                            );
+                        }
+                    });
+                    let mut tasks = connections.lock().unwrap();
+                    tasks.retain(|h| !h.is_finished());
+                    tasks.push(task.abort_handle());
+                }
+            },
+        ));
     }
     let mut endpoints = vec![];
     for (index, endpoint) in quic {
@@ -154,31 +284,34 @@ pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Resul
         let current = current.clone();
         let logs = logs.clone();
         let connections = connections.clone();
-        listeners.spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let g = current.load_full();
-                let inbound = g.inbounds[index].clone();
-                let app = g.app.clone();
-                let logs = logs.clone();
-                let tag = inbound.options.tag.clone();
-                let stats = app.stats.clone();
-                let task = tokio::spawn(async move {
-                    if crate::quic::serve(incoming, inbound, app).await.is_err() {
-                        stats.rejected.fetch_add(1, Ordering::Relaxed);
-                        log(&logs, format!("{tag}: QUIC session rejected"));
-                    }
-                });
-                let mut tasks = connections.lock().unwrap();
-                tasks.retain(|h| !h.is_finished());
-                tasks.push(task.abort_handle());
-            }
-        });
+        listeners.push(Task::spawn(
+            format!("server QUIC {}", first.inbounds[index].options.tag),
+            async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let g = current.load_full();
+                    let inbound = g.inbounds[index].clone();
+                    let app = g.app.clone();
+                    let logs = logs.clone();
+                    let tag = inbound.options.tag.clone();
+                    let stats = app.stats.clone();
+                    let task = tokio::spawn(async move {
+                        if crate::quic::serve(incoming, inbound, app).await.is_err() {
+                            stats.rejected.fetch_add(1, Ordering::Relaxed);
+                            log(&logs, format!("{tag}: QUIC session rejected"));
+                        }
+                    });
+                    let mut tasks = connections.lock().unwrap();
+                    tasks.retain(|h| !h.is_finished());
+                    tasks.push(task.abort_handle());
+                }
+            },
+        ));
     }
     for (socket, aead2022) in ssudp {
         let app = first.app.clone();
-        listeners.spawn(async move {
-            let _ = crate::protocol::ss_udp(socket, app, aead2022).await;
-        });
+        listeners.push(Task::spawn_result("server Shadowsocks UDP", async move {
+            crate::protocol::ss_udp(socket, app, aead2022).await
+        }));
     }
     let started = Instant::now();
     log(
@@ -187,19 +320,46 @@ pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Resul
     );
     let shutdown = astra_ipc::shutdown_signal();
     tokio::pin!(shutdown);
-    loop {
+    let mut health = tokio::time::interval(Duration::from_millis(100));
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let outcome: Result<()> = 'service: loop {
         tokio::select! {
-            _=&mut shutdown=>break,
-            accepted=management.accept()=>{let(mut stream,_)=accepted?;let request=tokio::time::timeout(Duration::from_secs(3),astra_ipc::receive_management::<Request>(&mut stream)).await;
-                let mut reply=Reply{version:VERSION,pid:std::process::id(),uptime_secs:started.elapsed().as_secs(),active:stats.active.load(Ordering::Relaxed),accepted:stats.accepted.load(Ordering::Relaxed),rejected:stats.rejected.load(Ordering::Relaxed),upload:stats.upload.load(Ordering::Relaxed),download:stats.download.load(Ordering::Relaxed),config:config.clone(),..Default::default()};let mut stop=false;
-                match request{Ok(Ok(request))if request.version==VERSION=>match request.action{Action::Status=>{},Action::Logs=>reply.logs=logs.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n"),Action::Stop=>stop=true,Action::Reload{path}=>{
+            signal=&mut shutdown=>break signal.map_err(Into::into),
+            error=candidate.wait_owner_loss()=>break Err(error.into()),
+            _=health.tick()=>{
+                for listener in &mut listeners {
+                    if let Some(error)=listener.check().await {break 'service Err(anyhow::anyhow!(error));}
+                }
+            }
+            accepted=management.accept()=>{let(mut stream,_)=match accepted {
+                Ok(value)=>value,
+                Err(error) if transient_io(&error)=>{tokio::time::sleep(Duration::from_millis(100)).await;continue;}
+                Err(error)=>break Err(error.into())
+            };let request=tokio::time::timeout(Duration::from_secs(3),astra_ipc::receive_management_versioned::<Request>(&mut stream,VERSION)).await;
+                let mut reply=Reply{version:VERSION,pid:std::process::id(),uptime_secs:started.elapsed().as_secs(),active:stats.active.load(Ordering::Relaxed),accepted:stats.accepted.load(Ordering::Relaxed),rejected:stats.rejected.load(Ordering::Relaxed),upload:stats.upload.load(Ordering::Relaxed),download:stats.download.load(Ordering::Relaxed),config:config.clone(),..Default::default()};let mut stop=false;let mut force=false;
+                match request{Ok(Ok(request))if request.version==VERSION=>match request.action{Action::Status=>{},Action::CommitService{boot_id}=>{
+                    reply.error=if boot_id==astra_platform::lifecycle::boot_id(){candidate.commit().err().map(|error|error.to_string())}else{Some("server identity changed; refusing commit".into())};
+                },Action::Monitor=>{
+                    let current = current.load();
+                    let tasks = connections.lock().unwrap().iter().filter(|handle| !handle.is_finished()).count();
+                    let log_lines = logs.lock().unwrap().len();
+                    match serde_json::to_string(&internal_snapshot(&current.app, current.inbounds.len(), tasks, log_lines)) {
+                        Ok(value) => reply.logs=value,
+                        Err(error) => reply.error=Some(error.to_string()),
+                    }
+                },Action::Logs=>reply.logs=logs.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n"),Action::Stop=>stop=true,Action::Reload{path}=>{
                     let result=reload(&config,path,&current);if let Err(error)=result{reply.error=Some(error.to_string())}else{log(&logs,"Configuration reloaded".into());}
+                },Action::StopIdentified{boot_id,force:requested_force}=>{
+                    if boot_id==astra_platform::lifecycle::boot_id(){stop=true;force=requested_force;}else{reply.error=Some("server identity changed; refusing stop".into());}
                 }},_=>reply.error=Some("invalid management request".into())}
-                reply.listeners=current.load().inbounds.iter().map(|v|format!("{} {:?} {}",v.options.tag,v.options.protocol,v.options.listen)).collect();let _=tokio::time::timeout(Duration::from_secs(3),astra_ipc::send_management(&mut stream,&reply)).await;if stop{break}
+                reply.identity=astra_platform::lifecycle::identity(Some(astra_model::control::Applied {path:config.clone(),digest:current.load().digest})).ok();
+                reply.listeners=current.load().inbounds.iter().map(|v|format!("{} {:?} {}",v.options.tag,v.options.protocol,v.options.listen)).collect();let _=tokio::time::timeout(Duration::from_secs(3),astra_ipc::send_management(&mut stream,&reply)).await;
+                if force {std::thread::spawn(||{std::thread::sleep(Duration::from_millis(25));std::process::exit(1);});}
+                if stop{break Ok(())}
             },
         }
-    }
-    listeners.abort_all();
+    };
+    drop(listeners);
     for endpoint in endpoints {
         endpoint.close(0u32.into(), b"server stopping");
     }
@@ -211,11 +371,23 @@ pub async fn run(config: PathBuf, control: PathBuf, prepared: Prepared) -> Resul
     for task in connections.lock().unwrap().drain(..) {
         task.abort();
     }
-    log(&logs, "Server stopped".into());
-    Ok(())
+    log(
+        &logs,
+        match &outcome {
+            Ok(()) => "Server stopped".into(),
+            Err(error) => format!("Server failed: {error:#}"),
+        },
+    );
+    outcome
 }
 
 fn reload(config: &std::path::Path, path: Option<PathBuf>, current: &Current) -> Result<()> {
+    let operation = astra_observe::operation!("server.reload", "服务端配置热重载");
+    let result = reload_inner(config, path, current);
+    operation.finish(result.is_ok());
+    result
+}
+fn reload_inner(config: &std::path::Path, path: Option<PathBuf>, current: &Current) -> Result<()> {
     ensure!(
         path.as_ref().is_none_or(|p| p == config),
         "reload uses the current configuration path"
@@ -265,4 +437,136 @@ fn reload(config: &std::path::Path, path: Option<PathBuf>, current: &Current) ->
     )?;
     current.store(new);
     Ok(())
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[test]
+    fn monitor_reports_real_session_and_buffer_permits() {
+        let source = "max_connections=10\nmax_udp_flows=8\n[[listeners]]\ntag='local'\nprotocol='socks5'\nlisten='127.0.0.1:0'\n[[listeners.users]]\nname='user'\npassword='secret'\n";
+        let config = toml::from_str(source).unwrap();
+        let app = App::new(
+            config,
+            Arc::new(Stats::default()),
+            Arc::new(Semaphore::new(10)),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(Semaphore::new(BUFFER_BUDGET)),
+        );
+        let session = app.session().unwrap();
+        let buffer = app.bytes.try_acquire_many(4096).unwrap();
+        let sample = internal_snapshot(&app, 1, 1, 3);
+        let value = |name: &str| {
+            sample
+                .metrics
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap()
+                .value
+                .as_str()
+        };
+        assert_eq!(value("server.sessions.active"), "1");
+        assert_eq!(value("server.sessions.available"), "9");
+        assert_eq!(value("server.udp.buffer_used"), "4096");
+        assert_eq!(value("server.sessions.accepted"), "1");
+        drop(buffer);
+        drop(session);
+        let sample = internal_snapshot(&app, 1, 0, 3);
+        assert_eq!(
+            sample
+                .metrics
+                .iter()
+                .find(|m| m.name == "server.sessions.active")
+                .unwrap()
+                .value,
+            "0"
+        );
+        assert_eq!(
+            sample
+                .metrics
+                .iter()
+                .find(|m| m.name == "server.udp.buffer_used")
+                .unwrap()
+                .value,
+            "0"
+        );
+    }
+    #[tokio::test]
+    async fn monitor_server_command_returns_internal_json_without_changing_status_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("server.toml");
+        let endpoint = directory.path().join("control.sock");
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        let prepared = config::prepare_text(&config, &format!("shutdown_timeout_secs=0\n[[listeners]]\ntag='local'\nprotocol='socks5'\nlisten='{address}'\n[[listeners.users]]\nname='user'\npassword='secret'\n")).unwrap();
+        drop(reservation);
+        let task = tokio::spawn(run(config, endpoint.clone(), prepared));
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(reply) = astra_management::server::call(&endpoint, Action::Monitor).await
+                {
+                    break reply;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reply.error.is_none());
+        let internal: astra_model::monitor::InternalSnapshot =
+            serde_json::from_str(&reply.logs).unwrap();
+        assert_eq!(internal.epoch, astra_platform::lifecycle::boot_id());
+        assert!(internal
+            .metrics
+            .iter()
+            .any(|m| m.name == "server.udp.buffer_capacity"));
+        assert!(!reply.logs.contains("secret"));
+        let status = astra_management::server::call(&endpoint, Action::Status)
+            .await
+            .unwrap();
+        assert_eq!(status.pid, reply.pid);
+        assert!(status.logs.is_empty());
+        astra_management::server::call(&endpoint, Action::Stop)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn panicked_listener_fails_service_and_releases_control_and_ingress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.toml");
+        let endpoint = directory.path().join("control.sock");
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        let source = format!("[[listeners]]\ntag='local'\nprotocol='socks5'\nlisten='{address}'\n[[listeners.users]]\nname='user'\npassword='secret'\n");
+        let prepared = config::prepare_text(&path, &source).unwrap();
+        drop(reservation);
+        let fault = Task::spawn("injected server listener", async {
+            panic!("listener fault injection")
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_supervised(path, endpoint.clone(), prepared, vec![fault]),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("injected server listener"));
+        assert!(!endpoint.exists());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+                    drop(listener);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }

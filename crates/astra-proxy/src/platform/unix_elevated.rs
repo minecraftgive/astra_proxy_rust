@@ -9,7 +9,7 @@
 //! macOS has no capability model: a utun device and its routes require a live
 //! root process, so this core stays root for its lifetime and is confined by
 //! its relationship with the manager (ticket, kernel peer-uid checks,
-//! configuration digest, and the lifeline that stops it when the manager exits).
+//! configuration digest, and explicit authenticated lifecycle commands).
 use anyhow::{bail, Context, Result};
 use astra_platform::unix_handoff::{
     self, ChildMessage, Commit, Handoff, Hello, LifelineCommand, Prepared, PROTOCOL_VERSION,
@@ -211,6 +211,10 @@ fn child_main(
     std::env::set_var("ASTRA_CONTROL_SOCKET", &handoff.control);
     std::env::set_var("ASTRA_LOG_LEVEL", &handoff.log_level);
     std::env::set_var("ASTRA_RUNTIME_DIR", &runtime_dir);
+    std::env::set_var(
+        "ASTRA_SERVICE_OWNER",
+        serde_json::to_string(&handoff.service_owner)?,
+    );
     if handoff.hosted {
         std::env::set_var("ASTRA_HOSTED_EXPERIMENTAL", "1");
     } else {
@@ -294,17 +298,20 @@ fn child_main(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(crate::proxy::runtime::run_with_lifeline(
+    let result = runtime.block_on(crate::proxy::runtime::run_with_lifeline(
         handoff.config,
         app,
         stop,
-    ))
+    ));
+    drop(runtime);
+    super::network_recovery::finish(result)
 }
 
 /// The manager cannot signal a root core, and a wedged runtime cannot be
 /// trusted to notice its lifeline. A dedicated thread therefore owns it:
-/// `Forced` ends the process at once; `Graceful`, EOF (the manager is gone)
-/// or a malformed frame request a normal stop, and the process still ends
+/// `Forced` ends the process at once; `Graceful` requests a normal stop.
+/// EOF or a malformed frame detaches the manager without stopping a committed
+/// healthy service. A graceful request still ends the process
 /// after `grace` if that stop hangs.
 fn watch_lifeline(
     mut stream: UnixStream,
@@ -318,6 +325,10 @@ fn watch_lifeline(
             if matches!(command, Ok(LifelineCommand::Forced)) {
                 eprintln!("manager forced the elevated core to stop");
                 unsafe { libc::_exit(1) }
+            }
+            if !matches!(command, Ok(LifelineCommand::Graceful)) {
+                tracing::warn!("manager lifecycle connection closed; core remains available for authenticated reattachment");
+                return;
             }
             let _ = sender.send(());
             std::thread::sleep(grace);

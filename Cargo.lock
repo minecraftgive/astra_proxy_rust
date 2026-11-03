@@ -241,6 +241,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astra-model",
+ "astra-observe",
  "hickory-proto",
  "ipnet",
  "serde",
@@ -254,7 +255,9 @@ name = "astra-ipc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "astra-model",
+ "astra-observe",
  "astra-platform",
  "bincode",
  "futures-util",
@@ -262,6 +265,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -327,6 +331,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-observe"
+version = "0.1.0"
+dependencies = [
+ "astra-model",
+]
+
+[[package]]
 name = "astra-platform"
 version = "0.1.0"
 dependencies = [
@@ -339,6 +350,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
@@ -384,6 +396,7 @@ dependencies = [
  "astra-dns",
  "astra-ipc",
  "astra-model",
+ "astra-observe",
  "astra-platform",
  "astra-protocols",
  "base64 0.22.1",
@@ -439,6 +452,7 @@ dependencies = [
  "arc-swap",
  "astra-ipc",
  "astra-model",
+ "astra-observe",
  "astra-platform",
  "astra-resource",
  "astra-rule-data",
@@ -480,6 +494,7 @@ dependencies = [
  "astra-ipc",
  "astra-management",
  "astra-model",
+ "astra-observe",
  "astra-platform",
  "astra-protocols",
  "base64 0.22.1",

@@ -123,9 +123,17 @@ impl Ui {
             Region::Tabs => PAGES.len(),
             Region::Controls if self.editor.is_some() => 3,
             Region::Controls if self.page == PROFILES => 3,
+            Region::Controls if self.page == OVERVIEW && self.active_proxy().is_some() => {
+                if self.live().is_some() {
+                    8
+                } else {
+                    2
+                }
+            }
             Region::Controls => 6,
             _ => 1,
         };
+        self.focus.cursor = self.focus.cursor.min(count - 1);
         match key.code {
             KeyCode::Left | KeyCode::Up => {
                 self.focus.cursor = self.focus.cursor.saturating_sub(1);
@@ -160,6 +168,17 @@ impl Ui {
                 Region::Controls => {
                     use astra_model::runtime::Command;
                     use astra_model::runtime::Mode;
+                    let runtime_count = if self.live().is_some() { 6 } else { 0 };
+                    if self.page == OVERVIEW
+                        && self.active_proxy().is_some()
+                        && self.focus.cursor >= runtime_count
+                    {
+                        return Some(if self.focus.cursor == runtime_count {
+                            self.active_operation(Operation::NetTools)
+                        } else {
+                            self.toggle_active()
+                        });
+                    }
                     let snapshot = self.live()?;
                     let command = match self.focus.cursor {
                         0 => Command::SetMode(Mode::Rule),
@@ -188,6 +207,21 @@ impl Ui {
             }
             Region::Controls if self.page == PROFILES => {
                 t(["Proxy profiles", "Rule cores", "Servers"][self.focus.cursor.min(2)]).into()
+            }
+            Region::Controls
+                if self.page == OVERVIEW
+                    && self.active_proxy().is_some()
+                    && (self.live().is_none() || self.focus.cursor >= 6) =>
+            {
+                let runtime_count = if self.live().is_some() { 6 } else { 0 };
+                t(if self.focus.cursor == runtime_count {
+                    "Network tools"
+                } else if self.active_proxy().is_some_and(|row| row.pid.is_some()) {
+                    "Disconnect profile"
+                } else {
+                    "Connect profile"
+                })
+                .into()
             }
             Region::Controls => t([
                 "Rule mode",

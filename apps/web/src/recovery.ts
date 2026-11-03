@@ -5,6 +5,7 @@ export interface Recovery {
   draftId: string;
   original?: string;
   sourceRevision?: string;
+  saveOperationId?: string;
 }
 const writes = new Map<string, Promise<void>>();
 async function open(): Promise<IDBDatabase> {
@@ -13,6 +14,8 @@ async function open(): Promise<IDBDatabase> {
     r.onupgradeneeded = () => r.result.createObjectStore("drafts");
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
+    r.onblocked = () =>
+      reject(new Error("Browser recovery storage is blocked"));
   });
 }
 async function write(key: string, value: Recovery) {
@@ -23,6 +26,8 @@ async function write(key: string, value: Recovery) {
       tx.objectStore("drafts").put(value, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () =>
+        reject(tx.error ?? new Error("Browser recovery write aborted"));
     });
   } finally {
     db.close();
@@ -41,6 +46,7 @@ export function retain(key: string, value: Recovery): Promise<void> {
   return next;
 }
 export async function recover(key: string): Promise<Recovery | undefined> {
+  await writes.get(key)?.catch(() => {});
   const db = await open();
   try {
     return await new Promise((resolve, reject) => {

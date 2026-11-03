@@ -7,25 +7,32 @@ use futures_util::{SinkExt, StreamExt};
 #[cfg(not(windows))]
 use std::process::Command;
 use std::sync::Arc;
-use tokio::{
-    sync::mpsc,
-    task::{JoinHandle, JoinSet},
-};
+use tokio::{sync::mpsc, task::JoinSet};
+
+#[cfg(test)]
+use tokio::task::JoinHandle;
 
 pub struct Prepared {
     device: Arc<tun_rs::AsyncDevice>,
     config: Tun,
     routes: Routes,
+    #[cfg(windows)]
+    adapter: Option<Arc<super::windows_network::AdapterGuard>>,
 }
 pub struct Guard {
-    task: Option<JoinHandle<()>>,
+    task: Option<astra_platform::supervision::Task>,
     _device: Arc<tun_rs::AsyncDevice>,
     routes: Routes,
     config: Tun,
+    #[cfg(windows)]
+    adapter: Option<Arc<super::windows_network::AdapterGuard>>,
 }
 impl Guard {
-    pub fn finished(&self) -> bool {
-        self.task.as_ref().is_some_and(|task| task.is_finished())
+    pub async fn failure(&mut self) -> Option<String> {
+        match self.task.as_mut() {
+            Some(task) => task.check().await,
+            None => None,
+        }
     }
 }
 impl Drop for Guard {
@@ -48,21 +55,31 @@ struct RouteSpec {
 pub(crate) struct OwnedRoute {
     spec: RouteSpec,
     #[cfg(not(windows))]
-    undo: Vec<String>,
+    record: RouteRecord,
+    #[cfg(not(windows))]
+    lease: super::network_recovery::Lease,
     #[cfg(windows)]
     _route: super::windows_network::Route,
 }
 #[cfg(not(windows))]
 impl Drop for OwnedRoute {
     fn drop(&mut self) {
-        if let Err(error) = command(&self.undo) {
-            tracing::error!(%error, "failed to remove owned TUN route");
+        match recover_route(&self.record, true) {
+            Ok(()) => {
+                if let Err(error) = self.lease.complete() {
+                    tracing::error!(%error, "route restoration checkpoint failed");
+                }
+            }
+            Err(error) => {
+                self.lease.failed(&error);
+                tracing::error!(%error, "owned TUN route recovery remains pending");
+            }
         }
     }
 }
 #[cfg(not(windows))]
 fn command(args: &[String]) -> Result<()> {
-    let output = Command::new(&args[0]).args(&args[1..]).output()?;
+    let output = astra_platform::command::output(Command::new(&args[0]).args(&args[1..]))?;
     ensure!(
         output.status.success(),
         "route command failed: {}{}",
@@ -118,6 +135,99 @@ fn route(
     }
     args
 }
+#[cfg(not(windows))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct RouteRecord {
+    cidr: String,
+    interface: Option<String>,
+    gateway: Option<std::net::IpAddr>,
+    fingerprint: Option<String>,
+}
+#[cfg(not(windows))]
+fn route_fingerprint(record: &RouteRecord) -> Result<Option<String>> {
+    let network: ipnet::IpNet = record.cidr.parse()?;
+    if cfg!(target_os = "linux") {
+        let output = astra_platform::command::output(Command::new("ip").args([
+            if network.addr().is_ipv4() { "-4" } else { "-6" },
+            "-j",
+            "route",
+            "show",
+            "exact",
+            &record.cidr,
+        ]))?;
+        ensure!(
+            output.status.success(),
+            "failed to inspect route: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        ensure!(rows.len() == 1, "route ownership is ambiguous");
+        let mut stable = serde_json::Map::new();
+        for key in [
+            "dst", "gateway", "dev", "protocol", "scope", "type", "metric", "prefsrc", "table",
+        ] {
+            if let Some(value) = rows[0].get(key) {
+                stable.insert(key.to_owned(), value.clone());
+            }
+        }
+        return Ok(Some(serde_json::to_string(&stable)?));
+    }
+    let output = astra_platform::command::output(Command::new("/sbin/route").args([
+        "-n",
+        "get",
+        if network.addr().is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        },
+        "-net",
+        &record.cidr,
+    ]))?;
+    ensure!(
+        output.status.success(),
+        "failed to inspect route: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    let fields: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|l| l.trim().split_once(':'))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    let expected = network.network().to_string();
+    if fields
+        .get("destination")
+        .is_none_or(|v| v != &expected && v != &record.cidr)
+    {
+        return Ok(None);
+    }
+    let mut stable = std::collections::BTreeMap::new();
+    for key in ["destination", "mask", "gateway", "interface", "flags"] {
+        if let Some(v) = fields.get(key) {
+            stable.insert(key, v);
+        }
+    }
+    Ok(Some(serde_json::to_string(&stable)?))
+}
+#[cfg(not(windows))]
+pub(super) fn recover_route(record: &RouteRecord, committed: bool) -> Result<()> {
+    let Some(actual) = route_fingerprint(record)? else {
+        return Ok(());
+    };
+    ensure!(
+        committed && record.fingerprint.as_ref() == Some(&actual),
+        "route ownership is unknown or changed externally; preserving it"
+    );
+    command(&route(
+        &record.cidr,
+        record.interface.as_deref(),
+        record.gateway,
+        false,
+    ))
+}
 impl Routes {
     fn add(
         &mut self,
@@ -149,11 +259,36 @@ impl Routes {
         };
         #[cfg(not(windows))]
         let owned = {
+            let mut record = RouteRecord {
+                cidr: spec.cidr.clone(),
+                interface: spec.interface.clone(),
+                gateway,
+                fingerprint: None,
+            };
+            ensure!(
+                route_fingerprint(&record)?.is_none(),
+                "route already exists; refusing to replace it"
+            );
+            let lease = super::network_recovery::Lease::prepare(
+                super::network_recovery::Resource::UnixRoute(record.clone()),
+            )?;
             command(&route(&spec.cidr, interface, gateway, true))?;
-            OwnedRoute {
-                undo: route(&spec.cidr, interface, gateway, false),
+            record.fingerprint = route_fingerprint(&record)?;
+            ensure!(
+                record.fingerprint.is_some(),
+                "created route could not be verified; recovery record retained"
+            );
+            let owned = OwnedRoute {
+                record,
+                lease,
                 spec,
-            }
+            };
+            owned
+                .lease
+                .commit_resource(super::network_recovery::Resource::UnixRoute(
+                    owned.record.clone(),
+                ))?;
+            owned
         };
         self.owned.push(Arc::new(owned));
         Ok(())
@@ -174,9 +309,15 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
                 && guard.config.ipv6_prefix == config.ipv6_prefix
         })
         .map(|guard| guard._device.clone());
+    super::network_recovery::ensure()?;
+    #[cfg(windows)]
+    let old_adapter = previous.and_then(|g| g.adapter.clone());
     let device_config = config.clone();
     let device = tokio::task::spawn_blocking(move || {
         if let Some(device) = existing_device {
+            #[cfg(windows)]
+            return Ok::<_, anyhow::Error>((device, old_adapter));
+            #[cfg(not(windows))]
             return Ok::<_, anyhow::Error>(device);
         }
         #[cfg(not(windows))]
@@ -209,6 +350,7 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
                     "create Windows TUN device (requires administrator and Wintun)".to_owned()
                 }
             })?;
+            let adapter = if existing { Some(Arc::new(super::windows_network::AdapterGuard::prepare(device.if_index()?, &device_config)?)) } else { None };
             device.set_mtu(device_config.mtu).context("configure Windows TUN MTU")?;
             device.set_metric(5).context("configure Windows TUN metric")?;
             device.set_network_address(device_config.address, device_config.prefix, None)
@@ -218,7 +360,8 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
                     .context("configure Windows TUN IPv6 address")?;
             }
             tracing::info!(name = %device.name()?, reused = existing, "Windows TUN session opened");
-            Ok(Arc::new(device))
+            if let Some(adapter) = &adapter { adapter.commit()?; }
+            Ok((Arc::new(device), adapter))
         }
         #[cfg(not(windows))]
         {
@@ -231,6 +374,8 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
         }
     })
     .await??;
+    #[cfg(windows)]
+    let (device, adapter) = device;
     let name = device.name()?;
     #[cfg(windows)]
     if let Some(interface) = &config.interface {
@@ -260,6 +405,8 @@ pub async fn prepare(config: Tun, previous: Option<&Guard>) -> Result<Prepared> 
         device,
         config,
         routes,
+        #[cfg(windows)]
+        adapter,
     })
 }
 impl Prepared {
@@ -292,20 +439,23 @@ impl Prepared {
                 _device: self.device,
                 routes: self.routes,
                 config: self.config,
+                #[cfg(windows)]
+                adapter: self.adapter,
             };
         }
         let device = self.device.clone();
         let config = self.config.clone();
-        let task = tokio::spawn(async move {
-            if let Err(error) = run(device, self.config.mtu, current).await {
-                tracing::error!(%error, "TUN processing failed");
-            }
-        });
+        let task = astra_platform::supervision::Task::spawn_result(
+            "TUN packet processing",
+            run(device, self.config.mtu, current),
+        );
         Guard {
             task: Some(task),
             _device: self.device,
             routes: self.routes,
             config,
+            #[cfg(windows)]
+            adapter: self.adapter,
         }
     }
 }

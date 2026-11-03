@@ -24,6 +24,7 @@ pub trait Transport: Send + Sync {
         query: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 }
+
 struct Cached {
     message: Message,
     inserted: Instant,
@@ -122,10 +123,20 @@ impl Resolver {
         self.config.fake_ip && Mappings::contains_fake(&self.config, ip)
     }
     pub async fn answer(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
+        let operation = astra_observe::operation!("dns.answer", "DNS 应答");
+        let result = self.answer_inner(raw, transport).await;
+        operation.finish(result.is_ok());
+        result
+    }
+    async fn answer_inner(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
         let _request = self
             .requests
             .clone()
             .try_acquire_owned()
+            .inspect_err(|_| {
+                astra_observe::counter!("dns.request_limit_rejections", "DNS 请求并发上限拒绝")
+                    .add(1);
+            })
             .context("DNS concurrent request limit reached")?;
         let query = Message::from_vec(raw)?;
         wire::validate_query(&query)?;
@@ -141,6 +152,11 @@ impl Resolver {
         if self.config.use_fake(&domain) && !self.excluded.contains(&domain) {
             // Prevent HTTPS/SVCB address hints bypassing Fake IP domain routing.
             if matches!(q.query_type(), RecordType::HTTPS | RecordType::SVCB) {
+                astra_observe::counter!(
+                    "dns.fake_ip.suppressed_hints",
+                    "Fake-IP 屏蔽 HTTPS/SVCB 地址提示"
+                )
+                .add(1);
                 return Ok(wire::response(&query, ResponseCode::NoError).to_vec()?);
             }
             if matches!(q.query_type(), RecordType::A | RecordType::AAAA) {
@@ -161,7 +177,9 @@ impl Resolver {
                         data,
                     ));
                 }
-                return Ok(reply.to_vec()?);
+                let bytes = reply.to_vec()?;
+                astra_observe::counter!("dns.fake_ip.replies", "Fake-IP 应答").add(1);
+                return Ok(bytes);
             }
         }
         Ok(self.real(&query, transport).await?.to_vec()?)
@@ -201,6 +219,12 @@ impl Resolver {
         Ok(addresses)
     }
     async fn real(&self, query: &Message, transport: &dyn Transport) -> Result<Message> {
+        let operation = astra_observe::operation!("dns.resolve", "DNS 真实解析（含缓存）");
+        let result = self.real_inner(query, transport).await;
+        operation.finish(result.is_ok());
+        result
+    }
+    async fn real_inner(&self, query: &Message, transport: &dyn Transport) -> Result<Message> {
         let mut normalized = query.clone();
         normalized.metadata.id = 0;
         let key = normalized.to_vec()?;
@@ -209,6 +233,7 @@ impl Resolver {
             if let Some(entry) = cache.get(&key) {
                 let age = entry.inserted.elapsed().as_secs();
                 if age < entry.ttl as u64 {
+                    astra_observe::counter!("dns.cache.hits", "DNS 缓存命中").add(1);
                     let mut message = entry.message.clone();
                     message.metadata.id = query.metadata.id;
                     for record in message
@@ -222,12 +247,19 @@ impl Resolver {
                     return Ok(message);
                 }
             }
-            cache.remove(&key);
+            if cache.remove(&key).is_some() {
+                astra_observe::counter!("dns.cache.expired", "DNS 缓存过期移除").add(1);
+            }
         }
+        astra_observe::counter!("dns.cache.misses", "DNS 缓存未命中").add(1);
         let _permit = self
             .permits
             .clone()
             .try_acquire_owned()
+            .inspect_err(|_| {
+                astra_observe::counter!("dns.query_limit_rejections", "DNS 上游查询并发上限拒绝")
+                    .add(1);
+            })
             .context("DNS concurrent query limit reached")?;
         let domain = query.queries[0]
             .name()
@@ -245,31 +277,35 @@ impl Resolver {
                 .chain(&self.config.fallback)
             {
                 let upstream = Upstream::parse(raw)?;
-                match tokio::time::timeout(
+                let packet = query.to_vec()?;
+                let attempt = astra_observe::operation!("dns.upstream", "DNS 上游交换");
+                let result = match tokio::time::timeout(
                     Duration::from_millis(self.config.query_timeout_ms),
-                    transport.exchange(&upstream, query.to_vec()?),
+                    transport.exchange(&upstream, packet),
                 )
                 .await
                 {
-                    Ok(Ok(bytes)) => match Message::from_vec(&bytes)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|message| {
-                            wire::validate_response(query, &message)?;
-                            Ok(message)
-                        }) {
-                        Ok(message)
-                            if !matches!(
+                    Ok(result) => result.and_then(|bytes| {
+                        let message = Message::from_vec(&bytes)?;
+                        wire::validate_response(query, &message)?;
+                        anyhow::ensure!(
+                            !matches!(
                                 message.metadata.response_code,
                                 ResponseCode::ServFail | ResponseCode::Refused
-                            ) =>
-                        {
-                            return Ok(message)
-                        }
-                        Ok(_) => last = Some(anyhow::anyhow!("upstream returned SERVFAIL/REFUSED")),
-                        Err(error) => last = Some(error),
-                    },
-                    Ok(Err(error)) => last = Some(error),
-                    Err(_) => last = Some(anyhow::anyhow!("DNS upstream timed out")),
+                            ),
+                            "upstream returned SERVFAIL/REFUSED"
+                        );
+                        Ok(message)
+                    }),
+                    Err(_) => {
+                        astra_observe::counter!("dns.upstream.timeouts", "DNS 上游超时").add(1);
+                        Err(anyhow::anyhow!("DNS upstream timed out"))
+                    }
+                };
+                attempt.finish(result.is_ok());
+                match result {
+                    Ok(message) => return Ok(message),
+                    Err(error) => last = Some(error),
                 }
             }
             Err(last.unwrap_or_else(|| anyhow::anyhow!("no usable DNS upstream")))
@@ -279,6 +315,9 @@ impl Resolver {
             exchange,
         )
         .await
+        .inspect_err(|_| {
+            astra_observe::counter!("dns.query_deadline_exceeded", "DNS 解析总截止时间超时").add(1);
+        })
         .context("DNS query deadline exceeded")??;
         if message.metadata.truncation {
             bail!("truncated upstream response after TCP fallback");
@@ -361,7 +400,10 @@ impl Resolver {
             )
         {
             let mut cache = self.cache.lock().unwrap();
+            let before = cache.len();
             cache.retain(|_, entry| entry.inserted.elapsed().as_secs() < entry.ttl as u64);
+            astra_observe::counter!("dns.cache.expired", "DNS 缓存过期移除")
+                .add((before - cache.len()) as u64);
             let bytes = key.len() + message.to_vec()?.len();
             while cache.len() >= self.config.cache_capacity
                 || cache.values().map(|entry| entry.bytes).sum::<usize>() + bytes > 16 * 1024 * 1024
@@ -372,6 +414,7 @@ impl Resolver {
                     .map(|(key, _)| key.clone())
                 {
                     cache.remove(&oldest);
+                    astra_observe::counter!("dns.cache.evictions", "DNS 缓存容量淘汰").add(1);
                 } else {
                     break;
                 }
@@ -387,5 +430,156 @@ impl Resolver {
             );
         }
         Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum Behavior {
+        Answer,
+        Failure,
+        Pending,
+    }
+    struct Mock {
+        behavior: Behavior,
+        calls: AtomicUsize,
+    }
+    impl Mock {
+        fn new(behavior: Behavior) -> Self {
+            Self {
+                behavior,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl Transport for Mock {
+        fn exchange<'a>(
+            &'a self,
+            _: &'a Upstream,
+            raw: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                match self.behavior {
+                    Behavior::Failure => bail!("mock upstream failure"),
+                    Behavior::Pending => std::future::pending().await,
+                    Behavior::Answer => {
+                        let query = Message::from_vec(&raw)?;
+                        let mut reply = wire::response(&query, ResponseCode::NoError);
+                        reply.answers.push(Record::from_rdata(
+                            query.queries[0].name().clone(),
+                            60,
+                            RData::A(A("203.0.113.1".parse().unwrap())),
+                        ));
+                        Ok(reply.to_vec()?)
+                    }
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_records_cache_failure_timeout_cancellation_fake_ip_and_saturation() {
+        let resolver = Resolver::new(Config {
+            cache_capacity: 1,
+            max_concurrent: 1,
+            query_timeout_ms: 100,
+            ..Config::default()
+        })
+        .unwrap();
+        let good = Mock::new(Behavior::Answer);
+        let query = wire::query("one.example", RecordType::A)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        resolver.answer(&query, &good).await.unwrap();
+        resolver.answer(&query, &good).await.unwrap();
+        assert_eq!(good.calls.load(Ordering::Relaxed), 1);
+        let other = wire::query("two.example", RecordType::A)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        resolver.answer(&other, &good).await.unwrap();
+
+        let failed = Mock::new(Behavior::Failure);
+        assert!(resolver.answer(&query, &failed).await.is_err());
+        let hanging = Mock::new(Behavior::Pending);
+        assert!(resolver.answer(&query, &hanging).await.is_err());
+        let mut cancelled = Box::pin(resolver.answer(&query, &hanging));
+        std::future::poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
+
+        let permit = resolver.requests.clone().try_acquire_owned().unwrap();
+        assert!(resolver
+            .answer(&query, &good)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request limit"));
+        drop(permit);
+        let permit = resolver.permits.clone().try_acquire_owned().unwrap();
+        assert!(resolver
+            .answer(&query, &good)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("query limit"));
+        drop(permit);
+
+        let fake = Resolver::new(Config {
+            fake_ip: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let raw = fake.answer(&query, &failed).await.unwrap();
+        assert!(matches!(
+            Message::from_vec(&raw).unwrap().answers[0].data,
+            RData::A(_)
+        ));
+
+        let snapshot = astra_observe::snapshot("dns-test");
+        // Other concurrently running resolvers may increase counters; assertions
+        // only require evidence of these paths, never a process-global exact delta.
+        for name in [
+            "dns.cache.hits",
+            "dns.cache.misses",
+            "dns.cache.evictions",
+            "dns.answer.failed",
+            "dns.answer.cancelled",
+            "dns.resolve.completed",
+            "dns.upstream.failed",
+            "dns.upstream.cancelled",
+            "dns.upstream.timeouts",
+            "dns.fake_ip.replies",
+            "dns.request_limit_rejections",
+            "dns.query_limit_rejections",
+        ] {
+            let metric = snapshot
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .unwrap();
+            assert!(metric.value.parse::<u64>().unwrap() > 0, "{name}");
+            assert_eq!(metric.kind, astra_observe::Kind::Counter);
+            assert_eq!(metric.unit, "count");
+        }
+        let duration = snapshot
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "dns.upstream.duration_us")
+            .unwrap();
+        assert_eq!(duration.unit, "us");
+        assert!(snapshot
+            .metrics
+            .iter()
+            .any(|metric| metric.name == "dns.answer.in_flight"
+                && metric.kind == astra_observe::Kind::Gauge));
     }
 }

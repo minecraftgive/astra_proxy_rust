@@ -30,8 +30,27 @@ pub(crate) struct Metrics {
     flows: Mutex<BTreeMap<u64, Weak<Flow>>>,
 }
 impl Metrics {
+    fn flows(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Weak<Flow>>> {
+        match self.flows.lock() {
+            Ok(flows) => flows,
+            Err(poisoned) => {
+                // This is an index, not routing state. Cancel every reachable
+                // flow before discarding a possibly partial index, then let new
+                // flows register against an empty, consistent map.
+                let mut flows = poisoned.into_inner();
+                for flow in flows.values().filter_map(Weak::upgrade) {
+                    flow.failed.store(true, Ordering::Relaxed);
+                    flow.cancel.send_replace(true);
+                }
+                flows.clear();
+                self.flows.clear_poison();
+                tracing::error!("traffic index update panicked; cancelled indexed flows and reset accounting index");
+                flows
+            }
+        }
+    }
     pub fn snapshot(&self) -> astra_model::runtime::Snapshot {
-        let flows = self.flows.lock().unwrap();
+        let flows = self.flows();
         let mut snapshot = astra_model::runtime::Snapshot {
             pid: std::process::id(),
             upload: self.upload.load(Ordering::Relaxed),
@@ -68,7 +87,7 @@ impl Metrics {
         snapshot
     }
     pub fn disconnect(&self, id: Option<u64>) -> bool {
-        let flows = self.flows.lock().unwrap();
+        let flows = self.flows();
         let mut found = id.is_none();
         for (key, flow) in flows.iter() {
             if id.is_none_or(|id| id == *key) {
@@ -135,11 +154,7 @@ impl Traffic {
             cancel: tokio::sync::watch::channel(false).0,
         });
         metrics.total.fetch_add(1, Ordering::Relaxed);
-        metrics
-            .flows
-            .lock()
-            .unwrap()
-            .insert(id, Arc::downgrade(&flow));
+        metrics.flows().insert(id, Arc::downgrade(&flow));
         Some(Self {
             metrics: metrics.clone(),
             flow,
@@ -197,7 +212,7 @@ impl Traffic {
 }
 impl Drop for Traffic {
     fn drop(&mut self) {
-        self.metrics.flows.lock().unwrap().remove(&self.id);
+        self.metrics.flows().remove(&self.id);
         let outcome = if self.failed.load(Ordering::Relaxed) {
             "failed"
         } else if self.connected.load(Ordering::Relaxed) {
@@ -245,7 +260,7 @@ impl<S> Stream<S> {
         if self.closed {
             Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "connection closed by user",
+                "connection closed",
             ))
         } else {
             Ok(())
@@ -345,6 +360,53 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing_subscriber::prelude::*;
+    #[tokio::test]
+    async fn poisoned_flow_index_does_not_panic_again_during_traffic_drop() {
+        let metrics = Arc::new(Metrics::default());
+        let make = || {
+            Traffic::new(
+                &metrics,
+                None,
+                &Target {
+                    host: "example.test".into(),
+                    port: 443,
+                },
+                Inbound::Socks5,
+                Network::Tcp,
+                &RouteAction::Proxy("node".into()),
+            )
+            .unwrap()
+        };
+        let dropping = make();
+        let survivor = make();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = metrics.flows.lock().unwrap();
+            panic!("injected traffic index panic");
+        }))
+        .is_err());
+        // Drop runs while another panic is already unwinding. An unwrap here
+        // would abort the test process instead of preserving the original panic.
+        let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _traffic = dropping;
+            panic!("original connection task panic");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            original.downcast_ref::<&str>(),
+            Some(&"original connection task panic")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), survivor.cancellation())
+            .await
+            .unwrap();
+        assert_eq!(metrics.snapshot().active, 0);
+        assert!(!metrics.flows.is_poisoned());
+        let next = make();
+        assert_eq!(metrics.snapshot().active, 1);
+        assert!(!*next.cancel.borrow());
+        drop(next);
+        drop(survivor);
+        assert_eq!(metrics.snapshot().active, 0);
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn stream_counts_actual_transferred_bytes_and_handles_half_close() {
         let subscriber =

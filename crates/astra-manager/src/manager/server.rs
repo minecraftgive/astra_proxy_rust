@@ -9,6 +9,15 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
+struct AbortTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for AbortTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Route {
     instance: Instance,
@@ -163,6 +172,7 @@ impl Hub {
                 log_levels: base.levels.clone(),
             },
             running: HashMap::new(),
+            blocked: HashMap::new(),
             exits: HashMap::new(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             elevations: HashMap::new(),
@@ -530,7 +540,8 @@ pub(super) async fn run(
     let (elevation_sender, mut elevation_events) = mpsc::unbounded_channel::<ElevationEvent>();
     manager.elevation_events = Some(elevation_sender);
     let actor_hub = hub.clone();
-    let actor = tokio::spawn(async move {
+    let mut owned_tasks = AbortTasks(Vec::new());
+    let mut actor = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
@@ -539,7 +550,7 @@ pub(super) async fn run(
                     actor_hub.publish(&manager);
                 }
                 work=requests.recv()=>{
-                    let Some(work)=work else {break;};
+                    let Some(work)=work else {return Err(anyhow::anyhow!("manager command channel closed unexpectedly"));};
                     if let Some(save)=work.save{
                         let result=if let Action::Save{name,original,text}=work.action{progress::scope(work.progress,manager.save_typed(name,original,text)).await}else{Err(anyhow::anyhow!("Invalid typed save command"))};
                         actor_hub.publish(&manager);let _=save.send(result);continue;
@@ -550,10 +561,11 @@ pub(super) async fn run(
                     work.progress.send_replace(Some(progress::Progress::new("Running",title.clone())));
                     let result=progress::scope(work.progress,manager.action(work.action)).await;
                     let reply=reply(result);
+                    let shutdown_error=if shutdown {reply.error.clone()} else {None};
                     actor_hub.log.write("manager",&format!("{} {title}",if reply.error.is_some(){"failed"}else{"completed"}));
                     actor_hub.publish(&manager);
                     let _=work.reply.send(reply);
-                    if shutdown{break;}
+                    if shutdown{if let Some(error)=shutdown_error {return Err(anyhow::anyhow!(error));} break;}
                 }
                 _=tick.tick()=>{
                     let _=manager.reap();
@@ -567,10 +579,11 @@ pub(super) async fn run(
                 }
             }
         }
-        manager.stop_all().await;
+        Ok::<(), anyhow::Error>(())
     });
+    owned_tasks.0.push(actor.abort_handle());
     let poll_hub = hub.clone();
-    let polling = tokio::spawn(async move {
+    let mut polling = tokio::spawn(async move {
         let mut tick = tokio::time::interval(crate::UI_REFRESH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -604,8 +617,9 @@ pub(super) async fn run(
         }
     });
     let permits = Arc::new(Semaphore::new(64));
+    owned_tasks.0.push(polling.abort_handle());
     let update_hub = hub.clone();
-    let update_polling = tokio::spawn(async move {
+    let mut update_polling = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -667,6 +681,7 @@ pub(super) async fn run(
         }
     });
     let diagnostics = Arc::new(Semaphore::new(2));
+    owned_tasks.0.push(update_polling.abort_handle());
     if let Some(ready) = ready {
         let _ = ready.send(NativeClient {
             hub: hub.clone(),
@@ -679,37 +694,71 @@ pub(super) async fn run(
     let mut clients = tokio::task::JoinSet::new();
     let signal = astra_ipc::shutdown_signal();
     tokio::pin!(signal);
-    loop {
+    let mut actor_joined = false;
+    let outcome = loop {
         tokio::select! {
-            _=&mut signal=>break,
-            _=stop.recv()=>break,
+            result=&mut actor=>{
+                actor_joined=true;
+                let result=result.context("native manager actor failed").and_then(|result|result);
+                if result.is_ok() {
+                    // Shutdown's caller must flush its acknowledgement before
+                    // the supervisor closes the connection tasks.
+                    let _=timeout(Duration::from_secs(3),stop.recv()).await;
+                }
+                break result;
+            },
+            result=&mut polling=>break Err(anyhow::anyhow!("manager status observer stopped unexpectedly: {result:?}")),
+            result=&mut update_polling=>break Err(anyhow::anyhow!("manager update observer stopped unexpectedly: {result:?}")),
+            result=&mut signal=>break result.map_err(Into::into),
+            _=stop.recv()=>break Ok(()),
             result=async{match &listener{Some(listener)=>listener.accept().await,None=>std::future::pending().await}}=>{
-                let (stream,_)=result?;
+                let (stream,_)=match result {Ok(value)=>value,Err(error) if astra_platform::supervision::transient_io(&error)=>{sleep(Duration::from_millis(100)).await;continue;},Err(error)=>break Err(error.into())};
                 if let Ok(permit)=permits.clone().try_acquire_owned(){let (hub,sender,stopped,diagnostics,followers)=(hub.clone(),sender.clone(),stopped.clone(),diagnostics.clone(),followers.clone());
                     clients.spawn(async move {let _permit=permit;let _=serve(stream,hub,sender,stopped,diagnostics,followers).await;});}
             }
             Some(_)=clients.join_next(),if !clients.is_empty()=>{},
         }
-    }
+    };
     polling.abort();
     update_polling.abort();
     clients.abort_all();
     while clients.join_next().await.is_some() {}
-    if !actor.is_finished() {
+    if outcome.is_err() {
+        // Aborting management detaches committed services; candidates retain RAII cleanup.
+        actor.abort();
+    } else if !actor.is_finished() {
         let (reply, _) = oneshot::channel();
         let (progress, _) = watch::channel(None);
-        let _ = sender
-            .send(Work {
+        let _ = timeout(
+            Duration::from_secs(3),
+            sender.send(Work {
                 action: Action::Shutdown,
                 reply,
                 progress,
                 save: None,
-            })
-            .await;
+            }),
+        )
+        .await;
     }
     drop(sender);
-    let _ = actor.await;
-    Ok(())
+    if !actor_joined {
+        match timeout(Duration::from_secs(35), &mut actor).await {
+            Ok(Err(error)) if outcome.is_ok() => {
+                return Err(error).context("manager shutdown actor failed")
+            }
+            Ok(Ok(Err(error))) if outcome.is_ok() => {
+                return Err(error).context("manager shutdown incomplete")
+            }
+            Err(_) => {
+                actor.abort();
+                return Err(anyhow::anyhow!(
+                    "manager shutdown timed out; inspect retained core identities"
+                ));
+            }
+            _ => {}
+        }
+    }
+    outcome
 }
 fn reply(result: Result<Reply>) -> Reply {
     result.unwrap_or_else(|error| {
@@ -1049,6 +1098,12 @@ async fn serve(
 }
 async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
     Some(match action {
+        Action::Monitor { name } => async {
+            let route = hub.route(name)?;
+            let snapshot = crate::monitor::core(name, route.instance.kind, route.pid, &route.socket).await?;
+            anyhow::ensure!(hub.route(name)?.pid == route.pid, "Core PID changed during monitor sample");
+            Ok(Reply::text(serde_json::to_string(&snapshot)?))
+        }.await,
         Action::List => Ok(hub.list.borrow().clone()),
         Action::UpdateStatus => serde_json::to_string(&*hub.updates.borrow())
             .map(Reply::text)

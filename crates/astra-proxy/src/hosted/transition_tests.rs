@@ -51,6 +51,7 @@ impl Fixture {
             );
         }
         let host = Arc::new(Host {
+            consistency: Default::default(),
             boot: "transition-test".into(),
             next_flow: AtomicU64::new(1),
             endpoint: directory.join("host.sock"),
@@ -175,8 +176,10 @@ async fn committed_runtime_cannot_send_a_late_disable_after_rollback() {
     };
     let published = AtomicBool::new(false);
     guard
-        .commit(vec![], || published.store(true, Ordering::Release))
-        .await;
+        .lock_commit(vec![])
+        .await
+        .unwrap()
+        .commit(|| published.store(true, Ordering::Release));
     assert!(published.load(Ordering::Acquire));
     assert_eq!(fixture.host.state.lock().await.active, 1);
     timeout(Duration::from_secs(3), started)
@@ -223,4 +226,202 @@ async fn failed_activation_and_cancelled_runtime_leave_previous_generation_selec
     .unwrap();
     assert_eq!(fixture.host.state.lock().await.active, 2);
     assert!(fixture.host.transition.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_admission_aborts_only_the_candidate() {
+    let fixture = Fixture::new(Some(1)).await;
+    let transition = fixture.host.transition.clone().lock_owned().await;
+    let candidate = CandidateGuard {
+        host: fixture.host.clone(),
+        id: 1,
+        committed: false,
+        transition: Some(transition),
+    };
+    let admission = fixture.host.state.lock().await;
+    assert!(
+        timeout(Duration::from_millis(25), candidate.lock_commit(vec![]))
+            .await
+            .is_err()
+    );
+    assert_eq!(admission.active, 2);
+    assert!(fixture.host.transition.try_lock().is_ok());
+    drop(admission);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let state = fixture.host.state.lock().await;
+            assert_eq!(state.active, 2);
+            if state.prepared.is_none() {
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn lost_override_acknowledgement(cancel: bool) {
+    let mut fixture = Fixture::new(None).await;
+    let generation = {
+        let mut state = fixture.host.state.lock().await;
+        state.paused = false;
+        state.generations[&state.active].clone()
+    };
+    let listener = astra_platform::platform::bind_listener(&generation.endpoint).unwrap();
+    let (started_tx, started) = oneshot::channel();
+    fixture.servers.push(tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let auth: Auth<WorkerRequest> = receive(&mut stream).await.unwrap();
+        assert!(matches!(auth.command, WorkerRequest::Overrides { .. }));
+        let _ = started_tx.send(());
+        if cancel {
+            std::future::pending::<()>().await;
+        }
+        // The worker accepted the mutation, but its acknowledgement was lost.
+    }));
+    let published = Arc::new(AtomicBool::new(false));
+    let visible = published.clone();
+    let host = fixture.host.clone();
+    let mut operation = tokio::spawn(async move {
+        host.overrides(Default::default(), None, || {
+            visible.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+    });
+    timeout(Duration::from_secs(3), started)
+        .await
+        .unwrap()
+        .unwrap();
+    if cancel {
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+    } else {
+        let error = timeout(Duration::from_secs(3), &mut operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"));
+    }
+    assert!(!published.load(Ordering::Acquire));
+    assert!(fixture
+        .host
+        .task_failure()
+        .await
+        .unwrap()
+        .contains("outcome unknown"));
+    assert!(fixture.host.ensure_consistent().is_err());
+    assert!(fixture
+        .host
+        .overrides(Default::default(), None, || panic!(
+            "uncertain state accepted another mutation"
+        ))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn lost_worker_override_reply_requires_controlled_shutdown() {
+    lost_override_acknowledgement(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_worker_override_requires_controlled_shutdown() {
+    lost_override_acknowledgement(true).await;
+}
+
+#[tokio::test]
+async fn worker_override_commit_with_failed_host_checkpoint_requires_shutdown() {
+    let mut fixture = Fixture::new(None).await;
+    let generation = {
+        let mut state = fixture.host.state.lock().await;
+        state.paused = false;
+        state.generations[&state.active].clone()
+    };
+    let listener = astra_platform::platform::bind_listener(&generation.endpoint).unwrap();
+    fixture.servers.push(tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let auth: Auth<WorkerRequest> = receive(&mut stream).await.unwrap();
+        assert!(matches!(auth.command, WorkerRequest::Overrides { .. }));
+        send(&mut stream, Ok::<(), String>(())).await.unwrap();
+    }));
+    let error = fixture
+        .host
+        .overrides(Default::default(), None, || {
+            anyhow::bail!("injected checkpoint write failure")
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("outcome unknown"));
+    assert!(fixture
+        .host
+        .task_failure()
+        .await
+        .unwrap()
+        .contains("checkpoint"));
+}
+
+fn poison<T>(lock: &std::sync::Mutex<T>) {
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = lock.lock().unwrap();
+        panic!("injected host lock poison");
+    }))
+    .is_err());
+}
+
+#[tokio::test]
+async fn poisoned_route_ownership_rejects_commit_before_publishing() {
+    let fixture = Fixture::new(Some(1)).await;
+    let generation = fixture.host.state.lock().await.generations[&1].clone();
+    poison(&generation.route_leases);
+    let transition = fixture.host.transition.clone().lock_owned().await;
+    let candidate = CandidateGuard {
+        host: fixture.host.clone(),
+        id: 1,
+        committed: false,
+        transition: Some(transition),
+    };
+    let error = candidate
+        .lock_commit(vec![])
+        .await
+        .err()
+        .expect("poisoned ownership accepted");
+    assert!(error.to_string().contains("route ownership"));
+    assert_eq!(fixture.host.state.lock().await.active, 2);
+    assert!(fixture
+        .host
+        .task_failure()
+        .await
+        .unwrap()
+        .contains("route ownership"));
+}
+
+#[tokio::test]
+async fn poisoned_host_cleanup_does_not_panic_again_or_trust_partial_telemetry() {
+    let fixture = Fixture::new(Some(1)).await;
+    poison(&fixture.host.telemetry);
+    let mut snapshot = astra_model::runtime::Snapshot::default();
+    fixture.host.merge_snapshot(&mut snapshot);
+    assert!(snapshot.truncated);
+    assert!(fixture
+        .host
+        .task_failure()
+        .await
+        .unwrap()
+        .contains("poisoned"));
+    poison(&fixture.host.tokens);
+    let preparation = Preparation {
+        state: fixture.host.state.clone(),
+        id: 1,
+        committed: false,
+        tokens: fixture.host.tokens.clone(),
+        token: Some("candidate".into()),
+        pid: None,
+    };
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(preparation))).is_ok());
+    poison(&fixture.host.tasks);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(fixture))).is_ok());
 }

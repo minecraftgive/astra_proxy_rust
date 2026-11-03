@@ -152,7 +152,9 @@ async fn hosted_stream_uses_original_source_for_acl_auth_and_loopback_protection
     drop(client);
 
     let app = app("authentication=['alice:correct']\nskip_auth_prefixes=['127.0.0.1/32']");
-    app.overrides.write().unwrap().allow_lan = Some(true);
+    let mut overrides = (*app.overrides.load_full()).clone();
+    overrides.allow_lan = Some(true);
+    app.overrides.store(std::sync::Arc::new(overrides));
     let (mut client, worker) = serve(app.clone(), Inbound::HttpConnect, source);
     client
         .write_all(b"CONNECT 127.0.0.1:12345 HTTP/1.1\r\n\r\n")

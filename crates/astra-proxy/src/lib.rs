@@ -56,7 +56,7 @@ pub struct App {
     hosted: Option<Arc<hosted::Host>>,
     worker_host: Option<hosted::WorkerHost>,
     metrics: Arc<proxy::traffic::Metrics>,
-    overrides: Arc<std::sync::RwLock<astra_model::runtime::Overrides>>,
+    overrides: Arc<arc_swap::ArcSwap<astra_model::runtime::Overrides>>,
     egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
     dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
@@ -93,7 +93,7 @@ fn loopback_target(host: &str) -> bool {
 impl App {
     fn inbound_allowed(&self, ip: std::net::IpAddr) -> bool {
         let ip = ip.to_canonical();
-        let allow_lan = self.overrides.read().unwrap().allow_lan.unwrap_or(false);
+        let allow_lan = self.overrides.load().allow_lan.unwrap_or(false);
         (allow_lan || ip.is_loopback())
             && (self.config.lan_allowed_ips.is_empty()
                 || self
@@ -120,7 +120,7 @@ impl App {
         }
     }
     fn lan_enabled(&self) -> bool {
-        let allowed = self.overrides.read().unwrap().allow_lan.unwrap_or(false);
+        let allowed = self.overrides.load().allow_lan.unwrap_or(false);
         allowed
             && self
                 .config
@@ -160,6 +160,22 @@ impl App {
         source: Option<std::net::SocketAddr>,
         destination: Option<std::net::SocketAddr>,
     ) -> Result<RouteAction> {
+        let operation = astra_observe::operation!("routing.ingress", "入站路由请求（含进程查找）");
+        let result = self
+            .route_connection_inner(target, inbound, network, source, destination)
+            .await;
+        operation.finish(result.is_ok());
+        result
+    }
+
+    async fn route_connection_inner(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<std::net::SocketAddr>,
+    ) -> Result<RouteAction> {
         // A LAN client must not use the proxy to reach this host's
         // loopback-only services: DIRECT would dial 127.0.0.1 locally.
         if matches!(
@@ -168,6 +184,9 @@ impl App {
         ) && source.is_some_and(|source| !source.ip().to_canonical().is_loopback())
             && loopback_target(&target.host)
         {
+            let operation = astra_observe::operation!("routing", "路由决策");
+            astra_observe::counter!("routing.block", "路由：拦截决策").add(1);
+            operation.finish(true);
             tracing::debug!(target: "astra_route", host = ?target.host, ?source, "LAN client blocked from host loopback");
             return Ok(RouteAction::Block);
         }
@@ -208,6 +227,33 @@ impl App {
             .await
     }
     async fn route_with_context(
+        &self,
+        target: &Target,
+        inbound: Inbound,
+        network: Network,
+        process: Option<ProcessInfo>,
+        destination_ip: Option<std::net::IpAddr>,
+    ) -> Result<RouteAction> {
+        let operation = astra_observe::operation!("routing", "路由决策");
+        let result = self
+            .route_with_context_inner(target, inbound, network, process, destination_ip)
+            .await;
+        operation.finish(result.is_ok());
+        match &result {
+            Ok(RouteAction::Direct) => {
+                astra_observe::counter!("routing.direct", "路由：直连决策").add(1)
+            }
+            Ok(RouteAction::Block) => {
+                astra_observe::counter!("routing.block", "路由：拦截决策").add(1)
+            }
+            Ok(RouteAction::Proxy(_)) => {
+                astra_observe::counter!("routing.proxy", "路由：代理决策").add(1)
+            }
+            Err(_) => {}
+        }
+        result
+    }
+    async fn route_with_context_inner(
         &self,
         target: &Target,
         inbound: Inbound,
@@ -257,12 +303,19 @@ impl App {
         process: Option<ProcessInfo>,
         destination_ip: Option<std::net::IpAddr>,
     ) -> Result<RouteAction> {
-        match self.overrides.read().unwrap().mode {
-            astra_model::runtime::Mode::Direct => return Ok(RouteAction::Direct),
-            astra_model::runtime::Mode::Global => return Ok(RouteAction::Proxy("PROXY".into())),
+        match self.overrides.load().mode {
+            astra_model::runtime::Mode::Direct => {
+                astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
+                return Ok(RouteAction::Direct);
+            }
+            astra_model::runtime::Mode::Global => {
+                astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
+                return Ok(RouteAction::Proxy("PROXY".into()));
+            }
             astra_model::runtime::Mode::Rule => {}
         }
         if let Some(action) = &self.standalone_action {
+            astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
             return Ok(action.clone());
         }
         let client = self.rule_client.as_ref().context("rule client missing")?;
@@ -277,8 +330,12 @@ impl App {
         };
         if revision != 0 && self.config.decision_cache_ttl_secs > 0 {
             if let Some(action) = self.cache.get(&key) {
+                astra_observe::counter!("routing.cache_hits", "路由缓存：命中").add(1);
                 return Ok(action);
             }
+            astra_observe::counter!("routing.cache_misses", "路由缓存：未命中").add(1);
+        } else {
+            astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
         }
         let req = RouteRequest {
             destination_ip,
@@ -294,6 +351,7 @@ impl App {
         if revision != 0 && response.revision == revision && self.config.decision_cache_ttl_secs > 0
         {
             self.cache.insert(key, response.action.clone());
+            astra_observe::counter!("routing.cache_inserts", "路由缓存：写入").add(1);
         }
         let decision = response.action;
         Ok(decision)

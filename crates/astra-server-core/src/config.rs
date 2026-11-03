@@ -5,6 +5,7 @@ pub use astra_model::config::server::{Config, Decryption, Listener, Protocol, Re
 pub struct Prepared {
     pub config: Config,
     pub tls: Vec<Option<Arc<tokio_rustls::rustls::ServerConfig>>>,
+    pub digest: u64,
 }
 pub fn load(path: &Path) -> Result<Prepared> {
     ensure!(
@@ -84,7 +85,11 @@ pub fn prepare_text(path: &Path, text: &str) -> Result<Prepared> {
         };
         tls.push(compiled);
     }
-    Ok(Prepared { config, tls })
+    Ok(Prepared {
+        config,
+        tls,
+        digest: astra_ipc::control::config_digest(text),
+    })
 }
 
 #[cfg(test)]

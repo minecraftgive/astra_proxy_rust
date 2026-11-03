@@ -448,19 +448,89 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
             &tls.private_key,
         )
         .await?;
-        axum_server::bind_rustls(config.listen, tls)
-            .serve(service)
-            .await?;
+        let handle = axum_server::Handle::new();
+        let server = axum_server::bind_rustls(config.listen, tls)
+            .handle(handle.clone())
+            .serve(service);
+        serve_until_shutdown(
+            server,
+            astra_platform::platform::shutdown_signal(),
+            move || handle.graceful_shutdown(Some(Duration::from_secs(5))),
+            Duration::from_secs(5),
+        )
+        .await?;
     } else {
-        axum::serve(tokio::net::TcpListener::bind(config.listen).await?, service).await?;
+        use std::future::IntoFuture;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = axum::serve(tokio::net::TcpListener::bind(config.listen).await?, service)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .into_future();
+        serve_until_shutdown(
+            server,
+            astra_platform::platform::shutdown_signal(),
+            move || {
+                let _ = stop.send(());
+            },
+            Duration::from_secs(5),
+        )
+        .await?;
     }
     Ok(())
+}
+
+async fn serve_until_shutdown(
+    server: impl std::future::Future<Output = std::io::Result<()>>,
+    signal: impl std::future::Future<Output = std::io::Result<()>>,
+    stop: impl FnOnce(),
+    grace: Duration,
+) -> anyhow::Result<()> {
+    tokio::pin!(server);
+    let signal = tokio::select! {
+        result = &mut server => return result.map_err(Into::into),
+        result = signal => result,
+    };
+    stop();
+    let drained = tokio::time::timeout(grace, server).await;
+    match (signal, drained) {
+        (Ok(()), Ok(result)) => result.map_err(Into::into),
+        (signal, result) => {
+            anyhow::bail!("Gateway shutdown incomplete: signal={signal:?}; drain={result:?}")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn shutdown_stops_accepting_and_waits_for_in_flight_work() {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        serve_until_shutdown(
+            async {
+                stopped.await.unwrap();
+                Ok(())
+            },
+            async { Ok(()) },
+            || {
+                stop.send(()).unwrap();
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let error = serve_until_shutdown(
+            std::future::pending(),
+            async { Ok(()) },
+            || {},
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("shutdown incomplete"));
+    }
     struct Stub;
     #[async_trait::async_trait]
     impl Backend for Stub {

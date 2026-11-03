@@ -178,10 +178,9 @@ pub async fn run_config(mut config: ManagerConfig) -> Result<()> {
     if let Some(parent) = endpoint.parent() {
         crate::private_dir(parent)?;
     }
-    let listener = astra_platform::platform::LocalListener::bind(&endpoint)
+    let listener = astra_platform::platform::bind_listener(&endpoint)
         .context("Management endpoint exists; an existing service is never replaced")?;
     astra_platform::platform::set_private(&endpoint, 0o600)?;
-    let _guard = Endpoint(endpoint);
     let _web = crate::web_process::supervise(&config)?;
     let ipc_connections = config.limits.ipc_connections;
     match config.mode {
@@ -193,17 +192,34 @@ pub async fn run_config(mut config: ManagerConfig) -> Result<()> {
             )
             .await?;
             let credentials = watch_credentials(config.config_file, controller.clone());
-            tokio::select! {result=controller.clone().listen()=>result,result=serve_local(listener,Service::Controller(controller),ipc_connections)=>result,_=credentials=>unreachable!("credential watcher is persistent")}
+            tokio::select! {result=controller.clone().listen()=>result,result=serve_local(listener,Service::Controller(controller.clone()),ipc_connections)=>result,error=controller.database_closed()=>Err(error),_=credentials=>Err(anyhow::anyhow!("credential watcher stopped unexpectedly")),result=astra_platform::platform::shutdown_signal()=>result.map_err(Into::into)}
         }
         Mode::Agent => {
             let agent = crate::agent::AgentService::new(config.clone())?;
-            let native = agent.start_native().await?;
+            let mut native = agent.start_native().await?;
             let local = serve_local(listener, Service::Agent(agent.clone()), ipc_connections);
-            if config.agent.controller_url.is_some() {
-                tokio::select! {result=native=>result.context("native actor task")?,result=local=>result,result=crate::controller::uplink(agent)=>result}
-            } else {
-                tokio::select! {result=native=>result.context("native actor task")?,result=local=>result}
+            let uplink = async {
+                if config.agent.controller_url.is_some() {
+                    crate::controller::uplink(agent.clone()).await
+                } else {
+                    std::future::pending::<Result<()>>().await
+                }
+            };
+            let mut completed = false;
+            let result = tokio::select! {
+                result=&mut native=>{completed=true;result.context("native actor task")?},
+                result=local=>result,
+                result=uplink=>result,
+                error=agent.database_closed()=>Err(error),
+            };
+            if !completed {
+                native.abort();
+                let _ = native.await;
             }
+            if result.is_ok() {
+                agent.shutdown_servers().await?;
+            }
+            result
         }
     }
 }
@@ -245,7 +261,14 @@ async fn serve_local(
 ) -> Result<()> {
     let capacity = Arc::new(tokio::sync::Semaphore::new(max_connections));
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = match listener.accept().await {
+            Ok(value) => value,
+            Err(error) if astra_platform::supervision::transient_io(&error) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let service = service.clone();
         let Ok(permit) = capacity.clone().try_acquire_owned() else {
             continue;
@@ -273,12 +296,7 @@ async fn serve_local(
         });
     }
 }
-struct Endpoint(PathBuf);
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        astra_platform::platform::remove_socket(&self.0);
-    }
-}
-
+#[cfg(test)]
+mod crash_tests;
 #[cfg(test)]
 mod tests;

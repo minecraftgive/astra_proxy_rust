@@ -162,6 +162,7 @@ impl Ui {
             && self.explanation.is_none()
             && self.help_scroll.is_none()
             && self.palette.is_none()
+            && self.monitor.is_none()
             && self.viewer.as_ref().is_none_or(logs::Viewer::browsing)
     }
     pub(super) fn close_viewer(&mut self) {
@@ -937,7 +938,7 @@ impl Ui {
             .split(area)
         } else {
             Layout::vertical([
-                Constraint::Length(1),
+                Constraint::Length(if self.kind == Kind::Server { 1 } else { 2 }),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
@@ -955,8 +956,24 @@ impl Ui {
         };
         // This page's keys, whole entries only; results live in the status line below.
         let hint_text = format!("[{}] Tab focus · {}", self.focus_label(), self.hint());
-        let spans = crate::theme::key_hints_fit(&hint_text, hint.width as usize, t("F1 more"));
-        f.render_widget(Paragraph::new(Line::from(spans)), hint);
+        let global = Line::from(crate::theme::key_hints(t("F2 / Ctrl-K commands · F1 help")));
+        let global_width = global.width() as u16;
+        let hints = if hint.width >= global_width + 22 {
+            f.render_widget(
+                Paragraph::new(global),
+                Rect::new(
+                    hint.right() - global_width,
+                    hint.y,
+                    global_width,
+                    hint.height,
+                ),
+            );
+            Rect::new(hint.x, hint.y, hint.width - global_width - 2, hint.height)
+        } else {
+            hint
+        };
+        let spans = crate::theme::key_hints_fit(&hint_text, hints.width as usize, t("F1 more"));
+        f.render_widget(Paragraph::new(Line::from(spans)), hints);
         content
     }
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
@@ -1046,33 +1063,8 @@ impl Ui {
                         ));
                     }
                 }
-                if level == 0 {
-                    // Rates sit at the right edge; idle traffic is muted rather than loud.
-                    let rate = |arrow: &str, bytes: u64, active: Color| {
-                        Span::styled(
-                            if self.runtime_rates_available() {
-                                format!("{arrow} {}/s", live::bytes(bytes))
-                            } else {
-                                format!("{arrow} —/s")
-                            },
-                            if bytes == 0 {
-                                muted
-                            } else {
-                                Style::default().fg(active)
-                            },
-                        )
-                    };
-                    right = vec![
-                        Span::styled(format!("{} ", self.runtime_health()), muted),
-                        Span::styled("Proxy ", muted),
-                        rate("↑", self.rates[0], Color::Magenta),
-                        Span::raw("  "),
-                        rate("↓", self.rates[1], Color::Cyan),
-                        Span::styled(" · Direct ", muted),
-                        rate("↑", self.direct_rates[0], Color::Magenta),
-                        Span::raw("  "),
-                        rate("↓", self.direct_rates[1], Color::Cyan),
-                    ];
+                if level == 0 && area.height >= 2 {
+                    right = self.rate_spans(0, area.width < 110);
                 }
             }
             let used = width(&left) + width(&right);
@@ -1080,6 +1072,12 @@ impl Ui {
                 if !right.is_empty() {
                     left.push(Span::raw(" ".repeat(area.width as usize - used)));
                     left.extend(right);
+                    Self::render_right_aligned(
+                        f,
+                        Rect::new(area.x, area.y + 1, area.width, 1),
+                        vec![Span::styled(format!(" {}", self.runtime_health()), muted)],
+                        self.rate_spans(1, area.width < 110),
+                    );
                 }
                 // Clicking the profile segment connects or disconnects, like the GUI switch.
                 self.hit(
@@ -1087,7 +1085,10 @@ impl Ui {
                         .intersection(area),
                     Target::Connect,
                 );
-                f.render_widget(Paragraph::new(Line::from(left)), area);
+                f.render_widget(
+                    Paragraph::new(Line::from(left)),
+                    Rect::new(area.x, area.y, area.width, area.height.min(1)),
+                );
                 return;
             }
         }
@@ -1124,14 +1125,6 @@ impl Ui {
             self.hit(rect, Target::Page(index));
             x = x.saturating_add(width + 1);
         }
-        let right = t("F2 / Ctrl-K commands · F1 help");
-        let width = Line::from(right).width() as u16;
-        if x + width + 2 < area.right() {
-            f.render_widget(
-                Paragraph::new(right).style(Style::default().fg(Color::DarkGray)),
-                Rect::new(area.right() - width - 1, area.y, width, 1),
-            );
-        }
     }
     fn hint(&self) -> String {
         let text = if self.palette.is_some() {
@@ -1145,7 +1138,7 @@ impl Ui {
         } else if self.editor.is_some() {
             "Enter edit · Space toggle · Ctrl-S save · Ctrl-Z/Y undo/redo · Esc retain draft"
         } else if self.viewer.is_some() {
-            "[ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
+            "End bottom · [ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
         } else if self.runtime_picker.is_some() {
             "↑↓ member · Enter select · / find · t test · Esc groups"
         } else {

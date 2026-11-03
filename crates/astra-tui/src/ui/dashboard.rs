@@ -29,17 +29,6 @@ pub(super) enum Target {
     NetTools,
 }
 
-/// Panels use the terminal's own background so light and dark themes both read well.
-fn short_rate(value: u64) -> String {
-    if value >= 1 << 20 {
-        format!("{:.1}M", value as f64 / (1u64 << 20) as f64)
-    } else if value >= 1 << 10 {
-        format!("{:.1}K", value as f64 / (1u64 << 10) as f64)
-    } else {
-        value.to_string()
-    }
-}
-
 fn fit_cells(text: &str, width: usize) -> String {
     astra_tui_kit::text::truncate_cells(text, width, "…")
 }
@@ -50,15 +39,15 @@ fn pad_cells(text: &str, width: usize) -> String {
 
 /// Current instance state as the uppercase colour code used by the layouts.
 fn indicator_state(row: &Row) -> (&'static str, Color) {
-    if row.pid.is_some() {
-        ("●G", Color::Green)
-    } else if row.state == "Starting" || row.state == "Stopping" {
+    if row.state == "Starting" || row.state == "Stopping" {
         ("●Y", Color::Yellow)
-    } else if row.state == "Unresponsive"
+    } else if row.state.starts_with("Unresponsive")
         || row.state.starts_with("Exited")
         || row.state.starts_with("Failed")
     {
         ("●R", Color::Red)
+    } else if row.pid.is_some() && row.state == "Running" {
+        ("●G", Color::Green)
     } else {
         ("○", MUTED)
     }
@@ -133,6 +122,33 @@ impl Ui {
         let Some(row) = self.active_proxy() else {
             return notices;
         };
+        if let Some(notice) = self
+            .details
+            .get(&row.instance.name)
+            .and_then(|d| d.network_recovery.as_ref())
+        {
+            use astra_model::recovery::RecoveryState;
+            let (label, color) = match notice.state {
+                RecoveryState::Recovered => ("Network settings recovered", Color::Green),
+                RecoveryState::Pending => ("Network recovery pending", Color::Red),
+                RecoveryState::Conflict => ("Network recovery conflict", Color::Red),
+            };
+            let time = i64::try_from(notice.timestamp_ms)
+                .ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|date| {
+                    date.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S %:z")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "?".into());
+            notices.push((color, format!("{} · {time}", t(label))));
+            notices.push((color, notice.message.clone()));
+            notices.push((
+                color,
+                format!("{}: {}", t("Recovery record"), notice.journal.display()),
+            ));
+        }
         if row.state.starts_with("Exited") || row.state == "Unresponsive" {
             notices.push((
                 Color::Red,
@@ -190,12 +206,8 @@ impl Ui {
         notices
     }
 
-    pub(super) fn overview_header_height(&self, width: u16) -> u16 {
-        if width < 80 {
-            6
-        } else {
-            5
-        }
+    pub(super) fn overview_header_height(&self, _width: u16) -> u16 {
+        5
     }
 
     /// One bordered panel for the active instance, its profile and the page tabs.
@@ -214,11 +226,13 @@ impl Ui {
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let muted = Style::default().fg(MUTED);
         let dark = Style::default().fg(Color::DarkGray);
-        let failed = row.state.starts_with("Exited") || row.state == "Unresponsive";
-        let (dot, color, state) = if row.pid.is_some() {
-            ("●", Color::Green, t("Connected"))
-        } else if failed {
+        let failed = row.state.starts_with("Exited")
+            || row.state.starts_with("Unresponsive")
+            || row.state.starts_with("Failed");
+        let (dot, color, state) = if failed {
             ("●", Color::Red, t("Failed"))
+        } else if row.pid.is_some() && row.state == "Running" {
+            ("●", Color::Green, t("Connected"))
         } else {
             ("○", MUTED, t("Not connected"))
         };
@@ -308,7 +322,7 @@ impl Ui {
             ));
         }
         let compact = area.width < 110;
-        let rates = self.rate_spans(compact);
+        let rates = self.rate_spans(0, compact);
         Self::render_right_aligned(
             f,
             Rect::new(inner.x, inner.y, inner.width, 1),
@@ -342,75 +356,49 @@ impl Ui {
         }
         let meta_row = inner.y + 1;
         if meta_row < inner.bottom() {
-            f.render_widget(
-                Paragraph::new(Line::from(meta)),
+            Self::render_right_aligned(
+                f,
                 Rect::new(inner.x, meta_row, inner.width, 1),
+                meta,
+                self.rate_spans(1, compact),
             );
-        }
-
-        if narrow {
-            if inner.height >= 4 {
-                let buttons = Rect::new(inner.x, inner.y + 2, inner.width, 1);
-                self.render_header_buttons(f, buttons, row);
-            }
-        } else {
-            let buttons = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-            self.render_header_buttons(f, buttons, row);
         }
         // Span the whole panel so the separator replaces the side borders.
         self.render_embedded_page_bar(f, Rect::new(area.x, inner.bottom() - 1, area.width, 1));
     }
 
-    fn rate_spans(&self, compact: bool) -> Vec<Span<'static>> {
-        if !self.runtime_rates_available() {
-            return vec![Span::styled(
-                " Proxy ↑— ↓— · Direct ↑— ↓— ",
-                Style::default().fg(MUTED),
-            )];
-        }
+    pub(super) fn rate_spans(&self, index: usize, compact: bool) -> Vec<Span<'static>> {
+        let available = self.runtime_rates_available();
+        let arrow = if index == 0 { "↑" } else { "↓" };
+        let color = if index == 0 {
+            Color::Magenta
+        } else {
+            Color::Cyan
+        };
         let style = |value: u64, color: Color| {
-            if value == 0 {
+            if !available || value == 0 {
                 Style::default().fg(MUTED)
             } else {
                 Style::default().fg(color)
             }
         };
-        if compact {
-            vec![Span::styled(
-                format!(
-                    "Proxy ↑{} ↓{} · Direct ↑{} ↓{}/s ",
-                    short_rate(self.rates[0]),
-                    short_rate(self.rates[1]),
-                    short_rate(self.direct_rates[0]),
-                    short_rate(self.direct_rates[1])
-                ),
-                Style::default().fg(Color::Cyan),
-            )]
-        } else {
-            vec![
-                Span::styled(
-                    format!(
-                        "Proxy ↑ {}/s · Direct ↑ {}/s",
-                        live::bytes(self.rates[0]),
-                        live::bytes(self.direct_rates[0])
-                    ),
-                    style(self.rates[0], Color::Magenta),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!(
-                        "Proxy ↓ {}/s · Direct ↓ {}/s",
-                        live::bytes(self.rates[1]),
-                        live::bytes(self.direct_rates[1])
-                    ),
-                    style(self.rates[1], Color::Cyan),
-                ),
-                Span::raw(" "),
-            ]
-        }
+        let value = |bytes| live::rate_value(available.then_some(bytes), compact);
+        vec![
+            Span::styled("Proxy ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{arrow} {}/s", value(self.rates[index])),
+                style(self.rates[index], color),
+            ),
+            Span::styled(" · Direct ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{arrow} {}/s", value(self.direct_rates[index])),
+                style(self.direct_rates[index], color),
+            ),
+            Span::raw(" "),
+        ]
     }
 
-    fn render_right_aligned(
+    pub(super) fn render_right_aligned(
         f: &mut Frame<'_>,
         area: Rect,
         mut left: Vec<Span<'static>>,
@@ -440,33 +428,6 @@ impl Ui {
             left.extend(right);
         }
         f.render_widget(Paragraph::new(Line::from(left)), area);
-    }
-
-    fn render_header_buttons(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
-        if area.width < 24 {
-            return;
-        }
-        let label = if row.pid.is_some() {
-            "c Disconnect"
-        } else {
-            "c Connect"
-        };
-        let width = Line::from(t(label)).width() as u16 + 2;
-        let c_x = area.right().saturating_sub(width + 1);
-        if c_x > area.x + 2 {
-            self.button(f, Rect::new(c_x, area.y, width, 1), label, Target::Connect);
-        }
-        let tools = "N Network tools";
-        let tools_width = Line::from(t(tools)).width() as u16 + 2;
-        let n_x = c_x.saturating_sub(tools_width + 1);
-        if n_x > area.x + 2 {
-            self.button(
-                f,
-                Rect::new(n_x, area.y, tools_width, 1),
-                tools,
-                Target::NetTools,
-            );
-        }
     }
 
     /// Page tabs drawn on a separator row inside the merged Astra panel.
@@ -527,13 +488,22 @@ impl Ui {
             return;
         };
         let notices = self.notices();
+        let notice_lines: usize = notices
+            .iter()
+            .map(|(_, text)| {
+                (astra_tui_kit::text::width(text) + 3)
+                    .div_ceil(area.width.saturating_sub(2).max(1) as usize)
+                    .max(1)
+            })
+            .sum();
         let bands = Layout::vertical([
             Constraint::Length(if notices.is_empty() {
                 0
             } else {
-                notices.len() as u16 + 2
+                (notice_lines.saturating_add(2).min(u16::MAX as usize) as u16)
+                    .min(area.height.saturating_sub(3))
             }),
-            Constraint::Length(if self.live().is_some() { 3 } else { 0 }),
+            Constraint::Length(self.runtime_controls_height(area.width)),
             Constraint::Min(0),
         ])
         .split(area);
@@ -1141,6 +1111,9 @@ impl Ui {
     }
 
     pub(super) fn mouse(&mut self, mouse: MouseEvent) -> Input {
+        if self.monitor.is_some() {
+            return Input::Idle;
+        }
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -1394,6 +1367,37 @@ mod tests {
         ui
     }
     #[test]
+    fn retained_pid_does_not_make_an_unresponsive_core_look_healthy() {
+        let mut ui = sample();
+        ui.rows[0].state = "Unresponsive".into();
+        assert_eq!(indicator_state(&ui.rows[0]), ("●R", Color::Red));
+        ui.rows[0].state = "Starting".into();
+        assert_eq!(indicator_state(&ui.rows[0]), ("●Y", Color::Yellow));
+    }
+    #[test]
+    fn network_recovery_notice_keeps_conflict_evidence_visible() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = sample();
+            ui.details.get_mut("proxy-00").unwrap().network_recovery =
+                Some(astra_model::recovery::Notice {
+                    state: astra_model::recovery::RecoveryState::Conflict,
+                    timestamp_ms: 1700000000000,
+                    message: "Route changed externally; retained".into(),
+                    journal: "C:/Astra/recovery.json".into(),
+                    boot_id: "boot".into(),
+                });
+            let notices = ui.notices();
+            assert_eq!(notices.len(), 3);
+            assert!(notices.iter().all(|(color, _)| *color == Color::Red));
+            assert!(
+                notices[0].1.contains("Network recovery conflict")
+                    && notices[0].1.contains("2023-")
+            );
+            assert!(notices[1].1.contains("retained"));
+            assert!(notices[2].1.contains("C:/Astra/recovery.json"));
+        });
+    }
+    #[test]
     fn overview_attention_hides_warnings_but_keeps_errors() {
         crate::i18n::with_language(crate::i18n::Language::English, || {
             let mut ui = sample();
@@ -1451,6 +1455,65 @@ mod tests {
             assert!(!text.contains("SNAPSHOT"));
         });
     }
+    #[test]
+    fn header_rates_keep_columns_and_actions_stay_in_controls() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            for width in [70, 100, 140] {
+                let mut ui = live_sample();
+                let mut columns = None;
+                for value in [0, 1_023, 1_048_575, 1 << 30, u64::MAX] {
+                    ui.rates = [value, value / 2];
+                    ui.direct_rates = [value / 3, value / 4];
+                    let terminal = render(&ui, width, 30);
+                    let buffer = terminal.backend().buffer();
+                    let up: Vec<_> = (0..width)
+                        .filter(|&x| buffer[(x, 1)].symbol() == "↑")
+                        .collect();
+                    let down: Vec<_> = (0..width)
+                        .filter(|&x| buffer[(x, 2)].symbol() == "↓")
+                        .collect();
+                    assert_eq!(up.len(), 2, "both rate columns at width {width}");
+                    assert_eq!(up, down, "upload and download columns align");
+                    assert_eq!(columns.get_or_insert(up.clone()), &up);
+                    let footer: String = (0..width).map(|x| buffer[(x, 28)].symbol()).collect();
+                    assert!(footer.contains("F2") && footer.contains("F1"));
+
+                    let controls_y = (0..30)
+                        .find(|&y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                                .contains("CONTROLS")
+                        })
+                        .unwrap();
+                    let hits = ui.hits.borrow();
+                    let tools = hits
+                        .iter()
+                        .find(|(_, target)| matches!(target, Target::NetTools))
+                        .unwrap()
+                        .0;
+                    let connect = hits
+                        .iter()
+                        .find(|(_, target)| matches!(target, Target::Connect))
+                        .unwrap()
+                        .0;
+                    assert!(tools.y > controls_y);
+                    assert!(tools.y < controls_y + ui.runtime_controls_height(width) - 1);
+                    assert_eq!(tools.y, connect.y);
+                    assert!(tools.right() < connect.x);
+                    assert!(connect.right() >= width - 3 && connect.right() < width);
+                }
+                // Missing telemetry keeps the same columns as live values.
+                let terminal = render(&sample(), width, 30);
+                let buffer = terminal.backend().buffer();
+                let up: Vec<_> = (0..width)
+                    .filter(|&x| buffer[(x, 1)].symbol() == "↑")
+                    .collect();
+                assert_eq!(columns.unwrap(), up);
+            }
+        });
+    }
+
     #[test]
     fn overview_expands_traffic_and_stays_stable_in_small_windows() {
         crate::i18n::with_language(crate::i18n::Language::English, || {
@@ -1648,6 +1711,21 @@ mod tests {
         ui.open_nettools = false;
         assert!(ui.diagnostics.is_none());
         assert_eq!(ui.page, OVERVIEW);
+        for live in [false, true] {
+            let mut controls = if live { live_sample() } else { sample() };
+            controls.focus.region = focus::Region::Controls;
+            controls.focus.cursor = if live { 6 } else { 0 };
+            assert!(matches!(
+                press(&mut controls, KeyCode::Enter),
+                Input::Run(Action::Diagnostics(_), _)
+            ));
+            assert!(controls.open_nettools);
+            press(&mut controls, KeyCode::Right);
+            assert!(matches!(
+                press(&mut controls, KeyCode::Enter),
+                Input::Run(Action::Stop(_), _)
+            ));
+        }
         // D still opens the node list, where n reaches the same tools.
         let Input::Run(action, _) = press(&mut ui, KeyCode::Char('D')) else {
             panic!()

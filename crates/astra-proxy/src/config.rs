@@ -84,7 +84,9 @@ mod inbound_acl_tests {
         let app = crate::App::from_text(std::path::Path::new("acl.toml"), "standalone=true\nstandalone_outbound='only'\nmixed_listen='0.0.0.0:7890'\nallow_lan=false\nauthentication=['alice:correct']\nlan_allowed_ips=['127.0.0.0/8','192.0.2.0/24']\nlan_disallowed_ips=['192.0.2.10/32']\nskip_auth_prefixes=['127.0.0.1/32']\n[proxy_groups.only]\nmembers=['DIRECT']\n".into()).unwrap();
         assert!(app.inbound_allowed("127.0.0.1".parse().unwrap()));
         assert!(!app.inbound_allowed("192.0.2.11".parse().unwrap()));
-        app.overrides.write().unwrap().allow_lan = Some(true);
+        let mut overrides = (*app.overrides.load_full()).clone();
+        overrides.allow_lan = Some(true);
+        app.overrides.store(std::sync::Arc::new(overrides));
         assert!(app.inbound_allowed("192.0.2.11".parse().unwrap()));
         assert!(!app.inbound_allowed("192.0.2.10".parse().unwrap()));
         assert!(!app.inbound_allowed("198.51.100.1".parse().unwrap()));

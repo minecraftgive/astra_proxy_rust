@@ -228,6 +228,7 @@ fn call_plan(action: Action, local: bool) -> Result<CallPlan> {
             request: request.into(),
         }),
         Action::StoragePaths => CallPlan::query(Q::StoragePaths),
+        Action::Monitor { name: instance } => CallPlan::query(Q::Monitor { instance }),
         Action::Runtime {
             name: instance,
             command: astra_model::runtime::Command::Snapshot,
@@ -293,6 +294,11 @@ fn call_plan(action: Action, local: bool) -> Result<CallPlan> {
     })
 }
 pub async fn call(p: &Path, action: Action) -> Result<Reply> {
+    // TUI rows retain names, while v2 addresses and replies use durable IDs.
+    let monitor_name = match &action {
+        Action::Monitor { name } => Some(name.clone()),
+        _ => None,
+    };
     let local = TARGET
         .get_or_init(Default::default)
         .lock()
@@ -312,6 +318,12 @@ pub async fn call(p: &Path, action: Action) -> Result<Reply> {
         } => save(p, name, original, text).await?,
         CallPlan::Rollback => rollback(p).await?,
     };
+    reply_for_action(result, monitor_name.as_deref())
+}
+fn reply_for_action(mut result: v::ResponseBody, monitor_name: Option<&str>) -> Result<Reply> {
+    if let (v::ResponseBody::Monitor(snapshot), Some(name)) = (&mut result, monitor_name) {
+        snapshot.instance = name.into();
+    }
     reply(result)
 }
 async fn save(p: &Path, name: String, original: String, text: String) -> Result<v::ResponseBody> {
@@ -423,6 +435,7 @@ fn reply(r: v::ResponseBody) -> Result<Reply> {
         R::NodeTags(x) => Reply::text(serde_json::to_string(&x)?),
         R::SubscriptionNodes(x) => Reply::text(serde_json::to_string(&x)?),
         R::StoragePaths(x) => Reply::text(serde_json::to_string(&x)?),
+        R::Monitor(x) => Reply::text(serde_json::to_string(&x)?),
         R::LogLevel(x) => Reply::text(x.as_str()),
         R::UpdateStatus(x) => Reply::text(serde_json::to_string(&x)?),
         R::Task(t) => {
@@ -675,6 +688,31 @@ async fn stream_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_is_a_read_only_query_for_local_and_remote_targets() {
+        for local in [true, false] {
+            assert!(matches!(
+                call_plan(Action::Monitor { name: "core".into() }, local).unwrap(),
+                CallPlan::Request(v::RequestBody::Query(v::Query::Monitor { instance })) if instance == "core"
+            ));
+        }
+    }
+
+    #[test]
+    fn monitor_reply_maps_durable_v2_identity_to_the_tui_request_name() {
+        let snapshot = v::MonitorSnapshot {
+            instance: "cf85e3bf-f8e4-4090-b8c3-69193a0e1ff6".into(),
+            pid: Some(42),
+            memory_bytes: Some("9007199254740993".into()),
+            ..Default::default()
+        };
+        let response = reply_for_action(v::ResponseBody::Monitor(snapshot), Some("proxy")).unwrap();
+        let sample: v::MonitorSnapshot = serde_json::from_str(&response.text).unwrap();
+        assert_eq!(sample.instance, "proxy");
+        assert_eq!(sample.pid, Some(42));
+        assert_eq!(sample.memory_bytes.as_deref(), Some("9007199254740993"));
+    }
 
     #[test]
     fn update_transaction_retains_the_callers_operation_identity() {

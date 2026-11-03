@@ -116,11 +116,11 @@ async fn flow(
     )
     .await
     .context("UDP open timeout")??;
-    let activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let (activity, _) = tokio::sync::watch::channel(Instant::now());
     let upload = async {
         while let Some(packet) = requests.recv().await {
             connection.send(&packet, destination).await?;
-            *activity.lock().unwrap() = Instant::now();
+            activity.send_replace(Instant::now());
         }
         Ok::<_, anyhow::Error>(())
     };
@@ -136,7 +136,7 @@ async fn flow(
             output
                 .send((packet[..size].to_vec(), remote, source))
                 .await?;
-            *activity.lock().unwrap() = Instant::now();
+            activity.send_replace(Instant::now());
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
@@ -144,9 +144,9 @@ async fn flow(
     let expiry = async {
         let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
         loop {
-            let deadline = *activity.lock().unwrap() + duration;
+            let deadline = *activity.borrow() + duration;
             tokio::time::sleep_until(deadline).await;
-            if activity.lock().unwrap().elapsed() >= duration {
+            if activity.borrow().elapsed() >= duration {
                 return;
             }
         }

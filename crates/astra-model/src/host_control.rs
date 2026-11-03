@@ -64,6 +64,8 @@ pub enum Command {
         token: String,
         operation: Box<MappingOperation>,
     },
+    /// Read-only internal diagnostics for the resident host and live workers.
+    Monitor,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GenerationStatus {

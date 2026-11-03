@@ -48,6 +48,39 @@ pub(super) fn bytes(value: u64) -> String {
     format!("{value} B")
 }
 
+/// Fixed terminal columns keep live rates still when values or units change.
+pub(super) fn rate_value(value: Option<u64>, compact: bool) -> String {
+    let width = if compact { 7 } else { 10 };
+    let Some(value) = value else {
+        return format!("{:>width$}", "—");
+    };
+    for (unit, short, shift) in [
+        ("EiB", "E", 60),
+        ("PiB", "P", 50),
+        ("TiB", "T", 40),
+        ("GiB", "G", 30),
+        ("MiB", "M", 20),
+        ("KiB", "K", 10),
+    ] {
+        let scale = 1u64 << shift;
+        if value >= scale {
+            let number = value as f64 / scale as f64;
+            let text = if compact {
+                format!("{number:.1}{short}")
+            } else {
+                format!("{number:.1} {unit}")
+            };
+            return format!("{text:>width$}");
+        }
+    }
+    let text = if compact {
+        value.to_string()
+    } else {
+        format!("{value} B")
+    };
+    format!("{text:>width$}")
+}
+
 /// Latency colored like the GUI: green < 150 ms, yellow < 400 ms, red otherwise.
 pub(super) fn delay_span(delay: Option<u64>, alive: Option<bool>) -> Span<'static> {
     match (alive, delay) {
@@ -926,22 +959,30 @@ impl Ui {
         None
     }
 
-    /// Mode segments and takeover switches, shared by Overview and the status bar.
-    pub(super) fn render_runtime_modes(&self, f: &mut Frame<'_>, area: Rect) {
+    fn runtime_control_items(&self, compact: bool) -> Vec<(Line<'static>, Command)> {
         let Some(snapshot) = self.live() else {
-            return;
+            return Vec::new();
         };
-        if area.width < 4 || area.height < 3 {
-            return;
+        let mut items = Vec::new();
+        for mode in [Mode::Rule, Mode::Global, Mode::Direct] {
+            let label = t(match mode {
+                Mode::Rule => "Rule",
+                Mode::Global => "Global",
+                Mode::Direct => "Direct",
+            });
+            let style = if snapshot.mode == mode {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(BLUE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            items.push((
+                Line::styled(format!(" m {label} "), style),
+                Command::SetMode(mode),
+            ));
         }
-        let block = self.focused_card("CONTROLS", focus::Region::Controls);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-        let area = inner;
-        let compact = area.width < 90;
         let switches = [
             (
                 'S',
@@ -966,55 +1007,118 @@ impl Ui {
                 Command::AllowLan(!snapshot.allow_lan),
             ),
         ];
-        let switch_width =
-            |key: char, label: &str| Line::from(format!(" {key} {label} ○ ")).width() as u16 + 2;
-        let cells = Layout::horizontal([
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(switch_width(switches[0].0, switches[0].1)),
-            Constraint::Length(switch_width(switches[1].0, switches[1].1)),
-            Constraint::Min(0),
-        ])
-        .split(area);
-        for (index, mode) in [Mode::Rule, Mode::Global, Mode::Direct].iter().enumerate() {
-            let label = t(match mode {
-                Mode::Rule => "Rule",
-                Mode::Global => "Global",
-                Mode::Direct => "Direct",
-            });
-            let rect = cells[index].inner(ratatui::layout::Margin::new(1, 0));
-            f.render_widget(
-                Paragraph::new(format!(" m {label} ")).style(if snapshot.mode == *mode {
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(BLUE)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(MUTED)
-                }),
-                rect,
-            );
-            self.hit(rect, Target::Runtime(Command::SetMode(*mode)));
-        }
-        for (index, (key, label, enabled, command)) in switches.into_iter().enumerate() {
-            let rect = cells[index + 3].inner(ratatui::layout::Margin::new(1, 0));
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
+        for (key, label, enabled, command) in switches {
+            items.push((
+                Line::from(vec![
                     Span::raw(format!(" {key} {label} ")),
                     Span::styled(
                         if enabled { "●" } else { "○" },
                         Style::default().fg(if enabled { Color::Green } else { MUTED }),
                     ),
-                ]))
+                    Span::raw(" "),
+                ])
                 .style(if enabled {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(MUTED)
                 }),
-                rect,
-            );
+                command,
+            ));
+        }
+        items
+    }
+
+    fn runtime_control_actions(&self) -> Vec<(&'static str, Target)> {
+        let Some(row) = self.active_proxy() else {
+            return Vec::new();
+        };
+        vec![
+            (t("N Network tools"), Target::NetTools),
+            (
+                t(if row.pid.is_some() {
+                    "c Disconnect"
+                } else {
+                    "c Connect"
+                }),
+                Target::Connect,
+            ),
+        ]
+    }
+
+    pub(super) fn runtime_controls_height(&self, width: u16) -> u16 {
+        if self.active_proxy().is_none() {
+            return 0;
+        }
+        let inner_width = width.saturating_sub(2) as usize;
+        let items = self.runtime_control_items(inner_width < 90);
+        let controls_width = items.iter().map(|(line, _)| line.width()).sum::<usize>()
+            + items.len().saturating_sub(1);
+        let actions = self.runtime_control_actions();
+        let actions_width = actions
+            .iter()
+            .map(|(label, _)| Line::from(*label).width() + 2)
+            .sum::<usize>()
+            + actions.len().saturating_sub(1);
+        if !items.is_empty() && controls_width + 2 + actions_width > inner_width {
+            4
+        } else {
+            3
+        }
+    }
+
+    /// Mode switches stay left; profile actions occupy the right edge of Controls.
+    pub(super) fn render_runtime_modes(&self, f: &mut Frame<'_>, area: Rect) {
+        if self.active_proxy().is_none() || area.width < 4 || area.height < 3 {
+            return;
+        }
+        let block = self.focused_card("CONTROLS", focus::Region::Controls);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let items = self.runtime_control_items(inner.width < 90);
+        let action_index = items.len();
+        let actions = self.runtime_control_actions();
+        let second_row = self.runtime_controls_height(area.width) == 4 && inner.height > 1;
+        let action_y = inner.y + u16::from(second_row);
+        let mut action_left = inner.right();
+        for (index, (label, target)) in actions.into_iter().enumerate().rev() {
+            let width = (Line::from(label).width() + 2) as u16;
+            if action_left.saturating_sub(inner.x) < width {
+                continue;
+            }
+            let rect = Rect::new(action_left - width, action_y, width, 1);
+            let mut style = Style::default().bg(BLUE).fg(Color::White);
+            if self.focus.region == focus::Region::Controls
+                && self.focus.cursor == action_index + index
+            {
+                style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+            f.render_widget(Paragraph::new(format!(" {label} ")).style(style), rect);
+            self.hit(rect, target);
+            action_left = rect.x.saturating_sub(1).max(inner.x);
+        }
+        let controls_right = if second_row {
+            inner.right()
+        } else {
+            action_left.saturating_sub(1).max(inner.x)
+        };
+        let mut x = inner.x;
+        for (index, (mut line, command)) in items.into_iter().enumerate() {
+            let width = line.width() as u16;
+            if x.saturating_add(width) > controls_right {
+                break;
+            }
+            if self.focus.region == focus::Region::Controls && self.focus.cursor == index {
+                line.style = line
+                    .style
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+            let rect = Rect::new(x, inner.y, width, 1);
+            f.render_widget(Paragraph::new(line), rect);
             self.hit(rect, Target::Runtime(command));
+            x = x.saturating_add(width + 1);
         }
     }
 
@@ -1650,7 +1754,8 @@ mod tests {
         key(&mut ui, KeyCode::PageUp);
         assert_eq!(ui.runtime_picker.as_ref().unwrap().1, 0);
         ui.navigate(OVERVIEW);
-        for (width, step) in [(140, 18), (70, 6)] {
+        // Narrow Controls places profile actions on a second row.
+        for (width, step) in [(140, 18), (70, 5)] {
             ui.overview_scroll = 0;
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|f| ui.render_overview(f, f.area())).unwrap();
@@ -1996,7 +2101,9 @@ mod tests {
             let mut t = ratatui::Terminal::new(TestBackend::new(width, 12)).unwrap();
             t.draw(|f| ui.render(f)).unwrap();
             let buffer = t.backend().buffer().clone();
-            let cells: Vec<_> = (0..width).map(|x| buffer[(x, 0)].clone()).collect();
+            let cells: Vec<_> = (0..width * 2)
+                .map(|index| buffer[(index % width, index / width)].clone())
+                .collect();
             let text: String = cells.iter().map(|c| c.symbol()).collect();
             (text, cells)
         };
@@ -2010,11 +2117,17 @@ mod tests {
             assert_eq!(color_of(&cells, &text, "LAN"), MUTED);
             assert_eq!(color_of(&cells, &text, "Rule"), Color::Cyan);
             assert_eq!(
-                color_of(&cells, &text, "↑ 0 B/s"),
+                color_of(&cells, &text, "↑        0 B/s"),
                 MUTED,
                 "idle rate is muted"
             );
             assert_eq!(color_of(&cells, &text, "↓"), Color::Cyan);
+            let up: Vec<_> = (0..220).filter(|&x| cells[x].symbol() == "↑").collect();
+            let down: Vec<_> = (0..220)
+                .filter(|&x| cells[x + 220].symbol() == "↓")
+                .collect();
+            assert_eq!(up.len(), 2);
+            assert_eq!(up, down, "standalone rates align across both rows");
             assert!(
                 text.contains("Proxy")
                     && text.contains("Direct")

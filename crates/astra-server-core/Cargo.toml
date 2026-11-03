@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 astra-management = { path = "../astra-management" }
 astra-model = { path = "../astra-model" }
+astra-observe = { path = "../astra-observe" }
 astra-platform = { path = "../astra-platform" }
 astra-protocols = { path = "../astra-protocols" }
 astra-ipc = { path = "../astra-ipc" }

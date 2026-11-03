@@ -53,6 +53,12 @@ pub struct Controller {
     index: Option<crate::database::Database>,
 }
 impl Controller {
+    pub(crate) async fn database_closed(&self) -> anyhow::Error {
+        match &self.index {
+            Some(database) => database.closed().await,
+            None => std::future::pending().await,
+        }
+    }
     pub fn new(config: ControllerConfig) -> Arc<Self> {
         Arc::new(Self {
             credentials: Mutex::new(config.agent_token_hashes.clone()),

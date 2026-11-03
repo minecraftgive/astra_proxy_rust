@@ -11,6 +11,7 @@ mod background;
 mod dashboard;
 mod detached;
 mod live;
+mod monitor;
 mod operations;
 mod pages;
 mod shell;
@@ -431,6 +432,7 @@ struct Ui {
     operation_result: Option<String>,
     tasks: background::Tasks,
     tui_viewer: Option<logs::Viewer>,
+    monitor: Option<monitor::View>,
     operation_failed: bool,
     ready_editors: HashMap<String, Editor>,
     last_find: String,
@@ -581,6 +583,7 @@ impl Ui {
             operation_result: None,
             tasks: Default::default(),
             tui_viewer: None,
+            monitor: None,
             operation_failed: false,
             ready_editors: HashMap::new(),
             last_find: String::new(),
@@ -902,6 +905,9 @@ impl Ui {
             .map_or(self.input.len(), |(index, _)| index)
     }
     fn paste(&mut self, text: &str) {
+        if self.monitor.is_some() {
+            return;
+        }
         if self.background_paste(text) {
             return;
         }
@@ -1212,6 +1218,14 @@ impl Ui {
         }
         if let Some(input) = self.command_key(key) {
             return input;
+        }
+        if let Some(view) = &mut self.monitor {
+            if key.code == KeyCode::Esc {
+                self.monitor = None;
+            } else {
+                view.key(key);
+            }
+            return Input::Idle;
         }
         if self.tasks.showing_details() || self.tui_viewer.is_some() {
             if let Some(input) = self.background_key(key) {
@@ -1780,16 +1794,23 @@ impl Ui {
     }
     fn render(&self, f: &mut Frame<'_>) {
         self.hits.borrow_mut().clear();
+        if let Some(view) = &self.monitor {
+            view.render(f, f.area());
+            return;
+        }
         if let Some(view) = &self.diagnostics {
             view.render(f, f.area());
             self.render_palette(f);
             if let Some(scroll) = self.help_scroll {
                 let text = self.command_help();
-                f.render_widget(
-                    Paragraph::new(text)
-                        .scroll((scroll, 0))
-                        .block(Block::default().borders(Borders::ALL).title(t("Help"))),
-                    f.area(),
+                let area = f.area();
+                crate::help::render(
+                    f,
+                    area,
+                    &text,
+                    scroll,
+                    Block::default().borders(Borders::ALL).title(t("Help")),
+                    self.help_override.is_none(),
                 );
             }
             self.render_background(f);
@@ -2026,18 +2047,18 @@ impl Ui {
         if let Some(scroll) = self.help_scroll {
             let text = self.command_help();
             let popup = crate::help::popup(f.area(), &text);
-            f.render_widget(Clear, popup);
-            f.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0))
-                    .block(
-                        Block::default()
-                            .title(t("Page operations"))
-                            .title_bottom(t("↑↓ scroll · ? / Esc close"))
-                            .borders(Borders::ALL),
-                    ),
+            crate::help::render(
+                f,
                 popup,
+                &text,
+                scroll,
+                Block::default()
+                    .title(t("Page operations"))
+                    .title_bottom(Line::from(crate::theme::key_hints(t(
+                        "↑↓ scroll · ? / Esc close",
+                    ))))
+                    .borders(Borders::ALL),
+                self.help_override.is_none(),
             );
         }
         self.render_background(f);

@@ -10,7 +10,7 @@ pub mod host;
 pub mod progress;
 pub mod session;
 
-pub const API_VERSION: u16 = 4;
+pub const API_VERSION: u16 = 5;
 const MAX_MESSAGE_BYTES: u32 = 8192;
 
 use astra_model::{
@@ -56,10 +56,43 @@ pub async fn receive_management<T: DeserializeOwned>(
     receive_bounded(stream, 1024 * 1024).await
 }
 
+/// Read a management DTO whose first field is a u16 protocol version. Inspect
+/// that stable prefix before decoding fields added by a newer wire contract.
+pub async fn receive_management_versioned<T: DeserializeOwned>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    expected: u16,
+) -> io::Result<T> {
+    let frame = receive_frame(stream, 1024 * 1024).await?;
+    let prefix: [u8; 2] = frame
+        .get(..2)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing management protocol version",
+            )
+        })?;
+    let version = u16::from_le_bytes(prefix);
+    if version != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "incompatible management protocol: peer version {version}, expected {expected}; update the matching core and manager"
+        )));
+    }
+    bincode::deserialize(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 async fn receive_bounded<T: DeserializeOwned>(
     stream: &mut (impl tokio::io::AsyncRead + Unpin),
     limit: u32,
 ) -> io::Result<T> {
+    let frame = receive_frame(stream, limit).await?;
+    bincode::deserialize(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+async fn receive_frame(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: u32,
+) -> io::Result<Vec<u8>> {
     let len = stream.read_u32().await?;
     if len == 0 || len > limit {
         return Err(io::Error::new(
@@ -69,7 +102,30 @@ async fn receive_bounded<T: DeserializeOwned>(
     }
     let mut frame = vec![0u8; len as usize];
     stream.read_exact(&mut frame).await?;
-    bincode::deserialize(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Ok(frame)
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[tokio::test]
+    async fn version_is_checked_before_new_fields_are_decoded() {
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        // An older reply lacks a field required by the new contract.
+        super::send_management(&mut sender, &(1u16, 42u32))
+            .await
+            .unwrap();
+        let error = super::receive_management_versioned::<(u16, u32, String)>(&mut receiver, 2)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("peer version 1, expected 2"));
+        super::send_management(&mut sender, &(2u16, 42u32, "ready"))
+            .await
+            .unwrap();
+        let reply: (u16, u32, String) = super::receive_management_versioned(&mut receiver, 2)
+            .await
+            .unwrap();
+        assert_eq!(reply.2, "ready");
+    }
 }
 
 pub use astra_platform::platform::shutdown_signal;
