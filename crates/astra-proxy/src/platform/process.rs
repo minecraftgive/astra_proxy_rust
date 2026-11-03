@@ -85,6 +85,7 @@ async fn bounded_lookup<T: Send + 'static>(
     .flatten()
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn info(pid: u32, path: String) -> Option<ProcessInfo> {
     let name = path.rsplit(['/', '\\']).next()?.to_owned();
     if name.is_empty() || name.len() > 256 || path.len() > 4096 {

@@ -259,7 +259,7 @@ pub fn peer_credentials(fd: std::os::fd::RawFd) -> io::Result<PeerCredentials> {
         Ok(PeerCredentials {
             uid,
             gid,
-            pid: pid as i32,
+            pid,
         })
     }
 }

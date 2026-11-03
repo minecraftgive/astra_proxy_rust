@@ -11,9 +11,9 @@ use astra_platform::unix_handoff::Hello;
 use astra_platform::unix_handoff::LifelineCommand;
 use astra_platform::unix_handoff::Offer;
 use astra_platform::unix_handoff::Prepared;
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use tokio::sync::oneshot;
@@ -727,6 +727,7 @@ fn pidfd_signal(fd: i32, signal: i32) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::*;
 
     #[cfg(target_os = "linux")]

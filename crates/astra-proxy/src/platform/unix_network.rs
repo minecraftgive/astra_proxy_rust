@@ -1,6 +1,8 @@
 //! Physical default-route discovery; command details are isolated from runtime policy.
 use super::egress::PhysicalEgress;
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
 use std::process::Command;
 
 pub(super) fn physical_egress(

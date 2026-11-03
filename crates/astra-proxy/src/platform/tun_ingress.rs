@@ -103,6 +103,7 @@ mod tests {
         packet
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     fn owned_packet(network: Network, source: SocketAddr, destination: SocketAddr) -> Vec<u8> {
         let builder = match (source.ip(), destination.ip()) {
             (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) => {
