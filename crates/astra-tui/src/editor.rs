@@ -1835,8 +1835,19 @@ impl Editor {
             self.guide_next()
         }
     }
-    pub fn key(&mut self, mut key: KeyEvent) -> Result<()> {
+    pub fn key(&mut self, key: KeyEvent) -> Result<()> {
         self.notice = None;
+        match &self.form.mode {
+            Mode::Search(_) => self.key_search(key),
+            Mode::Browse => self.key_browse(key),
+            Mode::Members { .. } => self.key_members(key),
+            Mode::Field { .. } => self.key_field(key),
+            Mode::Header(_) => self.key_header(key),
+            Mode::NewOutbound(_) => self.key_picker(key),
+            Mode::Delete { .. } => self.key_delete(key),
+        }
+    }
+    fn key_search(&mut self, key: KeyEvent) -> Result<()> {
         if let Mode::Search(input) = &mut self.form.mode {
             match key.code {
                 KeyCode::Esc => self.cancel_input(),
@@ -1852,77 +1863,9 @@ impl Editor {
             }
             return Ok(());
         }
-        if matches!(self.form.mode, Mode::Browse) {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Char('z') if ctrl => return self.restore(false),
-                KeyCode::Char('u') if key.modifiers.is_empty() => return self.restore(false),
-                KeyCode::Char('y') if ctrl => return self.restore(true),
-                KeyCode::Char('y') if key.modifiers.is_empty() => return self.duplicate(),
-                KeyCode::Char('/') => {
-                    let mut input = TextInput::new(self.form.last_search.clone());
-                    input.replace = true;
-                    self.form.mode = Mode::Search(input);
-                    return Ok(());
-                }
-                KeyCode::Char(' ') => {
-                    let doc = self.document()?;
-                    let boolean = matches!(self.visible_rows(&doc).get(self.form.selected), Some(FlatRow::Field { spec, .. }) if matches!(spec.kind, Type::Boolean));
-                    if boolean {
-                        return self.enter(false);
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
-                if !self.form.vim_g {
-                    self.form.vim_g = true;
-                    return Ok(());
-                }
-                key.code = KeyCode::Home;
-            }
-            self.form.vim_g = false;
-            if key.code == KeyCode::Char('z') && key.modifiers.is_empty() {
-                self.form.vim_z = true;
-                return Ok(());
-            }
-            if std::mem::take(&mut self.form.vim_z) {
-                match key.code {
-                    KeyCode::Char('M') => {
-                        self.form.expanded_collections.clear();
-                        self.form.expanded_rule_groups.clear();
-                        self.form.expanded_rule_sets.clear();
-                        self.form.expanded_proxy_groups.clear();
-                        self.form.expanded_nodes.clear();
-                        self.form.selected = 0;
-                        return Ok(());
-                    }
-                    KeyCode::Char('R') => {
-                        let doc = self.document()?;
-                        self.expand_all(&doc);
-                        return Ok(());
-                    }
-                    KeyCode::Char('c') => key.code = KeyCode::Left,
-                    KeyCode::Char('o') => key.code = KeyCode::Right,
-                    _ => return Ok(()),
-                }
-            }
-            key.code = match key.code {
-                KeyCode::Char('j') if key.modifiers.is_empty() => KeyCode::Down,
-                KeyCode::Char('k') if key.modifiers.is_empty() => KeyCode::Up,
-                KeyCode::Char('h') if key.modifiers.is_empty() => KeyCode::Left,
-                KeyCode::Char('l') if key.modifiers.is_empty() => KeyCode::Right,
-                KeyCode::Char('G') => KeyCode::End,
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    KeyCode::PageDown
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    KeyCode::PageUp
-                }
-                code => code,
-            };
-        }
+        Ok(())
+    }
+    fn key_members(&mut self, key: KeyEvent) -> Result<()> {
         if matches!(self.form.mode, Mode::Members { .. }) {
             let dynamic =
                 table_at(self.document()?.as_table(), &self.form.path).is_some_and(|group| {
@@ -2036,6 +1979,9 @@ impl Editor {
             }
             return Ok(());
         }
+        Ok(())
+    }
+    fn key_field(&mut self, key: KeyEvent) -> Result<()> {
         if matches!(self.form.mode, Mode::Field { .. }) {
             if key.code == KeyCode::Esc {
                 self.cancel_input();
@@ -2096,6 +2042,9 @@ impl Editor {
             input.key(key);
             return Ok(());
         }
+        Ok(())
+    }
+    fn key_header(&mut self, key: KeyEvent) -> Result<()> {
         if let Mode::Header(input) = &mut self.form.mode {
             match key.code {
                 KeyCode::Esc => self.cancel_input(),
@@ -2225,6 +2174,9 @@ impl Editor {
             }
             return Ok(());
         }
+        Ok(())
+    }
+    fn key_picker(&mut self, key: KeyEvent) -> Result<()> {
         if let Mode::NewOutbound(selected) = &mut self.form.mode {
             match key.code {
                 KeyCode::Esc => self.cancel_input(),
@@ -2249,6 +2201,9 @@ impl Editor {
             }
             return Ok(());
         }
+        Ok(())
+    }
+    fn key_delete(&mut self, key: KeyEvent) -> Result<()> {
         // Only drafts saved by older versions still sit in this confirmation.
         if matches!(self.form.mode, Mode::Delete { .. }) {
             match key.code {
@@ -2257,6 +2212,80 @@ impl Editor {
                 _ => {}
             }
             return Ok(());
+        }
+        Ok(())
+    }
+    fn key_browse(&mut self, mut key: KeyEvent) -> Result<()> {
+        if matches!(self.form.mode, Mode::Browse) {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('z') if ctrl => return self.restore(false),
+                KeyCode::Char('u') if key.modifiers.is_empty() => return self.restore(false),
+                KeyCode::Char('y') if ctrl => return self.restore(true),
+                KeyCode::Char('y') if key.modifiers.is_empty() => return self.duplicate(),
+                KeyCode::Char('/') => {
+                    let mut input = TextInput::new(self.form.last_search.clone());
+                    input.replace = true;
+                    self.form.mode = Mode::Search(input);
+                    return Ok(());
+                }
+                KeyCode::Char(' ') => {
+                    let doc = self.document()?;
+                    let boolean = matches!(self.visible_rows(&doc).get(self.form.selected), Some(FlatRow::Field { spec, .. }) if matches!(spec.kind, Type::Boolean));
+                    if boolean {
+                        return self.enter(false);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+                if !self.form.vim_g {
+                    self.form.vim_g = true;
+                    return Ok(());
+                }
+                key.code = KeyCode::Home;
+            }
+            self.form.vim_g = false;
+            if key.code == KeyCode::Char('z') && key.modifiers.is_empty() {
+                self.form.vim_z = true;
+                return Ok(());
+            }
+            if std::mem::take(&mut self.form.vim_z) {
+                match key.code {
+                    KeyCode::Char('M') => {
+                        self.form.expanded_collections.clear();
+                        self.form.expanded_rule_groups.clear();
+                        self.form.expanded_rule_sets.clear();
+                        self.form.expanded_proxy_groups.clear();
+                        self.form.expanded_nodes.clear();
+                        self.form.selected = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char('R') => {
+                        let doc = self.document()?;
+                        self.expand_all(&doc);
+                        return Ok(());
+                    }
+                    KeyCode::Char('c') => key.code = KeyCode::Left,
+                    KeyCode::Char('o') => key.code = KeyCode::Right,
+                    _ => return Ok(()),
+                }
+            }
+            key.code = match key.code {
+                KeyCode::Char('j') if key.modifiers.is_empty() => KeyCode::Down,
+                KeyCode::Char('k') if key.modifiers.is_empty() => KeyCode::Up,
+                KeyCode::Char('h') if key.modifiers.is_empty() => KeyCode::Left,
+                KeyCode::Char('l') if key.modifiers.is_empty() => KeyCode::Right,
+                KeyCode::Char('G') => KeyCode::End,
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::PageDown
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::PageUp
+                }
+                code => code,
+            };
         }
         let doc = self.document()?;
         let rows = self.visible_rows(&doc);
