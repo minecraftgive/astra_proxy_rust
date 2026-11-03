@@ -1544,12 +1544,7 @@ impl Manager {
     async fn action(&mut self, action: Action) -> Result<Reply> {
         self.reap()?;
         match action {
-            Action::Monitor { name } => {
-                let kind = self.instance(&name)?.kind;
-                let pid = self.running.get(&name).and_then(|r| r.child.id());
-                let snapshot = crate::monitor::core(&name, kind, pid, &self.socket(&name)).await?;
-                Ok(Reply::text(serde_json::to_string(&snapshot)?))
-            }
+            Action::Monitor { name } => self.action_monitor(name).await,
             Action::UpdateTransaction { request } => self.update_transaction(request).await,
             Action::RecoverUpdate { operation_id } => self.recover_update(&operation_id).await,
             Action::WatchUpdates => bail!("Update subscriptions require a dedicated connection"),
@@ -1569,109 +1564,17 @@ impl Manager {
                 name,
                 command,
                 expected_pid,
-            } => {
-                let instance = self.instance(&name)?;
-                anyhow::ensure!(
-                    instance.kind == Kind::Proxy,
-                    "Runtime controls require a proxy instance"
-                );
-                let running = self.running.get(&name).context("Instance is not running")?;
-                let expected = running.child.id();
-                anyhow::ensure!(
-                    expected_pid.is_none() || expected_pid == expected,
-                    "Core PID changed; refresh before changing runtime state"
-                );
-                let response = control::runtime(&self.socket(&name), command.clone()).await;
-                #[cfg(windows)]
-                if matches!(command, astra_model::runtime::Command::Tun(true))
-                    && response
-                        .as_ref()
-                        .is_err_and(|error| error.to_string().contains("administrator permission"))
-                {
-                    return self.elevate_runtime_tun(&name).await;
-                }
-                let snapshot = response?;
-                anyhow::ensure!(
-                    Some(snapshot.pid) == expected,
-                    "Core PID changed; retry the operation"
-                );
-                Ok(Reply::text(serde_json::to_string(&snapshot)?))
-            }
+            } => self.action_runtime(name, command, expected_pid).await,
             Action::PrepareElevation { name, expected_pid } => {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                {
-                    elevation::prepare(self, name, expected_pid).await
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                {
-                    let _ = (name, expected_pid);
-                    bail!("TUN elevation is supported on Linux only")
-                }
+                self.action_prepare_elevation(name, expected_pid).await
             }
             Action::CancelElevation { name, ticket } => {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                {
-                    elevation::cancel(self, &name, &ticket)
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                {
-                    let _ = (name, ticket);
-                    Ok(Reply::text("Elevation cancelled"))
-                }
+                self.action_cancel_elevation(name, ticket).await
             }
             Action::WaitElevation { .. } => {
                 bail!("Elevation status is served outside the mutation actor")
             }
-            Action::List => {
-                let mut reply = Reply::text("");
-                let mut details = HashMap::new();
-                for i in &self.registry.instances {
-                    details.insert(i.name.clone(), self.details(i));
-                    let status = if self.running.contains_key(&i.name) {
-                        control::request(&self.socket(&i.name), Command::Status)
-                            .await
-                            .ok()
-                    } else {
-                        None
-                    };
-                    let run = self.running.get(&i.name);
-                    reply.rows.push(Row {
-                        instance: i.clone(),
-                        pid: run.and_then(|r| r.child.id()),
-                        state: if run.is_some() {
-                            if status.is_some() {
-                                "Running"
-                            } else {
-                                "Unresponsive"
-                            }
-                            .into()
-                        } else {
-                            self.exits.get(&i.name).cloned().unwrap_or("Stopped".into())
-                        },
-                        uptime: status.as_ref().map(|s| s.uptime_secs).unwrap_or(0),
-                        changed: run
-                            .map(|r| {
-                                read_config(&i.config)
-                                    .map(|text| {
-                                        if let Some(applied) =
-                                            status.as_ref().and_then(|s| s.applied.as_ref())
-                                        {
-                                            applied.path
-                                                != fs::canonicalize(&i.config)
-                                                    .unwrap_or_else(|_| i.config.clone())
-                                                || applied.digest != control::config_digest(&text)
-                                        } else {
-                                            text != r.config || i.config != r.config_path
-                                        }
-                                    })
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(false),
-                    });
-                }
-                reply.text = serde_json::to_string(&details)?;
-                Ok(reply)
-            }
+            Action::List => self.action_list().await,
             Action::Add(i) => self.add(i).await,
             Action::Create { name, kind } => self.create(name, kind).await,
             Action::FollowLogs { .. } => bail!("Log subscriptions require a dedicated connection"),
@@ -1686,171 +1589,23 @@ impl Manager {
             Action::Session | Action::WatchList | Action::WatchRuntime { .. } => {
                 bail!("Transport action requires a dedicated connection")
             }
-            Action::NodeTags(name) => {
-                let json = serde_json::to_string(&self.node_tags(&name)?)?;
-                anyhow::ensure!(
-                    json.len() < 900 * 1024,
-                    "Node suggestions exceed response limit"
-                );
-                Ok(Reply::text(json))
-            }
-            Action::SubscriptionNodes(name) => {
-                let instance = self.instance(&name)?;
-                anyhow::ensure!(instance.kind == Kind::Proxy, "Select a proxy instance");
-                Ok(Reply::text(serde_json::to_string(
-                    &crate::subscription_view::read_in(&self.runtime_dir, &instance.config)?,
-                )?))
-            }
+            Action::NodeTags(name) => self.action_node_tags(name).await,
+            Action::SubscriptionNodes(name) => self.action_subscription_nodes(name).await,
             Action::ExplainRoute { name, request } => {
-                anyhow::ensure!(
-                    self.instance(&name)?.kind == Kind::Rule,
-                    "Select a rule instance"
-                );
-                let running = self
-                    .running
-                    .get(&name)
-                    .context("Start the rule instance before querying a route")?;
-                let explanation = control::explain_route(&self.socket(&name), request).await?;
-                anyhow::ensure!(
-                    Some(explanation.pid) == running.child.id(),
-                    "Core PID mismatch"
-                );
-                Ok(Reply::text(serde_json::to_string(&explanation)?))
+                self.action_explain_route(name, request).await
             }
-            Action::GetLogLevel(name) => {
-                self.instance(&name)?;
-                Ok(Reply::text(self.level(&name).as_str()))
-            }
-            Action::SetLogLevel { name, level } => {
-                self.instance(&name)?;
-                let previous = self.level(&name);
-                if self.running.contains_key(&name) {
-                    control::request(&self.socket(&name), Command::SetLogLevel(level))
-                        .await
-                        .context("Update core log level")?;
-                }
-                self.runtime.log_levels.insert(name.clone(), level);
-                if let Err(error) = self.persist_runtime() {
-                    self.runtime.log_levels.insert(name.clone(), previous);
-                    if self.running.contains_key(&name) {
-                        let _ =
-                            control::request(&self.socket(&name), Command::SetLogLevel(previous))
-                                .await;
-                    }
-                    return Err(error);
-                }
-                Ok(Reply::text(level.as_str()))
-            }
-            Action::BindStart { name, targets } => {
-                self.bind_start(&name, targets)?;
-                Ok(Reply::text("Startup bindings saved"))
-            }
-            Action::Remove(name) => {
-                anyhow::ensure!(
-                    !self.running.contains_key(&name),
-                    "Stop the instance before removing it"
-                );
-                self.instance(&name)?;
-                let old = self.registry.clone();
-                self.registry.instances.retain(|i| i.name != name);
-                let previous_level = self.runtime.log_levels.remove(&name);
-                self.registry.start_bindings.remove(&name);
-                for targets in self.registry.start_bindings.values_mut() {
-                    targets.retain(|target| target != &name);
-                }
-                if let Err(e) = self.persist() {
-                    self.registry = old;
-                    if let Some(level) = previous_level {
-                        self.runtime.log_levels.insert(name.clone(), level);
-                    }
-                    return Err(e);
-                }
-                self.persist_runtime()?;
-                Ok(Reply::text("Instance removed; configuration retained"))
-            }
-            Action::Start(name) => {
-                self.start(&name).await?;
-                Ok(Reply::text("Started"))
-            }
-            Action::Stop(name) => {
-                self.stop(&name).await?;
-                Ok(Reply::text("Stopped"))
-            }
-            Action::UpdateSubscriptions(name) => {
-                anyhow::ensure!(
-                    self.instance(&name)?.kind == Kind::Proxy,
-                    "Select a proxy instance"
-                );
-                if !self.running.contains_key(&name) {
-                    return self.diagnostic_plan(&name)?.run_refresh().await;
-                }
-                astra_ipc::control::request(&self.socket(&name), Command::UpdateSubscriptions)
-                    .await?;
-                Ok(Reply::text("Subscription update scheduled"))
-            }
-            Action::Reload(name) => {
-                let i = self.instance(&name)?;
-                self.reload(&name, &i.config).await?;
-                Ok(Reply::text(
-                    "Configuration hot reloaded; existing sessions retained",
-                ))
-            }
-            Action::Restart(name) => {
-                let i = self.instance(&name)?;
-                // Validate before stopping so a bad file never causes downtime;
-                // start() checks the not-yet-running dependencies itself.
-                self.validate(i.kind, &i.config).await?;
-                self.start_plan(&name)?;
-                #[cfg(windows)]
-                if self.restart_elevated(&name).await? {
-                    return Ok(Reply::text("Restarted with current configuration"));
-                }
-                self.stop(&name).await?;
-                self.start(&name).await?;
-                Ok(Reply::text("Restarted with current configuration"))
-            }
-            Action::SetConfig(name, path) => {
-                let i = self.instance(&name)?;
-                ensure_config(i.kind, &path)?;
-                let path = fs::canonicalize(path)?;
-                self.validate(i.kind, &path).await?;
-                let index = self
-                    .registry
-                    .instances
-                    .iter()
-                    .position(|i| i.name == name)
-                    .unwrap();
-                self.registry.instances[index].config = path.clone();
-                if let Err(e) = self.persist() {
-                    self.registry.instances[index] = i;
-                    return Err(e);
-                }
-                if self.running.contains_key(&name) {
-                    if let Err(error) = self.reload(&name, &path).await {
-                        self.registry.instances[index] = i;
-                        self.persist()
-                            .context("restore previous configuration selection")?;
-                        return Err(error);
-                    }
-                }
-                Ok(Reply::text(
-                    "Configuration selected and hot applied when running",
-                ))
-            }
-            Action::Read(name) => {
-                let i = self.instance(&name)?;
-                ensure_config(i.kind, &i.config)?;
-                Ok(Reply::text(read_config(&i.config)?))
-            }
-            Action::PrepareConfig(name) => {
-                let i = self.instance(&name)?;
-                let created = ensure_config(i.kind, &i.config)?;
-                Ok(Reply::text(if created {
-                    read_config(&i.config)?
-                } else {
-                    String::new()
-                }))
-            }
+            Action::GetLogLevel(name) => self.action_get_log_level(name).await,
+            Action::SetLogLevel { name, level } => self.action_set_log_level(name, level).await,
+            Action::BindStart { name, targets } => self.action_bind_start(name, targets).await,
+            Action::Remove(name) => self.action_remove(name).await,
+            Action::Start(name) => self.action_start(name).await,
+            Action::Stop(name) => self.action_stop(name).await,
+            Action::UpdateSubscriptions(name) => self.action_update_subscriptions(name).await,
+            Action::Reload(name) => self.action_reload(name).await,
+            Action::Restart(name) => self.action_restart(name).await,
+            Action::SetConfig(name, path) => self.action_set_config(name, path).await,
+            Action::Read(name) => self.action_read(name).await,
+            Action::PrepareConfig(name) => self.action_prepare_config(name).await,
             Action::Save {
                 name,
                 original,
@@ -1859,46 +1614,361 @@ impl Manager {
                 self.save_typed(name, original, text).await?.message,
             )),
             Action::CloneConfig(name, destination) => {
-                let i = self.instance(&name)?;
-                // A clone in another directory could silently change relative asset paths.
-                let parent = fs::canonicalize(
-                    destination
-                        .parent()
-                        .context("Missing destination directory")?,
-                )?;
-                anyhow::ensure!(
-                    Some(parent.as_path()) == i.config.parent(),
-                    "Clone into the same directory to preserve relative asset paths"
-                );
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(destination)?;
-                file.write_all(read_config(&i.config)?.as_bytes())?;
-                file.sync_all()?;
-                Ok(Reply::text("Configuration copied; use c to select it"))
+                self.action_clone_config(name, destination).await
             }
-            Action::Validate(name) => {
-                let i = self.instance(&name)?;
-                self.validate(i.kind, &i.config).await?;
-                Ok(Reply::text("Configuration valid"))
+            Action::Validate(name) => self.action_validate(name).await,
+            Action::Logs(name) => self.action_logs(name).await,
+            Action::Shutdown => self.action_shutdown().await,
+        }
+    }
+
+    async fn action_monitor(&mut self, name: String) -> Result<Reply> {
+        let kind = self.instance(&name)?.kind;
+        let pid = self.running.get(&name).and_then(|r| r.child.id());
+        let snapshot = crate::monitor::core(&name, kind, pid, &self.socket(&name)).await?;
+        Ok(Reply::text(serde_json::to_string(&snapshot)?))
+    }
+
+    async fn action_runtime(
+        &mut self,
+        name: String,
+        command: astra_model::runtime::Command,
+        expected_pid: Option<u32>,
+    ) -> Result<Reply> {
+        let instance = self.instance(&name)?;
+        anyhow::ensure!(
+            instance.kind == Kind::Proxy,
+            "Runtime controls require a proxy instance"
+        );
+        let running = self.running.get(&name).context("Instance is not running")?;
+        let expected = running.child.id();
+        anyhow::ensure!(
+            expected_pid.is_none() || expected_pid == expected,
+            "Core PID changed; refresh before changing runtime state"
+        );
+        let response = control::runtime(&self.socket(&name), command.clone()).await;
+        #[cfg(windows)]
+        if matches!(command, astra_model::runtime::Command::Tun(true))
+            && response
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("administrator permission"))
+        {
+            return self.elevate_runtime_tun(&name).await;
+        }
+        let snapshot = response?;
+        anyhow::ensure!(
+            Some(snapshot.pid) == expected,
+            "Core PID changed; retry the operation"
+        );
+        Ok(Reply::text(serde_json::to_string(&snapshot)?))
+    }
+
+    async fn action_prepare_elevation(
+        &mut self,
+        name: String,
+        expected_pid: Option<u32>,
+    ) -> Result<Reply> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            elevation::prepare(self, name, expected_pid).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (name, expected_pid);
+            bail!("TUN elevation is supported on Linux only")
+        }
+    }
+
+    async fn action_cancel_elevation(&mut self, name: String, ticket: String) -> Result<Reply> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            elevation::cancel(self, &name, &ticket)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (name, ticket);
+            Ok(Reply::text("Elevation cancelled"))
+        }
+    }
+
+    async fn action_list(&mut self) -> Result<Reply> {
+        let mut reply = Reply::text("");
+        let mut details = HashMap::new();
+        for i in &self.registry.instances {
+            details.insert(i.name.clone(), self.details(i));
+            let status = if self.running.contains_key(&i.name) {
+                control::request(&self.socket(&i.name), Command::Status)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let run = self.running.get(&i.name);
+            reply.rows.push(Row {
+                instance: i.clone(),
+                pid: run.and_then(|r| r.child.id()),
+                state: if run.is_some() {
+                    if status.is_some() {
+                        "Running"
+                    } else {
+                        "Unresponsive"
+                    }
+                    .into()
+                } else {
+                    self.exits.get(&i.name).cloned().unwrap_or("Stopped".into())
+                },
+                uptime: status.as_ref().map(|s| s.uptime_secs).unwrap_or(0),
+                changed: run
+                    .map(|r| {
+                        read_config(&i.config)
+                            .map(|text| {
+                                if let Some(applied) =
+                                    status.as_ref().and_then(|s| s.applied.as_ref())
+                                {
+                                    applied.path
+                                        != fs::canonicalize(&i.config)
+                                            .unwrap_or_else(|_| i.config.clone())
+                                        || applied.digest != control::config_digest(&text)
+                                } else {
+                                    text != r.config || i.config != r.config_path
+                                }
+                            })
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false),
+            });
+        }
+        reply.text = serde_json::to_string(&details)?;
+        Ok(reply)
+    }
+
+    async fn action_node_tags(&mut self, name: String) -> Result<Reply> {
+        let json = serde_json::to_string(&self.node_tags(&name)?)?;
+        anyhow::ensure!(
+            json.len() < 900 * 1024,
+            "Node suggestions exceed response limit"
+        );
+        Ok(Reply::text(json))
+    }
+
+    async fn action_subscription_nodes(&mut self, name: String) -> Result<Reply> {
+        let instance = self.instance(&name)?;
+        anyhow::ensure!(instance.kind == Kind::Proxy, "Select a proxy instance");
+        Ok(Reply::text(serde_json::to_string(
+            &crate::subscription_view::read_in(&self.runtime_dir, &instance.config)?,
+        )?))
+    }
+
+    async fn action_explain_route(
+        &mut self,
+        name: String,
+        request: astra_model::RouteRequest,
+    ) -> Result<Reply> {
+        anyhow::ensure!(
+            self.instance(&name)?.kind == Kind::Rule,
+            "Select a rule instance"
+        );
+        let running = self
+            .running
+            .get(&name)
+            .context("Start the rule instance before querying a route")?;
+        let explanation = control::explain_route(&self.socket(&name), request).await?;
+        anyhow::ensure!(
+            Some(explanation.pid) == running.child.id(),
+            "Core PID mismatch"
+        );
+        Ok(Reply::text(serde_json::to_string(&explanation)?))
+    }
+
+    async fn action_get_log_level(&mut self, name: String) -> Result<Reply> {
+        self.instance(&name)?;
+        Ok(Reply::text(self.level(&name).as_str()))
+    }
+
+    async fn action_set_log_level(
+        &mut self,
+        name: String,
+        level: astra_model::logging::LogLevel,
+    ) -> Result<Reply> {
+        self.instance(&name)?;
+        let previous = self.level(&name);
+        if self.running.contains_key(&name) {
+            control::request(&self.socket(&name), Command::SetLogLevel(level))
+                .await
+                .context("Update core log level")?;
+        }
+        self.runtime.log_levels.insert(name.clone(), level);
+        if let Err(error) = self.persist_runtime() {
+            self.runtime.log_levels.insert(name.clone(), previous);
+            if self.running.contains_key(&name) {
+                let _ = control::request(&self.socket(&name), Command::SetLogLevel(previous)).await;
             }
-            Action::Logs(name) => {
-                self.instance(&name)?;
-                let mut file = fs::File::open(self.log(&name))
-                    .context("No log yet; start this instance first")?;
-                let size = file.metadata()?.len();
-                file.seek(SeekFrom::Start(size.saturating_sub(24 * 1024)))?;
-                let mut bytes = vec![];
-                file.take(24 * 1024).read_to_end(&mut bytes)?;
-                Ok(Reply::text(String::from_utf8_lossy(&bytes)))
+            return Err(error);
+        }
+        Ok(Reply::text(level.as_str()))
+    }
+
+    async fn action_bind_start(&mut self, name: String, targets: Vec<String>) -> Result<Reply> {
+        self.bind_start(&name, targets)?;
+        Ok(Reply::text("Startup bindings saved"))
+    }
+
+    async fn action_remove(&mut self, name: String) -> Result<Reply> {
+        anyhow::ensure!(
+            !self.running.contains_key(&name),
+            "Stop the instance before removing it"
+        );
+        self.instance(&name)?;
+        let old = self.registry.clone();
+        self.registry.instances.retain(|i| i.name != name);
+        let previous_level = self.runtime.log_levels.remove(&name);
+        self.registry.start_bindings.remove(&name);
+        for targets in self.registry.start_bindings.values_mut() {
+            targets.retain(|target| target != &name);
+        }
+        if let Err(e) = self.persist() {
+            self.registry = old;
+            if let Some(level) = previous_level {
+                self.runtime.log_levels.insert(name.clone(), level);
             }
-            Action::Shutdown => {
-                self.stop_all().await?;
-                Ok(Reply::text("Manager and all instances stopped"))
+            return Err(e);
+        }
+        self.persist_runtime()?;
+        Ok(Reply::text("Instance removed; configuration retained"))
+    }
+
+    async fn action_start(&mut self, name: String) -> Result<Reply> {
+        self.start(&name).await?;
+        Ok(Reply::text("Started"))
+    }
+
+    async fn action_stop(&mut self, name: String) -> Result<Reply> {
+        self.stop(&name).await?;
+        Ok(Reply::text("Stopped"))
+    }
+
+    async fn action_update_subscriptions(&mut self, name: String) -> Result<Reply> {
+        anyhow::ensure!(
+            self.instance(&name)?.kind == Kind::Proxy,
+            "Select a proxy instance"
+        );
+        if !self.running.contains_key(&name) {
+            return self.diagnostic_plan(&name)?.run_refresh().await;
+        }
+        astra_ipc::control::request(&self.socket(&name), Command::UpdateSubscriptions).await?;
+        Ok(Reply::text("Subscription update scheduled"))
+    }
+
+    async fn action_reload(&mut self, name: String) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        self.reload(&name, &i.config).await?;
+        Ok(Reply::text(
+            "Configuration hot reloaded; existing sessions retained",
+        ))
+    }
+
+    async fn action_restart(&mut self, name: String) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        // Validate before stopping so a bad file never causes downtime;
+        // start() checks the not-yet-running dependencies itself.
+        self.validate(i.kind, &i.config).await?;
+        self.start_plan(&name)?;
+        #[cfg(windows)]
+        if self.restart_elevated(&name).await? {
+            return Ok(Reply::text("Restarted with current configuration"));
+        }
+        self.stop(&name).await?;
+        self.start(&name).await?;
+        Ok(Reply::text("Restarted with current configuration"))
+    }
+
+    async fn action_set_config(&mut self, name: String, path: PathBuf) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        ensure_config(i.kind, &path)?;
+        let path = fs::canonicalize(path)?;
+        self.validate(i.kind, &path).await?;
+        let index = self
+            .registry
+            .instances
+            .iter()
+            .position(|i| i.name == name)
+            .unwrap();
+        self.registry.instances[index].config = path.clone();
+        if let Err(e) = self.persist() {
+            self.registry.instances[index] = i;
+            return Err(e);
+        }
+        if self.running.contains_key(&name) {
+            if let Err(error) = self.reload(&name, &path).await {
+                self.registry.instances[index] = i;
+                self.persist()
+                    .context("restore previous configuration selection")?;
+                return Err(error);
             }
         }
+        Ok(Reply::text(
+            "Configuration selected and hot applied when running",
+        ))
+    }
+
+    async fn action_read(&mut self, name: String) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        ensure_config(i.kind, &i.config)?;
+        Ok(Reply::text(read_config(&i.config)?))
+    }
+
+    async fn action_prepare_config(&mut self, name: String) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        let created = ensure_config(i.kind, &i.config)?;
+        Ok(Reply::text(if created {
+            read_config(&i.config)?
+        } else {
+            String::new()
+        }))
+    }
+
+    async fn action_clone_config(&mut self, name: String, destination: PathBuf) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        // A clone in another directory could silently change relative asset paths.
+        let parent = fs::canonicalize(
+            destination
+                .parent()
+                .context("Missing destination directory")?,
+        )?;
+        anyhow::ensure!(
+            Some(parent.as_path()) == i.config.parent(),
+            "Clone into the same directory to preserve relative asset paths"
+        );
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(destination)?;
+        file.write_all(read_config(&i.config)?.as_bytes())?;
+        file.sync_all()?;
+        Ok(Reply::text("Configuration copied; use c to select it"))
+    }
+
+    async fn action_validate(&mut self, name: String) -> Result<Reply> {
+        let i = self.instance(&name)?;
+        self.validate(i.kind, &i.config).await?;
+        Ok(Reply::text("Configuration valid"))
+    }
+
+    async fn action_logs(&mut self, name: String) -> Result<Reply> {
+        self.instance(&name)?;
+        let mut file =
+            fs::File::open(self.log(&name)).context("No log yet; start this instance first")?;
+        let size = file.metadata()?.len();
+        file.seek(SeekFrom::Start(size.saturating_sub(24 * 1024)))?;
+        let mut bytes = vec![];
+        file.take(24 * 1024).read_to_end(&mut bytes)?;
+        Ok(Reply::text(String::from_utf8_lossy(&bytes)))
+    }
+
+    async fn action_shutdown(&mut self) -> Result<Reply> {
+        self.stop_all().await?;
+        Ok(Reply::text("Manager and all instances stopped"))
     }
 }
 
