@@ -12,7 +12,7 @@ use tokio::{
     sync::watch,
 };
 
-pub(crate) const COPY_BUFFER_SIZE: usize = 64 * 1024;
+pub(crate) const COPY_BUFFER_SIZE: usize = 32 * 1024;
 
 #[derive(Default)]
 pub(crate) struct Sessions(Mutex<HashMap<String, watch::Sender<u64>>>);
