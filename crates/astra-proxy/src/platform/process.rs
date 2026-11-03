@@ -360,6 +360,7 @@ mod linux {
         collections::HashSet,
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        time::Instant,
     };
     fn address(value: &str) -> Option<SocketAddr> {
         let (ip, port) = value.split_once(':')?;
@@ -387,6 +388,9 @@ mod linux {
     }
     const SNAPSHOT_TTL: Duration = Duration::from_millis(100);
     const OWNER_LIMIT: usize = 65_536;
+    // After an oversized owner table, use targeted scans for a while instead
+    // of rebuilding a table that will overflow again.
+    const OVERFLOW_RETRY: Duration = Duration::from_secs(10);
     #[derive(Clone)]
     struct Socket {
         local: SocketAddr,
@@ -394,10 +398,19 @@ mod linux {
         inode: u64,
     }
     type SocketTable = std::collections::HashMap<u16, Vec<Socket>>;
-    type SocketSnapshot = (std::time::Instant, Arc<SocketTable>);
+    type SocketSnapshot = (Instant, Arc<SocketTable>);
     static TABLES: std::sync::Mutex<[Option<SocketSnapshot>; 2]> =
         std::sync::Mutex::new([None, None]);
 
+    /// `newer_than` asks for a snapshot taken after that instant. Callers that
+    /// queued behind a refresh which started after their own lookup reuse it
+    /// instead of rescanning /proc once each.
+    fn reusable(at: Instant, newer_than: Option<Instant>) -> bool {
+        match newer_than {
+            Some(start) => at >= start,
+            None => at.elapsed() < SNAPSHOT_TTL,
+        }
+    }
     fn parse_socket(line: &str) -> Option<Socket> {
         let mut fields = line.split_whitespace();
         let local = address(fields.nth(1)?)?;
@@ -409,14 +422,12 @@ mod linux {
             inode,
         })
     }
-    fn socket_table(network: Network, fresh: bool) -> Option<Arc<SocketTable>> {
+    fn socket_table(network: Network, newer_than: Option<Instant>) -> Option<Arc<SocketTable>> {
         let index = usize::from(network == Network::Udp);
         let mut tables = TABLES.lock().ok()?;
-        if !fresh {
-            if let Some((at, table)) = &tables[index] {
-                if at.elapsed() < SNAPSHOT_TTL {
-                    return Some(table.clone());
-                }
+        if let Some((at, table)) = &tables[index] {
+            if reusable(*at, newer_than) {
+                return Some(table.clone());
             }
         }
         let base = if network == Network::Tcp {
@@ -434,7 +445,7 @@ mod linux {
             }
         }
         let table = Arc::new(table);
-        tables[index] = Some((std::time::Instant::now(), table.clone()));
+        tables[index] = Some((Instant::now(), table.clone()));
         Some(table)
     }
     fn matching_inodes(
@@ -460,8 +471,13 @@ mod linux {
     // once per short window also amortizes bursts of different new connections.
     // None records ambiguity (forked/shared descriptors), never a first-owner win.
     type Owners = std::collections::HashMap<u64, Option<u32>>;
-    type OwnerSnapshot = (std::time::Instant, Arc<Owners>);
-    static OWNERS: std::sync::Mutex<Option<OwnerSnapshot>> = std::sync::Mutex::new(None);
+    #[derive(Clone)]
+    enum OwnerSnapshot {
+        Table(Arc<Owners>),
+        /// The host has more socket descriptors than `OWNER_LIMIT`.
+        Overflow,
+    }
+    static OWNERS: std::sync::Mutex<Option<(Instant, OwnerSnapshot)>> = std::sync::Mutex::new(None);
     fn add_owner(owners: &mut Owners, inode: u64, pid: u32) {
         owners
             .entry(inode)
@@ -472,16 +488,8 @@ mod linux {
             })
             .or_insert(Some(pid));
     }
-    fn owner_table(fresh: bool) -> Option<Arc<Owners>> {
-        let mut snapshot = OWNERS.lock().ok()?;
-        if !fresh {
-            if let Some((at, owners)) = &*snapshot {
-                if at.elapsed() < SNAPSHOT_TTL {
-                    return Some(owners.clone());
-                }
-            }
-        }
-        let mut owners = Owners::new();
+    /// Visits every socket descriptor as `(inode, pid)` until `visit` returns false.
+    fn scan_socket_owners(mut visit: impl FnMut(u64, u32) -> bool) -> Option<()> {
         for entry in fs::read_dir("/proc").ok()?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -505,17 +513,48 @@ mod linux {
                 else {
                     continue;
                 };
-                add_owner(&mut owners, inode, pid);
-                if owners.len() > OWNER_LIMIT {
-                    // Do not return a partially scanned ownership table: a later
-                    // process could share an inode already seen above.
+                if !visit(inode, pid) {
                     return None;
                 }
             }
         }
-        let owners = Arc::new(owners);
-        *snapshot = Some((std::time::Instant::now(), owners.clone()));
+        Some(())
+    }
+    fn owner_table(newer_than: Option<Instant>) -> Option<OwnerSnapshot> {
+        let mut snapshot = OWNERS.lock().ok()?;
+        match &*snapshot {
+            Some((at, OwnerSnapshot::Overflow)) if at.elapsed() < OVERFLOW_RETRY => {
+                return Some(OwnerSnapshot::Overflow);
+            }
+            Some((at, owners @ OwnerSnapshot::Table(_))) if reusable(*at, newer_than) => {
+                return Some(owners.clone());
+            }
+            _ => {}
+        }
+        let mut owners = Owners::new();
+        // Do not keep a partially scanned ownership table: a later process
+        // could share an inode already seen.
+        let owners = match scan_socket_owners(|inode, pid| {
+            add_owner(&mut owners, inode, pid);
+            owners.len() <= OWNER_LIMIT
+        }) {
+            Some(()) => OwnerSnapshot::Table(Arc::new(owners)),
+            None => OwnerSnapshot::Overflow,
+        };
+        *snapshot = Some((Instant::now(), owners.clone()));
         Some(owners)
+    }
+    /// Uncached lookup that records only the requested inodes, for hosts whose
+    /// full ownership table exceeds `OWNER_LIMIT`.
+    fn scan_owner(inodes: &HashSet<u64>) -> Option<u32> {
+        let mut owners = Owners::new();
+        scan_socket_owners(|inode, pid| {
+            if inodes.contains(&inode) {
+                add_owner(&mut owners, inode, pid);
+            }
+            true
+        })?;
+        unique_owner(&owners, inodes)
     }
     fn unique_owner(owners: &Owners, inodes: &HashSet<u64>) -> Option<u32> {
         let mut owner = None;
@@ -537,10 +576,11 @@ mod linux {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Option<ProcessInfo> {
+        let started = Instant::now();
         let source = SocketAddr::new(source.ip().to_canonical(), source.port());
         let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
         let mut inodes = matching_inodes(
-            socket_table(network, false)?.as_ref(),
+            socket_table(network, None)?.as_ref(),
             network,
             source,
             destination,
@@ -548,7 +588,7 @@ mod linux {
         if inodes.is_empty() {
             // Fresh sockets must not wait for the snapshot to expire.
             inodes = matching_inodes(
-                socket_table(network, true)?.as_ref(),
+                socket_table(network, Some(started))?.as_ref(),
                 network,
                 source,
                 destination,
@@ -557,11 +597,16 @@ mod linux {
         if inodes.is_empty() {
             return None;
         }
-        let mut owners = owner_table(false)?;
-        if inodes.iter().any(|inode| !owners.contains_key(inode)) {
-            owners = owner_table(true)?;
+        let mut owners = owner_table(None)?;
+        if let OwnerSnapshot::Table(table) = &owners {
+            if inodes.iter().any(|inode| !table.contains_key(inode)) {
+                owners = owner_table(Some(started))?;
+            }
         }
-        let pid = unique_owner(&owners, &inodes)?;
+        let pid = match owners {
+            OwnerSnapshot::Table(table) => unique_owner(&table, &inodes),
+            OwnerSnapshot::Overflow => scan_owner(&inodes),
+        }?;
         info(
             pid,
             fs::read_link(format!("/proc/{pid}/exe"))
@@ -591,6 +636,28 @@ mod linux {
             add_owner(&mut owners, 1, 20);
             add_owner(&mut owners, 1, 10);
             assert_eq!(unique_owner(&owners, &HashSet::from([1])), None);
+        }
+        #[test]
+        fn forced_refresh_reuses_snapshots_taken_after_the_lookup_started() {
+            let start = Instant::now();
+            let before = start - Duration::from_millis(1);
+            assert!(reusable(start, Some(start)));
+            assert!(!reusable(before, Some(start)));
+            assert!(reusable(before, None));
+            assert!(!reusable(start - SNAPSHOT_TTL, None));
+        }
+        #[test]
+        fn overflow_fallback_scans_only_requested_inodes() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local = listener.local_addr().unwrap();
+            let table = socket_table(Network::Tcp, Some(Instant::now())).unwrap();
+            let inodes: HashSet<u64> = table[&local.port()]
+                .iter()
+                .filter(|socket| socket.local == local)
+                .map(|socket| socket.inode)
+                .collect();
+            assert_eq!(scan_owner(&inodes), Some(std::process::id()));
+            assert_eq!(scan_owner(&HashSet::from([u64::MAX])), None);
         }
         #[test]
         fn wildcard_udp_matching_keeps_remote_semantics() {
