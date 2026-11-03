@@ -52,6 +52,38 @@ fn background_stack_child() {
 
 async fn exercise(case: String) {
     let fixture = crate::import::tests::Fixture::new();
+    #[cfg(windows)]
+    if astra_platform::elevation::is_elevated().unwrap() {
+        // Hosted Windows runners use an elevated token whose default file
+        // owner is Administrators. Give only this new fixture directory the
+        // actual user's owner SID, as an unelevated launcher would. The IPC
+        // ownership/reparse-point checks and the stack budget stay unchanged.
+        let identity = std::process::Command::new("whoami.exe")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        assert!(identity.status.success());
+        let identity = String::from_utf8_lossy(&identity.stdout);
+        let sid = identity
+            .trim()
+            .rsplit(',')
+            .next()
+            .unwrap()
+            .trim_matches('"');
+        assert!(sid.starts_with("S-1-"), "Expected the current user's SID");
+        let owner = std::process::Command::new("icacls.exe")
+            .arg(&fixture.0)
+            .args(["/setowner", &format!("*{sid}"), "/L", "/Q"])
+            .output()
+            .unwrap();
+        assert!(
+            owner.status.success(),
+            "Cannot assign the test directory to its user: {}\n{}",
+            String::from_utf8_lossy(&owner.stdout),
+            String::from_utf8_lossy(&owner.stderr),
+        );
+    }
+    astra_platform::platform::set_private(&fixture.0, 0o700).unwrap();
     let socket = fixture.0.join("management.sock");
     let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
