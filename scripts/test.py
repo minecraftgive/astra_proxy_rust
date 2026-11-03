@@ -4,7 +4,7 @@
 Suites (default: unit live client):
   check    Rust workspace and all target compilation checks
   unit     cargo unit and integration tests for the whole workspace
-  live     TUI end-to-end tests that drive real proxy and rule cores
+  live     TUI and manager end-to-end tests that drive real proxy and rule cores
   client   local client regressions (subscriptions, DNS, groups, routes, Windows)
   server   server core regressions; build first with build.py --role server
   management  real TLS Controller/Agents/Web; --artifact-dir validates all four packages
@@ -70,6 +70,7 @@ def main():
         steps.append(('unit', ['cargo', 'test', '--workspace', *cargo]))
     if 'live' in suites:
         steps.append(('live', ['cargo', 'test', '-p', 'astra-tui', *cargo, 'live_', '--', '--ignored']))
+        steps.append(('manager live', ['cargo', 'test', '-p', 'astra-manager', *cargo, 'live_', '--', '--ignored']))
     if 'client' in suites:
         for name in CLIENT + (CLIENT_WINDOWS if os.name == 'nt' else []):
             steps.append((name, python + [SCRIPTS/f'{name}.py', '--bin-dir', bin_dir]))

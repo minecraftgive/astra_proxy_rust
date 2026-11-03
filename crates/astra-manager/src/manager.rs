@@ -1980,6 +1980,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn test_binaries() -> PathBuf {
+        std::env::var_os("ASTRA_UPDATE_TEST_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_owned()
+            })
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -2102,13 +2115,7 @@ mod tests {
         let temp = Temp::new();
         let home = temp.0.join("state");
         let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned();
+        let bin = test_binaries();
         let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = slow.local_addr().unwrap();
         let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2223,13 +2230,7 @@ mod tests {
         let temp = Temp::new();
         let home = temp.0.join("state");
         let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned();
+        let bin = test_binaries();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2328,13 +2329,7 @@ mod tests {
         let temp = Temp::new();
         let home = temp.0.join("state");
         let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let bin = test_binaries();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = listener.local_addr().unwrap();
         let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(2);
@@ -2654,13 +2649,7 @@ mod tests {
     #[ignore = "requires freshly built core binaries"]
     async fn live_bound_start_reuses_running_dependencies_and_rolls_back_new_ones() {
         let temp = Temp::new();
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let bin = test_binaries();
         let route = temp.0.join("rule.r");
         let rules = temp.0.join("rule.toml");
         fs::write(
@@ -2936,13 +2925,7 @@ mod tests {
         let temp = Temp::new();
         let home = temp.0.join("state");
         let socket = home.join("manager.sock");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let bin = test_binaries();
         let task = tokio::spawn(serve(home.clone(), bin));
         for _ in 0..100 {
             if socket.exists() {
@@ -3092,13 +3075,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let temp = Temp::new();
         let home = temp.0.join("state");
-        let bin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let bin = test_binaries();
         let route_socket = temp.0.join("rule.sock");
         let rule_path = temp.0.join("rule.toml");
         let proxy_path = temp.0.join("proxy.toml");

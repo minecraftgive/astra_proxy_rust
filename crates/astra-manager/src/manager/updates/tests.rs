@@ -398,14 +398,15 @@ async fn update_transaction_child() {
         "run the parent test"
     );
     let bin = binaries();
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = bin
-        .parent()
-        .unwrap()
-        .join(format!("update-regression-{}-{unique}", std::process::id()));
+    // Unix endpoints must fit sun_path even when the checkout or artifact
+    // directory is long. Keep all transaction files together under a private
+    // short root: package copies, staging and releases remain on one filesystem.
+    #[cfg(unix)]
+    let temporary = tempfile::Builder::new().prefix("au-").tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let temporary = tempfile::Builder::new().prefix("au-").tempdir();
+    // Failed assertions retain diagnostics; successful runs remove this root.
+    let root = temporary.unwrap().keep();
     let state = root.join("state");
     let config = root.join("config");
     private_dir(&state).unwrap();
@@ -418,7 +419,7 @@ async fn update_transaction_child() {
     drop(manager);
     match result {
         Ok(Ok(())) => {
-            // This directory was freshly allocated under the build artifact root.
+            // This is the private directory allocated by this test invocation.
             for _ in 0..30 {
                 if fs::remove_dir_all(&root).is_ok() {
                     return;

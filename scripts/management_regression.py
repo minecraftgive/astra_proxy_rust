@@ -61,13 +61,28 @@ def binaries(args, work):
             actual = {entry['path'] for entry in manifest['files']}
             assert expected <= actual, f'{role} is missing a role executable'
             result[role] = roots[0]
-        return result
+        return result, archives['client']
     bins = resolve_binary_dir(args.bin_dir, profile=args.profile)
-    return {role: bins for role in ROLES}
+    return {role: bins for role in ROLES}, None
 
 
 def run(args, work, report):
-    bins = binaries(args, work)
+    bins, client_archive = binaries(args, work)
+    upload_limit = 256 * 1024 * 1024
+    if client_archive:
+        archive_bytes = client_archive.stat().st_size
+        # Debug symbols can make a genuine CI release exceed the production
+        # default. Explicitly provision this test agent for its exact archive;
+        # neither the production default nor the 256 KiB wire chunks change.
+        if not 0 < archive_bytes <= 4 * 1024 * 1024 * 1024:
+            raise ValueError('Client test archive must fit the configured 4 GiB upload ceiling; rebuild without debug symbols')
+        upload_limit = max(upload_limit, archive_bytes)
+        report['artifact'] = {
+            'archive': client_archive.name, 'archive_bytes': archive_bytes,
+            'upload_limit_bytes': upload_limit, 'chunk_bytes': 256 * 1024,
+            'chunks': (archive_bytes + 256 * 1024 - 1) // (256 * 1024),
+        }
+        print(f'Artifact fixture: {archive_bytes} bytes, {report["artifact"]["chunks"]} chunks; agent-a upload limit {upload_limit} bytes', flush=True)
     manager = bins['controller']/executable('astra-manager')
     web = bins['web']/executable('astra-web')
     assert manager.is_file() and web.is_file(), 'Build astra-manager and astra-web first'
@@ -95,7 +110,8 @@ def run(args, work, report):
                         '--token-out', credential], check=True, capture_output=True, timeout=15)
         agent_configs[name] = write_config(directory/'manager.toml', 'role="agent"\n' + storage(directory, bins[role]) +
             f'[upstream]\nenabled=true\nagent_id="{name}"\nname="{name}"\ncontroller_url="wss://localhost:{controller_port}/agents/v2"\n'
-            f'credential_file={quoted(credential)}\ntrust_root={quoted(ca)}\n')
+            f'credential_file={quoted(credential)}\ntrust_root={quoted(ca)}\n' +
+            (f'[limits]\nupload_bytes={upload_limit}\n' if name == 'agent-a' and client_archive else ''))
     password = secrets.token_urlsafe(24)
     web_configs, clients = {}, {}
     for name, owner in [('remote', ctl_dir), ('local', work/'agent-a')]:
@@ -207,9 +223,12 @@ def run(args, work, report):
             browser_checks(remote.origin, password, work, report)
             passed('real browser login, node selection and client/server management')
 
-        if args.artifact_dir:
-            archive = dict(ArtifactIndex.load(args.artifact_dir).archives(profile=args.profile))['client']
-            artifact_checks(remote, archive, bins['client'])
+        if client_archive:
+            artifact_started = time.monotonic()
+            try:
+                artifact_checks(remote, client_archive, bins['client'], report['artifact'])
+            finally:
+                report['artifact']['total_seconds'] = round(time.monotonic() - artifact_started, 3)
             passed('resumable artifact upload verifies chunks and package digest, then stages exact release without activation')
 
         before = {(agent, name): instance(remote, agent, name)['pid'] for agent, name in active}
@@ -302,12 +321,17 @@ def instance(client, agent, name):
     return next(row for row in client.query('instances', agent) if row['name'] == name)
 
 
-def artifact_checks(client, archive, directory):
+def artifact_checks(client, archive, directory, stats):
     identity = 'client-package'
     def command(kind, **data):
         return client.request({'type': 'artifacts', 'data': {'type': kind, 'data': data}}, 'agent-a')
     size = archive.stat().st_size
+    stats['phase'] = 'hash'
+    started = time.monotonic()
     digest = sha256(archive)
+    stats['hash_seconds'] = round(time.monotonic() - started, 3)
+    stats['phase'] = 'upload'
+    started = last_progress = time.monotonic()
     state = command('begin', id=identity, name=archive.name, size=str(size), sha256=digest)['data']
     assert state['received'] == '0' and not state['complete']
     with archive.open('rb') as source:
@@ -320,10 +344,18 @@ def artifact_checks(client, archive, directory):
             state = command('write', **data)['data']
             offset += len(chunk)
             assert state['received'] == str(offset)
+            stats['received_bytes'] = offset
+            stats['upload_seconds'] = round(time.monotonic() - started, 3)
+            if time.monotonic() - last_progress >= 10 or offset == size:
+                print(f'Artifact upload: {offset}/{size} bytes in {stats["upload_seconds"]:.1f}s', flush=True)
+                last_progress = time.monotonic()
             if data['offset'] == '0':
                 assert command('write', **data)['data']['received'] == str(offset), 'Retried chunk duplicated bytes'
     state = command('finish', id=identity)['data']
     assert state['complete'] and state['sha256'] == digest and state['received'] == str(size)
+    stats['upload_seconds'] = round(time.monotonic() - started, 3)
+    stats['phase'] = 'stage'
+    started = time.monotonic()
     expected = json.loads((directory/'manifest.json').read_text(encoding='utf-8'))['release_id']
     before = client.query('update_status', 'agent-a')
     response = client.execute('agent-a', 'update_artifact', operation='stage-client-artifact', artifact_id=identity)
@@ -333,6 +365,8 @@ def artifact_checks(client, archive, directory):
     assert status['runtime_directory'] == before['runtime_directory'], 'Upload/stage must not activate the package'
     assert status['next_launch'] == before['next_launch'], 'Upload/stage must not change the next launch'
     assert client.execute('agent-a', 'update_artifact', operation='stage-client-artifact', artifact_id=identity) == response
+    stats['staging_seconds'] = round(time.monotonic() - started, 3)
+    stats['phase'] = 'complete'
 
 
 def supervisor_checks(children, local, password, port, work, ports, destination):

@@ -67,6 +67,10 @@ class ArtifactTests(unittest.TestCase):
     def test_index_roundtrip_nested_package_and_integrity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            # Exercise a noncanonical spelling on every platform. macOS /var
+            # aliases and Windows 8.3 temp paths expose the same distinction.
+            (root / 'alias').mkdir()
+            root = root / 'alias' / '..'
             binaries = root / 'target/host/debug'
             binaries.mkdir(parents=True)
             (binaries / executable('astra-manager')).write_bytes(b'controller executable fixture')
@@ -80,7 +84,9 @@ class ArtifactTests(unittest.TestCase):
             index.add(role='controller', profile='debug', binary_dir=binaries, staged=staged, archive=archive)
             index.save()
             loaded = discover_index(root / 'dist')
-            self.assertEqual(loaded.archives(profile='debug'), [('controller', archive)])
+            self.assertNotEqual(archive, archive.resolve())
+            self.assertEqual(loaded.directory, run.resolve())
+            self.assertEqual(loaded.archives(profile='debug'), [('controller', archive.resolve())])
             self.assertEqual(resolve_binary_dir(artifact_dir=run, profile='debug'), binaries.resolve())
             with self.assertRaises(ValueError):
                 loaded.select(profile='release')
