@@ -1,3 +1,6 @@
+//! Current bincode management wire protocol, retained for existing IPC peers.
+//! The typed API in `v2` adapts these contracts; it does not replace their wire format.
+
 pub use astra_model::logging::LogLevel;
 pub mod updates;
 use serde::{Deserialize, Serialize};

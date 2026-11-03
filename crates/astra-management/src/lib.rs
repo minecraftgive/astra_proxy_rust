@@ -1,6 +1,6 @@
 //! Management contracts and clients. No daemon or UI implementation belongs here.
-mod legacy;
-pub use legacy::*;
+mod wire;
+pub use wire::*;
 pub mod client;
 pub mod config;
 mod update_json;
