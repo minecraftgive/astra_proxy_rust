@@ -2680,17 +2680,30 @@ impl Editor {
             );
             return;
         };
-        // Fields changed since the last save carry a marker in the left gutter.
-        let mut saved = Editor::new(String::new(), self.original.clone());
-        saved.kind = self.kind;
-        let saved = saved.document().ok();
         let rows = self.visible_rows(&doc);
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
-        let expanded_groups = if self.is_proxy(&doc) {
-            expanded_proxy_groups(&doc, &self.subscription_nodes).ok()
+        let list = self.render_rows(frame, sections[0], &doc, &rows, title);
+        self.render_footer(frame, sections[1], &rows);
+        self.render_popup(frame, area, sections[0], &doc, &list);
+    }
+
+    fn render_rows(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        doc: &DocumentMut,
+        rows: &[FlatRow],
+        title: Line<'_>,
+    ) -> (ListState, usize, bool) {
+        // Fields changed since the last save carry a marker in the left gutter.
+        let mut saved = Editor::new(String::new(), self.original.clone());
+        saved.kind = self.kind;
+        let saved = saved.document().ok();
+        let expanded_groups = if self.is_proxy(doc) {
+            expanded_proxy_groups(doc, &self.subscription_nodes).ok()
         } else {
             None
         };
@@ -2704,7 +2717,7 @@ impl Editor {
             })
             .max()
             .unwrap_or(0)
-            .min((sections[0].width as usize * 2 / 5).max(16));
+            .min((area.width as usize * 2 / 5).max(16));
         let fold = |open: bool| if open { "▾ " } else { "▸ " };
         let dim = Style::default().fg(Color::DarkGray);
         let heading = Style::default()
@@ -2787,7 +2800,7 @@ impl Editor {
                         spans
                     }
                     FlatRow::Collection { path, label } => {
-                        let count = collection(&doc, path).map(|a| a.len()).unwrap_or(0);
+                        let count = collection(doc, path).map(|a| a.len()).unwrap_or(0);
                         let mark = if last_key(path) == Some("rules") {
                             fold(self.form.expanded_collections.contains(&"rules".into()))
                         } else {
@@ -2860,7 +2873,7 @@ impl Editor {
                                 }
                             )
                         } else if rule_set_name(path).is_some() {
-                            rule_set_summary(&doc, path)
+                            rule_set_summary(doc, path)
                         } else if matches!(
                             last_key(path),
                             Some("tls" | "system_proxy" | "tun" | "dns" | "tproxy" | "redirect")
@@ -2940,18 +2953,22 @@ impl Editor {
         let mut state = ListState::default();
         if !items_empty {
             let selected = self.form.selected.min(items.len() - 1);
-            state = state.with_offset(
-                selected.saturating_sub(sections[0].height.saturating_sub(2) as usize / 3),
-            );
+            state = state
+                .with_offset(selected.saturating_sub(area.height.saturating_sub(2) as usize / 3));
             state.select(Some(selected));
         }
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(crate::theme::selected_keep_colors())
                 .block(Block::default().title(title).borders(Borders::ALL)),
-            sections[0],
+            area,
             &mut state,
         );
+        (state, label_column, items_empty)
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect, rows: &[FlatRow]) {
+        let dim = Style::default().fg(Color::DarkGray);
         let first = if let Mode::Search(input) = &self.form.mode {
             let mut text: Vec<char> = input.text.chars().collect();
             text.insert(input.cursor.min(text.len()), '▏');
@@ -2977,17 +2994,28 @@ impl Editor {
             ),
             dim,
         );
-        frame.render_widget(Paragraph::new(vec![first, second]), sections[1]);
+        frame.render_widget(Paragraph::new(vec![first, second]), area);
+    }
+
+    fn render_popup(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        list_area: Rect,
+        doc: &DocumentMut,
+        list: &(ListState, usize, bool),
+    ) {
+        let (state, label_column, items_empty) = (&list.0, list.1, list.2);
         if !matches!(self.form.mode, Mode::Browse | Mode::Search(_)) {
             let height = match &self.form.mode {
                 Mode::NewOutbound(_) => 15,
                 Mode::Members { .. } => 15,
                 Mode::Field { key, input, .. } => {
                     let choices = self
-                        .suggestions(&doc, key, input)
+                        .suggestions(doc, key, input)
                         .map_or(0, |values| values.len().clamp(1, 6) as u16);
                     let help = self
-                        .current_spec(&doc, key)
+                        .current_spec(doc, key)
                         .is_ok_and(|spec| !Self::generic_help(&spec.help));
                     choices + u16::from(help) + 4
                 }
@@ -3003,7 +3031,7 @@ impl Editor {
             // A field editor opens right under its row, so the label stays in sight.
             if matches!(self.form.mode, Mode::Field { .. }) && !items_empty {
                 let row =
-                    sections[0].y + 1 + (self.form.selected.saturating_sub(state.offset())) as u16;
+                    list_area.y + 1 + (self.form.selected.saturating_sub(state.offset())) as u16;
                 let left = area.x + 3 + label_column as u16;
                 let room = area.right().saturating_sub(left + 1);
                 if room >= 32 {
@@ -3012,7 +3040,7 @@ impl Editor {
                 } else {
                     popup.x = area.right().saturating_sub(width + 1).max(area.x);
                 }
-                popup.y = if row + 1 + popup.height <= sections[0].bottom() {
+                popup.y = if row + 1 + popup.height <= list_area.bottom() {
                     row + 1
                 } else {
                     row.saturating_sub(popup.height).max(area.y)
@@ -3037,20 +3065,20 @@ impl Editor {
                         .block(Block::default().title(title).title_bottom(hint).borders(Borders::ALL)), popup, &mut state);
                 }
                 Mode::Field{key,input,reveal} => {
-                    let spec = self.current_spec(&doc,key).ok();
+                    let spec = self.current_spec(doc,key).ok();
                     let secret = spec.as_ref().is_some_and(Spec::secret) && !reveal;
                     let display = if secret { "•".repeat(input.text.chars().count()) } else { input.text.replace('\n'," ↵ ") };
                     let flavor = spec.as_ref().map(|spec| Self::flavor(spec, table_at(doc.as_table(), &self.form.path))).unwrap_or(crate::highlight::Flavor::Auto);
                     let colored = if secret { vec![Span::raw(display.clone())] } else { crate::highlight::spans(&display, flavor) };
                     let mut first = vec![Span::raw("> ")];
                     first.extend(crate::highlight::with_cursor(colored, input.cursor.min(display.chars().count())));
-                    let suggestions = self.suggestions(&doc, key, input);
+                    let suggestions = self.suggestions(doc, key, input);
                     let choices = suggestions.as_ref().map(|values| {
                         if values.is_empty() { return t("No matches").to_owned(); }
                         let selected = input.candidate.as_ref().unwrap_or(&input.text);
                         let at = values.iter().position(|value| value == selected).unwrap_or(0);
                         let start = at.saturating_sub(2).min(values.len().saturating_sub(6));
-                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},self.reference_label(&doc,key,value))).collect::<Vec<_>>().join("\n")
+                        values.iter().skip(start).take(6).map(|value| format!("{} {}",if value == selected {"›"} else {" "},self.reference_label(doc,key,value))).collect::<Vec<_>>().join("\n")
                     }).unwrap_or_default();
                     let hint = if suggestions.is_some() { t("Type to filter · ↑↓ select · Tab complete · Enter confirm · Esc cancel") } else { t("Enter confirm · Esc cancel · Ctrl-U clear · F2 reveal") };
                     let help = spec.as_ref().map(|s| s.help.as_str()).filter(|help| !Self::generic_help(help)).unwrap_or("");
