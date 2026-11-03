@@ -160,13 +160,28 @@ fn cli_diagnostics_group_under_one_absolute_source_path_and_keep_lines() {
         .unwrap();
     assert!(result.status.success());
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(
-        stderr.starts_with(&format!("── {} ──\n", path.display()))
-            && stderr.contains("提示: [第 3 行] 跳过节点 bad"),
+    let source_label = stderr
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("── "))
+        .and_then(|line| line.strip_suffix(" ──"))
+        .expect("diagnostics must begin with a source heading");
+    let reported = std::path::Path::new(source_label);
+    assert!(reported.is_absolute(), "{stderr}");
+    // The child's current directory can resolve a system alias such as
+    // macOS /tmp -> /private/tmp. Compare file identity, not alias spelling.
+    assert_eq!(
+        fs::canonicalize(reported).unwrap(),
+        fs::canonicalize(&path).unwrap(),
         "{stderr}"
     );
+    assert!(stderr.contains("提示: [第 3 行] 跳过节点 bad"), "{stderr}");
+    assert_eq!(stderr.matches(source_label).count(), 1, "{stderr}");
     assert_eq!(
-        stderr.matches(&path.display().to_string()).count(),
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("── "))
+            .count(),
         1,
         "{stderr}"
     );

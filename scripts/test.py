@@ -67,7 +67,7 @@ def main():
     if 'check' in suites:
         steps.append(('check', ['cargo', 'check', '--workspace', '--all-targets', *cargo]))
     if 'unit' in suites:
-        steps.append(('unit', ['cargo', 'test', '--workspace', *cargo]))
+        steps.append(('unit', ['cargo', 'test', '--workspace', '--no-fail-fast', *cargo]))
     if 'live' in suites:
         steps.append(('live', ['cargo', 'test', '-p', 'astra-tui', *cargo, 'live_', '--', '--ignored']))
         steps.append(('manager live', ['cargo', 'test', '-p', 'astra-manager', *cargo, 'live_', '--', '--ignored']))
