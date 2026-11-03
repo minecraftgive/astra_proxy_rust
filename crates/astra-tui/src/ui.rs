@@ -1282,6 +1282,10 @@ impl Ui {
                 return input;
             }
         }
+        self.key_context(key)
+    }
+
+    fn key_context(&mut self, key: event::KeyEvent) -> Input {
         if self.help_scroll.is_some()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c')
@@ -1341,6 +1345,34 @@ impl Ui {
             }
             return Input::Idle;
         }
+        if self.binding_picker.is_some() {
+            return self.key_binding_picker(key);
+        }
+        if self.menu.is_some() {
+            return self.key_operations_menu(key);
+        }
+        if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
+            return self.key_confirm_prompt(key);
+        }
+        if self.prompt.is_some() {
+            return self.key_text_prompt(key);
+        } else if key.code == KeyCode::Char('t')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.kind == Kind::Rule
+            && self.editor.as_ref().is_some_and(Editor::browsing)
+        {
+            self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
+        } else if self.editor.is_some() {
+            return self.key_editor_focus(key);
+        } else if self.viewer.is_some() {
+            return self.key_log_focus(key);
+        } else if self.page == PROFILES {
+            return self.key_profiles_focus(key);
+        }
+        Input::Idle
+    }
+
+    fn key_binding_picker(&mut self, key: event::KeyEvent) -> Input {
         let binding_is_proxy = self.kind == Kind::Proxy;
         if let Some(picker) = &mut self.binding_picker {
             match key.code {
@@ -1378,6 +1410,10 @@ impl Ui {
             }
             return Input::Idle;
         }
+        Input::Idle
+    }
+
+    fn key_operations_menu(&mut self, key: event::KeyEvent) -> Input {
         if let Some(selected) = self.menu {
             let operations = self.operations();
             match key.code {
@@ -1396,6 +1432,10 @@ impl Ui {
             }
             return Input::Idle;
         }
+        Input::Idle
+    }
+
+    fn key_confirm_prompt(&mut self, key: event::KeyEvent) -> Input {
         if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
             match key.code {
                 KeyCode::Esc => self.prompt = None,
@@ -1421,276 +1461,274 @@ impl Ui {
             }
             return Input::Idle;
         }
-        if self.prompt.is_some() {
-            match key.code {
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.input.clear();
-                    self.input_cursor = 0;
-                    self.prefilled_input = false;
-                }
-                KeyCode::Esc => {
-                    if let Some(Prompt::AddPath(name)) = self.prompt.take() {
-                        self.prompt = Some(Prompt::AddName);
-                        self.input = name;
-                        self.input_cursor = self.input.chars().count();
-                    }
-                }
-                KeyCode::Left => {
-                    self.prefilled_input = false;
-                    self.input_cursor = self.input_cursor.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    self.prefilled_input = false;
-                    self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count());
-                }
-                KeyCode::Home => {
-                    self.prefilled_input = false;
-                    self.input_cursor = 0;
-                }
-                KeyCode::End => {
-                    self.prefilled_input = false;
+        Input::Idle
+    }
+
+    fn key_text_prompt(&mut self, key: event::KeyEvent) -> Input {
+        match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.prefilled_input = false;
+            }
+            KeyCode::Esc => {
+                if let Some(Prompt::AddPath(name)) = self.prompt.take() {
+                    self.prompt = Some(Prompt::AddName);
+                    self.input = name;
                     self.input_cursor = self.input.chars().count();
                 }
-                KeyCode::Backspace | KeyCode::Delete if self.prefilled_input => {
+            }
+            KeyCode::Left => {
+                self.prefilled_input = false;
+                self.input_cursor = self.input_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.prefilled_input = false;
+                self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count());
+            }
+            KeyCode::Home => {
+                self.prefilled_input = false;
+                self.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.prefilled_input = false;
+                self.input_cursor = self.input.chars().count();
+            }
+            KeyCode::Backspace | KeyCode::Delete if self.prefilled_input => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.prefilled_input = false;
+            }
+            KeyCode::Backspace if self.input_cursor > 0 => {
+                self.input_cursor -= 1;
+                let byte = self.prompt_byte();
+                self.input.remove(byte);
+            }
+            KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
+                let byte = self.prompt_byte();
+                self.input.remove(byte);
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if self.prefilled_input {
                     self.input.clear();
                     self.input_cursor = 0;
                     self.prefilled_input = false;
                 }
-                KeyCode::Backspace if self.input_cursor > 0 => {
-                    self.input_cursor -= 1;
-                    let byte = self.prompt_byte();
-                    self.input.remove(byte);
-                }
-                KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
-                    let byte = self.prompt_byte();
-                    self.input.remove(byte);
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    if self.prefilled_input {
-                        self.input.clear();
-                        self.input_cursor = 0;
-                        self.prefilled_input = false;
-                    }
-                    let byte = self.prompt_byte();
-                    self.input.insert(byte, c);
-                    self.input_cursor += 1;
-                }
-                KeyCode::Enter => {
-                    let prompt = self.prompt.take().unwrap();
-                    let input = if prompt.confirmation() && self.input.trim().is_empty() {
-                        "yes".to_owned()
-                    } else {
-                        self.input.trim().to_owned()
-                    };
-                    match self.submit(prompt.clone(), input.clone()) {
-                        Ok(Some(action)) => {
-                            return Input::Run(action, Some(Box::new((prompt, input))))
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            self.fail(format!("{error:#}"), Resume::Prompt(prompt, input))
-                        }
-                    }
-                }
-                _ => {}
+                let byte = self.prompt_byte();
+                self.input.insert(byte, c);
+                self.input_cursor += 1;
             }
-        } else if key.code == KeyCode::Char('t')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.kind == Kind::Rule
-            && self.editor.as_ref().is_some_and(Editor::browsing)
-        {
-            self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
-        } else if self.editor.is_some() {
-            let editor_kind = self.kind;
-            let editor = self.editor.as_mut().unwrap();
-            if editor.requests_subscription_update(key) {
-                if editor.text() != editor.original {
-                    self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
+            KeyCode::Enter => {
+                let prompt = self.prompt.take().unwrap();
+                let input = if prompt.confirmation() && self.input.trim().is_empty() {
+                    "yes".to_owned()
                 } else {
-                    return Input::Run(Action::UpdateSubscriptions(editor.name.clone()), None);
-                }
-            } else if key.code == KeyCode::Char('o')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                if editor.browsing() {
-                    self.prompt(Prompt::Import);
-                } else {
-                    self.message = "Confirm or cancel the field before importing".into();
-                }
-            } else if matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && editor.browsing()
-            {
-                self.prompt(
-                    if key.code == KeyCode::Char('I') || key.modifiers.contains(KeyModifiers::SHIFT)
-                    {
-                        Prompt::ImportRule(crate::import::MergeMode::Append)
-                    } else {
-                        Prompt::ImportNode(crate::import::MergeMode::Append)
-                    },
-                );
-            } else if matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && editor.browsing()
-            {
-                let share = key.code == KeyCode::Char('E') && editor_kind == Kind::Proxy;
-                let result = if editor_kind == Kind::Proxy {
-                    if share {
-                        editor.export_selected_node_share()
-                    } else {
-                        editor.export_selected_node()
-                    }
-                } else {
-                    editor.export_selected_rule()
+                    self.input.trim().to_owned()
                 };
-                match result {
-                    Ok(text) => self.prompt(if editor_kind == Kind::Proxy {
-                        Prompt::ExportNode { text, share }
-                    } else {
-                        Prompt::ExportRule { text }
-                    }),
-                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+                match self.submit(prompt.clone(), input.clone()) {
+                    Ok(Some(action)) => return Input::Run(action, Some(Box::new((prompt, input)))),
+                    Ok(None) => {}
+                    Err(error) => self.fail(format!("{error:#}"), Resume::Prompt(prompt, input)),
                 }
-            } else if key.code == KeyCode::Char('s')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                match editor.prepare_save() {
-                    Ok(text) => {
-                        return Input::Run(
-                            Action::Save {
-                                name: editor.name.clone(),
-                                original: editor.original.clone(),
-                                text,
-                            },
-                            None,
-                        )
-                    }
-                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
-                }
-            } else if key.code == KeyCode::Char('f')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && editor.browsing()
-            {
-                // Ctrl-F matches the GUI; it opens the same search as `/`.
-                if let Err(error) =
-                    editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-                {
-                    self.fail(format!("{error:#}"), Resume::Editor);
-                }
-            } else if key.code == KeyCode::Esc && editor.can_close() {
-                self.suspend_editor();
-            } else if let Err(error) = editor.key(key) {
-                self.fail(format!("{error:#}"), Resume::Editor);
             }
-        } else if let Some(viewer) = &mut self.viewer {
-            let name = viewer.name.clone();
-            match viewer.key(key) {
-                logs::Command::Close => {
-                    let settings = viewer.settings.clone();
-                    self.log_settings.insert(name, settings);
-                    self.viewer = None;
-                    self.active_log = None;
-                }
-                logs::Command::Reconnect => return Input::Run(Action::Logs(name), None),
-                logs::Command::Capture(level) => {
-                    return Input::Run(Action::SetLogLevel { name, level }, None)
-                }
-                logs::Command::None => {}
-            }
-        } else if self.page == PROFILES {
-            let index = self.index();
-            let name = self.selected().map(|r| r.instance.name.clone());
-            let running = self.selected().is_some_and(|r| r.pid.is_some());
-            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
-                if self.vim_g {
-                    self.selections[index] = 0;
-                    self.vim_g = false;
-                } else {
-                    self.vim_g = true;
-                }
-                return Input::Idle;
-            }
-            self.vim_g = false;
-            match key.code {
-                KeyCode::Char('q') => return Input::Quit,
-                KeyCode::Tab => {
-                    self.switch_core(next_kind(self.kind));
-                }
-                KeyCode::Left | KeyCode::Char('h') => self.switch_core(Kind::Proxy),
-                KeyCode::Right | KeyCode::Char('l') => self.switch_core(Kind::Rule),
-                KeyCode::Char('3') => self.switch_core(Kind::Server),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selections[index] = self.selections[index].saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selections[index] =
-                        (self.selections[index] + 1).min(self.rows().len().saturating_sub(1))
-                }
-                KeyCode::Home => self.selections[index] = 0,
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.selections[index] = self.rows().len().saturating_sub(1)
-                }
-                KeyCode::PageDown => {
-                    self.selections[index] = (self.selections[index]
-                        + self.profile_viewport.get().max(1))
-                    .min(self.rows().len().saturating_sub(1))
-                }
-                KeyCode::PageUp => {
-                    self.selections[index] =
-                        self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.selections[index] = (self.selections[index]
-                        + self.profile_viewport.get().max(1))
-                    .min(self.rows().len().saturating_sub(1))
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.selections[index] =
-                        self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
-                }
-                KeyCode::Char('n') => self.prompt(Prompt::AddName),
-                KeyCode::Enter if name.is_some() => self.menu = Some(0),
-                KeyCode::Char(c)
-                    if name.is_some()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    // Activation is explicit; Space is reserved for local selection/pause.
-                    let operation = match c {
-                        'c' if running => Operation::Stop,
-                        'c' => Operation::Start,
-                        's' => Operation::Start,
-                        'x' => Operation::Stop,
-                        'r' => Operation::Reload,
-                        'e' => Operation::Edit,
-                        'L' => Operation::Logs,
-                        't' => {
-                            if self.kind == Kind::Rule {
-                                Operation::Explain
-                            } else {
-                                Operation::Diagnostics
-                            }
-                        }
-                        'b' => Operation::Bind,
-                        'd' => Operation::Remove,
-                        'y' => Operation::Copy,
-                        'E' => Operation::ExportConfig,
-                        'P' => Operation::ExportTerminal,
-                        'v' => return Input::Run(Action::Validate(name.unwrap()), None),
-                        _ => return Input::Idle,
-                    };
-                    return self.operation(operation);
-                }
-                _ => {}
-            }
+            _ => {}
         }
         Input::Idle
     }
+
+    fn key_editor_focus(&mut self, key: event::KeyEvent) -> Input {
+        let editor_kind = self.kind;
+        let editor = self.editor.as_mut().unwrap();
+        if editor.requests_subscription_update(key) {
+            if editor.text() != editor.original {
+                self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
+            } else {
+                return Input::Run(Action::UpdateSubscriptions(editor.name.clone()), None);
+            }
+        } else if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if editor.browsing() {
+                self.prompt(Prompt::Import);
+            } else {
+                self.message = "Confirm or cancel the field before importing".into();
+            }
+        } else if matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && editor.browsing()
+        {
+            self.prompt(
+                if key.code == KeyCode::Char('I') || key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Prompt::ImportRule(crate::import::MergeMode::Append)
+                } else {
+                    Prompt::ImportNode(crate::import::MergeMode::Append)
+                },
+            );
+        } else if matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && editor.browsing()
+        {
+            let share = key.code == KeyCode::Char('E') && editor_kind == Kind::Proxy;
+            let result = if editor_kind == Kind::Proxy {
+                if share {
+                    editor.export_selected_node_share()
+                } else {
+                    editor.export_selected_node()
+                }
+            } else {
+                editor.export_selected_rule()
+            };
+            match result {
+                Ok(text) => self.prompt(if editor_kind == Kind::Proxy {
+                    Prompt::ExportNode { text, share }
+                } else {
+                    Prompt::ExportRule { text }
+                }),
+                Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+            }
+        } else if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match editor.prepare_save() {
+                Ok(text) => {
+                    return Input::Run(
+                        Action::Save {
+                            name: editor.name.clone(),
+                            original: editor.original.clone(),
+                            text,
+                        },
+                        None,
+                    )
+                }
+                Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
+            }
+        } else if key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && editor.browsing()
+        {
+            // Ctrl-F matches the GUI; it opens the same search as `/`.
+            if let Err(error) =
+                editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            {
+                self.fail(format!("{error:#}"), Resume::Editor);
+            }
+        } else if key.code == KeyCode::Esc && editor.can_close() {
+            self.suspend_editor();
+        } else if let Err(error) = editor.key(key) {
+            self.fail(format!("{error:#}"), Resume::Editor);
+        }
+        Input::Idle
+    }
+
+    fn key_log_focus(&mut self, key: event::KeyEvent) -> Input {
+        let viewer = self.viewer.as_mut().unwrap();
+        let name = viewer.name.clone();
+        match viewer.key(key) {
+            logs::Command::Close => {
+                let settings = viewer.settings.clone();
+                self.log_settings.insert(name, settings);
+                self.viewer = None;
+                self.active_log = None;
+            }
+            logs::Command::Reconnect => return Input::Run(Action::Logs(name), None),
+            logs::Command::Capture(level) => {
+                return Input::Run(Action::SetLogLevel { name, level }, None)
+            }
+            logs::Command::None => {}
+        }
+        Input::Idle
+    }
+
+    fn key_profiles_focus(&mut self, key: event::KeyEvent) -> Input {
+        let index = self.index();
+        let name = self.selected().map(|r| r.instance.name.clone());
+        let running = self.selected().is_some_and(|r| r.pid.is_some());
+        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+            if self.vim_g {
+                self.selections[index] = 0;
+                self.vim_g = false;
+            } else {
+                self.vim_g = true;
+            }
+            return Input::Idle;
+        }
+        self.vim_g = false;
+        match key.code {
+            KeyCode::Char('q') => return Input::Quit,
+            KeyCode::Tab => {
+                self.switch_core(next_kind(self.kind));
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.switch_core(Kind::Proxy),
+            KeyCode::Right | KeyCode::Char('l') => self.switch_core(Kind::Rule),
+            KeyCode::Char('3') => self.switch_core(Kind::Server),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selections[index] = self.selections[index].saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selections[index] =
+                    (self.selections[index] + 1).min(self.rows().len().saturating_sub(1))
+            }
+            KeyCode::Home => self.selections[index] = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.selections[index] = self.rows().len().saturating_sub(1)
+            }
+            KeyCode::PageDown => {
+                self.selections[index] = (self.selections[index]
+                    + self.profile_viewport.get().max(1))
+                .min(self.rows().len().saturating_sub(1))
+            }
+            KeyCode::PageUp => {
+                self.selections[index] =
+                    self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selections[index] = (self.selections[index]
+                    + self.profile_viewport.get().max(1))
+                .min(self.rows().len().saturating_sub(1))
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selections[index] =
+                    self.selections[index].saturating_sub(self.profile_viewport.get().max(1))
+            }
+            KeyCode::Char('n') => self.prompt(Prompt::AddName),
+            KeyCode::Enter if name.is_some() => self.menu = Some(0),
+            KeyCode::Char(c)
+                if name.is_some()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                // Activation is explicit; Space is reserved for local selection/pause.
+                let operation = match c {
+                    'c' if running => Operation::Stop,
+                    'c' => Operation::Start,
+                    's' => Operation::Start,
+                    'x' => Operation::Stop,
+                    'r' => Operation::Reload,
+                    'e' => Operation::Edit,
+                    'L' => Operation::Logs,
+                    't' => {
+                        if self.kind == Kind::Rule {
+                            Operation::Explain
+                        } else {
+                            Operation::Diagnostics
+                        }
+                    }
+                    'b' => Operation::Bind,
+                    'd' => Operation::Remove,
+                    'y' => Operation::Copy,
+                    'E' => Operation::ExportConfig,
+                    'P' => Operation::ExportTerminal,
+                    'v' => return Input::Run(Action::Validate(name.unwrap()), None),
+                    _ => return Input::Idle,
+                };
+                return self.operation(operation);
+            }
+            _ => {}
+        }
+        Input::Idle
+    }
+
     fn operation_text(&self) -> String {
         if self.operation_steps.is_empty()
             || self
