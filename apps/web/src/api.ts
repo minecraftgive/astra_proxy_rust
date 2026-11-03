@@ -274,6 +274,7 @@ export function takeEvents(buffer: string): {
     rest,
   };
 }
+// Authentication uses a Bearer header; native EventSource cannot send it.
 export async function watch(
   agent: string,
   signal: AbortSignal,
@@ -338,6 +339,7 @@ export async function watch(
         await reader.cancel().catch(() => {});
         reader.releaseLock();
       }
+      if (!signal.aborted) onStatus("事件连接已断开，正在重连");
     } catch (e) {
       if (signal.aborted) return;
       onStatus(e instanceof Error ? e.message : "连接中断");

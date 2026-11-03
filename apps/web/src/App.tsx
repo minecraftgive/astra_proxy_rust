@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as API from "./api";
+import { usePolling } from "./usePolling";
 import { readTheme, retainTheme } from "./resilience";
 import type { LogChunk, LogCursor } from "./generated/management";
 import Editor from "./components/Editor";
@@ -73,43 +74,29 @@ export default function App() {
     setError(e instanceof Error ? e.message : String(e));
     if (!API.signedIn()) setAuthenticated(false);
   }, []);
-  const refresh = useCallback(async () => {
-    if (!agent) return;
-    const generation = epoch.current;
-    try {
-      const r = await API.query<API.Instance[]>(agent, "instances");
-      if (generation !== epoch.current) return;
-      setInstances(r.data);
-      setSelected((old) =>
-        r.data.some((i) => i.id === old) ? old : (r.data[0]?.id ?? ""),
-      );
-    } catch (e) {
-      if (generation === epoch.current) fail(e);
-    }
-  }, [agent, fail]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!agent) return;
+      const generation = epoch.current;
+      try {
+        const r = await API.query<API.Instance[]>(
+          agent,
+          "instances",
+          undefined,
+          signal,
+        );
+        if (signal?.aborted || generation !== epoch.current) return;
+        setInstances(r.data);
+        setSelected((old) =>
+          r.data.some((i) => i.id === old) ? old : (r.data[0]?.id ?? ""),
+        );
+      } catch (e) {
+        if (!signal?.aborted && generation === epoch.current) fail(e);
+      }
+    },
+    [agent, fail],
+  );
   useEffect(() => {
-    if (!authenticated) return;
-    let active = true;
-    const load = () =>
-      API.query<API.Agent[]>(null, "agents")
-        .then((r) => {
-          if (active) {
-            setAgents(r.data);
-            setAgent((old) =>
-              r.data.some((a) => a.id === old) ? old : (r.data[0]?.id ?? ""),
-            );
-          }
-        })
-        .catch(fail);
-    void load();
-    const timer = setInterval(load, 5000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [authenticated, fail]);
-  useEffect(() => {
-    if (!authenticated || !agent) return;
     epoch.current++;
     setInstances([]);
     setSelected("");
@@ -121,52 +108,73 @@ export default function App() {
     setSearch("");
     setPaused(false);
     setLogs("");
-    const abort = new AbortController();
-    void refresh();
-    void API.watch(
-      agent,
-      abort.signal,
-      (batch, gap) => {
-        if (abort.signal.aborted) return;
-        setEvents((old) => [...old, ...batch].slice(-500));
-        if (batch.length || gap) void refresh();
-      },
-      (value) => {
-        if (!abort.signal.aborted) setStatus(value);
-      },
-    );
-    return () => abort.abort();
-  }, [agent, authenticated, refresh]);
-  useEffect(() => {
-    if (
-      !agent ||
-      !selected ||
-      !online ||
-      !current?.pid ||
-      (current.kind !== "proxy" && current.kind !== "server")
-    )
-      return;
-    const abort = new AbortController();
-    const load = async () => {
+    setStatus("连接中");
+  }, [agent, authenticated]);
+  const fallbackMs = status === "已连接" ? 30_000 : 10_000;
+  const refreshAgents = usePolling(
+    async (signal) => {
+      try {
+        const r = await API.query<API.Agent[]>(
+          null,
+          "agents",
+          undefined,
+          signal,
+        );
+        if (signal.aborted) return;
+        setAgents(r.data);
+        setAgent((old) =>
+          r.data.some((a) => a.id === old) ? old : (r.data[0]?.id ?? ""),
+        );
+      } catch (e) {
+        if (!signal.aborted) fail(e);
+      }
+    },
+    authenticated ? fallbackMs : null,
+    [authenticated, fail],
+  );
+  const refreshInstances = usePolling(
+    refresh,
+    authenticated && agent ? fallbackMs : null,
+    [agent, authenticated],
+  );
+  const refreshRuntime = usePolling(
+    async (signal) => {
       try {
         const r = await API.query<{ kind: string; snapshot: Row }>(
           agent,
           "runtime",
           { instance: selected },
-          abort.signal,
+          signal,
         );
-        if (!abort.signal.aborted && !paused) setRuntime(r.data.snapshot);
+        if (!signal.aborted) setRuntime(r.data.snapshot);
       } catch (e) {
-        if (!(e instanceof API.ApiError && e.code === "unsupported")) fail(e);
+        if (
+          !signal.aborted &&
+          !(e instanceof API.ApiError && e.code === "unsupported")
+        )
+          fail(e);
       }
-    };
-    void load();
-    const timer = setInterval(load, 1500);
-    return () => {
-      abort.abort();
-      clearInterval(timer);
-    };
-  }, [agent, selected, online, paused, current?.pid, current?.kind, fail]);
+    },
+    authenticated &&
+      agent &&
+      selected &&
+      online &&
+      current?.pid &&
+      !paused &&
+      (current.kind === "proxy" || current.kind === "server")
+      ? 5_000
+      : null,
+    [
+      agent,
+      selected,
+      online,
+      paused,
+      current?.pid,
+      current?.kind,
+      authenticated,
+      fail,
+    ],
+  );
   useEffect(() => {
     setRuntime(null);
     setResult(null);
@@ -174,28 +182,29 @@ export default function App() {
     setLogs("");
     setError("");
   }, [agent, selected]);
+  const logState = useRef<{ cursor: LogCursor | null; decoder: TextDecoder }>({
+    cursor: null,
+    decoder: new TextDecoder(),
+  });
   useEffect(() => {
-    if (page !== "logs" || !agent || !selected || paused) return;
-    const abort = new AbortController();
-    let cursor: LogCursor | null = null;
-    let pending = false;
-    let decoder = new TextDecoder();
-    const load = async () => {
-      if (pending) return;
-      pending = true;
+    logState.current = { cursor: null, decoder: new TextDecoder() };
+  }, [page, agent, selected, paused]);
+  const refreshLogs = usePolling(
+    async (signal) => {
+      const state = logState.current;
       try {
         const r = await API.query<LogChunk>(
           agent,
           "log_chunk",
-          { instance: selected, cursor },
-          abort.signal,
+          { instance: selected, cursor: state.cursor },
+          signal,
         );
-        if (abort.signal.aborted) return;
+        if (signal.aborted) return;
         if (r.data.type === "data") {
           const data = r.data.data;
-          cursor = data.cursor;
-          if (data.reset) decoder = new TextDecoder();
-          const text = decoder.decode(new Uint8Array(data.bytes), {
+          state.cursor = data.cursor;
+          if (data.reset) state.decoder = new TextDecoder();
+          const text = state.decoder.decode(new Uint8Array(data.bytes), {
             stream: true,
           });
           setLogs((old) => {
@@ -208,46 +217,67 @@ export default function App() {
           });
         } else if (r.data.type === "error") throw new Error(r.data.data);
       } catch (e) {
-        fail(e);
-      } finally {
-        pending = false;
+        if (!signal.aborted) fail(e);
       }
-    };
-    void load();
-    const timer = setInterval(load, 1500);
-    return () => {
-      abort.abort();
-      clearInterval(timer);
-    };
-  }, [page, agent, selected, paused, fail]);
-  useEffect(() => {
-    if (!authenticated || !agent || !online) return;
-    const abort = new AbortController();
-    let pending = false;
-    const load = async () => {
-      if (pending) return;
-      pending = true;
+    },
+    authenticated && page === "logs" && agent && selected && !paused
+      ? 5_000
+      : null,
+    [page, agent, selected, paused, authenticated, fail],
+  );
+  const refreshTasks = usePolling(
+    async (signal) => {
       try {
         const r = await API.query<API.Task[]>(
           agent,
           "tasks",
           { limit: 64 },
-          abort.signal,
+          signal,
         );
-        if (!abort.signal.aborted) setTasks(r.data);
+        if (!signal.aborted) setTasks(r.data);
       } catch (e) {
-        fail(e);
-      } finally {
-        pending = false;
+        if (!signal.aborted) fail(e);
       }
-    };
-    void load();
-    const timer = setInterval(load, 3000);
-    return () => {
-      abort.abort();
-      clearInterval(timer);
-    };
-  }, [authenticated, agent, online, fail]);
+    },
+    authenticated && agent && online ? fallbackMs : null,
+    [authenticated, agent, online, fail],
+  );
+  useEffect(() => {
+    if (!authenticated || !agent) return;
+    const abort = new AbortController();
+    void API.watch(
+      agent,
+      abort.signal,
+      (batch, gap) => {
+        if (abort.signal.aborted) return;
+        setEvents((old) => [...old, ...batch].slice(-500));
+        // Free-form event kinds do not expose a stable entity schema. Coalesce
+        // each batch into one refresh per affected snapshot, including resync gaps.
+        if (batch.length || gap) {
+          refreshAgents();
+          refreshInstances();
+          refreshRuntime();
+          refreshLogs();
+          refreshTasks();
+        }
+      },
+      (value) => {
+        if (!abort.signal.aborted) {
+          setStatus(value);
+          if (!API.signedIn()) setAuthenticated(false);
+        }
+      },
+    );
+    return () => abort.abort();
+  }, [
+    agent,
+    authenticated,
+    refreshAgents,
+    refreshInstances,
+    refreshRuntime,
+    refreshLogs,
+    refreshTasks,
+  ]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme === "system" ? "" : theme;
     retainTheme(theme);
@@ -481,7 +511,12 @@ export default function App() {
               </div>
               {current && <NetworkRecovery details={current.details} />}
               {page === "monitor" && (
-                <Monitor agent={agent} instance={selected} online={online} onError={fail} />
+                <Monitor
+                  agent={agent}
+                  instance={selected}
+                  online={online}
+                  onError={fail}
+                />
               )}
               {page === "overview" &&
                 (current ? (
