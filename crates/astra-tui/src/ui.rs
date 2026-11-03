@@ -373,7 +373,7 @@ impl Session {
     fn save(&self, path: &std::path::Path) -> Result<()> {
         let data = serde_json::to_vec(self)?;
         anyhow::ensure!(data.len() as u64 <= SESSION_LIMIT, "Session exceeds 4 MiB");
-        crate::manager::atomic_write(path, &data)
+        Ok(astra_platform::storage::atomic_write_default(path, &data)?)
     }
 }
 
@@ -3330,7 +3330,7 @@ default_action = "direct"
     #[test]
     fn external_editor_roundtrip_keeps_original_and_recovers_invalid_or_conflicting_edits() {
         let home = std::env::temp_dir().join(format!("astra-external-ui-{}", std::process::id()));
-        crate::manager::private_dir(&home).unwrap();
+        astra_platform::storage::private_dir(&home).unwrap();
         let mut ui = sample_ui(false);
         let original = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n";
         ui.editor = Some(Editor::new("proxy".into(), original.into()));

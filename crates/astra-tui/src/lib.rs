@@ -11,6 +11,7 @@ mod i18n;
 mod import;
 mod log_stream;
 mod logs;
+#[cfg(test)]
 mod manager;
 mod nettools;
 mod network_interfaces;

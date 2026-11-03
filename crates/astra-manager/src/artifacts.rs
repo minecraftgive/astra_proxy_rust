@@ -62,7 +62,7 @@ fn load(path: &Path) -> Result<Artifact> {
     )?)
 }
 fn persist(path: &Path, artifact: &Artifact) -> Result<()> {
-    crate::atomic_write(path, &serde_json::to_vec(artifact)?)
+    Ok(crate::atomic_write(path, &serde_json::to_vec(artifact)?)?)
 }
 pub fn complete_path(root: &Path, id: &str) -> Result<PathBuf> {
     let (meta, body) = paths(root, id)?;

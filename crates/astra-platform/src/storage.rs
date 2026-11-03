@@ -43,6 +43,23 @@ pub fn prepare_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Create a private state directory, rejecting symbolic-link destinations.
+pub fn private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "State directory cannot be a symlink",
+        ));
+    }
+    crate::platform::set_private(path, 0o700)
+}
+
+/// Atomically replace a private file with the default storage policy.
+pub fn atomic_write_default(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes, WritePolicy::default())
+}
+
 /// File replacement requirements belong to the caller's transaction.
 #[derive(Debug, Clone, Copy)]
 pub struct WritePolicy {

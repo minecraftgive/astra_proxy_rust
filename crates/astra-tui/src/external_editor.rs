@@ -23,7 +23,7 @@ impl Draft {
             t("External draft exceeds 480 KiB")
         );
         let directory = home.join("external-drafts");
-        crate::manager::private_dir(&directory)?;
+        astra_platform::storage::private_dir(&directory)?;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
@@ -156,7 +156,7 @@ mod tests {
     fn editor_process_receives_literal_draft_path_and_failure_retains_the_file() {
         let home =
             std::env::temp_dir().join(format!("astra editor process 中文 {}", std::process::id()));
-        crate::manager::private_dir(&home).unwrap();
+        astra_platform::storage::private_dir(&home).unwrap();
         let draft = Draft::create(&home, "proxy".into(), "standalone=true\n".into()).unwrap();
         #[cfg(windows)]
         let (script, command) = {
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn draft_io_is_bounded_and_does_not_change_the_saved_configuration() {
         let home = std::env::temp_dir().join(format!("astra-external-{}", std::process::id()));
-        crate::manager::private_dir(&home).unwrap();
+        astra_platform::storage::private_dir(&home).unwrap();
         let source = home.join("saved.toml");
         fs::write(&source, "original").unwrap();
         let draft = Draft::create(&home, "proxy".into(), "standalone=true\n".into()).unwrap();

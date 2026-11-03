@@ -89,7 +89,7 @@ impl Launch {
                 "Invalid window ID"
             );
             let directory = home.join("window-sessions");
-            crate::manager::private_dir(&directory)?;
+            astra_platform::storage::private_dir(&directory)?;
             Ok(directory.join(format!("{id}.json")))
         } else {
             Ok(home.join("ui-session.json"))

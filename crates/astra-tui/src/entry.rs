@@ -1,4 +1,4 @@
-use crate::{i18n, manager, protocol, ui, windows};
+use crate::{i18n, protocol, ui, windows};
 use anyhow::{Context, Result};
 use astra_platform::platform::OpenOptionsExt;
 use std::{
@@ -214,7 +214,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
     if let (Some(view), None) = (launch.view, &launch.window_id) {
         launch.window_id = windows::Launch::detached(view, None, protocol::Kind::Proxy).window_id;
     }
-    manager::private_dir(&home)?;
+    astra_platform::storage::private_dir(&home)?;
     home = std::fs::canonicalize(home)?;
     anyhow::ensure!(
         agent_id.is_none() || endpoint.is_some(),
@@ -259,7 +259,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
         };
         return ui::run(endpoint, context, launch).await;
     }
-    manager::private_dir(&config_home)?;
+    astra_platform::storage::private_dir(&config_home)?;
     config_home = std::fs::canonicalize(config_home)?;
     anyhow::ensure!(
         config_home != home && !config_home.starts_with(&home) && !home.starts_with(&config_home),

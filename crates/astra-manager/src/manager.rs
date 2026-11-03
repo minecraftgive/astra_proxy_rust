@@ -493,23 +493,7 @@ fn core_process(path: PathBuf, runtime_dir: &Path) -> Process {
     command
 }
 
-pub fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    anyhow::ensure!(
-        !fs::symlink_metadata(path)?.file_type().is_symlink(),
-        "State directory cannot be a symlink"
-    );
-    set_private(path, 0o700)?;
-    Ok(())
-}
-
-pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    Ok(astra_platform::storage::atomic_write(
-        path,
-        data,
-        astra_platform::storage::WritePolicy::default(),
-    )?)
-}
+pub use astra_platform::storage::{atomic_write_default as atomic_write, private_dir};
 
 fn read_config(path: &Path) -> Result<String> {
     let mut text = String::new();
@@ -712,16 +696,16 @@ impl Manager {
         Ok(manager)
     }
     fn persist_runtime(&self) -> Result<()> {
-        atomic_write(
+        Ok(atomic_write(
             &self.home.join("runtime.json"),
             &serde_json::to_vec(&self.runtime)?,
-        )
+        )?)
     }
     fn persist(&self) -> Result<()> {
-        atomic_write(
+        Ok(atomic_write(
             &self.config_home.join("instances.toml"),
             toml::to_string_pretty(&self.registry)?.as_bytes(),
-        )
+        )?)
     }
     fn instance(&self, name: &str) -> Result<Instance> {
         if let Some(reason) = self.blocked.get(name) {

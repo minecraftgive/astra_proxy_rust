@@ -27,7 +27,7 @@ pub fn session_home(home: &Path) -> Result<PathBuf> {
         let identity = format!("{}\0{}", endpoint.display(), agent.unwrap_or_default());
         let key = format!("{:x}", sha2::Sha256::digest(identity.as_bytes()));
         let path = home.join("remote-sessions").join(key);
-        crate::manager::private_dir(&path)?;
+        astra_platform::storage::private_dir(&path)?;
         Ok(path)
     } else {
         Ok(home.into())
