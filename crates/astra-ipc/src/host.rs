@@ -305,7 +305,7 @@ impl<S> HostStream<S> {
             read_fin: false,
             write_fin: false,
             failed: None,
-            output: Vec::new(),
+            output: Vec::with_capacity(HEADER_BYTES + MAX_STREAM_DATA),
             written: 0,
         }
     }
