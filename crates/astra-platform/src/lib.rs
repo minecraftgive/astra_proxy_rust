@@ -13,3 +13,4 @@ pub mod command;
 pub mod supervision;
 pub mod recovery;
 pub mod monitor;
+pub mod tui_log;

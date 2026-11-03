@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = "0.4"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 astra-model = { path = "../astra-model" }

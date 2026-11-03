@@ -10,3 +10,5 @@ pub use client::ManagerClient;
 pub mod server;
 
 pub mod host_control;
+
+pub mod subscription_view;

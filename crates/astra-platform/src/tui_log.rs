@@ -1,5 +1,5 @@
 //! Private UI/manager activity log. Configuration payloads are never logged.
-use astra_platform::platform::OpenOptionsExt;
+use crate::platform::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -36,7 +36,12 @@ impl Log {
             let _ = writeln!(
                 file,
                 "[{}] INFO {} {}",
-                stamp(astra_ipc::progress::now_ms()),
+                stamp(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                ),
                 category,
                 message
             );

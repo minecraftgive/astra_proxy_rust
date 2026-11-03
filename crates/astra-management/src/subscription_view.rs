@@ -1,4 +1,4 @@
-use crate::protocol::SubscriptionNodes;
+use crate::SubscriptionNodes;
 use anyhow::{ensure, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,6 +7,9 @@ use std::{
 };
 
 pub fn read(path: &Path) -> Result<BTreeMap<String, SubscriptionNodes>> {
+    read_in(&astra_platform::storage::runtime_root()?, path)
+}
+pub fn read_in(root: &Path, path: &Path) -> Result<BTreeMap<String, SubscriptionNodes>> {
     let base = std::fs::read_to_string(path)?;
     ensure!(base.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
     let doc: toml::Value = toml::from_str(&base)?;
@@ -41,7 +44,7 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, SubscriptionNodes>> {
     let cache = (|| -> Result<serde_json::Value> {
         let mut data = Vec::new();
         std::fs::File::open({
-            let runtime = astra_platform::storage::runtime_path(path, "subscriptions")?;
+            let runtime = astra_platform::storage::runtime_path_in(root, path, "subscriptions")?;
             if runtime.exists() {
                 runtime
             } else {
