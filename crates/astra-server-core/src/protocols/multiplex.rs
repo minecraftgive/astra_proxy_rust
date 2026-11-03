@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use astra_model::Target;
+use bytes::{Bytes, BytesMut};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -36,8 +37,8 @@ pub async fn sing(mut stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
                 if padding {
                     let n = stream.read_u16().await? as usize;
                     ensure!(n <= 1024, "mux padding limit");
-                    let mut discard = vec![0; n];
-                    stream.read_exact(&mut discard).await?;
+                    let mut discard = [0; 1024];
+                    stream.read_exact(&mut discard[..n]).await?;
                 }
             }
             Ok::<_, anyhow::Error>((protocol, padding))
@@ -256,8 +257,9 @@ async fn smux(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
         }
     });
     let _writer = Tasks(vec![writer.abort_handle()]);
-    let mut flows = HashMap::<u32, mpsc::Sender<Vec<u8>>>::new();
+    let mut flows = HashMap::<u32, mpsc::Sender<Bytes>>::new();
     let mut children = JoinSet::new();
+    let mut data = BytesMut::new();
     loop {
         let mut header = [0; 8];
         match tokio::time::timeout(
@@ -274,7 +276,7 @@ async fn smux(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
         let n = u16::from_le_bytes([header[2], header[3]]) as usize;
         let id = u32::from_le_bytes(header[4..].try_into().unwrap());
         ensure!(n <= 32768 && cmd <= 3, "smux frame");
-        let mut data = vec![0; n];
+        data.resize(n, 0);
         rd.read_exact(&mut data).await?;
         flows.retain(|_, tx| !tx.is_closed());
         while children.try_join_next().is_some() {}
@@ -304,7 +306,7 @@ async fn smux(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
                     if !matches!(
                         tokio::time::timeout(
                             Duration::from_secs(app.config.handshake_timeout_secs),
-                            input.send(data)
+                            input.send(data.split_to(n).freeze())
                         )
                         .await,
                         Ok(Ok(()))
@@ -321,7 +323,7 @@ async fn smux(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
 }
 async fn stream_flow(
     id: u32,
-    mut input: mpsc::Receiver<Vec<u8>>,
+    mut input: mpsc::Receiver<Bytes>,
     output: mpsc::Sender<Vec<u8>>,
     app: Arc<App>,
     udp: bool,
@@ -409,7 +411,7 @@ pub async fn cool(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
     });
     let _writer = Tasks(vec![writer.abort_handle()]);
     enum Flow {
-        Tcp(mpsc::Sender<Vec<u8>>),
+        Tcp(mpsc::Sender<Bytes>),
         Udp { target: Target, association: u32 },
     }
     let mut flows = HashMap::<u16, Flow>::new();
@@ -419,26 +421,28 @@ pub async fn cool(stream: Stream, app: Arc<App>, udp: bool) -> Result<()> {
     // Keep reads in one task so a UDP reply cannot cancel half a frame header.
     let (frames, mut receive) = mpsc::channel(8);
     let reader = tokio::spawn(async move {
+        let mut meta = BytesMut::new();
+        let mut payload = BytesMut::new();
         loop {
             let result = async {
                 let n = rd.read_u16().await? as usize;
                 ensure!((4..=512).contains(&n), "Mux.Cool metadata length");
-                let mut meta = vec![0; n];
+                meta.resize(n, 0);
                 rd.read_exact(&mut meta).await?;
                 ensure!(
                     !(meta[2] == 3 && meta[3] & 1 != 0),
                     "End frame carries payload"
                 );
-                let payload = if meta[3] & 1 != 0 {
+                let body = if meta[3] & 1 != 0 {
                     let n = rd.read_u16().await? as usize;
                     ensure!(n <= 8192, "Mux.Cool payload limit");
-                    let mut payload = vec![0; n];
+                    payload.resize(n, 0);
                     rd.read_exact(&mut payload).await?;
-                    Some(payload)
+                    Some(payload.split_to(n).freeze())
                 } else {
                     None
                 };
-                Ok::<_, anyhow::Error>((meta, payload))
+                Ok::<_, anyhow::Error>((meta.split().freeze(), body))
             }
             .await;
             match result {
@@ -514,8 +518,23 @@ mod tests {
         let mut result = [0; 18];
         stream.read_exact(&mut result).await.unwrap();
         assert_eq!(&result, b"padded-server-flow");
-        stream.shutdown().await.unwrap();
-        drop(stream);
+        let payload: Vec<_> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut received = vec![0; payload.len()];
+        let (mut read, mut write) = tokio::io::split(stream);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(
+                async {
+                    for chunk in payload.chunks(7319) {
+                        write.write_all(chunk).await?;
+                    }
+                    write.flush().await
+                },
+                async { read.read_exact(&mut received).await.map(|_| ()) },
+            )
+        }).await.unwrap().unwrap();
+        assert_eq!(received, payload);
+        write.shutdown().await.unwrap();
+        drop((read, write));
         drop(session);
         task.abort();
         echo.abort();

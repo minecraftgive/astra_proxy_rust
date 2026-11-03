@@ -133,7 +133,8 @@ impl App {
         s.connect(address).await?;
         Ok(s)
     }
-    pub fn packet(&self, association: u32, target: Target, payload: Vec<u8>) -> Result<Packet> {
+    pub fn packet(&self, association: u32, target: Target, payload: impl Into<Bytes>) -> Result<Packet> {
+        let payload = payload.into();
         ensure!(payload.len() <= 65507, "UDP datagram exceeds 65507 bytes");
         let permit = self
             .bytes
@@ -143,7 +144,7 @@ impl App {
         Ok(Packet {
             association,
             target,
-            payload: payload.into(),
+            payload,
             _budget: permit,
         })
     }
