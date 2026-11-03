@@ -1,5 +1,12 @@
 //! UI-only translations. Configuration values, paths and raw logs are never translated.
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        OnceLock,
+    },
+};
+static INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Language {
@@ -99,9 +106,17 @@ pub fn t(source: &str) -> &str {
     translate(source, language())
 }
 pub fn translate(source: &str, language: Language) -> &str {
-    let Some(entry) = CATALOG.iter().find(|entry| entry.0 == source) else {
+    let index = INDEX.get_or_init(|| {
+        CATALOG
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.0, index))
+            .collect()
+    });
+    let Some(&position) = index.get(source) else {
         return source;
     };
+    let entry = &CATALOG[position];
     match language {
         Language::English => entry.1,
         Language::Simplified => entry.2,
@@ -1008,6 +1023,18 @@ mod tests {
         for locale in ["en-US", "C", "de_DE.UTF-8"] {
             assert_eq!(Language::resolve(locale), Language::English);
         }
+    }
+    #[test]
+    fn indexed_translations_match_every_catalog_entry_and_preserve_unknown_text() {
+        for &(source, english, simplified, traditional) in CATALOG {
+            assert_eq!(translate(source, Language::English), english);
+            assert_eq!(translate(source, Language::Simplified), simplified);
+            assert_eq!(translate(source, Language::Traditional), traditional);
+        }
+        assert_eq!(
+            translate("unknown translation key", Language::Simplified),
+            "unknown translation key"
+        );
     }
     #[test]
     fn translations_keep_all_placeholders() {
