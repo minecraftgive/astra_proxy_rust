@@ -76,7 +76,15 @@ impl Candidate {
 }
 #[cfg(target_os = "linux")]
 pub fn capture(pid: u32) -> io::Result<ProcessIdentity> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    // A process exiting between open and read makes the read fail with ESRCH;
+    // that is the same "gone" answer as a missing /proc entry.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            io::ErrorKind::NotFound.into()
+        } else {
+            error
+        }
+    })?;
     let fields: Vec<_> = stat
         .rsplit_once(')')
         .ok_or_else(|| io::Error::other("invalid process stat"))?
