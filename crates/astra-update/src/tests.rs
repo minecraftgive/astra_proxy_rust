@@ -57,26 +57,38 @@ fn legacy_manifests_roundtrip_without_build_metadata() {
 }
 
 #[test]
-fn imports_all_build_modes_and_preserves_metadata() {
+fn imports_dev_and_release_packages_and_preserves_metadata() {
+    for (profile, cargo_profile) in [("debug", "dev"), ("release", "release")] {
+        let fixture = Fixture::new("build-metadata");
+        fixture.edit(|manifest| {
+            manifest.profile = Some(profile.into());
+            manifest.cargo_profile = Some(cargo_profile.into());
+        });
+        let manifest = fixture.manifest();
+        let encoded = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(encoded["profile"], profile);
+        assert!(encoded.get("mode").is_none());
+        assert_eq!(encoded["cargo_profile"], cargo_profile);
+        assert_eq!(fixture.import().unwrap().manifest, manifest);
+        assert_eq!(fixture.import().unwrap().manifest, manifest);
+    }
+}
+
+#[test]
+fn imports_legacy_build_mode_packages() {
     for (profile, mode, cargo_profile) in [
         ("debug", "fast", "dev"),
         ("release", "fast", "release-fast"),
         ("debug", "runtime", "dev-runtime"),
         ("release", "runtime", "release-runtime"),
     ] {
-        let fixture = Fixture::new("build-metadata");
+        let fixture = Fixture::new("legacy-build-mode");
         fixture.edit(|manifest| {
             manifest.profile = Some(profile.into());
             manifest.mode = Some(mode.into());
             manifest.cargo_profile = Some(cargo_profile.into());
         });
         let manifest = fixture.manifest();
-        let encoded = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(encoded["profile"], profile);
-        assert_eq!(encoded["mode"], mode);
-        assert_eq!(encoded["cargo_profile"], cargo_profile);
-        let imported = fixture.import().unwrap();
-        assert_eq!(imported.manifest, manifest);
         assert_eq!(fixture.import().unwrap().manifest, manifest);
     }
 }
@@ -85,14 +97,17 @@ fn imports_all_build_modes_and_preserves_metadata() {
 fn rejects_incomplete_or_mismatched_build_metadata() {
     let fixture = Fixture::new("invalid-build-metadata");
     for (profile, mode, cargo_profile) in [
+        (None, None, Some("dev")),
+        (Some("debug"), None, None),
         (None, Some("fast"), Some("dev")),
-        (Some("debug"), None, Some("dev")),
         (Some("debug"), Some("fast"), None),
+        (Some("debug"), None, Some("release")),
+        (Some("release"), None, Some("release-runtime")),
         (Some("debug"), Some("fast"), Some("release-fast")),
         (Some("release"), Some("runtime"), Some("dev-runtime")),
         (Some("release"), Some("unknown"), Some("release")),
-        (Some("unknown"), Some("fast"), Some("dev")),
-        (Some("debug"), Some("fast"), Some("unknown")),
+        (Some("unknown"), None, Some("dev")),
+        (Some("debug"), None, Some("unknown")),
     ] {
         fixture.edit(|manifest| {
             manifest.profile = profile.map(str::to_owned);

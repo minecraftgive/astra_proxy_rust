@@ -48,6 +48,7 @@ pub struct ReleaseManifest {
     /// Build metadata is absent from legacy release manifests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Only present in legacy packages built with the removed fast/runtime modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +147,12 @@ impl ReleaseManifest {
             self.cargo_profile.as_deref(),
         ) {
             (None, None, None) => {}
+            // Current packages: the workspace has exactly the dev and release Cargo profiles.
+            (Some(profile), None, Some(cargo_profile)) => ensure!(
+                matches!((profile, cargo_profile), ("debug", "dev") | ("release", "release")),
+                "Invalid build metadata: profile={profile}, cargo_profile={cargo_profile}"
+            ),
+            // Packages built before the build modes were removed remain importable.
             (Some(profile), Some(mode), Some(cargo_profile)) => ensure!(
                 matches!(
                     (profile, mode, cargo_profile),
@@ -156,7 +163,7 @@ impl ReleaseManifest {
                 ),
                 "Invalid build metadata: profile={profile}, mode={mode}, cargo_profile={cargo_profile}"
             ),
-            _ => bail!("Build metadata requires profile, mode and cargo_profile together"),
+            _ => bail!("Build metadata requires profile and cargo_profile together"),
         }
         ensure!(self.role == ReleaseRole::Client,
             "This is a {:?} package, not a client worker update; install it through the corresponding service maintenance restart", self.role);
