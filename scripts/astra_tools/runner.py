@@ -32,7 +32,8 @@ class Step:
 
 def _run_annotated(command, *, cwd, env, timeout):
     """Stream output like subprocess.run, keeping failure context for a GitHub annotation."""
-    tail, interesting = deque(maxlen=25), deque(maxlen=40)
+    tail, interesting = deque(maxlen=25), deque(maxlen=60)
+    context = 0
     # Bytes pass through unchanged: the child's encoding (cp1252 on Windows runners) is
     # unknown here, and re-encoding text into this process's stdout can fail.
     child = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -59,6 +60,11 @@ def _run_annotated(command, *, cwd, env, timeout):
             tail.append(line)
             if _FAILURE_LINE.search(line):
                 interesting.append(line)
+                # A panic's message (unwrap error, assertion values) follows on the next lines.
+                context = 4 if 'panicked at' in line else context
+            elif context > 0 and line:
+                interesting.append(line)
+                context -= 1
         code = child.wait()
     finally:
         if timer:

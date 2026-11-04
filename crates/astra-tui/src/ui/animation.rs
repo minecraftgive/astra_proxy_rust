@@ -177,8 +177,16 @@ impl Motion {
     pub(super) fn new(mode: MotionMode) -> Self {
         let remote =
             std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
-        let no_color = std::env::var_os("NO_COLOR").is_some();
-        let color_count = crossterm::style::available_color_count();
+        // Tests must not depend on the runner's TERM/COLORTERM/NO_COLOR: CI terminals
+        // report fewer colors, which would remap every expected RGB value.
+        let (no_color, color_count) = if cfg!(test) {
+            (false, u16::MAX)
+        } else {
+            (
+                std::env::var_os("NO_COLOR").is_some(),
+                crossterm::style::available_color_count(),
+            )
+        };
         Self {
             state: RefCell::new(State {
                 mode,
