@@ -1,11 +1,19 @@
 """Suite command execution and machine-readable results, independent of CLI parsing."""
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
+import sys
+import threading
 import time
 from .workspace import ROOT
+
+# Lines worth surfacing when a step fails: Rust test failures, panics, Python errors.
+_FAILURE_LINE = re.compile(r'panicked at|^---- |^test .* FAILED|^failures:|^error(\[|:)|Error:|Traceback|assert')
 
 
 def timestamped_report(name):
@@ -22,14 +30,56 @@ class Step:
     cwd: Path = ROOT
 
 
+def _run_annotated(command, *, cwd, env, timeout):
+    """Stream output like subprocess.run, keeping failure context for a GitHub annotation."""
+    tail, interesting = deque(maxlen=25), deque(maxlen=40)
+    child = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, encoding='utf-8', errors='replace', bufsize=1)
+    killed = []
+
+    def kill():
+        killed.append(True)
+        child.kill()
+
+    timer = threading.Timer(timeout, kill) if timeout else None
+    if timer:
+        timer.start()
+    try:
+        for line in child.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            line = line.rstrip()
+            tail.append(line)
+            if _FAILURE_LINE.search(line):
+                interesting.append(line)
+        code = child.wait()
+    finally:
+        if timer:
+            timer.cancel()
+    return (124 if killed else code), [*interesting, '--- last output ---', *tail]
+
+
+def _annotate_failure(name, lines):
+    """Logs need a GitHub login; annotations are public, so failures stay diagnosable."""
+    message = '\n'.join(lines)[-6000:]
+    escaped = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+    print(f'::error title=Step {name} failed::{escaped}', flush=True)
+
+
 def run_steps(steps, *, env, keep_going=False, report=None):
     results = []
+    annotate = os.environ.get('GITHUB_ACTIONS') == 'true'
     for step in steps:
         command = list(map(str, step.command))
         print(f'\n== {step.name}', flush=True)
         start = time.monotonic()
         try:
-            code = subprocess.run(command, cwd=step.cwd, env=env, timeout=step.timeout).returncode
+            if annotate:
+                code, context = _run_annotated(command, cwd=step.cwd, env=env, timeout=step.timeout)
+                if code:
+                    _annotate_failure(step.name, context)
+            else:
+                code = subprocess.run(command, cwd=step.cwd, env=env, timeout=step.timeout).returncode
         except subprocess.TimeoutExpired:
             code = 124
         except OSError as error:
