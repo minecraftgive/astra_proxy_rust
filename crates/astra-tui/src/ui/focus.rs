@@ -33,11 +33,24 @@ impl Ui {
     pub(super) fn focus_border(&self, region: Region, fallback: Color) -> Style {
         Style::default().fg(
             if self.focus.region == region && self.palette.is_none() && self.prompt.is_none() {
-                Color::Cyan
+                if self.animations.marquee().border {
+                    super::animation::FOCUS_MARK
+                } else {
+                    Color::Cyan
+                }
             } else {
                 fallback
             },
         )
+    }
+    /// A healthy (green) connection indicator runs the marquee when it is on;
+    /// warnings and failures keep their color.
+    pub(super) fn indicator_color(&self, color: Color) -> Color {
+        if color == Color::Green && self.animations.marquee().indicator {
+            super::animation::STATUS_MARK
+        } else {
+            color
+        }
     }
     pub(super) fn focused_card<'a>(&self, title: &'a str, region: Region) -> Block<'a> {
         super::dashboard::card(title).border_style(self.focus_border(region, Color::DarkGray))

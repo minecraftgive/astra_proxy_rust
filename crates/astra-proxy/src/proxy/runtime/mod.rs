@@ -470,6 +470,7 @@ async fn run_inner(
     mut lifeline: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
     crate::platform::network_recovery::set_profile(&path);
+    crate::platform::network_recovery::set_enabled(app.config.experimental.network_recovery);
     // Claim management ownership before preparing any OS takeover resources.
     let control = astra_ipc::control::Control::from_env()?;
     crate::platform::network_recovery::recover_abandoned()
@@ -583,11 +584,20 @@ async fn run_inner(
                 let endpoint = astra_convert::subscription::diagnostics::endpoint(&settings.url);
                 let retry_secs = settings.interval;
                 let mut managed = ownership.get(&source).cloned().unwrap_or(settings.clone());
+                let previous_nodes = managed.managed_nodes.len();
+                tracing::info!(
+                    subscription = %source, %endpoint,
+                    proxy = %settings.proxy, import_groups = settings.import_groups,
+                    previous_nodes, retry_secs,
+                    "subscription update started"
+                );
                 let merge_source = source.clone();
                 let source_path = path.clone();
                 let download_app = current.load_full();
                 let download_runtime = tokio::runtime::Handle::current();
+                let span = tracing::info_span!("subscription_update", subscription = %source);
                 let result = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let _entered = span.enter();
                     let converted = astra_convert::subscription::fetch_with(
                         &settings,
                         source_path.parent().context("config has no parent")?,
@@ -601,6 +611,23 @@ async fn run_inner(
                         },
                     )
                     .context("fetch subscription nodes")?;
+                    tracing::info!(
+                        subscription = %merge_source, nodes = converted.nodes,
+                        warnings = converted.warnings.len(),
+                        "subscription converted"
+                    );
+                    for warning in converted.warnings.iter().take(50) {
+                        tracing::warn!(
+                            subscription = %merge_source,
+                            detail = %astra_convert::subscription::diagnostics::error(&anyhow::anyhow!(warning.clone())),
+                            "subscription conversion warning"
+                        );
+                    }
+                    if converted.warnings.len() > 50 {
+                        tracing::warn!(subscription = %merge_source,
+                            omitted = converted.warnings.len() - 50,
+                            "additional subscription conversion warnings omitted");
+                    }
                     let text = astra_convert::subscription::merge_named(
                         &previous,
                         &converted.proxy,
@@ -617,6 +644,9 @@ async fn run_inner(
                 .await;
                 let mut state = state.lock().await;
                 if state.generation != revision {
+                    tracing::info!(subscription = %source, %endpoint,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "subscription result discarded because configuration changed");
                     continue;
                 }
                 match result {
@@ -626,7 +656,10 @@ async fn run_inner(
                             effective = text;
                             tracing::info!(
                                 subscription = %source,
+                                %endpoint, previous_nodes,
                                 nodes = managed.managed_nodes.len(),
+                                groups = managed.managed_groups.len(),
+                                elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
                                 "subscription updated"
                             );
                             ownership.insert(source.clone(), managed);
@@ -651,23 +684,27 @@ async fn run_inner(
                                     error = %astra_convert::subscription::diagnostics::error(&error),
                                     "subscription updated but node cache could not be saved"
                                 );
+                            } else {
+                                tracing::info!(subscription = %source,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    "subscription node cache saved");
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(subscription = %source, %endpoint,
+                            tracing::warn!(subscription = %source, %endpoint, previous_nodes,
                                 elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
                                 error = %astra_convert::subscription::diagnostics::error(&error),
                                 "subscription apply failed; previous nodes retained")
                         }
                     },
                     Ok(Err(error)) => tracing::warn!(
-                        subscription = %source, %endpoint,
+                        subscription = %source, %endpoint, previous_nodes,
                         elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
                         error = %astra_convert::subscription::diagnostics::error(&error),
                         "subscription download or validation failed; previous nodes retained"
                     ),
                     Err(error) => tracing::warn!(
-                        subscription = %source, %endpoint,
+                        subscription = %source, %endpoint, previous_nodes,
                         elapsed_ms = started.elapsed().as_millis() as u64, retry_secs,
                         error = %astra_convert::subscription::diagnostics::error(&error.into()),
                         "subscription worker failed; previous nodes retained"

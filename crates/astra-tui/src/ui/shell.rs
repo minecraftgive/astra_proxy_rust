@@ -2,6 +2,7 @@
 //! Every page except Profiles follows the active profile, the selected proxy instance.
 use super::dashboard::{Target, BLUE, MUTED};
 use super::*;
+use crate::i18n::{language, translate, Language};
 use astra_model::runtime::Command;
 use astra_model::runtime::Mode;
 use ratatui::{layout::Rect, style::Modifier};
@@ -475,6 +476,9 @@ impl Ui {
     }
 
     fn palette_entries(&self) -> Vec<Entry> {
+        self.palette_entries_in(language())
+    }
+    fn palette_entries_in(&self, language: Language) -> Vec<Entry> {
         let mut entries = Vec::new();
         let chooser = self.palette.as_ref().filter(|palette| palette.profiles);
         let kind = chooser.map_or(self.kind, |palette| palette.profile_kind);
@@ -493,11 +497,14 @@ impl Ui {
                 label: format!(
                     "{} · {}",
                     row.instance.name,
-                    t(if row.pid.is_some() {
-                        "Running"
-                    } else {
-                        "Stopped"
-                    })
+                    translate(
+                        if row.pid.is_some() {
+                            "Running"
+                        } else {
+                            "Stopped"
+                        },
+                        language,
+                    )
                 ),
                 key: if chooser.is_some() { "" } else { "p" },
                 run: Run::Activate {
@@ -513,7 +520,7 @@ impl Ui {
         for (index, page) in PAGES.iter().enumerate() {
             entries.push(Entry {
                 scope: "Go to",
-                label: t(page).into(),
+                label: translate(page, language).into(),
                 key: ["1", "2", "3", "4", "5", "6", "7"][index],
                 run: Run::Page(index),
                 unavailable: None,
@@ -539,7 +546,7 @@ impl Ui {
         let mut add = |scope, label: &str, key, run, unavailable| {
             entries.push(Entry {
                 scope,
-                label: t(label).into(),
+                label: translate(label, language).into(),
                 key,
                 run,
                 unavailable,
@@ -580,7 +587,11 @@ impl Ui {
         {
             add(
                 "Run",
-                &format!("{} · {}", t("Force start"), row.instance.name),
+                &format!(
+                    "{} · {}",
+                    translate("Force start", language),
+                    row.instance.name
+                ),
                 "",
                 Run::ForceStart,
                 None,
@@ -808,13 +819,35 @@ impl Ui {
             .as_ref()
             .map(|p| p.query.to_lowercase())
             .unwrap_or_default();
-        self.palette_entries()
+        let current_language = language();
+        let entries = self.palette_entries_in(current_language);
+        if query.is_empty() {
+            return entries;
+        }
+        let matches = |entry: &Entry, language| {
+            format!(
+                "{} {} {}",
+                translate(entry.scope, language),
+                entry.label,
+                entry.key
+            )
+            .to_lowercase()
+            .contains(&query)
+        };
+        if current_language == Language::English {
+            return entries
+                .into_iter()
+                .filter(|entry| matches(entry, Language::English))
+                .collect();
+        }
+        // The same UI state produces the same actions in either language. Keep
+        // localized entries for display and dispatch; English is a search alias.
+        entries
             .into_iter()
-            .filter(|e| {
-                query.is_empty()
-                    || format!("{} {} {}", t(e.scope), e.label, e.key)
-                        .to_lowercase()
-                        .contains(&query)
+            .zip(self.palette_entries_in(Language::English))
+            .filter_map(|(entry, english)| {
+                (matches(&entry, current_language) || matches(&english, Language::English))
+                    .then_some(entry)
             })
             .collect()
     }
@@ -1051,6 +1084,7 @@ impl Ui {
         } else {
             ("○ ", MUTED, t("Not connected"))
         };
+        let color = self.indicator_color(color);
         let live = self.live();
         let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
         // Detail levels, richest first; the first that fits the bar is drawn, so a
@@ -1469,6 +1503,98 @@ mod palette_layout_tests {
     }
     fn press(ui: &mut Ui, code: KeyCode) -> Input {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn palette_searches_current_language_and_english() {
+        for language in [
+            Language::English,
+            Language::Simplified,
+            Language::Traditional,
+        ] {
+            crate::i18n::with_language(language, || {
+                let mut ui = Ui::new(Session::default());
+                ui.palette = Some(Palette::default());
+                assert_eq!(ui.palette_matches().len(), ui.palette_entries().len());
+                for source in [
+                    "Overview",
+                    "Full restart",
+                    "Command palette",
+                    "Import local update package",
+                ] {
+                    for query in [t(source).to_owned(), source.to_uppercase()] {
+                        ui.palette.as_mut().unwrap().query = query;
+                        let entries = ui.palette_matches();
+                        assert_eq!(entries.len(), 1, "{language:?}: {source}");
+                        assert_eq!(entries[0].label, t(source));
+                    }
+                }
+                for query in [t("General"), "GENERAL"] {
+                    ui.palette.as_mut().unwrap().query = query.into();
+                    let entries = ui.palette_matches();
+                    assert!(!entries.is_empty());
+                    assert!(entries.iter().all(|entry| entry.scope == "General"));
+                }
+                for query in [
+                    format!("{} {}", t("Go to"), t("Overview")),
+                    "GO TO OVERVIEW".into(),
+                ] {
+                    ui.palette.as_mut().unwrap().query = query;
+                    let entries = ui.palette_matches();
+                    assert_eq!(entries.len(), 1);
+                    assert!(matches!(entries[0].run, Run::Page(OVERVIEW)));
+                }
+                ui.palette.as_mut().unwrap().query = "ctrl-k".into();
+                assert_eq!(ui.palette_matches().len(), 1);
+                ui.palette.as_mut().unwrap().query = "no matching command".into();
+                assert!(ui.palette_matches().is_empty());
+            });
+        }
+    }
+    #[test]
+    fn palette_searches_dynamic_labels_in_both_languages() {
+        for language in [
+            Language::English,
+            Language::Simplified,
+            Language::Traditional,
+        ] {
+            crate::i18n::with_language(language, || {
+                let mut ui = profile_ui();
+                ui.rows[0].pid = Some(42);
+                for profiles in [false, true] {
+                    ui.palette = Some(Palette {
+                        profiles,
+                        ..Default::default()
+                    });
+                    for (name, status) in [("proxy-a", "Running"), ("proxy-b", "Stopped")] {
+                        for query in [
+                            format!("{} {name} · {}", t("Profile"), t(status)),
+                            format!("PROFILE {name} · {}", status.to_uppercase()),
+                        ] {
+                            ui.palette.as_mut().unwrap().query = query;
+                            let entries = ui.palette_matches();
+                            assert_eq!(entries.len(), 1);
+                            assert_eq!(entries[0].label, format!("{name} · {}", t(status)));
+                            assert!(
+                                matches!(&entries[0].run, Run::Activate { name: target, .. } if target == name)
+                            );
+                        }
+                    }
+                }
+                ui.palette = Some(Palette::default());
+                for query in [
+                    format!("{} · proxy-b", t("Force start")),
+                    "FORCE START · proxy-b".into(),
+                ] {
+                    ui.palette.as_mut().unwrap().query = query;
+                    let entries = ui.palette_matches();
+                    assert_eq!(entries.len(), 1);
+                    assert!(matches!(entries[0].run, Run::ForceStart));
+                    assert_eq!(entries[0].label, format!("{} · proxy-b", t("Force start")));
+                }
+                ui.palette_run(0);
+                assert!(matches!(&ui.prompt, Some(Prompt::ForceStart(name)) if name == "proxy-b"));
+            });
+        }
     }
     #[test]
     fn force_start_palette_targets_the_selected_core_or_active_profile() {

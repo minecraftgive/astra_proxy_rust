@@ -17,7 +17,7 @@ impl Default for Subscription {
         Self {
             url: String::new(),
             interval: 3600,
-            user_agent: "clash.meta/astra".into(),
+            user_agent: "mihomo/1.19.0".into(),
             proxy: "PROXY".into(),
             import_groups: false,
             managed_nodes: vec![],

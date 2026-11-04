@@ -4,15 +4,36 @@ use ratatui::style::{Color, Modifier, Style};
 pub const BLUE: Color = Color::Rgb(79, 91, 213);
 pub const MUTED: Color = Color::Rgb(140, 147, 161);
 
+/// Background of [`selected`] while selections are marked for a frame effect.
+/// One step off [`BLUE`], so an unprocessed frame still looks the same.
+pub const SELECTED_MARK: Color = Color::Rgb(79, 91, 212);
+/// Background of [`selected_keep_colors`] while selections are marked.
+pub const SELECTED_KEEP_MARK: Color = Color::Rgb(24, 28, 33);
+static MARK_SELECTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Mark cursor rows with [`SELECTED_MARK`] / [`SELECTED_KEEP_MARK`] so a frame
+/// post-processor can find them. The post-processor maps marks back otherwise.
+pub fn set_selection_mark(on: bool) {
+    MARK_SELECTION.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn marking() -> bool {
+    MARK_SELECTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The row, tab or choice under the cursor; white on blue reads on every background.
 pub fn selected() -> Style {
-    Style::default().bg(BLUE).fg(Color::White)
+    Style::default()
+        .bg(if marking() { SELECTED_MARK } else { BLUE })
+        .fg(Color::White)
 }
 /// Cursor row whose spans carry meaning in their colors (highlighted values).
 /// A neutral background keeps blue proxy labels distinct from the selection.
 /// Leave the foreground unset: list highlights are applied after span styles.
 pub fn selected_keep_colors() -> Style {
-    Style::default().bg(Color::Rgb(24, 28, 34))
+    Style::default().bg(if marking() {
+        SELECTED_KEEP_MARK
+    } else {
+        Color::Rgb(24, 28, 34)
+    })
 }
 /// A focused pane's cursor when keyboard focus has moved to a neighbouring pane.
 pub fn selected_inactive() -> Style {

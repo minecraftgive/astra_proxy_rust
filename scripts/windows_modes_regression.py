@@ -109,7 +109,8 @@ def system_proxy(args, directory):
             origin.shutdown()
         assert proxy_state() == original and not core.journal.exists(), 'normal shutdown did not restore settings'
         checks.append('normal shutdown restores original proxy/PAC/bypass/flags')
-        core = Core(args, directory, config, 'system-proxy-crash')
+        # Crash recovery is an experimental opt-in; the default keeps no record.
+        core = Core(args, directory, config+'\n[experimental]\nnetwork_recovery=true\n', 'system-proxy-crash')
         try:
             core.ready()
             core.child.kill()

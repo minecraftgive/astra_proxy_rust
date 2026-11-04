@@ -177,6 +177,82 @@ mod tests {
     }
 
     #[test]
+    fn quoted_reality_batch_pastes_and_imports_selected_nodes_from_both_shortcuts() {
+        const PUBLIC_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+        let encoded_labels = [
+            "%F0%9F%8C%8F%20%E9%A6%99%E6%B8%AF",
+            "%F0%9F%9A%80%20%E6%97%A5%E6%9C%AC",
+            "%F0%9F%8C%9F%20%E6%96%B0%E5%8A%A0%E5%9D%A1",
+        ];
+        let lines = encoded_labels.iter().enumerate().map(|(index, label)| {
+            let number = index + 1;
+            format!("vless://00000000-0000-4000-8000-00000000000{number}@edge{number}.example.invalid:443?encryption=none&headerType=&spx=%2F&fp=chrome&type=tcp&flow=xtls-rprx-vision&security=reality&sni=front.example.invalid&sid=abcd&pbk={PUBLIC_KEY}#{label}")
+        }).collect::<Vec<_>>().join("\n");
+        let batch = format!("\"{lines}\"");
+        for shortcut in ['i', 'o'] {
+            let mut ui = ui();
+            let before = ui.editor.as_ref().unwrap().text();
+            ui.key(event::KeyEvent::new(
+                KeyCode::Char(shortcut),
+                KeyModifiers::CONTROL,
+            ));
+            assert!(matches!(
+                (&ui.prompt, shortcut),
+                (Some(Prompt::ImportNode(_)), 'i') | (Some(Prompt::Import), 'o')
+            ));
+            ui.paste_prompt(&batch);
+            assert_eq!(
+                ui.input, batch,
+                "Ctrl-{shortcut} must preserve all line breaks"
+            );
+            ui.key(key(KeyCode::Enter));
+            assert!(ui.recovery.is_none(), "Ctrl-{shortcut}: {}", ui.message);
+            let Some(Prompt::ImportNodeSelection {
+                candidates,
+                selected,
+                ..
+            }) = &ui.prompt
+            else {
+                panic!("Ctrl-{shortcut} did not open the node selection dialog");
+            };
+            assert_eq!(candidates.tags, ["🌏 香港", "🚀 日本", "🌟 新加坡"]);
+            assert_eq!(selected, &[0, 1, 2]);
+            let preview: toml::Value = toml::from_str(&candidates.text).unwrap();
+            assert_eq!(ui.editor.as_ref().unwrap().text(), before);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let rendered = rendered.replace(' ', "");
+            for label in ["🌏香港", "🚀日本", "🌟新加坡"] {
+                assert!(rendered.contains(label), "{rendered}");
+            }
+
+            ui.key(key(KeyCode::Down));
+            ui.key(key(KeyCode::Char(' ')));
+            ui.key(key(KeyCode::Enter));
+            assert!(
+                ui.prompt.is_none() && ui.recovery.is_none(),
+                "{}",
+                ui.message
+            );
+            let document: toml::Value =
+                toml::from_str(&ui.editor.as_ref().unwrap().text()).unwrap();
+            let nodes = document["outbounds"].as_array().unwrap();
+            assert_eq!(nodes.len(), 4);
+            assert_eq!(nodes[0]["tag"].as_str(), Some("first"));
+            assert_eq!(nodes[1]["tag"].as_str(), Some("second"));
+            assert_eq!(nodes[2], preview["outbounds"][0]);
+            assert_eq!(nodes[3], preview["outbounds"][2]);
+        }
+    }
+
+    #[test]
     fn node_transfer_picklists_render_in_chinese_and_reject_empty_or_changed_targets() {
         crate::i18n::with_language(crate::i18n::Language::Simplified, || {
             let mut ui = ui();

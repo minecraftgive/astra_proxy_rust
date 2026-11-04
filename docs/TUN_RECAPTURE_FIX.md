@@ -37,7 +37,7 @@ TUN IP 包不包含 IPv6 zone/scope ID。旧逻辑将目的地址转为不带 sc
 
 - Windows 优先使用显式 `tun.interface`（名称或索引）；未指定时，从默认路由中选择工作中的硬件网卡，排除虚拟适配器和 TUN，按路由与接口 metric 之和排序，优先 IPv4 默认路由、其次 IPv6。此机器实测选中 `Ethernet 2`，索引 28。
 - 出口安装到 `meow_common::outbound_iface`，覆盖原生协议的 TCP/UDP 连接；普通 SOCKS/HTTP/TLS 连接也统一使用受保护拨号，TUIC 使用已绑定的 UDP socket 创建 QUIC endpoint。DIRECT TCP/UDP 使用当前代数的明确接口，并恢复链路本地 IPv6 scope。
-- 订阅下载及嵌套 HTTP provider 使用 Proxy Core 的 DIRECT 拨号，保留 TLS 校验、最多三次重定向、20 秒时限及 8 MiB 响应上限。转换器独立运行时仍用原下载器。
+- 订阅下载及嵌套 HTTP provider 使用 Proxy Core 的 DIRECT 拨号，保留 TLS 校验、最多三次重定向、20 秒时限及 8 MiB 响应上限。转换器独立运行时仍用原下载器。此条记录当时实现；当前订阅下载使用配置的 `proxy` 出口，最多 10 次重定向，共享 30 秒下载预算，并支持 gzip/deflate，压缩体与解压内容分别限制为 8 MiB，详见 [订阅下载](MIHOMO_CONVERTER.md#proxy-core-管理-clash-订阅)。
 - 早期版本在 `tun.interface` 缺失时自动识别，并在配置提交时补写该字段；使用保留格式的 TOML 编辑器，原注释和其他字段不变。已有明确指定的接口不覆盖。保存前检查文件是否被修改，使用临时文件原子替换，并迁移匹配的订阅缓存，保持离线重启可用；保存失败会明确记录警告。接口绑定有所有权，准备失败释放新 owner 后恢复旧 owner；已建立 socket 保留原绑定。禁用 TUN 后撤销全局绑定。
 - 不再强制要求每个代理服务器 IP 都写入 `tun.bypass`；受保护的出站 socket 已绑定出口。显式 bypass 路由仍可使用。
 

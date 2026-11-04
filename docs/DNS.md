@@ -88,11 +88,11 @@ Fake IP 表有容量上限，满时返回 SERVFAIL，不提前回收仍有效的
 
 ## Mihomo 导入
 
-本地 YAML 和订阅节点导入均转换 dns：enable、listen、ipv6、respect-rules、nameserver、
+使用 `astra-convert --include-config` 完整转换时支持 dns：enable、listen、ipv6、respect-rules、nameserver、
 fallback、default-nameserver（普通 IP UDP/53）、enhanced-mode、fake-ip-range、fake-ip-range6、
 fake-ip-ttl、fake-ip-filter、blacklist/whitelist filter-mode、cache-size 和域名 nameserver-policy。
-订阅首次合并仅在本地没有 dns 表时采用远端设置；以后保留本地设置，不覆盖手工调整。
-删除本地 dns 表后再次更新可重新采用订阅 DNS。多个订阅按先成功导入的 DNS 设置为准。
+converter 默认只转换节点，不导入 DNS；订阅更新同样不导入 DNS，即使设置了 `import_groups=true`。
+本地已有的 dns 表（包括之前导入后保存的设置）保留不变；需要 DNS 时请手工配置或使用完整转换。
 
 不支持的字段明确提示；GeoSite/规则集 DNS policy、rule 模式 fake-ip-filter、带 #PROXY
 等后缀的上游地址不能等价转换，会报告转换错误。fallback-filter 的 GeoIP/污染筛选尚未实现，

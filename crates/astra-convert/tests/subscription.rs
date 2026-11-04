@@ -192,8 +192,8 @@ fn local_groups_override_remote_groups() {
 }
 
 #[test]
-fn node_import_ignores_remote_rules_groups_and_listeners_by_default() {
-    let input = "proxies: [{name: only, type: socks5, server: localhost, port: 1234}]\nproxy-groups: invalid\nrules: invalid\nrule-providers: invalid\nsocks-port: invalid\ntun: {enable: true}";
+fn node_import_ignores_remote_dns_rules_groups_and_listeners_by_default() {
+    let input = "proxies: [{name: only, type: socks5, server: localhost, port: 1234}]\nproxy-groups: invalid\nrules: invalid\nrule-providers: invalid\nsocks-port: invalid\ntun: {enable: true}\ndns: invalid";
     let converted = convert_nodes(input, &Options::default(), "test", false).unwrap();
     let proxy: toml::Value = toml::from_str(&converted.proxy).unwrap();
     assert_eq!(converted.nodes, 1);
@@ -208,6 +208,8 @@ fn node_import_ignores_remote_rules_groups_and_listeners_by_default() {
         Some("DIRECT")
     );
     assert!(proxy.get("tun").is_none());
+    assert!(proxy.get("dns").is_none());
+    assert_eq!(converted.rule_count, 0);
     assert!(convert_nodes(input, &Options::default(), "test", true).is_err());
     let mut owned = Subscription {
         managed_nodes: vec!["only".into()],
@@ -404,6 +406,7 @@ fn remote_subscriptions_accept_http_refuse_downgrade_and_local_files() {
 fn subscription_update_proxy_defaults_and_round_trips() {
     let defaults: Subscription = toml::from_str("url='https://example.com/sub'").unwrap();
     assert_eq!(defaults.proxy, "PROXY");
+    assert!(!defaults.import_groups);
     for proxy in ["DIRECT", "custom-group", "node"] {
         let config: Subscription =
             toml::from_str(&format!("url='https://example.com/sub'\nproxy='{proxy}'")).unwrap();

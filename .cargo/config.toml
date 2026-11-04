@@ -3,6 +3,3 @@
 target = "host-tuple"
 jobs = 32           
 incremental = true
-
-[profile.dev]
-codegen-backend = "cranelift"

@@ -79,6 +79,22 @@ fn mtu() -> u16 {
     1500
 }
 
+/// Opt-in features that are not yet part of the supported surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Experimental {
+    /// Journal system proxy, route and adapter changes and run a guardian that
+    /// restores them if the core exits abruptly. Off: nothing is recorded and
+    /// a crash leaves those settings as applied. Read at core startup.
+    #[serde(default)]
+    pub network_recovery: bool,
+}
+impl Experimental {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transparent {
@@ -152,6 +168,8 @@ pub struct ProxyConfig {
     pub outbounds: Vec<OutboundConfig>,
     #[serde(default)]
     pub proxy_groups: BTreeMap<String, crate::groups::Group>,
+    #[serde(default, skip_serializing_if = "Experimental::is_default")]
+    pub experimental: Experimental,
 }
 fn default_udp_flows() -> usize {
     512

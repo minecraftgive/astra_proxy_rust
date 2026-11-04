@@ -10,9 +10,9 @@ const HELP: &str = "astra-convert — 转换 Clash/Mihomo YAML 或订阅为 Astr
 
 用法: astra-convert INPUT.yaml|URL|vless://... [选项]
   --subscribe URL       本地 YAML 绑定订阅 URL（URL 输入自动绑定）
-  --include-config      订阅额外导入代理组和规则（默认仅节点）
+  --include-config      额外导入代理组、规则、DNS 和监听配置（默认仅节点）
   --interval SECONDS    节点更新间隔，默认 3600，最小 60
-  --user-agent VALUE    订阅请求 User-Agent
+  --user-agent VALUE    订阅请求 User-Agent（默认 mihomo/1.19.0）
   INPUT 为 - 时从标准输入读取
   -o, --output-dir DIR    输出目录（默认输入 YAML 所在目录；stdin 使用当前目录）
   --select GROUP=MEMBER  固定代理组成员，可重复
@@ -24,12 +24,19 @@ const HELP: &str = "astra-convert — 转换 Clash/Mihomo YAML 或订阅为 Astr
   --check               仅转换检查，不写文件
   -h, --help            显示帮助
 
-订阅默认仅输出 proxy.toml；--include-config 或普通文件转换另输出 rule.toml。已有文件不会覆盖。
+所有输入默认仅导入节点并输出 proxy.toml；--include-config 另输出 rule.toml。已有文件不会覆盖。
 未支持字段/协议/规则会跳过，转换摘要写入标准错误。";
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
     if let Err(err) = run() {
-        eprintln!("astra-convert: {err:#}");
+        eprintln!("astra-convert: {}", subscription::diagnostics::error(&err));
         std::process::exit(1);
     }
 }
@@ -156,8 +163,9 @@ fn run() -> Result<()> {
     } else {
         std::path::absolute(&input)?.display().to_string()
     };
-    let nodes_only =
-        share || astra_convert::share::is_share(&text) || (subscribe.is_some() && !include_config);
+    options.remote = remote;
+    let nodes_only = share || astra_convert::share::is_share(&text) || !include_config;
+    let subscription_input = subscribe.is_some();
     let mut result = if share || astra_convert::share::is_share(&text) {
         astra_convert::share::convert_links(&text, &options)
     } else if nodes_only {
@@ -198,7 +206,14 @@ fn run() -> Result<()> {
     }
     eprintln!("── {source_label} ──");
     for warning in &result.warnings {
-        eprintln!("提示: {warning}");
+        if subscription_input {
+            eprintln!(
+                "提示: {}",
+                subscription::diagnostics::error(&anyhow::anyhow!(warning.clone()))
+            );
+        } else {
+            eprintln!("提示: {warning}");
+        }
     }
     if !check {
         fs::create_dir_all(&output).context("无法创建输出目录")?;
@@ -211,7 +226,7 @@ fn run() -> Result<()> {
         }
         if nodes_only {
             eprintln!(
-                "已写入 {}（订阅节点及 DNS；保留本地 DNS 设置）",
+                "已写入 {}（仅导入节点；未导入源配置的组、规则、DNS 和监听设置）",
                 output.join("proxy.toml").display()
             );
         } else {

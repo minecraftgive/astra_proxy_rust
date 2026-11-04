@@ -1,5 +1,9 @@
 //! A separate, same-binary process survives core termination and restores only
 //! resources whose ownership was durably confirmed. No command strings are run.
+//!
+//! Experimental and off by default (`[experimental] network_recovery`). While
+//! off, no guardian is started and nothing is journaled or restored after an
+//! abrupt core exit; normal shutdown still restores settings from memory.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,7 +11,10 @@ use std::{
     io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -58,6 +65,14 @@ struct Owner {
 }
 static OWNER: OnceLock<Mutex<Option<Owner>>> = OnceLock::new();
 static PROFILE: OnceLock<PathBuf> = OnceLock::new();
+static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Latched once per core process from the startup configuration.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::SeqCst);
+}
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
+}
 pub fn set_profile(path: &Path) {
     let _ = PROFILE.set(path.to_owned());
 }
@@ -155,6 +170,11 @@ pub(super) fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn recover_abandoned() -> Result<()> {
+    if !enabled() {
+        // Leftover records stay untouched; `--recover-network <record>` still
+        // restores them explicitly.
+        return Ok(());
+    }
     let directory = astra_platform::storage::runtime_root()?.join("network-recovery");
     let metadata = match std::fs::symlink_metadata(&directory) {
         Ok(metadata) => metadata,
@@ -273,6 +293,9 @@ fn start() -> Result<Owner> {
     })
 }
 pub fn ensure() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
     let mut guard = owner()
         .lock()
         .map_err(|_| anyhow::anyhow!("network recovery coordinator panicked"))?;
@@ -350,10 +373,14 @@ pub fn cleanup_status() -> Result<()> {
 /// existing Arc owner across candidate/old/current generations.
 #[derive(Debug)]
 pub(super) struct Lease {
-    id: String,
+    /// None when recovery was disabled at preparation: nothing is journaled.
+    id: Option<String>,
 }
 impl Lease {
     pub fn prepare(resource: Resource) -> Result<Self> {
+        if !enabled() {
+            return Ok(Self { id: None });
+        }
         ensure()?;
         let mut guard = owner()
             .lock()
@@ -369,16 +396,19 @@ impl Lease {
             error: None,
         });
         save(&owner.path, &owner.journal)?;
-        Ok(Self { id })
+        Ok(Self { id: Some(id) })
     }
     pub fn failed(&self, error: &anyhow::Error) {
+        let Some(id) = &self.id else {
+            return;
+        };
         if let Ok(mut guard) = owner().lock() {
             if let Some(owner) = guard.as_mut() {
                 if let Some(item) = owner
                     .journal
                     .resources
                     .iter_mut()
-                    .find(|item| item.id == self.id)
+                    .find(|item| &item.id == id)
                 {
                     item.error = Some(format!("{error:#}"));
                 }
@@ -392,6 +422,9 @@ impl Lease {
     }
     #[cfg(not(windows))]
     pub fn commit_resource(&self, resource: Resource) -> Result<()> {
+        let Some(id) = &self.id else {
+            return Ok(());
+        };
         let mut guard = owner()
             .lock()
             .map_err(|_| anyhow::anyhow!("network recovery coordinator panicked"))?;
@@ -405,7 +438,7 @@ impl Lease {
                 let item = journal
                     .resources
                     .iter_mut()
-                    .find(|item| item.id == self.id)
+                    .find(|item| &item.id == id)
                     .context("recovery resource missing")?;
                 item.resource = resource;
                 item.committed = true;
@@ -419,6 +452,9 @@ impl Lease {
         self.update(true)
     }
     fn update(&self, remove: bool) -> Result<()> {
+        let Some(id) = &self.id else {
+            return Ok(());
+        };
         let mut guard = owner()
             .lock()
             .map_err(|_| anyhow::anyhow!("network recovery coordinator panicked"))?;
@@ -430,12 +466,12 @@ impl Lease {
             &mut owner.journal,
             |journal| {
                 if remove {
-                    journal.resources.retain(|item| item.id != self.id);
+                    journal.resources.retain(|item| &item.id != id);
                 } else {
                     journal
                         .resources
                         .iter_mut()
-                        .find(|item| item.id == self.id)
+                        .find(|item| &item.id == id)
                         .context("recovery resource missing")?
                         .committed = true;
                 }
@@ -698,6 +734,23 @@ fn guardian(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabled_recovery_records_nothing() {
+        // The switch defaults off and is never enabled inside this test binary.
+        assert!(!enabled());
+        ensure().unwrap();
+        let lease = Lease::prepare(Resource::SystemProxy {
+            path: PathBuf::from("unused"),
+            snapshot: None,
+        })
+        .unwrap();
+        assert!(lease.id.is_none());
+        lease.commit().unwrap();
+        lease.failed(&anyhow::anyhow!("ignored"));
+        lease.complete().unwrap();
+        assert!(owner().lock().unwrap().is_none());
+        cleanup_status().unwrap();
+    }
     #[test]
     fn unknown_documents_are_retained() {
         let directory =

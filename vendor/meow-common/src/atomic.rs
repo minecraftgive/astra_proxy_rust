@@ -43,23 +43,26 @@ pub type Int = i32;
 /// wrapping onto IDs the peer's window has already spent.
 #[inline]
 pub fn checked_increment(counter: &AtomicU) -> Option<u64> {
-    counter
-        .fetch_update(
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).filter(|&n| n != Uint::MAX)?;
+        // Keep compatibility with Rust 1.89; `try_update` requires Rust 1.95.
+        match counter.compare_exchange_weak(
+            current,
+            next,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |x| x.checked_add(1).filter(|&n| n != Uint::MAX),
-        )
-        .ok()
-        .map(|prev| {
-            // `prev + 1` cannot overflow: the filter above guarantees the
-            // stored value stayed below `Uint::MAX`.
-            #[allow(
-                clippy::useless_conversion,
-                reason = "identity on 64-bit; u32→u64 widening on mips32"
-            )]
-            let widened = u64::from(prev);
-            widened + 1
-        })
+        ) {
+            Ok(_) => {
+                #[allow(
+                    clippy::useless_conversion,
+                    reason = "identity on 64-bit; u32→u64 widening on mips32"
+                )]
+                return Some(u64::from(next));
+            }
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[cfg(test)]

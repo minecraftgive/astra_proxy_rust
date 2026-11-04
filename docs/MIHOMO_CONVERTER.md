@@ -1,21 +1,21 @@
 # Mihomo 配置转换工具
 
-`astra-convert` 是独立的原生 Rust 命令行工具和 Rust library，将本地 mihomo YAML 转为当前 Astra 的 `proxy.toml`、`rule.toml`。运行时不需要 Python、mihomo 或代理核心；转换阶段不会下载订阅、规则集或连接节点；规则 core 启动时加载文件/HTTP(S) 资源并按 interval 更新。只编译此工具也不需要代理协议库、CMake 或 libclang。
+`astra-convert` 是独立的原生 Rust 命令行工具和 Rust library。CLI 对本地 mihomo YAML、stdin、订阅 URL 和分享链接默认只提取节点并生成 `proxy.toml`；显式添加 `--include-config` 才采用来源的代理组、规则、DNS 和监听配置，并额外生成 `rule.toml`。运行时不需要 Python、mihomo 或代理核心；URL 输入和 HTTP proxy-provider 会在转换时下载，规则集由规则 core 启动后加载并按 interval 更新，转换不会连接节点。只编译此工具也不需要代理协议库、CMake 或 libclang。
 
 ```sh
 cargo build --release -p astra-convert
-target/<本机 Rust target>/release/astra-convert configs/mihomo-rulesets-example.yaml -o converted
+target/<本机 Rust target>/release/astra-convert configs/mihomo-rulesets-example.yaml --include-config -o converted
 # 指定代理组成员；多个代理组可重复 --select：
-target/<本机 Rust target>/release/astra-convert your-mihomo.yaml -o your-config --select 'Proxy=节点名称'
+target/<本机 Rust target>/release/astra-convert your-mihomo.yaml --include-config -o your-config --select 'Proxy=节点名称'
 # 只解析检查，不创建输出目录：
 target/<本机 Rust target>/release/astra-convert your-mihomo.yaml --check
 # 标准输入：
 cat your-mihomo.yaml | target/<本机 Rust target>/release/astra-convert - -o converted-stdin
 ```
 
-未指定 `-o/--output-dir` 时，`proxy.toml` 和 `rule.toml` 输出到输入 YAML 所在目录；输入为 `-`（stdin）时输出到当前工作目录。`--base-dir` 仅影响资源路径解析，不改变输出位置。已有文件不会覆盖，Unix 下新文件权限为 `0600`。两份配置默认共用 `/tmp/astra-rule.sock`，可用 `--rule-socket /path/to/rule.sock` 修改。多实例应使用不同的 socket 和监听端口。
+未指定 `-o/--output-dir` 时，输出文件写到输入 YAML 所在目录；输入为 `-`（stdin）或 URL 时写到当前工作目录。默认只写 `proxy.toml`，已有 `rule.toml` 不受影响。`--base-dir` 仅影响资源路径解析，不改变输出位置。已有输出文件不会覆盖，Unix 下新文件权限为 `0600`。完整转换的两份配置默认共用 `/tmp/astra-rule.sock`，可用 `--rule-socket /path/to/rule.sock` 修改。多实例应使用不同的 socket 和监听端口。
 
-转换后用核心检查实际协议参数，再启动：
+使用 `--include-config` 完整转换后，用核心检查实际协议参数，再启动：
 
 ```sh
 target/<本机 Rust target>/release/astra-rule --check converted/rule.toml
@@ -27,7 +27,7 @@ target/<本机 Rust target>/release/astra-proxy converted/proxy.toml
 
 转换器的 `--check` 只检查解析和映射，并输出跳过摘要；核心的 `--check` 进一步验证协议和加密参数。这些检查均不能证明节点在线、凭据有效或服务端互通。
 
-跳过节点、代理组、规则和规则集的提示附带输入 YAML 中条目的原始行号。CLI 以 `── 完整输入路径 ──` 作为分隔，只显示一次源文件路径；下面逐条显示 `提示: [第 42 行] 跳过节点 example: 不支持的协议 ssr`。行号从 1 开始，按原文计算，保留注释、空行、CRLF、行内列表及锚点引用的位置；多行字符串定位到内容起始行。独立条目使用别名时定位到引用行，整个列表通过合并/别名继承时定位到定义中的条目。标准输入以 `── <stdin> ──` 分隔。`--strict` 的规则/规则集错误也带行号；TUI 导入使用同样的提示。
+完整转换中跳过节点、代理组、规则和规则集的提示附带输入 YAML 中条目的原始行号。CLI 以 `── 完整输入路径 ──` 作为分隔，只显示一次源文件路径；下面逐条显示 `提示: [第 42 行] 跳过节点 example: 不支持的协议 ssr`。行号从 1 开始，按原文计算，保留注释、空行、CRLF、行内列表及锚点引用的位置；多行字符串定位到内容起始行。独立条目使用别名时定位到引用行，整个列表通过合并/别名继承时定位到定义中的条目。默认节点提取和 provider 展开后的行号对应提取/展开后的 YAML。标准输入以 `── <stdin> ──` 分隔。`--include-config --strict` 的规则/规则集错误也带行号；TUI 导入使用同样的提示。
 
 ## 转换范围
 
@@ -75,7 +75,7 @@ target/<本机 Rust target>/release/astra-proxy converted/proxy.toml
 
 `mode: rule` 按源顺序转换规则；未知策略、不支持的规则、引用被跳过节点的规则会跳过。没有可用 `MATCH` 时默认 `block`。`mode: direct` 使用默认直连并忽略规则；`mode: global` 使用源配置中显式声明的 `GLOBAL` 组，无可用组时默认 `block`。
 
-DNS/Fake-IP 常用字段可转换，支持范围及订阅本地优先策略见 [DNS](DNS.md)。没有对应实现的字段忽略，包括 sniffer、proxy-provider、面板及控制 API。TUN、重定向、透明代理及自定义 listeners 也不自动映射：双方的路由和系统设置语义不同。没有可转换监听器时补充 `127.0.0.1:1080` SOCKS5 并提示。远程代理 provider 不展开，节点必须已经位于 `proxies` 中。规则 provider 由规则 core 在运行时加载。
+显式使用 `--include-config` 时，DNS/Fake-IP 常用字段可转换，支持范围见 [DNS](DNS.md)。没有对应实现的字段忽略，包括 sniffer、面板及控制 API。TUN、重定向、透明代理及自定义 listeners 也不自动映射：双方的路由和系统设置语义不同。没有可转换监听器时补充 `127.0.0.1:1080` SOCKS5 并提示。代理 provider 在转换阶段展开为节点；规则 provider 由规则 core 在运行时加载。
 
 跳过信息输出到标准错误；摘要不保证枚举每个未映射字段，首条提示说明其他字段被忽略。语法错误、顶层数组格式错误、重复名称、端口冲突、错误的 `--select` 会失败；单个节点缺少必要字段会跳过该节点。转换结果是功能子集，忽略规则及字段会改变源配置的路由行为，应检查摘要及输出后再使用。
 
@@ -92,7 +92,7 @@ cargo test -p astra-convert
 ## GeoIP 与规则集
 
 ```sh
-astra-convert mihomo.yaml -o converted --geoip-db /path/to/Country.mmdb --strict
+astra-convert mihomo.yaml --include-config -o converted --geoip-db /path/to/Country.mmdb --strict
 ```
 
 `GEOIP` 支持 MMDB 和标准 V2Ray `geoip.dat`，按文件内容识别格式。MMDB 支持 GeoIP2/GeoLite2 国家记录、分类字符串和分类列表；`geoip.dat` 支持 CN、telegram 等命名分类、IPv4/IPv6 CIDR 和数据库的 inverse_match。分类不区分大小写，必须存在于所用数据库；DAT 缺少引用分类会拒绝加载，并在更新时保留有效缓存和当前规则。
@@ -126,7 +126,7 @@ astra-convert mihomo.yaml -o converted --geoip-db /path/to/Country.mmdb --strict
 [subscription]
 url = "https://example.com/clash?token=YOUR_TOKEN"
 interval = 3600
-user_agent = "clash.meta/astra"
+user_agent = "mihomo/1.19.0"
 proxy = "PROXY" # 更新使用的代理组、节点名，或 DIRECT
 # 默认 false：只导入节点，保留本地代理组。
 import_groups = false
@@ -140,13 +140,13 @@ converter 也能生成包含订阅链接的代理配置：
 astra-convert "https://example.com/clash?token=YOUR_TOKEN" -o configs/subscribed --interval 3600
 ```
 
-订阅默认只生成 `proxy.toml`，导入节点和订阅信息；不生成 `rule.toml`，不采用订阅的组、规则、代理监听或 TUN 设置；DNS/Fake IP 在本地没有 dns 表时导入，后续更新保留本地设置。默认 PROXY 仍是本地动态节点组。普通本地 YAML 转换仍默认输出两份完整配置；使用 `--subscribe URL` 绑定订阅后也默认仅节点。
+订阅默认只生成 `proxy.toml`，导入节点和订阅信息；不生成 `rule.toml`，不采用订阅的组、规则、DNS/Fake IP、代理监听或 TUN 设置。默认 PROXY 仍是本地动态节点组。普通本地 YAML、stdin 和使用 `--subscribe URL` 绑定订阅的转换也默认仅节点；所有输入都需要显式 `--include-config` 才采用来源的其他配置。
 
-需要首次转换时额外采用远程配置的组与规则，可显式使用 `--include-config`。这会生成两份配置并设置 `import_groups = true`，后续核心更新节点及订阅管理的组；定时更新始终不会改变 Rule Core 的规则和本地入站设置。只有设置 `import_groups = true` 时，订阅里的组定义才参与周期转换与校验；默认节点模式会忽略无效或不支持的远程规则、组和监听设置。
+需要首次转换时额外采用源配置的组、规则、DNS 和监听配置，可显式使用 `--include-config`。这会生成两份配置；绑定订阅时还会设置 `import_groups = true`，后续核心更新节点及订阅管理的组。定时更新始终不会改变 Rule Core 的规则、本地 DNS 和入站设置。只有设置 `import_groups = true` 时，订阅里的组定义才参与周期转换与校验；默认节点模式会忽略无效或不支持的远程规则、组、DNS 和监听设置。
 
-`--user-agent` 控制下载请求的 User-Agent，默认 `clash.meta/astra`。URL 输入未指定输出目录时使用当前目录；本地 YAML 仍默认写到输入文件旁。已有输出文件不会覆盖，`--check` 不写配置。
+`--user-agent` 控制下载请求的 User-Agent，默认 `mihomo/1.19.0`，可按服务商要求覆盖；生成的订阅配置会保存该值，后续更新继续使用。URL 输入未指定输出目录时使用当前目录；本地 YAML 仍默认写到输入文件旁。已有输出文件不会覆盖，`--check` 不写配置。
 
-支持完整 Clash/Mihomo YAML 中的节点、仅含 `proxies` 的节点订阅、YAML 锚点/合并键，以及 HTTP、file、inline 类型的 `proxy-providers`。provider 的 `filter`、`exclude-filter`、`exclude-type` 会过滤节点；暂不支持 provider `override`，遇到时明确失败。file 路径相对于本地输入目录；URL 输入的 file 路径相对于 `--base-dir` 或当前配置目录。普通文件转换保留原始行号；provider 展开或节点提取后的诊断会标明展开后的内容。
+支持完整 Clash/Mihomo YAML 中的节点、仅含 `proxies` 的节点订阅、YAML 锚点/合并键，以及 HTTP、file、inline 类型的 `proxy-providers`。provider 的 `filter`、`exclude-filter`、`exclude-type` 会过滤节点；暂不支持 provider `override`，遇到时明确失败。本地输入的 file 路径相对于输入目录或 `--base-dir`；远程订阅不允许读取本地 file provider。完整文件转换保留原始行号；provider 展开或节点提取后的诊断使用展开后的内容行号。
 
 更新周期允许 60–604800 秒，默认 3600 秒。Proxy Core 启动后检查一次，之后定时重试。无需启用 `watch_config`。空节点列表、名称冲突、无效节点配置或下载失败，均保留上次成功的运行状态。订阅只替换自身管理的节点；与手动节点同名时拒绝更新，避免覆盖手动配置。converter 自动填写的 `managed_nodes`/`managed_groups` 用于兼容初始导出的条目，TUI 不要求用户编辑这些内部列表。
 
@@ -154,7 +154,9 @@ astra-convert "https://example.com/clash?token=YOUR_TOKEN" -o configs/subscribed
 
 成功结果写入 `~/.astra/runtime/subscriptions/<源路径摘要>.cache`（可用 `ASTRA_RUNTIME_DIR` 指定根目录）；旧配置旁的 `*.subscription-cache.json` 只兼容读取，保存节点、归属及对应配置。重启时先校验并恢复缓存，再检查订阅，断网时仍可使用最新成功节点。缓存损坏或本地配置发生改变时忽略旧缓存，重新从当前配置和链接建立状态。缓存文件包含节点凭据，权限与本地配置同样需要妥善保管。保存缓存失败会记录提示，不丢弃已经可用的运行节点。
 
-每份 YAML/响应上限为 8 MiB，最多展开 32 个 providers、4096 个节点；核心仍校验自身节点与组的容量限制。HTTP 请求有超时、证书校验和有限重定向；更新日志不输出订阅链接或凭据。订阅的 interval 统一控制其中 providers 的检查周期。
+每份 YAML/响应上限为 8 MiB，最多展开 32 个 providers、4096 个节点；核心仍校验自身节点与组的容量限制。订阅和 HTTP proxy-provider 请求默认使用 `User-Agent: mihomo/1.19.0`、`Accept: */*` 和 `Accept-Encoding: gzip, deflate`，支持未压缩、gzip（包括多个成员）和 zlib 封装的 deflate 响应；压缩体与解压后内容分别限制为 8 MiB。
+
+每次下载最多跟随 10 次 HTTP 301/302/303/307/308 重定向，包括相对地址；所有跳转共享 30 秒下载预算，provider 的每次下载分别计时。每一跳都会校验 URL，禁止 URL 账号密码及 HTTPS 降级为 HTTP，并保持 TLS 证书校验。Proxy Core 的超时覆盖 DNS/出口连接、TLS、响应头和响应体；独立 converter 的系统 DNS 解析仍受操作系统解析超时约束，可能超出该预算。更新日志不输出订阅链接路径或凭据；CLI 下载进度写入 stderr，默认 `info`，可用 `RUST_LOG` 调整。订阅的 interval 统一控制其中 providers 的检查周期。
 
 
 ## 多订阅与手动刷新
@@ -186,7 +188,7 @@ astra-proxy --update-subscriptions "实例的管理 socket 路径"
 
 ## VLESS 分享链接导入
 
-代理配置编辑页按 Ctrl+O 后粘贴 `vless://...`，也可在浏览配置时直接粘贴链接。支持每行一个节点的链接列表。节点追加到当前草稿，现有节点、组、订阅和监听设置保留；Ctrl+S 校验并保存。名称冲突会报错，不覆盖原节点。规则核心不接受节点链接。
+代理配置编辑页按 Ctrl+I 或 Ctrl+O 后粘贴 `vless://...`，也可在浏览配置时直接粘贴链接。支持每行一个节点的链接列表，可整段粘贴；兼容整段或逐行的配对引号、UTF-8 BOM、Windows 换行和空行。预览列表中按空格勾选、`a` 全选或清空、Enter 导入选中节点。节点追加到当前草稿，现有节点、组、订阅和监听设置保留；Ctrl+S 校验并保存。名称冲突会报错，不覆盖原节点。规则核心不接受节点链接。
 
 converter 支持直接将链接作为输入（包含 `&` 时须加引号），也可通过标准输入读取，每行一个链接。Proxy Core 的节点订阅同样支持返回 VLESS 链接列表。
 
@@ -195,6 +197,8 @@ astra-convert "vless://UUID@server.example:443?security=tls&sni=server.example&t
 ```
 
 支持 UUID、百分号编码的节点名称、IPv6、VLESS encryption、Vision flow、TLS/REALITY、SNI、客户端指纹 `fp`、证书 SHA-256 指纹 `pcs`、REALITY `pbk`/`sid`，以及 TCP、WebSocket、gRPC、HTTP Upgrade、XHTTP。`pcs` 映射为 `cert_pin_sha256`，与客户端指纹 `fp` 不同。XHTTP path/host/mode 按原值导入。未知参数、重复参数、不支持的 TLS 设置和不安全证书跳过选项会明确拒绝，避免静默改变节点行为。导入不发起节点连通性测试；解析错误不输出原始链接。
+
+兼容客户端分享链接中未启用伪装的 `headerType=` / `headerType=none`，以及 REALITY 的空 `spx` 或默认 `spx=%2F`。默认 spider 路径可导入并提示当前内核未实现 HTTP spider 回退；自定义 spider 路径和非空、非 `none` 的 headerType 仍明确拒绝。中文及 emoji 名称按百分号编码解码；同一服务器的不同名称保留为独立节点。
 
 
 ## 更多协议分享链接

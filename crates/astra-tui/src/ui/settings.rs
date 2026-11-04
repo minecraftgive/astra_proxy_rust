@@ -124,7 +124,85 @@ pub(super) struct Preferences {
     pub(super) vim_keys: bool,
     pub(super) mouse: bool,
     pub(super) start_page: StartPage,
+    pub(super) marquee: MarqueePreferences,
 }
+
+/// Hidden until Ctrl+Home is held for three seconds on the accent color row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct MarqueePreferences {
+    pub(super) unlocked: bool,
+    pub(super) border: bool,
+    pub(super) text: bool,
+    pub(super) background: bool,
+    pub(super) status: bool,
+    pub(super) indicator: bool,
+    pub(super) speed: MarqueeSpeed,
+    pub(super) width: MarqueeWidth,
+    pub(super) true_color: bool,
+}
+impl MarqueePreferences {
+    /// What actually runs: nothing while the section is hidden.
+    pub(super) fn effect(self) -> animation::Marquee {
+        animation::Marquee {
+            border: self.unlocked && self.border,
+            text: self.unlocked && self.text,
+            background: self.unlocked && self.background,
+            status: self.unlocked && self.status,
+            indicator: self.unlocked && self.indicator,
+            true_color: self.true_color,
+            speed: self.speed.degrees_per_second(),
+            width: self.width.cells(),
+        }
+    }
+}
+/// How fast the colors run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MarqueeSpeed {
+    Slow,
+    #[default]
+    Normal,
+    Fast,
+    VeryFast,
+}
+impl MarqueeSpeed {
+    const ALL: [Self; 4] = [Self::Slow, Self::Normal, Self::Fast, Self::VeryFast];
+    fn degrees_per_second(self) -> f32 {
+        match self {
+            Self::Slow => 60.0,
+            Self::Normal => 160.0,
+            Self::Fast => 320.0,
+            Self::VeryFast => 640.0,
+        }
+    }
+}
+/// How many cells one whole rainbow spans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MarqueeWidth {
+    Narrow,
+    #[default]
+    Normal,
+    Wide,
+    ExtraWide,
+}
+impl MarqueeWidth {
+    const ALL: [Self; 4] = [Self::Narrow, Self::Normal, Self::Wide, Self::ExtraWide];
+    fn cells(self) -> f32 {
+        match self {
+            Self::Narrow => 12.0,
+            Self::Normal => 30.0,
+            Self::Wide => 60.0,
+            Self::ExtraWide => 120.0,
+        }
+    }
+}
+/// How long Ctrl+Home must be held, and the longest gap between key repeats
+/// that still counts as holding (the first repeat waits for the OS delay).
+const HOLD: Duration = Duration::from_secs(3);
+const HOLD_GAP: Duration = Duration::from_millis(800);
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -135,6 +213,7 @@ impl Default for Preferences {
             vim_keys: false,
             mouse: true,
             start_page: StartPage::Overview,
+            marquee: MarqueePreferences::default(),
         }
     }
 }
@@ -148,8 +227,16 @@ pub(super) enum Field {
     VimKeys,
     Mouse,
     StartPage,
+    MarqueeBorder,
+    MarqueeText,
+    MarqueeBackground,
+    MarqueeStatus,
+    MarqueeIndicator,
+    MarqueeSpeed,
+    MarqueeWidth,
+    MarqueeTrueColor,
 }
-const FIELDS: [Field; 7] = [
+const ALL_FIELDS: [Field; 15] = [
     Field::Language,
     Field::Accent,
     Field::Colors,
@@ -157,8 +244,30 @@ const FIELDS: [Field; 7] = [
     Field::VimKeys,
     Field::Mouse,
     Field::StartPage,
+    Field::MarqueeBorder,
+    Field::MarqueeText,
+    Field::MarqueeBackground,
+    Field::MarqueeStatus,
+    Field::MarqueeIndicator,
+    Field::MarqueeSpeed,
+    Field::MarqueeWidth,
+    Field::MarqueeTrueColor,
 ];
-const SECTIONS: [(&str, std::ops::Range<usize>); 2] = [("Appearance", 0..4), ("Interaction", 4..7)];
+/// Row of the first marquee field.
+const MARQUEE_ROW: usize = 7;
+/// Rows shown now; the marquee section stays hidden until it is unlocked.
+fn fields(p: &Preferences) -> &'static [Field] {
+    if p.marquee.unlocked {
+        &ALL_FIELDS
+    } else {
+        &ALL_FIELDS[..MARQUEE_ROW]
+    }
+}
+const SECTIONS: [(&str, std::ops::Range<usize>); 3] = [
+    ("Appearance", 0..4),
+    ("Interaction", 4..7),
+    ("Marquee", 7..15),
+];
 
 impl Field {
     fn label(self) -> &'static str {
@@ -170,6 +279,14 @@ impl Field {
             Self::VimKeys => "Vim navigation",
             Self::Mouse => "Mouse",
             Self::StartPage => "Start page",
+            Self::MarqueeBorder => "Focused border",
+            Self::MarqueeText => "Focused item text",
+            Self::MarqueeBackground => "Focused item background",
+            Self::MarqueeStatus => "Status text",
+            Self::MarqueeIndicator => "Status indicator",
+            Self::MarqueeSpeed => "Marquee speed",
+            Self::MarqueeWidth => "Gradient width",
+            Self::MarqueeTrueColor => "Always true color",
         }
     }
     fn description(self) -> &'static str {
@@ -181,6 +298,14 @@ impl Field {
             Self::VimKeys => "h j k l g G move in lists and logs, in addition to the arrow keys.",
             Self::Mouse => "Off returns the mouse to the terminal so you can select and copy text.",
             Self::StartPage => "Page shown when a window opens without --view.",
+            Self::MarqueeBorder => "A rainbow runs around the border of the focused panel.",
+            Self::MarqueeText => "A rainbow runs across the text of the selected row.",
+            Self::MarqueeBackground => "A rainbow runs across the background of the selected row.",
+            Self::MarqueeStatus => "A rainbow runs across the status text at the bottom of the window.",
+            Self::MarqueeIndicator => "A rainbow runs across the connection dot and state word, only while connected.",
+            Self::MarqueeSpeed => "How fast the marquee colors run. Reduced or Off motion holds them still.",
+            Self::MarqueeWidth => "How many cells one whole rainbow spans; wider is a gentler gradient.",
+            Self::MarqueeTrueColor => "Marquee colors ignore the Colors setting and are always sent as 24-bit color. Needs a terminal with true color.",
         }
     }
     /// Choice names; language names are shown in their own language.
@@ -196,7 +321,16 @@ impl Field {
                 "Monochrome",
             ],
             Self::Motion => &["Normal", "Reduced", "Off"],
-            Self::VimKeys | Self::Mouse => &["On", "Off"],
+            Self::VimKeys
+            | Self::Mouse
+            | Self::MarqueeBorder
+            | Self::MarqueeText
+            | Self::MarqueeBackground
+            | Self::MarqueeStatus
+            | Self::MarqueeIndicator
+            | Self::MarqueeTrueColor => &["On", "Off"],
+            Self::MarqueeSpeed => &["Slow", "Normal", "Fast", "Very fast"],
+            Self::MarqueeWidth => &["Narrow", "Normal", "Wide", "Extra wide"],
             Self::StartPage => &shell::PAGES,
         }
     }
@@ -214,6 +348,14 @@ impl Field {
             Self::VimKeys => usize::from(!p.vim_keys),
             Self::Mouse => usize::from(!p.mouse),
             Self::StartPage => p.start_page.page(),
+            Self::MarqueeBorder => usize::from(!p.marquee.border),
+            Self::MarqueeText => usize::from(!p.marquee.text),
+            Self::MarqueeBackground => usize::from(!p.marquee.background),
+            Self::MarqueeStatus => usize::from(!p.marquee.status),
+            Self::MarqueeIndicator => usize::from(!p.marquee.indicator),
+            Self::MarqueeSpeed => p.marquee.speed as usize,
+            Self::MarqueeWidth => p.marquee.width as usize,
+            Self::MarqueeTrueColor => usize::from(!p.marquee.true_color),
         }
     }
     fn set(self, p: &mut Preferences, index: usize) {
@@ -244,6 +386,14 @@ impl Field {
             Self::VimKeys => p.vim_keys = index == 0,
             Self::Mouse => p.mouse = index == 0,
             Self::StartPage => p.start_page = StartPage::ALL[index],
+            Self::MarqueeBorder => p.marquee.border = index == 0,
+            Self::MarqueeText => p.marquee.text = index == 0,
+            Self::MarqueeBackground => p.marquee.background = index == 0,
+            Self::MarqueeStatus => p.marquee.status = index == 0,
+            Self::MarqueeIndicator => p.marquee.indicator = index == 0,
+            Self::MarqueeSpeed => p.marquee.speed = MarqueeSpeed::ALL[index],
+            Self::MarqueeWidth => p.marquee.width = MarqueeWidth::ALL[index],
+            Self::MarqueeTrueColor => p.marquee.true_color = index == 0,
         }
     }
     fn choice_label(self, index: usize) -> &'static str {
@@ -344,6 +494,9 @@ impl Ui {
                 viewer.set_vim_navigation(p.vim_keys);
             }
         }
+        if previous.is_none_or(|old| old.marquee != p.marquee) {
+            self.animations.set_marquee(p.marquee.effect());
+        }
         // Mouse capture belongs to the terminal session, which the event loop owns.
         if previous.is_some_and(|old| old.mouse != p.mouse) || (previous.is_none() && !p.mouse) {
             self.mouse_request = Some(p.mouse);
@@ -351,7 +504,88 @@ impl Ui {
     }
 
     fn settings_field(&self) -> Field {
-        FIELDS[self.settings_cursor.min(FIELDS.len() - 1)]
+        let fields = fields(&self.preferences);
+        fields[self.settings_cursor.min(fields.len() - 1)]
+    }
+
+    /// Holding Ctrl+Home for three seconds on the accent color row shows the
+    /// marquee section, or hides it again and turns it off. Any other key, a
+    /// release or a pause longer than the key-repeat delay starts over.
+    pub(super) fn marquee_hold_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        let chord = key.code == KeyCode::Home
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let here = self.page == shell::SETTINGS
+            && self.settings_field() == Field::Accent
+            && self.focus.region == focus::Region::Main
+            && self.palette.is_none()
+            && self.prompt.is_none()
+            && self.menu.is_none()
+            && self.help_scroll.is_none();
+        if !(chord && here) {
+            self.marquee_hold = None;
+            return None;
+        }
+        self.marquee_hold_at(Instant::now());
+        Some(Input::Idle)
+    }
+    fn marquee_hold_at(&mut self, now: Instant) {
+        let (start, done) = match self.marquee_hold {
+            Some((start, last, done)) if now.saturating_duration_since(last) <= HOLD_GAP => {
+                (start, done)
+            }
+            _ => (now, false),
+        };
+        let held = now.saturating_duration_since(start);
+        let finished = !done && held >= HOLD;
+        self.marquee_hold = Some((start, now, done || finished));
+        if finished {
+            let unlock = !self.preferences.marquee.unlocked;
+            self.change_preferences(|p| {
+                p.marquee = if unlock {
+                    MarqueePreferences {
+                        unlocked: true,
+                        border: true,
+                        ..p.marquee
+                    }
+                } else {
+                    MarqueePreferences::default()
+                }
+            });
+            if unlock {
+                self.settings_cursor = MARQUEE_ROW;
+                self.settings_view.follow_selection.set(true);
+            }
+            self.message = t(if unlock {
+                "Marquee unlocked"
+            } else {
+                "Marquee hidden"
+            })
+            .into();
+        } else if !done && held >= Duration::from_millis(500) {
+            let steps = ((held.as_millis() * 10 / HOLD.as_millis()) as usize).min(10);
+            self.message = tr!(
+                "Keep holding\u{2026} {}",
+                format!(
+                    "{}{}",
+                    "\u{25B0}".repeat(steps),
+                    "\u{25B1}".repeat(10 - steps)
+                )
+            );
+        }
+    }
+    /// Releasing Home or Ctrl ends a hold even inside the repeat gap
+    /// (terminals that report releases).
+    pub(super) fn key_release(&mut self, key: event::KeyEvent) {
+        use event::ModifierKeyCode::{LeftControl, RightControl};
+        if matches!(
+            key.code,
+            KeyCode::Home | KeyCode::Modifier(LeftControl | RightControl)
+        ) {
+            self.marquee_hold = None;
+        }
     }
     fn choose_setting(&mut self, field: Field, index: usize) {
         self.change_preferences(|p| field.set(p, index));
@@ -364,7 +598,7 @@ impl Ui {
     pub(super) fn click_setting(&mut self, row: usize, choice: Option<usize>) -> Input {
         self.focus = Default::default();
         self.settings_view.follow_selection.set(true);
-        self.settings_cursor = row.min(FIELDS.len() - 1);
+        self.settings_cursor = row.min(fields(&self.preferences).len() - 1);
         let field = self.settings_field();
         let count = field.choices().len();
         let index = choice.unwrap_or((field.get(&self.preferences) + 1) % count);
@@ -414,7 +648,8 @@ impl Ui {
                 self.settings_cursor = self.settings_cursor.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.settings_cursor = (self.settings_cursor + 1).min(FIELDS.len() - 1)
+                self.settings_cursor =
+                    (self.settings_cursor + 1).min(fields(&self.preferences).len() - 1)
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.settings_cursor = 0;
@@ -422,7 +657,9 @@ impl Ui {
                 self.settings_view.follow_selection.set(false);
                 return Some(Input::Idle);
             }
-            KeyCode::End | KeyCode::Char('G') => self.settings_cursor = FIELDS.len() - 1,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.settings_cursor = fields(&self.preferences).len() - 1
+            }
             KeyCode::Left | KeyCode::Char('h') if current > 0 => {
                 self.choose_setting(field, current - 1)
             }
@@ -467,8 +704,9 @@ impl Ui {
             self.settings_view.selected_visible.set(false);
             return;
         }
-        let selected = self.settings_cursor.min(FIELDS.len() - 1);
-        let label_width = FIELDS
+        let fields = fields(&self.preferences);
+        let selected = self.settings_cursor.min(fields.len() - 1);
+        let label_width = fields
             .iter()
             .map(|field| Line::from(t(field.label())).width())
             .max()
@@ -482,6 +720,9 @@ impl Ui {
             .collect();
         lines.push((Line::raw(""), None));
         for (index, (title, range)) in SECTIONS.iter().enumerate() {
+            if range.start >= fields.len() {
+                break;
+            }
             if index > 0 {
                 lines.push((Line::raw(""), None));
             }
@@ -498,7 +739,7 @@ impl Ui {
         }
         let description = Paragraph::new(vec![
             Line::styled(
-                t(FIELDS[selected].description()).to_owned(),
+                t(fields[selected].description()).to_owned(),
                 Style::default().fg(MUTED),
             ),
             Line::styled(
@@ -585,15 +826,19 @@ impl Ui {
         selected: bool,
         label_width: usize,
     ) {
-        let field = FIELDS[row];
+        let field = ALL_FIELDS[row];
         let current = field.get(&self.preferences);
         let marker = if selected { " › " } else { "   " };
         let label = astra_tui_kit::text::pad_cells(t(field.label()), label_width);
+        let marquee = self.animations.marquee();
         let mut spans = vec![
             Span::styled(marker, Style::default().fg(Color::Cyan)),
             Span::styled(
                 label,
-                if selected {
+                if selected && (marquee.text || marquee.background) {
+                    // Give the item marquee something to run across here too.
+                    crate::theme::selected().add_modifier(Modifier::BOLD)
+                } else if selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -705,7 +950,7 @@ mod tests {
 
     #[test]
     fn every_field_round_trips_each_choice() {
-        for field in FIELDS {
+        for field in ALL_FIELDS {
             for index in 0..field.choices().len() {
                 let mut p = Preferences::default();
                 field.set(&mut p, index);
@@ -795,5 +1040,70 @@ mod tests {
         crate::i18n::with_language(crate::i18n::Language::English, || {
             assert_eq!(Field::Language.choice_label(2), "简体中文");
         });
+    }
+    #[test]
+    fn indicator_marquee_only_marks_healthy_states() {
+        let (mut ui, _dir) = settings_ui();
+        ui.change_preferences(|p| p.marquee.indicator = true);
+        assert_eq!(
+            ui.indicator_color(Color::Green),
+            Color::Green,
+            "locked: no effect"
+        );
+        ui.change_preferences(|p| p.marquee.unlocked = true);
+        assert_eq!(ui.indicator_color(Color::Green), animation::STATUS_MARK);
+        assert_eq!(ui.indicator_color(Color::Red), Color::Red);
+        assert_eq!(ui.indicator_color(MUTED), MUTED);
+    }
+    #[test]
+    fn holding_ctrl_home_on_accent_unlocks_and_hides_the_marquee() {
+        let (mut ui, dir) = settings_ui();
+        let ctrl_home = event::KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        // Not on the accent row: the chord does nothing here.
+        assert!(ui.marquee_hold_key(ctrl_home).is_none());
+        press(&mut ui, KeyCode::Down);
+        assert_eq!(ui.settings_field(), Field::Accent);
+        assert_eq!(
+            fields(&ui.preferences).len(),
+            MARQUEE_ROW,
+            "hidden by default"
+        );
+        let start = Instant::now();
+        let hold = |ui: &mut Ui, until: u64| {
+            for ms in (0..=until).step_by(50) {
+                ui.marquee_hold_at(start + Duration::from_millis(ms));
+            }
+        };
+        // A pause longer than the repeat gap starts over.
+        hold(&mut ui, 2500);
+        ui.marquee_hold_at(start + Duration::from_millis(3600));
+        assert!(!ui.preferences.marquee.unlocked);
+        // Another key in between starts over too.
+        ui.marquee_hold = None;
+        hold(&mut ui, 2900);
+        assert!(ui
+            .marquee_hold_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .is_none());
+        assert!(ui.marquee_hold.is_none());
+        ui.settings_cursor = 1;
+        hold(&mut ui, 3000);
+        assert!(ui.preferences.marquee.unlocked);
+        assert!(ui.animations.marquee().border);
+        assert_eq!(ui.settings_field(), Field::MarqueeBorder);
+        assert_eq!(fields(&ui.preferences).len(), ALL_FIELDS.len());
+        let (loaded, _) = load(&dir.path().join(FILE), &Session::default());
+        assert!(loaded.marquee.unlocked && loaded.marquee.border);
+        // Still holding after unlocking does not toggle it straight back.
+        ui.marquee_hold_at(start + Duration::from_millis(6500));
+        assert!(ui.preferences.marquee.unlocked);
+        // A new hold on the accent row hides and turns everything off.
+        ui.settings_cursor = 1;
+        ui.marquee_hold = None;
+        let start = start + Duration::from_secs(10);
+        for ms in (0..=3000).step_by(50) {
+            ui.marquee_hold_at(start + Duration::from_millis(ms));
+        }
+        assert_eq!(ui.preferences.marquee, MarqueePreferences::default());
+        assert!(!ui.animations.marquee().border);
     }
 }

@@ -102,4 +102,16 @@ mod inbound_acl_tests {
         let bad: ProxyConfig = toml::from_str("authentication=['missing-separator']").unwrap();
         assert!(bad.validate().is_err());
     }
+    #[test]
+    fn network_recovery_is_an_opt_in_experiment() {
+        let default: ProxyConfig = toml::from_str("socks5_listen='127.0.0.1:1080'").unwrap();
+        assert!(!default.experimental.network_recovery);
+        assert!(!toml::to_string(&default).unwrap().contains("experimental"));
+        let enabled: ProxyConfig =
+            toml::from_str("[experimental]
+network_recovery=true").unwrap();
+        assert!(enabled.experimental.network_recovery);
+        assert!(toml::from_str::<ProxyConfig>("[experimental]
+unknown=true").is_err());
+    }
 }

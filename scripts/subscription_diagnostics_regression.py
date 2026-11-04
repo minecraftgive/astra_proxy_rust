@@ -14,9 +14,13 @@ from astra_tools.net import free_port
 
 class Subscription(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        self.server.user_agents.append(self.headers.get('User-Agent'))
+        body = self.server.body.encode()
         self.send_response(self.server.status)
+        self.send_header('Content-Type', 'text/yaml; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        self.wfile.write(self.server.body.encode())
+        self.wfile.write(body)
 
     def log_message(self, *args):
         pass
@@ -27,9 +31,11 @@ def main():
     parser.add_argument('--bin-dir', type=pathlib.Path, required=True)
     args = parser.parse_args()
     binary = str(args.bin_dir.resolve()/executable('astra-proxy'))
+    env = dict(os.environ, RUST_LOG='info', ASTRA_LOG_LEVEL='info')
     with tempfile.TemporaryDirectory(prefix='astra subscription diagnostics ') as td, http.server.ThreadingHTTPServer(('127.0.0.1', 0), Subscription) as server:
         directory = pathlib.Path(td)
         server.status, server.body = 403, ''
+        server.user_agents = []
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             config = directory/'proxy.toml'
@@ -38,7 +44,7 @@ def main():
             config.write_text(text, encoding='utf-8')
             log_path = directory/'proxy.log'
             with log_path.open('w', encoding='utf-8') as log:
-                child = subprocess.Popen([binary, str(config)], env=dict(os.environ, ASTRA_CONTROL_SOCKET=str(control)), stdout=log, stderr=subprocess.STDOUT, **process_flags())
+                child = subprocess.Popen([binary, str(config)], env=dict(env, ASTRA_CONTROL_SOCKET=str(control)), stdout=log, stderr=subprocess.STDOUT, **process_flags())
                 try:
                     deadline = time.monotonic()+15
                     while True:
@@ -48,7 +54,7 @@ def main():
                         if child.poll() is not None or time.monotonic() >= deadline:
                             raise AssertionError(output)
                         time.sleep(.05)
-                    for expected in ['subscription=no', 'HTTP 403', 'download subscription', 'endpoint=', 'elapsed_ms=', 'retry_secs=60', 'previous nodes retained']:
+                    for expected in ['subscription update started', 'proxy=DIRECT', 'import_groups=false', 'previous_nodes=0', 'subscription=no', 'subscription HTTP request started', 'user_agent="mihomo/1.19.0"', 'subscription HTTP response received', 'status=403', 'content_length=Some(0)', 'content_encoding=identity', 'HTTP 403', 'download subscription', 'endpoint=', 'elapsed_ms=', 'retry_secs=60', 'previous nodes retained']:
                         assert expected in output, output
                     assert 'private-secret' not in output and 'query-secret' not in output, output
                 finally:
@@ -63,10 +69,22 @@ def main():
                 (200, 'proxies: [{name: invalid, type: imaginary, server: 127.0.0.1, port: 1234, password: body-secret}]', 'imaginary'),
             ]:
                 server.status, server.body = status, body
-                result = subprocess.run([binary, '--refresh-subscriptions-stdin', str(config)], input=text, text=True, encoding='utf-8', capture_output=True, timeout=30)
+                result = subprocess.run([binary, '--refresh-subscriptions-stdin', str(config)], input=text, text=True, encoding='utf-8', capture_output=True, timeout=30, env=env)
                 assert result.returncode != 0 and expected in result.stderr, result.stderr
                 assert all(secret not in result.stderr for secret in ['private-secret', 'query-secret', 'body-secret']), result.stderr
                 assert config.read_text(encoding='utf-8') == text
+            server.status, server.body = 200, '''proxies:
+  - {name: valid, type: http, server: 127.0.0.1, port: 1234}
+  - {name: unsupported, type: imaginary, server: 127.0.0.1, port: 1234, password: body-secret}
+'''
+            result = subprocess.run([binary, '--refresh-subscriptions-stdin', str(config)], input=text, text=True, encoding='utf-8', capture_output=True, timeout=30, env=env)
+            assert result.returncode == 0 and result.stdout.strip() == 'Updated 1 subscriptions', result.stderr
+            body_bytes = len(server.body.encode())
+            for expected in ['subscription update started', 'subscription HTTP request started', 'user_agent="mihomo/1.19.0"', 'subscription HTTP response received', 'status=200', f'content_length=Some({body_bytes})', 'content_encoding=identity', 'subscription download completed', f'wire_bytes={body_bytes}', f'bytes={body_bytes}', 'subscription converted', 'nodes=1', 'subscription conversion warning', 'imaginary', 'elapsed_ms=', 'subscription refresh finished; node cache saved']:
+                assert expected in result.stderr, result.stderr
+            assert all(secret not in result.stderr for secret in ['private-secret', 'query-secret', 'body-secret']), result.stderr
+            assert server.user_agents and all(agent == 'mihomo/1.19.0' for agent in server.user_agents), server.user_agents
+            assert config.read_text(encoding='utf-8') == text
         finally:
             server.shutdown()
     print('PASS subscription diagnostics: live HTTP status/error chain/timing/retry, stopped updates, HTML/YAML/unsupported protocol errors, credential redaction')

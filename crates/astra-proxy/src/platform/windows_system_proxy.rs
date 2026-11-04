@@ -256,52 +256,63 @@ impl Guard {
             original: original.clone(),
             expected: Some(expected.clone()),
         };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(journal)
-            .with_context(|| {
-                format!(
-                    "recovery file exists or cannot be created: {}; restore it before starting",
-                    journal.display()
-                )
-            })?;
-        let saved = (|| -> Result<()> {
-            astra_platform::platform::set_private(journal, 0o600)?;
-            file.write_all(toml::to_string(&snapshot)?.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(error) = saved {
-            let _ = std::fs::remove_file(journal);
-            return Err(error);
-        }
-        let lease = super::network_recovery::Lease::prepare(
-            super::network_recovery::Resource::SystemProxy {
-                path: std::fs::canonicalize(journal)?,
-                snapshot: Some(snapshot.clone()),
-            },
-        )?;
+        // Crash recovery is experimental: without it the original settings
+        // stay in memory only and an abrupt core exit leaves them as applied.
+        let recording = super::network_recovery::enabled();
+        let lease = if recording {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(journal)
+                .with_context(|| {
+                    format!(
+                        "recovery file exists or cannot be created: {}; restore it before starting",
+                        journal.display()
+                    )
+                })?;
+            let saved = (|| -> Result<()> {
+                astra_platform::platform::set_private(journal, 0o600)?;
+                file.write_all(toml::to_string(&snapshot)?.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            drop(file);
+            if let Err(error) = saved {
+                let _ = std::fs::remove_file(journal);
+                return Err(error);
+            }
+            Some(super::network_recovery::Lease::prepare(
+                super::network_recovery::Resource::SystemProxy {
+                    path: std::fs::canonicalize(journal)?,
+                    snapshot: Some(snapshot.clone()),
+                },
+            )?)
+        } else {
+            None
+        };
         let mut guard = Self {
             original: Some(original),
-            journal: Some(journal.to_owned()),
+            journal: recording.then(|| journal.to_owned()),
             lock: None,
             monitor: None,
             expected: Some(expected.clone()),
-            lease: Some(lease),
+            lease,
         };
         lock.set_len(0)?;
-        lock.write_all(
-            std::fs::canonicalize(journal)?
-                .to_str()
-                .context("recovery path is not UTF-8")?
-                .as_bytes(),
-        )?;
+        if recording {
+            lock.write_all(
+                std::fs::canonicalize(journal)?
+                    .to_str()
+                    .context("recovery path is not UTF-8")?
+                    .as_bytes(),
+            )?;
+        }
         lock.sync_all()?;
         guard.lock = Some(lock);
         write(&expected)?;
-        guard.lease.as_ref().unwrap().commit()?;
+        if let Some(lease) = &guard.lease {
+            lease.commit()?;
+        }
         guard.monitor = Some(monitor(expected)?);
         Ok(guard)
     }

@@ -247,6 +247,7 @@ impl Hub {
         );
         Ok(DiagnosticPlan {
             runtime_dir: self.runtime_dir.clone(),
+            log_path: self.home.join(format!("{name}.log")),
             executable: self.bin.join(Kind::Proxy.binary()),
             config_path: route.instance.config.clone(),
             text: if route.pid.is_some() {

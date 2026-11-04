@@ -57,6 +57,79 @@ fn line_lists_ipv6_reality_and_errors_are_explicit() {
 }
 
 #[test]
+fn quoted_multiline_reality_links_keep_distinct_unicode_labels() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    const REALITY: &str = "vless://00000000-0000-4000-8000-000000000002@edge.example.invalid:443?security=reality&encryption=none&pbk=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=front.example.invalid&sid=0123456789abcdef";
+    let labels = [
+        "🇦🇱 剩余流量：379.73 GB",
+        "🇦🇱 距离下次重置剩余：10 天",
+        "🇦🇱 套餐到期：2027-01-13",
+    ];
+    let lines = labels.map(|label| {
+        format!(
+            "{REALITY}#{}",
+            percent_encoding::utf8_percent_encode(label, percent_encoding::NON_ALPHANUMERIC)
+        )
+    });
+    let plain = lines.join("\n");
+    let inputs = [
+        plain.clone(),
+        format!("\"{plain}\""),
+        format!("'{plain}'"),
+        format!("“{plain}”"),
+        format!("\u{feff} \r\n\"\r\n{}\r\n\"\r\n", lines.join("\r\n\r\n")),
+        lines
+            .iter()
+            .map(|line| format!("\"{line}\""))
+            .collect::<Vec<_>>()
+            .join("\r\n"),
+        STANDARD.encode(format!("\u{feff}\"{plain}\"")),
+        format!("\"{}\"", STANDARD.encode(&plain)),
+    ];
+    for input in inputs {
+        assert!(astra_convert::share::is_share(&input));
+        let converted = convert_links(&input, &Options::default()).unwrap();
+        assert_eq!(converted.nodes, 3);
+        assert_eq!(converted.warnings.len(), 1);
+        assert!(converted.warnings[0].contains("spx=/"));
+        let doc: toml::Value = toml::from_str(&converted.proxy).unwrap();
+        for (node, label) in doc["outbounds"].as_array().unwrap().iter().zip(labels) {
+            assert_eq!(node["tag"].as_str(), Some(label));
+            assert_eq!(node["config"]["flow"].as_str(), Some("xtls-rprx-vision"));
+            assert_eq!(
+                node["config"]["tls"]["reality_short_id"].as_str(),
+                Some("0123456789abcdef")
+            );
+        }
+    }
+}
+
+#[test]
+fn default_share_options_are_compatible_but_unsupported_behavior_is_rejected() {
+    const REALITY: &str = "vless://00000000-0000-4000-8000-000000000002@edge.example.invalid:443?security=reality&encryption=none&pbk=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA&headerType=none&spx=&type=tcp#reality";
+    let converted = convert_links(REALITY, &Options::default()).unwrap();
+    assert_eq!(converted.nodes, 1);
+    assert!(converted.warnings.is_empty());
+    for invalid in [
+        REALITY.replace("headerType=none", "headerType=http"),
+        REALITY.replace("spx=", "spx=%2Fprivate-spider-path"),
+        REALITY.replace("security=reality", "security=tls"),
+        REALITY.replace("spx=", "spx=&spx=%2F"),
+    ] {
+        let error = convert_links(&format!("\"{LINK}\n{invalid}\""), &Options::default())
+            .err()
+            .unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("share link line 2"));
+        assert!(!message.contains("00000000-0000") && !message.contains("private-spider-path"));
+    }
+    let quoted_label = LINK.replace("#TW%20%E8%8A%82%E7%82%B9", "#%22%E8%8A%82%E7%82%B9%22");
+    let converted = convert_links(&format!("\"{quoted_label}\""), &Options::default()).unwrap();
+    let doc: toml::Value = toml::from_str(&converted.proxy).unwrap();
+    assert_eq!(doc["outbounds"][0]["tag"].as_str(), Some("\"节点\""));
+}
+
+#[test]
 fn cli_link_and_stdin_only_write_proxy_config() {
     use std::io::Write;
     use std::process::{Command, Stdio};

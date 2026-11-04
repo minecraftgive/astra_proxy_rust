@@ -6,6 +6,7 @@ use std::{collections::HashSet, io::Read, path::Path};
 
 const LIMIT: u64 = 8 * 1024 * 1024;
 pub mod diagnostics;
+pub mod http;
 pub use astra_model::config::subscription::Subscription;
 pub fn validate_url(value: &str) -> Result<()> {
     astra_model::config::validate_remote_url(value)
@@ -16,23 +17,71 @@ pub use astra_model::config::validate_redirect;
 #[cfg(feature = "download")]
 pub fn download(url: &str, user_agent: &str) -> Result<String> {
     validate_url(url)?;
-    let response = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(20))
-        .redirects(3)
-        .build()
-        .get(url)
-        .set("User-Agent", user_agent)
-        .call()
-        .map_err(|error| match error {
-            ureq::Error::Status(code, _) => anyhow::anyhow!("subscription HTTP {code}"),
-            ureq::Error::Transport(error) => anyhow::anyhow!(
-                "subscription transport {:?}: {}",
-                error.kind(),
-                diagnostics::error(&anyhow::anyhow!(error.to_string()))
-            ),
-        })?;
-    validate_redirect(url, response.get_url())?;
-    bounded(response.into_reader())
+    let started = std::time::Instant::now();
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let mut url = url::Url::parse(url)?;
+    for redirect in 0..=http::MAX_REDIRECTS {
+        let endpoint = diagnostics::endpoint(url.as_str());
+        tracing::info!(%endpoint, user_agent, redirect, timeout_secs = http::TIMEOUT.as_secs(),
+            "subscription HTTP request started");
+        let remaining = http::TIMEOUT
+            .checked_sub(started.elapsed())
+            .filter(|timeout| !timeout.is_zero())
+            .context("subscription download timed out after 30s")?;
+        let response = agent
+            .get(url.as_str())
+            .timeout(remaining)
+            .set("User-Agent", user_agent)
+            .set("Accept", "*/*")
+            .set("Accept-Encoding", http::ACCEPT_ENCODING)
+            .call()
+            .or_else(|error| match error {
+                ureq::Error::Status(_, response) => Ok(response),
+                error => Err(error),
+            })
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "subscription transport: {}",
+                    diagnostics::error(&anyhow::anyhow!(error.to_string()))
+                )
+            })?;
+        let status = response.status();
+        let encoding = response
+            .header("Content-Encoding")
+            .unwrap_or("identity")
+            .to_owned();
+        let content_type = diagnostics::error(&anyhow::anyhow!(response
+            .header("Content-Type")
+            .unwrap_or("unknown")
+            .to_owned()));
+        tracing::info!(%endpoint, status, %content_type,
+            content_encoding = %diagnostics::error(&anyhow::anyhow!(encoding.clone())),
+            content_length = ?response.header("Content-Length").and_then(|s| s.parse::<u64>().ok()),
+            elapsed_ms = started.elapsed().as_millis() as u64, "subscription HTTP response received");
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            ensure!(
+                redirect < http::MAX_REDIRECTS,
+                "too many subscription redirects (limit 10)"
+            );
+            let next = url.join(
+                response
+                    .header("Location")
+                    .context("redirect location missing")?,
+            )?;
+            // Validate every hop before making a request, including URL credentials and TLS downgrade.
+            validate_redirect(url.as_str(), next.as_str())?;
+            tracing::info!(%endpoint, next_endpoint = %diagnostics::endpoint(next.as_str()), redirect = redirect + 1,
+                "subscription HTTP redirect");
+            url = next;
+            continue;
+        }
+        ensure!((200..300).contains(&status), "subscription HTTP {status}");
+        let text = http::decode(response.into_reader(), &encoding)?;
+        tracing::info!(%endpoint, bytes = text.len(), redirects = redirect,
+            elapsed_ms = started.elapsed().as_millis() as u64, "subscription download completed");
+        return Ok(text);
+    }
+    unreachable!()
 }
 #[cfg(not(feature = "download"))]
 pub fn download(_url: &str, _user_agent: &str) -> Result<String> {
@@ -40,9 +89,12 @@ pub fn download(_url: &str, _user_agent: &str) -> Result<String> {
 }
 fn bounded(reader: impl Read) -> Result<String> {
     let mut data = Vec::new();
-    reader.take(LIMIT + 1).read_to_end(&mut data)?;
+    reader
+        .take(LIMIT + 1)
+        .read_to_end(&mut data)
+        .context("read subscription content")?;
     ensure!(data.len() as u64 <= LIMIT, "subscription exceeds 8 MiB");
-    String::from_utf8(data).context("subscription must be UTF-8 YAML")
+    String::from_utf8(data).context("subscription must be UTF-8 YAML or share links")
 }
 fn matches(spec: &Y, node: &Y) -> Result<bool> {
     let name = required(node, "name")?;
@@ -217,7 +269,7 @@ fn convert_clash_with(
     );
     Ok(result)
 }
-/// Subscription imports deliberately ignore inbound/routing configuration.
+/// Subscription imports deliberately ignore DNS, inbound and routing configuration.
 pub fn convert_nodes(
     input: &str,
     options: &Options,
@@ -242,7 +294,7 @@ fn convert_nodes_with(
         .as_mapping()
         .context("Clash configuration must be a mapping")?;
     let mut nodes = serde_yaml::Mapping::new();
-    for key in ["proxies", "proxy-providers", "proxy-groups", "dns"] {
+    for key in ["proxies", "proxy-providers", "proxy-groups"] {
         if key == "proxy-groups" && !import_groups {
             continue;
         }
@@ -299,18 +351,8 @@ pub fn fetch_with(
 pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Result<String> {
     let mut current: toml::Table = toml::from_str(current)?;
     let remote: toml::Table = toml::from_str(converted)?;
-    // Import DNS on first use; explicit local settings and previous imports
-    // remain editable and win over subsequent subscription refreshes.
-    if !current.contains_key("dns") {
-        if let Some(mut dns) = remote.get("dns").cloned() {
-            // Resolvers come from the subscription, but where this machine
-            // listens is a local decision: keep the loopback default.
-            if let Some(table) = dns.as_table_mut() {
-                table.remove("listen");
-            }
-            current.insert("dns".into(), dns);
-        }
-    }
+    // Only nodes and explicitly opted-in groups belong to a subscription.
+    // Even a full converted document must not add or replace local DNS/settings.
     let incoming = remote
         .get("outbounds")
         .and_then(|v| v.as_array())

@@ -275,6 +275,7 @@ impl Ui {
         } else {
             ("○", MUTED, t("Not connected"))
         };
+        let color = self.indicator_color(color);
         let mut title = vec![Span::styled(" Astra", bold.fg(BLUE))];
         if narrow {
             title.push(Span::styled(" · ", dark));

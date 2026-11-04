@@ -11,8 +11,11 @@ download = ["dep:ureq"]
 [dependencies]
 astra-model = { path = "../astra-model" }
 anyhow.workspace = true
+tracing.workspace = true
+flate2 = "1"
 serde.workspace = true
 toml.workspace = true
+tracing-subscriber.workspace = true
 serde_yaml = "0.9"
 yaml-rust2 = { version = "0.13", default-features = false }
 ipnet = "2"

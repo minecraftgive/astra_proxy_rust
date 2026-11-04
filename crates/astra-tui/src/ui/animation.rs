@@ -121,7 +121,55 @@ pub(super) struct Motion {
     detected_no_color: bool,
     detected_colors: u16,
     palette: std::cell::Cell<Palette>,
+    marquee: std::cell::Cell<Marquee>,
+    /// Whether the last frame had anything for the marquee to paint.
+    marquee_seen: std::cell::Cell<bool>,
 }
+
+/// Hidden running-light effect, unlocked from Settings. Each part is optional.
+/// It deliberately breaks the "never restyle persistent content" rule above, so
+/// it is off unless the user turns it on, and it stands still without Normal motion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Marquee {
+    pub(super) border: bool,
+    pub(super) text: bool,
+    pub(super) background: bool,
+    /// The bottom status line text.
+    pub(super) status: bool,
+    /// The connection dot and state word, only while connected.
+    pub(super) indicator: bool,
+    /// Paint marquee cells in 24-bit color whatever the Colors setting says.
+    pub(super) true_color: bool,
+    /// Hue degrees per second.
+    pub(super) speed: f32,
+    /// Cells covered by one whole rainbow.
+    pub(super) width: f32,
+}
+impl Default for Marquee {
+    fn default() -> Self {
+        Self {
+            border: false,
+            text: false,
+            background: false,
+            status: false,
+            indicator: false,
+            true_color: false,
+            speed: 160.0,
+            width: 30.0,
+        }
+    }
+}
+impl Marquee {
+    fn any(self) -> bool {
+        self.border || self.text || self.background || self.status || self.indicator
+    }
+}
+/// Focused border color while the border marquee is on; one step off Cyan so an
+/// unprocessed frame looks the same.
+pub(super) const FOCUS_MARK: Color = Color::Rgb(0, 215, 214);
+/// Status line text, and the connected dot and word, while their marquee is on.
+pub(super) const STATUS_MARK: Color = Color::Rgb(140, 147, 160);
+use astra_tui_kit::theme::{SELECTED_KEEP_MARK, SELECTED_MARK};
 impl Motion {
     pub(super) fn new(mode: MotionMode) -> Self {
         let remote =
@@ -145,7 +193,149 @@ impl Motion {
                 no_color,
                 color_count,
             }),
+            marquee: Default::default(),
+            marquee_seen: Default::default(),
         }
+    }
+    pub(super) fn set_marquee(&self, marquee: Marquee) {
+        self.marquee.set(marquee);
+        astra_tui_kit::theme::set_selection_mark(marquee.text || marquee.background);
+    }
+    pub(super) fn marquee(&self) -> Marquee {
+        self.marquee.get()
+    }
+    /// The marquee needs frames of its own while it has something to move.
+    pub(super) fn marquee_running(&self) -> bool {
+        self.mode() == MotionMode::Normal && self.marquee.get().any() && self.marquee_seen.get()
+    }
+    /// Paint marked cells; returns which cells now carry marquee colors.
+    fn paint_marquee(&self, buffer: &mut Buffer, mode: MotionMode) -> Vec<bool> {
+        let marquee = self.marquee.get();
+        let area = buffer.area;
+        let width = area.width as usize;
+        let mut painted = vec![false; buffer.content.len()];
+        if width == 0 {
+            return painted;
+        }
+        // Reduced and Off keep the colors but stand still.
+        let phase = if mode == MotionMode::Normal {
+            self.epoch.elapsed().as_secs_f32() * marquee.speed
+        } else {
+            0.0
+        };
+        let rainbow = marquee.width.max(2.0);
+        let step = 360.0 / rainbow;
+        let at = |index: usize| ((index % width) as u16, (index / width) as u16);
+        let mut seen = false;
+        let cells = &mut buffer.content;
+        let mut visited = vec![false; cells.len()];
+        for start in 0..cells.len() {
+            if visited[start] || cells[start].fg != FOCUS_MARK {
+                continue;
+            }
+            // One connected ring of border cells per focused card.
+            let mut ring = vec![];
+            let mut stack = vec![start];
+            visited[start] = true;
+            while let Some(index) = stack.pop() {
+                ring.push(index);
+                let (x, y) = at(index);
+                let mut push = |next: usize| {
+                    if !visited[next] && cells[next].fg == FOCUS_MARK {
+                        visited[next] = true;
+                        stack.push(next);
+                    }
+                };
+                if x > 0 {
+                    push(index - 1);
+                }
+                if (x as usize) + 1 < width {
+                    push(index + 1);
+                }
+                if y > 0 {
+                    push(index - width);
+                }
+                if index + width < cells.len() {
+                    push(index + width);
+                }
+            }
+            if !marquee.border {
+                for index in ring {
+                    cells[index].set_fg(Color::Cyan);
+                }
+                continue;
+            }
+            seen = true;
+            let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0, 0);
+            for &index in &ring {
+                let (x, y) = at(index);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+            let (w, h) = ((x1 - x0) as f32, (y1 - y0) as f32);
+            let length = (2.0 * (w + h)).max(1.0);
+            // A whole number of rainbows, so the loop has no seam.
+            let cycles = (length / rainbow).round().max(1.0);
+            for index in ring {
+                let (x, y) = at(index);
+                let (dx, dy) = ((x - x0) as f32, (y - y0) as f32);
+                let position = if y == y0 {
+                    dx
+                } else if x == x1 {
+                    w + dy
+                } else if y == y1 {
+                    w + h + (w - dx)
+                } else if x == x0 {
+                    2.0 * w + h + (h - dy)
+                } else {
+                    dx + dy
+                };
+                let hue = 360.0 * cycles * position / length - phase;
+                cells[index].set_fg(hsl(hue, 0.85, 0.6));
+                painted[index] = true;
+            }
+        }
+        let items = marquee.text || marquee.background;
+        for (index, cell) in cells.iter_mut().enumerate() {
+            if cell.fg == STATUS_MARK {
+                if marquee.status || marquee.indicator {
+                    seen = true;
+                    painted[index] = true;
+                    let hue = (index % width) as f32 * step - phase;
+                    cell.set_fg(hsl(hue, 0.85, 0.68));
+                } else {
+                    cell.set_fg(Color::Gray);
+                }
+            }
+            let original = match cell.bg {
+                SELECTED_MARK => BLUE,
+                SELECTED_KEEP_MARK => Color::Rgb(24, 28, 34),
+                _ => continue,
+            };
+            if !items {
+                cell.set_bg(original);
+                continue;
+            }
+            seen = true;
+            painted[index] = true;
+            let (x, y) = at(index);
+            let hue = (x as f32 + y as f32 * 2.0) * step - phase;
+            match (marquee.text, marquee.background) {
+                (true, true) => {
+                    cell.set_bg(hsl(hue, 0.7, 0.36));
+                    cell.set_fg(hsl(hue + 180.0, 0.9, 0.8));
+                }
+                (false, true) => {
+                    cell.set_bg(hsl(hue, 0.7, 0.4));
+                    cell.set_fg(Color::White);
+                }
+                _ => {
+                    cell.set_bg(original);
+                    cell.set_fg(hsl(hue, 0.9, 0.74));
+                }
+            }
+        }
+        self.marquee_seen.set(seen);
+        painted
     }
     pub(super) fn set_palette(&self, accent: Color, depth: super::settings::ColorDepth) {
         use super::settings::ColorDepth;
@@ -323,6 +513,11 @@ impl Motion {
         state
             .surfaces
             .retain(|s| !s.closing || active.contains(&s.kind));
+        let mode = state.mode;
+        drop(state);
+        let painted = self.paint_marquee(f.buffer_mut(), mode);
+        // With "always true color", marquee cells skip the depth reduction below.
+        let keep = |index: usize| self.marquee.get().true_color && painted[index];
         let palette = self.palette.get();
         if let Some(accent) = palette.accent {
             for cell in &mut f.buffer_mut().content {
@@ -335,12 +530,18 @@ impl Motion {
             }
         }
         if palette.no_color {
-            for cell in &mut f.buffer_mut().content {
+            for (index, cell) in f.buffer_mut().content.iter_mut().enumerate() {
+                if keep(index) {
+                    continue;
+                }
                 cell.set_fg(Color::Reset);
                 cell.set_bg(Color::Reset);
             }
         } else if palette.color_count < u16::MAX {
-            for cell in &mut f.buffer_mut().content {
+            for (index, cell) in f.buffer_mut().content.iter_mut().enumerate() {
+                if keep(index) {
+                    continue;
+                }
                 cell.set_fg(terminal_color(cell.fg, palette.color_count));
                 cell.set_bg(terminal_color(cell.bg, palette.color_count));
             }
@@ -367,6 +568,23 @@ fn rgb(color: Color) -> Option<(u8, u8, u8)> {
         Color::White => (230, 230, 230),
         _ => return None,
     })
+}
+/// Hue in degrees (any value), saturation and lightness in 0..=1.
+fn hsl(hue: f32, saturation: f32, lightness: f32) -> Color {
+    let hue = hue.rem_euclid(360.0) / 60.0;
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue as u8 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    let channel = |v: f32| ((v + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(channel(r), channel(g), channel(b))
 }
 fn mix(from: (u8, u8, u8), to: (u8, u8, u8), p: f32) -> Color {
     let p = p.clamp(0.0, 1.0);
@@ -567,6 +785,126 @@ mod tests {
             terminal.backend().buffer()[(0, 0)].bg,
             Color::Indexed(_)
         ));
+    }
+    #[test]
+    fn marquee_runs_around_focused_borders_and_across_selections() {
+        use ratatui::widgets::{Block, Borders};
+        let paint = |f: &mut Frame<'_>| {
+            f.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(FOCUS_MARK)),
+                Rect::new(0, 0, 20, 6),
+            );
+            f.buffer_mut().set_style(
+                Rect::new(1, 2, 18, 1),
+                Style::default().bg(SELECTED_MARK).fg(Color::White),
+            );
+        };
+        let draw = |motion: &Motion| {
+            let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+            terminal
+                .draw(|f| {
+                    paint(f);
+                    motion.finish_frame(f);
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        // Off: marks map back to the normal colors.
+        let motion = Motion::new(MotionMode::Off);
+        let plain = draw(&motion);
+        assert_eq!(plain[(0, 0)].fg, Color::Cyan);
+        assert_eq!(plain[(5, 2)].bg, BLUE);
+        assert!(!motion.marquee_running());
+        // Set the field directly: the selection mark flag is process-wide.
+        motion.marquee.set(Marquee {
+            border: true,
+            text: true,
+            background: true,
+            ..Default::default()
+        });
+        let lit = draw(&motion);
+        let border: Vec<_> = [(0, 0), (10, 0), (19, 3), (10, 5), (0, 3)]
+            .map(|p| lit[p].fg)
+            .into();
+        assert!(border
+            .iter()
+            .all(|c| matches!(c, Color::Rgb(..)) && *c != FOCUS_MARK));
+        assert!(
+            border.windows(2).any(|w| w[0] != w[1]),
+            "colors vary along the ring"
+        );
+        assert_ne!(lit[(5, 2)].bg, lit[(12, 2)].bg);
+        assert_ne!(lit[(5, 2)].bg, SELECTED_MARK);
+        assert_eq!(lit[(5, 3)], plain[(5, 3)], "other content is untouched");
+        // Without Normal motion the colors stand still and need no frames.
+        assert_eq!(draw(&motion), lit);
+        assert!(!motion.marquee_running());
+        let moving = Motion::new(MotionMode::Normal);
+        moving.marquee.set(motion.marquee.get());
+        draw(&moving);
+        assert!(moving.marquee_running());
+    }
+    #[test]
+    fn status_marquee_width_and_true_color() {
+        let paint = |f: &mut Frame<'_>| {
+            f.buffer_mut()
+                .set_style(Rect::new(0, 0, 24, 1), Style::default().fg(STATUS_MARK));
+            f.buffer_mut().set_style(
+                Rect::new(0, 1, 24, 1),
+                Style::default().fg(Color::Rgb(64, 128, 230)),
+            );
+        };
+        let draw = |motion: &Motion| {
+            let mut terminal = Terminal::new(TestBackend::new(24, 2)).unwrap();
+            terminal
+                .draw(|f| {
+                    paint(f);
+                    motion.finish_frame(f);
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let motion = Motion::new(MotionMode::Off);
+        motion.set_palette(BLUE, super::super::settings::ColorDepth::Ansi16);
+        assert!(
+            !matches!(draw(&motion)[(0, 0)].fg, Color::Rgb(..)),
+            "off: a plain color"
+        );
+        let status = Marquee {
+            status: true,
+            width: 12.0,
+            ..Default::default()
+        };
+        motion.marquee.set(status);
+        let reduced = draw(&motion);
+        assert!(
+            !matches!(reduced[(3, 0)].fg, Color::Rgb(..)),
+            "16 colors without true color"
+        );
+        motion.marquee.set(Marquee {
+            true_color: true,
+            ..status
+        });
+        let lit = draw(&motion);
+        assert!(
+            matches!(lit[(3, 0)].fg, Color::Rgb(..)),
+            "marquee cells stay 24-bit"
+        );
+        assert!(
+            !matches!(lit[(3, 1)].fg, Color::Rgb(..)),
+            "other cells are still reduced"
+        );
+        // One rainbow per 12 cells: cell 0 and cell 12 share a color, cell 6 does not.
+        assert_eq!(lit[(0, 0)].fg, lit[(12, 0)].fg);
+        assert_ne!(lit[(0, 0)].fg, lit[(6, 0)].fg);
+    }
+    #[test]
+    fn hsl_hits_primary_hues() {
+        assert_eq!(hsl(0.0, 1.0, 0.5), Color::Rgb(255, 0, 0));
+        assert_eq!(hsl(120.0, 1.0, 0.5), Color::Rgb(0, 255, 0));
+        assert_eq!(hsl(-120.0, 1.0, 0.5), Color::Rgb(0, 0, 255));
     }
     #[test]
     fn resize_discards_old_geometry() {

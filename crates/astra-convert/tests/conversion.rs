@@ -155,6 +155,7 @@ fn cli_diagnostics_group_under_one_absolute_source_path_and_keep_lines() {
     let result = Command::new(binary)
         .current_dir(&dir)
         .arg(path.file_name().unwrap())
+        .arg("--include-config")
         .arg("--check")
         .output()
         .unwrap();
@@ -193,7 +194,7 @@ fn cli_diagnostics_group_under_one_absolute_source_path_and_keep_lines() {
             > 1
     );
     let mut child = Command::new(binary)
-        .args(["-", "--check"])
+        .args(["-", "--include-config", "--check"])
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -361,6 +362,90 @@ fn transport_options_and_http_upstream() {
 }
 
 #[test]
+fn cli_defaults_to_nodes_only_for_files_stdin_and_bound_subscriptions() {
+    use std::{io::Write, process::Stdio};
+    let dir = std::env::temp_dir().join(format!("astra-convert-nodes-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("source.yaml");
+    fs::write(&input, FIXTURE).unwrap();
+    let binary = env!("CARGO_BIN_EXE_astra-convert");
+    for mode in ["file", "stdin", "subscription", "full"] {
+        let output = dir.join(mode);
+        fs::create_dir_all(&output).unwrap();
+        if mode != "full" {
+            fs::write(output.join("rule.toml"), "existing rules").unwrap();
+        }
+        let mut command = Command::new(binary);
+        command.arg(if mode == "stdin" {
+            std::path::Path::new("-")
+        } else {
+            &input
+        });
+        command.arg("-o").arg(&output);
+        if mode == "subscription" {
+            command.args(["--subscribe", "https://example.com/subscription"]);
+        } else if mode == "full" {
+            command.arg("--include-config");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if mode == "stdin" {
+            stdin.write_all(FIXTURE.as_bytes()).unwrap();
+        }
+        drop(stdin);
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stdout.is_empty());
+        let proxy = toml(&fs::read_to_string(output.join("proxy.toml")).unwrap());
+        assert_eq!(proxy["outbounds"].as_array().unwrap().len(), 7);
+        if mode == "full" {
+            assert!(proxy.get("dns").is_some());
+            assert!(proxy.get("mixed_listen").is_some());
+            assert!(proxy["proxy_groups"].get("Proxy").is_some());
+            assert!(
+                toml(&fs::read_to_string(output.join("rule.toml")).unwrap())["rules"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+        } else {
+            assert!(proxy.get("dns").is_none());
+            assert!(proxy.get("mixed_listen").is_none());
+            assert!(proxy["proxy_groups"].get("Proxy").is_none());
+            assert_eq!(
+                fs::read_to_string(output.join("rule.toml")).unwrap(),
+                "existing rules"
+            );
+            if mode == "subscription" {
+                assert_eq!(
+                    proxy["subscription"]["import_groups"].as_bool(),
+                    Some(false)
+                );
+                assert_eq!(
+                    proxy["subscription"]["user_agent"].as_str(),
+                    Some("mihomo/1.19.0")
+                );
+            }
+        }
+        fs::remove_file(output.join("proxy.toml")).unwrap();
+        fs::remove_file(output.join("rule.toml")).unwrap();
+        fs::remove_dir(output).unwrap();
+    }
+    fs::remove_file(input).unwrap();
+    fs::remove_dir(dir).unwrap();
+}
+
+#[test]
 fn cli_never_overwrites_and_check_does_not_write() {
     let dir = std::env::temp_dir().join(format!("astra-convert-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -381,16 +466,16 @@ fn cli_never_overwrites_and_check_does_not_write() {
     assert!(!dir.exists());
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("rule.toml"), "original").unwrap();
-    assert!(!run(&[]).status.success());
+    assert!(!run(&["--include-config"]).status.success());
     assert!(!dir.join("proxy.toml").exists());
     assert_eq!(
         fs::read_to_string(dir.join("rule.toml")).unwrap(),
         "original"
     );
     fs::remove_file(dir.join("rule.toml")).unwrap();
-    assert!(run(&[]).status.success());
+    assert!(run(&["--include-config"]).status.success());
     let original = fs::read(dir.join("proxy.toml")).unwrap();
-    assert!(!run(&[]).status.success());
+    assert!(!run(&["--include-config"]).status.success());
     assert_eq!(fs::read(dir.join("proxy.toml")).unwrap(), original);
     #[cfg(unix)]
     {
@@ -509,9 +594,8 @@ fn cli_defaults_to_yaml_directory_and_stdin_to_working_directory() {
     fs::write(&input, "rules: ['MATCH,DIRECT']\n").unwrap();
     let binary = env!("CARGO_BIN_EXE_astra-convert");
     let clear = |path: &std::path::Path| {
-        for name in ["proxy.toml", "rule.toml"] {
-            fs::remove_file(path.join(name)).unwrap();
-        }
+        fs::remove_file(path.join("proxy.toml")).unwrap();
+        assert!(!path.join("rule.toml").exists());
     };
     let result = Command::new(binary)
         .current_dir(&work)
@@ -536,7 +620,8 @@ fn cli_defaults_to_yaml_directory_and_stdin_to_working_directory() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(source.join("proxy.toml").exists() && source.join("rule.toml").exists());
+        assert!(source.join("proxy.toml").exists());
+        assert!(!source.join("rule.toml").exists());
         assert!(!work.join("proxy.toml").exists() && !work.join("converted").exists());
         clear(&source);
     }

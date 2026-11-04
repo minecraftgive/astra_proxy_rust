@@ -569,6 +569,11 @@ impl Ui {
             left = cut + "…";
         }
         let pad = room.saturating_sub(Line::from(left.as_str()).width());
+        let color = if self.animations.marquee().status {
+            animation::STATUS_MARK
+        } else {
+            color
+        };
         let mut spans = vec![
             Span::styled(left, Style::default().fg(color)),
             Span::raw(" ".repeat(pad)),

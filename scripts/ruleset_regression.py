@@ -90,7 +90,7 @@ rules:
   - GEOIP,CN,REJECT,no-resolve
   - MATCH,REJECT
 ''', encoding='utf-8')
-        run([str(binaries / executable('astra-convert')), str(yaml), '--strict', '--rule-socket', str(route), '-o', str(output)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(yaml), '--include-config', '--strict', '--rule-socket', str(route), '-o', str(output)], check=True, capture_output=True, timeout=10)
         assert state['requests'] == 0, 'converter must remain offline'
         rules = output / 'rule.toml'
         rules.write_text('watch_config=true\n' + rules.read_text(encoding='utf-8'), encoding='utf-8')
@@ -182,7 +182,7 @@ rules:
         ip_yaml.write_text(f"geodata-mode: true\ngeox-url: {{geoip: 'http://127.0.0.1:{provider_server.server_address[1]}/geoip'}}\nrule-providers: {{ips: {{type: inline, behavior: classical, payload: ['GEOIP,telegram,no-resolve']}}}}\nrules: ['RULE-SET,ips,REJECT,no-resolve','MATCH,DIRECT']\n", encoding='utf-8')
         ip_output = root / 'ip-converted'
         before = state['requests']
-        run([str(binaries / executable('astra-convert')), str(ip_yaml), '--strict', '--rule-socket', str(route), '-o', str(ip_output)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(ip_yaml), '--include-config', '--strict', '--rule-socket', str(route), '-o', str(ip_output)], check=True, capture_output=True, timeout=10)
         assert state['requests'] == before, 'GeoIP conversion must remain offline'
         ip_config = ip_output / 'rule.toml'
         ip_config.write_text('geoip_interval=1\n' + ip_config.read_text(encoding='utf-8'), encoding='utf-8')
@@ -235,7 +235,7 @@ rules:
         site_yaml = source / 'site.yaml'
         site_yaml.write_text("rule-providers: {sites: {type: inline, behavior: classical, payload: ['GEOSITE,test@!cn']}}\nrules: ['RULE-SET,sites,REJECT','MATCH,DIRECT']\n", encoding='utf-8')
         site_output = root / 'site-converted'
-        run([str(binaries / executable('astra-convert')), str(site_yaml), '--strict', '--geosite-db', str(site_source), '--rule-socket', str(route), '-o', str(site_output)], check=True, capture_output=True, timeout=10)
+        run([str(binaries / executable('astra-convert')), str(site_yaml), '--include-config', '--strict', '--geosite-db', str(site_source), '--rule-socket', str(route), '-o', str(site_output)], check=True, capture_output=True, timeout=10)
         result = run([str(binaries / executable('astra-rule')), '--switch', str(children[0][1]), str(site_output / 'rule.toml')], capture_output=True, timeout=10)
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         assert status('localhost') == 2

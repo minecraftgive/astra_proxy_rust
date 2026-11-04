@@ -20,18 +20,31 @@ fn mihomo_dns_and_fake_ip_convert_to_valid_native_settings() {
         .any(|warning| warning.contains("忽略顶层配置 dns")));
 }
 #[test]
-fn subscription_imports_dns_once_and_preserves_local_changes() {
-    let converted = convert_nodes(INPUT, &Options::default(), "test", false).unwrap();
-    let mut ownership = Subscription::default();
-    let merged = merge("", &converted.proxy, &mut ownership).unwrap();
-    let document: toml::Table = toml::from_str(&merged).unwrap();
-    assert_eq!(document["dns"]["fake_ip"].as_bool(), Some(true));
-    assert!(
-        document["dns"].get("listen").is_none(),
-        "a subscription must not choose where local DNS listens"
-    );
-    let changed = merged.replace("fake_ip = true", "fake_ip = false");
-    let merged = merge(&changed, &converted.proxy, &mut ownership).unwrap();
-    let document: toml::Table = toml::from_str(&merged).unwrap();
-    assert_eq!(document["dns"]["fake_ip"].as_bool(), Some(false));
+fn subscription_never_imports_dns_even_when_importing_groups() {
+    let input = format!("{INPUT}proxy-groups: [{{name: remote, type: select, proxies: [node]}}]\n");
+    for import_groups in [false, true] {
+        let converted = convert_nodes(&input, &Options::default(), "test", import_groups).unwrap();
+        let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
+        assert_eq!(converted.nodes, 1);
+        assert!(document.get("dns").is_none());
+        assert_eq!(
+            document["proxy_groups"].get("remote").is_some(),
+            import_groups
+        );
+
+        // Updating from an already converted full document is also restricted.
+        let full = convert(&input, &Options::default()).unwrap();
+        let mut ownership = Subscription {
+            import_groups,
+            ..Default::default()
+        };
+        let merged = merge("", &full.proxy, &mut ownership).unwrap();
+        let document: toml::Table = toml::from_str(&merged).unwrap();
+        assert!(document.get("dns").is_none());
+        let changed = format!("{merged}\n[dns]\nenable=true\nlisten=['127.0.0.1:2053']\nfake_ip=false\nnameserver=['9.9.9.9']\n");
+        let before: toml::Table = toml::from_str(&changed).unwrap();
+        let merged = merge(&changed, &full.proxy, &mut ownership).unwrap();
+        let after: toml::Table = toml::from_str(&merged).unwrap();
+        assert_eq!(after["dns"], before["dns"]);
+    }
 }

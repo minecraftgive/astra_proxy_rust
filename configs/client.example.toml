@@ -104,7 +104,10 @@ decision_cache_ttl_secs = 5
 # ./target/release/astra-proxy --switch /tmp/astra-proxy-control.sock /absolute/path/to/other-proxy.toml
 # --switch 成功后记住新路径，之后的 SIGHUP/文件监测针对新文件；相对 CA 路径相对新配置所在目录。
 # 每个 core 使用不同 ASTRA_CONTROL_SOCKET；不要给同时启动双 core 的 Python 启动器统一设置同一个值。
-# 系统代理异常退出恢复：确认旧 core 停止后执行：
+# 异常退出自动恢复网络设置为实验性功能，默认关闭（不写恢复记录）；开启需重启 core：
+# [experimental]
+# network_recovery = true
+# 开启后系统代理异常退出恢复：确认旧 core 停止后执行：
 # ./target/release/astra-proxy --restore-system-proxy /absolute/path/to/example_proxy.system-proxy-state.toml
 # 无管理 socket 时恢复文件在初始配置旁；有管理 socket 时在 socket 旁，将扩展名替换为 .system-proxy-state.toml。
 # 正常恢复会删除文件，失败保留供重试；不要直接删除尚未恢复的文件。
@@ -1639,7 +1642,7 @@ include_all = true
 # [subscription]
 # url = "https://example.com/clash"
 # interval = 3600
-# user_agent = "clash.meta/astra"
+# user_agent = "mihomo/1.19.0"
 # import_groups = false
 # 核心自动维护下载节点缓存；已有手动节点保留。
 

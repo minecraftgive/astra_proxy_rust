@@ -7,8 +7,24 @@ pub use export::export_node;
 use serde_yaml::{Mapping, Value as Y};
 use std::collections::BTreeMap;
 
+fn normalize_input(input: &str) -> &str {
+    let trim = |c: char| c.is_whitespace() || c == '\u{feff}';
+    let input = input.trim_matches(trim);
+    for (open, close) in [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
+        if let Some(inner) = input.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+            // Unwrap a whole pasted batch, but leave individually quoted lines
+            // for the per-line pass. Never alter quotes encoded inside a URI.
+            if !inner.contains([open, close]) {
+                return inner.trim_matches(trim);
+            }
+        }
+    }
+    input
+}
+
 fn direct_share(input: &str) -> bool {
-    let input = input.trim();
+    let input = normalize_input(input);
+    let input = normalize_input(input.lines().next().unwrap_or_default());
     [
         "vless://",
         "vmess://",
@@ -24,6 +40,7 @@ fn direct_share(input: &str) -> bool {
     .any(|scheme| input.starts_with(scheme))
 }
 pub fn is_share(input: &str) -> bool {
+    let input = normalize_input(input);
     direct_share(input)
         || (input.len() <= 8 * 1024 * 1024
             && !input.contains("://")
@@ -40,16 +57,18 @@ fn put(map: &mut Mapping, key: &str, value: impl Into<String>) {
 }
 pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
     ensure!(input.len() <= 8 * 1024 * 1024, "share input exceeds 8 MiB");
+    let input = normalize_input(input);
     let decoded;
     let input = if !direct_share(input) && !input.contains("://") {
         decoded = other::unbase(input)?;
-        decoded.as_str()
+        normalize_input(&decoded)
     } else {
         input
     };
     let mut nodes = vec![];
+    let mut spider_fallback = false;
     for (line, value) in input.lines().enumerate() {
-        let value = value.trim();
+        let value = normalize_input(value);
         if value.is_empty() {
             continue;
         }
@@ -98,6 +117,8 @@ pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
                 "mode",
                 "serviceName",
                 "allowInsecure",
+                "headerType",
+                "spx",
             ];
             ensure!(
                 query.keys().all(|k| allowed.contains(&k.as_str())),
@@ -107,6 +128,10 @@ pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
                 query.get(key).cloned().unwrap_or_else(|| default.into())
             };
             ensure!(
+                matches!(param("headerType", "none").as_str(), "" | "none"),
+                "VLESS header obfuscation is not supported"
+            );
+            ensure!(
                 matches!(param("allowInsecure", "0").as_str(), "0" | "false"),
                 "insecure TLS share links are not supported"
             );
@@ -115,6 +140,17 @@ pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
                 matches!(security.as_str(), "none" | "tls" | "reality"),
                 "unsupported VLESS security"
             );
+            if let Some(spx) = query.get("spx") {
+                ensure!(security == "reality", "spx requires security=reality");
+                ensure!(
+                    matches!(spx.as_str(), "" | "/"),
+                    "custom REALITY spider paths are not supported"
+                );
+                // The native REALITY handshake has no HTTP spider fallback.
+                // Accept the default path exported by clients, without mapping
+                // it to transport.path (which has a different meaning).
+                spider_fallback |= !spx.is_empty();
+            }
             ensure!(
                 security != "none"
                     || !query.keys().any(|k| matches!(
@@ -210,13 +246,19 @@ pub fn convert_links(input: &str, options: &Options) -> Result<Converted> {
         ensure!(nodes.len() <= 4096, "too many share links");
     }
     ensure!(!nodes.is_empty(), "no share links");
+    let expected_nodes = nodes.len();
     let mut root = Mapping::new();
     root.insert(Y::String("proxies".into()), Y::Sequence(nodes));
     let mut converted = convert(&serde_yaml::to_string(&root)?, options)?;
     ensure!(
-        converted.nodes == input.lines().filter(|v| !v.trim().is_empty()).count(),
+        converted.nodes == expected_nodes,
         "share link contains an unsupported or invalid node"
     );
     converted.warnings.clear();
+    if spider_fallback {
+        converted
+            .warnings
+            .push("已导入 REALITY 节点；默认 spx=/ 未应用，当前内核不支持 HTTP spider 回退".into());
+    }
     Ok(converted)
 }

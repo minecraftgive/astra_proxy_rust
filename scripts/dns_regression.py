@@ -116,7 +116,7 @@ def main():
             yaml = directory/'input.yaml'
             yaml.write_text('proxies:\n  - {name: node, type: socks5, server: 127.0.0.1, port: 9}\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [tls://1.1.1.1]\n', encoding='utf-8')
             output = directory/'imported'
-            subprocess.run([str(binaries/executable('astra-convert')), str(yaml), '-o', str(output)], check=True, capture_output=True)
+            subprocess.run([str(binaries/executable('astra-convert')), str(yaml), '--include-config', '-o', str(output)], check=True, capture_output=True)
             imported = output/'proxy.toml'
             assert tomllib.loads(imported.read_text(encoding='utf-8'))['dns']['fake_ip'] is True
             subprocess.run([str(core), '--check', str(imported)], check=True, capture_output=True)

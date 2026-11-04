@@ -334,6 +334,15 @@ async fn live_stopped_subscription_update_keeps_manager_responsive() {
     drop((push, log));
 
     assert!(update.await.unwrap().unwrap().text.contains("Updated 1"));
+    let refresh_log = fs::read_to_string(socket.parent().unwrap().join("proxy.log")).unwrap();
+    for expected in [
+        "subscription update started",
+        "subscription converted",
+        "nodes=1",
+        "subscription refresh finished; node cache saved",
+    ] {
+        assert!(refresh_log.contains(expected), "{refresh_log}");
+    }
     let nodes = call(&socket, Action::SubscriptionNodes("proxy".into()))
         .await
         .unwrap();

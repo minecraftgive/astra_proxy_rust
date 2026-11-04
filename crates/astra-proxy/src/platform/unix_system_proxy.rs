@@ -330,44 +330,55 @@ impl Guard {
             changes: changes.clone(),
             checks: checks.clone(),
         };
-        let text = toml::to_string(&snapshot)?;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(journal)
-            .with_context(|| format!("system proxy recovery file exists or cannot be created: {}; restore it using --restore-system-proxy before starting", journal.display()))?;
-        if let Err(error) = astra_platform::platform::adopt_owner(journal) {
-            let _ = std::fs::remove_file(journal);
-            return Err(anyhow::Error::new(error)
-                .context("hand the system proxy journal to the invoking user"));
-        }
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        astra_platform::storage::sync_directory(
-            journal.parent().context("proxy snapshot directory")?,
-        )?;
-        let lease = super::network_recovery::Lease::prepare(
-            super::network_recovery::Resource::SystemProxy {
-                path: std::fs::canonicalize(journal)?,
-                snapshot: Some(snapshot.clone()),
-            },
-        )?;
+        // Crash recovery is experimental: without it the restore plan stays in
+        // memory only and an abrupt core exit leaves the settings as applied.
+        let recording = super::network_recovery::enabled();
+        let lease = if recording {
+            let text = toml::to_string(&snapshot)?;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(journal)
+                .with_context(|| format!("system proxy recovery file exists or cannot be created: {}; restore it using --restore-system-proxy before starting", journal.display()))?;
+            if let Err(error) = astra_platform::platform::adopt_owner(journal) {
+                let _ = std::fs::remove_file(journal);
+                return Err(anyhow::Error::new(error)
+                    .context("hand the system proxy journal to the invoking user"));
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            astra_platform::storage::sync_directory(
+                journal.parent().context("proxy snapshot directory")?,
+            )?;
+            Some(super::network_recovery::Lease::prepare(
+                super::network_recovery::Resource::SystemProxy {
+                    path: std::fs::canonicalize(journal)?,
+                    snapshot: Some(snapshot.clone()),
+                },
+            )?)
+        } else {
+            None
+        };
         let mut lock = lock;
         lock.set_len(0)?;
-        lock.write_all(
-            std::fs::canonicalize(journal)?
-                .as_os_str()
-                .as_encoded_bytes(),
-        )?;
+        if recording {
+            lock.write_all(
+                std::fs::canonicalize(journal)?
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )?;
+        }
         lock.sync_all()?;
         let guard = Self {
             changes,
-            journal: Some(journal.to_owned()),
+            journal: recording.then(|| journal.to_owned()),
             checks,
-            lease: Some(lease),
+            lease,
             lock: Some(lock),
         };
         for change in &guard.changes {
             command(&change.apply)?;
         }
-        guard.lease.as_ref().unwrap().commit()?;
+        if let Some(lease) = &guard.lease {
+            lease.commit()?;
+        }
         Ok(guard)
     }
     pub fn restore(&mut self) -> Result<()> {

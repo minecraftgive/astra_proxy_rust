@@ -474,6 +474,8 @@ struct Ui {
     preferences_path: Option<PathBuf>,
     settings_cursor: usize,
     settings_view: settings::View,
+    /// Ctrl+Home held on the accent setting: (first press, latest press, done).
+    marquee_hold: Option<(Instant, Instant, bool)>,
     program_info: background::ProgramInformation,
     /// Mouse capture change for the event loop, which owns the terminal.
     mouse_request: Option<bool>,
@@ -632,6 +634,7 @@ impl Ui {
             preferences_path: None,
             settings_cursor: 0,
             settings_view: Default::default(),
+            marquee_hold: None,
             program_info: Default::default(),
             mouse_request: None,
         }
@@ -1259,6 +1262,9 @@ impl Ui {
             if !navigation && !text && !commands::repeatable(key) {
                 return Input::Idle;
             }
+        }
+        if let Some(input) = self.marquee_hold_key(key) {
+            return input;
         }
         if self.keymap_notice_pending
             && matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::F(1))

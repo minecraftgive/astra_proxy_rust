@@ -122,9 +122,14 @@ pub(super) async fn run_local(
         }
         let animated = ui.animations.active();
         let spinner = ui.tasks.running() && ui.animations.mode() == animation::MotionMode::Normal;
-        let scheduled = redraw || animated || spinner;
+        let marquee = ui.animations.marquee_running();
+        let scheduled = redraw || animated || spinner || marquee;
         let frame_time = if redraw || animated {
             ui.animations.frame_interval()
+        } else if marquee {
+            ui.animations
+                .frame_interval()
+                .max(Duration::from_millis(50))
         } else {
             Duration::from_millis(80)
         };
@@ -184,6 +189,10 @@ pub(super) async fn run_local(
                 Input::Idle
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => ui.key(key),
+            Event::Key(key) => {
+                ui.key_release(key);
+                Input::Idle
+            }
             Event::Mouse(mouse) => ui.mouse(mouse),
             Event::Resize(..) => {
                 ui.animations.resize();

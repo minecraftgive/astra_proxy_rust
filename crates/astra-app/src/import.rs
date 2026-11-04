@@ -47,7 +47,9 @@ pub fn links(input: &str, kind: Kind, current: &str) -> Result<Imported> {
     ensure!(input.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
     let converted = astra_convert::share::convert_links(input, &Default::default())?;
     let imported: toml_edit::DocumentMut = converted.proxy.parse()?;
-    append_nodes(imported, current)
+    let mut imported = append_nodes(imported, current)?;
+    imported.warnings = converted.warnings;
+    Ok(imported)
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -992,6 +994,66 @@ pub(crate) mod tests {
         let node = &toml::from_str::<toml::Value>(&merged.text).unwrap()["outbounds"][0];
         assert_eq!(node["tag"].as_str(), Some("second"));
         assert_eq!(node["config"]["transport"]["path"].as_str(), Some("/hello"));
+    }
+
+    #[test]
+    fn quoted_reality_batch_candidates_and_selected_merge_preserve_native_fields() {
+        const PUBLIC_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+        let lines = [
+            "%F0%9F%8C%8F%20%E9%A6%99%E6%B8%AF",
+            "%F0%9F%9A%80%20%E6%97%A5%E6%9C%AC",
+            "%F0%9F%8C%9F%20%E6%96%B0%E5%8A%A0%E5%9D%A1",
+        ].iter().enumerate().map(|(index, label)| {
+            let number = index + 1;
+            format!("vless://00000000-0000-4000-8000-00000000000{number}@edge{number}.example.invalid:443?encryption=none&headerType=&spx=%2F&fp=chrome&type=tcp&flow=xtls-rprx-vision&security=reality&sni=front.example.invalid&sid=abcd&pbk={PUBLIC_KEY}#{label}")
+        }).collect::<Vec<_>>().join("\n");
+        let current = "# keep draft\nstandalone=true\nsocks5_listen='127.0.0.1:1080'\n";
+        for quote in ['"', '\''] {
+            let batch = format!("{quote}{lines}{quote}");
+            assert!(astra_convert::share::is_share(&batch));
+            let candidates = node_candidates_at(&batch, Path::new(".")).unwrap();
+            assert_eq!(candidates.tags, ["🌏 香港", "🚀 日本", "🌟 新加坡"]);
+            assert_eq!(
+                links(&batch, Kind::Proxy, current).unwrap().warnings,
+                candidates.warnings
+            );
+            let imported =
+                merge_selected_nodes(current, &candidates, &[2, 0], MergeMode::Append).unwrap();
+            assert!(imported.text.contains("# keep draft"));
+            let document: toml::Value = toml::from_str(&imported.text).unwrap();
+            assert_eq!(document["socks5_listen"].as_str(), Some("127.0.0.1:1080"));
+            let nodes = document["outbounds"].as_array().unwrap();
+            assert_eq!(nodes.len(), 2);
+            for (node, number, label) in [(&nodes[0], 1, "🌏 香港"), (&nodes[1], 3, "🌟 新加坡")]
+            {
+                assert_eq!(node["tag"].as_str(), Some(label));
+                assert_eq!(node["kind"].as_str(), Some("native"));
+                let config = &node["config"];
+                assert_eq!(config["protocol"].as_str(), Some("vless"));
+                assert_eq!(
+                    config["server"].as_str(),
+                    Some(format!("edge{number}.example.invalid").as_str())
+                );
+                assert_eq!(config["port"].as_integer(), Some(443));
+                assert_eq!(
+                    config["uuid"].as_str(),
+                    Some(format!("00000000-0000-4000-8000-00000000000{number}").as_str())
+                );
+                assert_eq!(config["encryption"].as_str(), Some("none"));
+                assert_eq!(config["flow"].as_str(), Some("xtls-rprx-vision"));
+                assert_eq!(
+                    config["tls"]["server_name"].as_str(),
+                    Some("front.example.invalid")
+                );
+                assert_eq!(config["tls"]["fingerprint"].as_str(), Some("chrome"));
+                assert_eq!(
+                    config["tls"]["reality_public_key"].as_str(),
+                    Some(PUBLIC_KEY)
+                );
+                assert_eq!(config["tls"]["reality_short_id"].as_str(), Some("abcd"));
+                assert!(config.get("transport").is_none());
+            }
+        }
     }
 
     #[test]

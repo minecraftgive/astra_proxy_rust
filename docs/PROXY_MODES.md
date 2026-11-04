@@ -44,7 +44,7 @@ Windows 通过 WinINet per-connection API 管理当前用户的 LAN HTTP/HTTPS �
 
 Windows 每个账户只允许一个 Astra 实例管理系统代理。跨进程独占锁与待恢复文件位置记在 `%LOCALAPPDATA%/.astra/system-proxy.lock`；新版本通过恢复助手及持久化网络记录处理崩溃，旧版记录或恢复冲突会指出需要处理的文件，不能用另一配置覆盖原快照。恢复命令必须以原来的用户身份执行；UAC 提升应使用同一个账户。TUI 状态目录中的恢复文件持续保留；Python 启动器在 `%LOCALAPPDATA%/.astra/launchers/` 保存控制端点，恢复失败时保留该目录。
 
-写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则写入 `~/.astra/runtime/system-proxy/<源路径摘要>.cache`（`ASTRA_RUNTIME_DIR` 可自定义根目录）。旧配置旁若存在未恢复记录，会提示先用恢复命令处理，避免遗漏旧的系统设置快照。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
+异常退出恢复为实验性功能，默认关闭且不写恢复文件，见 [异常退出与恢复](ERROR_RECOVERY.md)。开启 `[experimental] network_recovery = true` 后，写设置前创建 0600 恢复文件：有 `ASTRA_CONTROL_SOCKET` 时在该 socket 同目录、同文件名但扩展名为 `.system-proxy-state.toml`；否则写入 `~/.astra/runtime/system-proxy/<源路径摘要>.cache`（`ASTRA_RUNTIME_DIR` 可自定义根目录）。旧配置旁若存在未恢复记录，会提示先用恢复命令处理，避免遗漏旧的系统设置快照。存在未恢复文件时拒绝覆盖。SIGKILL 或掉电后，在确认旧 core 已停止后恢复：
 
 ```sh
 ./target/<本机 Rust target>/release/astra-proxy --restore-system-proxy /absolute/path/to/modes.system-proxy-state.toml

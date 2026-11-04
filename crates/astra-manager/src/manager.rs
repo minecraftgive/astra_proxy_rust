@@ -285,6 +285,7 @@ async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
 
 struct DiagnosticPlan {
     runtime_dir: PathBuf,
+    log_path: PathBuf,
     executable: PathBuf,
     config_path: PathBuf,
     text: String,
@@ -394,9 +395,23 @@ impl DiagnosticPlan {
             let payload = if selected {
                 serde_json::to_vec(&astra_model::diagnostics::Request { config: self.text, targets, list_targets: list })?
             } else { self.text.into_bytes() };
+            // A stopped core has no inherited instance log. Redirect stderr
+            // directly so progress remains visible even if the job times out.
+            let refresh_log = if refresh {
+                match OpenOptions::new().create(true).append(true).mode(0o600).open(&self.log_path) {
+                    Ok(log) => Some(log),
+                    Err(error) => {
+                        eprintln!("Subscription refresh log could not be opened: {error}");
+                        None
+                    }
+                }
+            } else { None };
+            let redirected = refresh_log.is_some();
             let mut child = core_process(self.executable, &self.runtime_dir)
                 .arg(if refresh { "--refresh-subscriptions-stdin" } else if selected { "--diagnose-request" } else { "--diagnose-stdin" }).arg(self.config_path)
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+                .stdin(Stdio::piped()).stdout(Stdio::piped())
+                .stderr(refresh_log.map(Stdio::from).unwrap_or_else(Stdio::piped))
+                .kill_on_drop(true).spawn()?;
             let mut input = child.stdin.take().context("Missing diagnostic input")?;
             input.write_all(&payload).await?;
             drop(input);
@@ -404,10 +419,9 @@ impl DiagnosticPlan {
             anyhow::ensure!(
                 output.status.success(),
                 "Diagnostic core failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(4096)
-                    .collect::<String>()
+                if redirected { log_tail(&self.log_path, 4096) } else {
+                    String::from_utf8_lossy(&output.stderr[output.stderr.len().saturating_sub(4096)..]).into_owned()
+                }
             );
             anyhow::ensure!(
                 output.stdout.len() < 900 * 1024,
@@ -610,6 +624,7 @@ impl Manager {
         let running = self.running.get(name);
         Ok(DiagnosticPlan {
             runtime_dir: self.runtime_dir.clone(),
+            log_path: self.log(name),
             executable: self.bin.join(Kind::Proxy.binary()),
             config_path: running
                 .map(|r| r.config_path.clone())

@@ -16,9 +16,10 @@ pub(crate) async fn download(
     proxy: &str,
 ) -> Result<String> {
     use anyhow::Context;
+    use astra_convert::subscription::{diagnostics, http as subscription_http};
     use http_body_util::{BodyExt, Empty};
     use hyper_util::rt::TokioIo;
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
     use tokio_rustls::{
         rustls::{self, pki_types::ServerName, RootCertStore},
         TlsConnector,
@@ -30,11 +31,17 @@ pub(crate) async fn download(
         }
     }
     let phase = std::sync::atomic::AtomicUsize::new(0);
+    let received = std::sync::atomic::AtomicUsize::new(0);
     use std::sync::atomic::Ordering;
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let started = std::time::Instant::now();
+    tokio::time::timeout(subscription_http::TIMEOUT, async {
         let mut url = url::Url::parse(url)?;
-        for redirect in 0..=3 {
+        for redirect in 0..=subscription_http::MAX_REDIRECTS {
             astra_convert::subscription::validate_url(url.as_str())?;
+            let endpoint = diagnostics::endpoint(url.as_str());
+            tracing::info!(%endpoint, proxy, user_agent, redirect,
+                timeout_secs = subscription_http::TIMEOUT.as_secs(),
+                "subscription HTTP request started");
             let host = url
                 .host_str()
                 .context("subscription host missing")?
@@ -46,6 +53,7 @@ pub(crate) async fn download(
                     .context("subscription port missing")?,
             };
             phase.store(0, Ordering::Relaxed);
+            received.store(0, Ordering::Relaxed);
             let mut connection = app
                 .connect(&target, &astra_model::RouteAction::Proxy(proxy.into()))
                 .await
@@ -55,6 +63,8 @@ pub(crate) async fn download(
                         target.port
                     )
                 })?;
+            tracing::info!(%endpoint, proxy, elapsed_ms = started.elapsed().as_millis() as u64,
+                "subscription server connected (DNS/TCP/egress)");
             if url.scheme() == "https" {
                 phase.store(1, Ordering::Relaxed);
                 let mut roots = RootCertStore::empty();
@@ -71,6 +81,8 @@ pub(crate) async fn download(
                         .await
                         .context("subscription TLS handshake/certificate validation")?,
                 );
+                tracing::info!(%endpoint, elapsed_ms = started.elapsed().as_millis() as u64,
+                    "subscription TLS handshake completed");
             }
             phase.store(2, Ordering::Relaxed);
             let uri: http::Uri = url.as_str().parse()?;
@@ -93,13 +105,25 @@ pub(crate) async fn download(
                                 .as_str(),
                         )
                         .header("User-Agent", user_agent)
+                        .header("Accept", "*/*")
+                        .header("Accept-Encoding", subscription_http::ACCEPT_ENCODING)
                         .header("Connection", "close")
                         .body(Empty::<bytes::Bytes>::new())?,
                 )
                 .await
                 .context("send subscription HTTP request/read response headers")?;
+            let encoding = response.headers().get("Content-Encoding")
+                .map(|value| value.to_str()).transpose().context("invalid Content-Encoding header")?
+                .unwrap_or("identity").to_owned();
+            let content_type = response.headers().get("Content-Type")
+                .and_then(|value| value.to_str().ok()).unwrap_or("unknown");
+            tracing::info!(%endpoint, status = response.status().as_u16(),
+                content_type = %diagnostics::error(&anyhow::anyhow!(content_type.to_owned())),
+                content_encoding = %diagnostics::error(&anyhow::anyhow!(encoding.clone())),
+                content_length = ?response.headers().get("Content-Length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()),
+                elapsed_ms = started.elapsed().as_millis() as u64, "subscription HTTP response received");
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-                ensure!(redirect < 3, "too many subscription redirects");
+                ensure!(redirect < subscription_http::MAX_REDIRECTS, "too many subscription redirects (limit 10)");
                 let next = url.join(
                     response
                         .headers()
@@ -108,6 +132,8 @@ pub(crate) async fn download(
                         .to_str()?,
                 )?;
                 astra_convert::subscription::validate_redirect(url.as_str(), next.as_str())?;
+                tracing::info!(%endpoint, next_endpoint = %diagnostics::endpoint(next.as_str()), redirect = redirect + 1,
+                    "subscription HTTP redirect");
                 url = next;
                 continue;
             }
@@ -121,7 +147,7 @@ pub(crate) async fn download(
             let mut data = Vec::new();
             while let Some(frame) = body.frame().await {
                 if let Ok(chunk) = frame
-                    .context("read subscription response body")?
+                    .with_context(|| format!("read subscription response body (received {} bytes)", data.len()))?
                     .into_data()
                 {
                     ensure!(
@@ -129,22 +155,28 @@ pub(crate) async fn download(
                         "subscription exceeds 8 MiB"
                     );
                     data.extend_from_slice(&chunk);
+                    received.store(data.len(), Ordering::Relaxed);
                 }
             }
-            return String::from_utf8(data).context("subscription must be UTF-8 YAML");
+            let wire_bytes = data.len();
+            let text = subscription_http::decode(data.as_slice(), &encoding)?;
+            tracing::info!(%endpoint, wire_bytes, bytes = text.len(), redirects = redirect,
+                elapsed_ms = started.elapsed().as_millis() as u64, "subscription download completed");
+            return Ok(text);
         }
         unreachable!()
     })
     .await
     .with_context(|| {
         format!(
-            "subscription download timed out after 20s during {}",
+            "subscription download timed out after 30s during {} (received {} bytes)",
             [
                 "DNS/TCP/egress connect",
                 "TLS handshake",
                 "HTTP response headers",
                 "response body"
-            ][phase.load(Ordering::Relaxed)]
+            ][phase.load(Ordering::Relaxed)],
+            received.load(Ordering::Relaxed)
         )
     })?
 }
@@ -239,9 +271,15 @@ pub(crate) fn cached_app(config: &Path, original: App) -> App {
 /// Refresh a stopped instance without starting listeners or changing OS settings.
 pub(crate) async fn refresh_once(config: &Path, original: App) -> Result<String> {
     use anyhow::Context;
+    let started = std::time::Instant::now();
     let base = original.source_text.clone();
     let sources = original.config.subscription_sources();
     ensure!(!sources.is_empty(), "No subscriptions configured");
+    tracing::info!(
+        subscriptions = sources.len(),
+        mode = "stopped",
+        "subscription refresh started"
+    );
     let mut ownership = sources.clone();
     let mut effective = base.clone();
     if let Some(cache) = read(config, &base) {
@@ -257,19 +295,39 @@ pub(crate) async fn refresh_once(config: &Path, original: App) -> Result<String>
     let mut updated = 0;
     let mut failed = Vec::new();
     for (source, settings) in sources {
+        let source_started = std::time::Instant::now();
+        let endpoint = astra_convert::subscription::diagnostics::endpoint(&settings.url);
         let path = config.to_owned();
         let previous = effective.clone();
         let mut managed = ownership.get(&source).cloned().unwrap_or(settings.clone());
+        let previous_nodes = managed.managed_nodes.len();
+        tracing::info!(subscription = %source, %endpoint,
+            proxy = %settings.proxy, import_groups = settings.import_groups,
+            previous_nodes, "subscription update started");
         let name = source.clone();
         let app = std::sync::Arc::new(App::from_text(config, previous.clone())?);
         let runtime = tokio::runtime::Handle::current();
+        let span = tracing::info_span!("subscription_update", subscription = %source);
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
+            let _entered = span.enter();
             let converted = astra_convert::subscription::fetch_with(
                 &settings,
                 path.parent().context("config has no parent")?,
                 &|url, agent| runtime.block_on(download(&app, url, agent, &settings.proxy)),
             )
             .context("fetch subscription nodes")?;
+            tracing::info!(subscription = %name, nodes = converted.nodes,
+                warnings = converted.warnings.len(), "subscription converted");
+            for warning in converted.warnings.iter().take(50) {
+                tracing::warn!(subscription = %name,
+                    detail = %astra_convert::subscription::diagnostics::error(&anyhow::anyhow!(warning.clone())),
+                    "subscription conversion warning");
+            }
+            if converted.warnings.len() > 50 {
+                tracing::warn!(subscription = %name,
+                    omitted = converted.warnings.len() - 50,
+                    "additional subscription conversion warnings omitted");
+            }
             let text = astra_convert::subscription::merge_named(
                 &previous,
                 &converted.proxy,
@@ -281,17 +339,27 @@ pub(crate) async fn refresh_once(config: &Path, original: App) -> Result<String>
                 .context("validate merged subscription configuration")?;
             Ok((text, managed))
         })
-        .await?;
+        .await
+        .context("subscription refresh worker failed")
+        .and_then(|result| result);
         match result {
             Ok((text, managed)) => {
+                tracing::info!(subscription = %source, %endpoint, previous_nodes,
+                    nodes = managed.managed_nodes.len(), groups = managed.managed_groups.len(),
+                    elapsed_ms = source_started.elapsed().as_millis() as u64,
+                    "subscription validated; awaiting cache save");
                 effective = text;
                 ownership.insert(source, managed);
                 updated += 1;
             }
-            Err(error) => failed.push(format!(
-                "{source}: {}",
-                astra_convert::subscription::diagnostics::error(&error)
-            )),
+            Err(error) => {
+                let detail = astra_convert::subscription::diagnostics::error(&error);
+                tracing::warn!(subscription = %source, %endpoint, previous_nodes,
+                    elapsed_ms = source_started.elapsed().as_millis() as u64,
+                    error = %detail,
+                    "subscription download or validation failed; previous nodes retained");
+                failed.push(format!("{source}: {detail}"));
+            }
         }
     }
     ensure!(
@@ -307,7 +375,17 @@ pub(crate) async fn refresh_once(config: &Path, original: App) -> Result<String>
             ownership: ownership.get("__legacy__").cloned().unwrap_or_default(),
             subscriptions: ownership,
         },
-    )?;
+    )
+    .inspect_err(|error| {
+        tracing::warn!(updated, error = %astra_convert::subscription::diagnostics::error(error),
+            "subscription cache save failed; previous cached nodes retained");
+    })?;
+    tracing::info!(
+        updated,
+        failed = failed.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "subscription refresh finished; node cache saved"
+    );
     if failed.is_empty() {
         Ok(format!("Updated {updated} subscriptions"))
     } else {
@@ -335,6 +413,54 @@ pub(crate) fn save(config: &Path, cache: &Cache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn mihomo_download_follows_long_redirect_chain_and_decodes_gzip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for hop in 0..=5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                assert!(request.starts_with(&format!("get /{hop}?token=private ")));
+                assert!(request.contains("user-agent: mihomo/1.19.0\r\n"));
+                assert!(request.contains("accept: */*\r\n"));
+                assert!(request.contains("accept-encoding: gzip, deflate\r\n"));
+                if hop < 5 {
+                    stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: /{}?token=private\r\nContent-Length: 0\r\n\r\n", hop + 1).as_bytes()).await.unwrap();
+                } else {
+                    let data = [
+                        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 203, 203, 79, 73, 45, 6, 0, 252, 5, 61,
+                        29, 5, 0, 0, 0,
+                    ];
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", data.len()).as_bytes()).await.unwrap();
+                    stream.write_all(&data).await.unwrap();
+                }
+            }
+        });
+        let app = App::from_text(
+            Path::new("gzip-download.toml"),
+            "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:9'\n".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            download(
+                &app,
+                &format!("http://{address}/0?token=private"),
+                &Subscription::default().user_agent,
+                "DIRECT"
+            )
+            .await
+            .unwrap(),
+            "nodes"
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn download_uses_selected_proxy_group_and_rejects_missing_groups() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

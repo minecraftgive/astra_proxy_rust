@@ -477,7 +477,7 @@ pub fn rows(
         vec![
             text("url", t("Subscription URL"), "", true),
             number("interval", t("Update interval (seconds)"), 3600, 60, 604800),
-            text("user_agent", "User-Agent", "clash.meta/astra", false),
+            text("user_agent", "User-Agent", "mihomo/1.19.0", false),
             text(
                 "proxy",
                 t("Update proxy (group / node / DIRECT)"),

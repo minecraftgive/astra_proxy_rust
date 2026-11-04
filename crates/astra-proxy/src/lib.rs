@@ -758,6 +758,13 @@ pub async fn run() -> Result<()> {
             App::load(&path)?
         };
         if first.as_deref() == Some("--refresh-subscriptions-stdin") {
+            // stdout is the management reply; diagnostics belong on stderr.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .try_init()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             println!("{}", subscription::refresh_once(&path, app).await?);
             return Ok(());
         }

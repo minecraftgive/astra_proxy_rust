@@ -89,17 +89,17 @@ VLESS Encryption、Vision 与 XHTTP 的配置字段见 [原生协议说明](docs
 
 ### 转换 Mihomo 配置
 
-独立原生 Rust 工具 `astra-convert` 可将 mihomo YAML 转为 Astra 的代理与规则 TOML，不支持的配置项会跳过并输出提示，无需运行 mihomo 或 Python：
+独立原生 Rust 工具 `astra-convert` 默认只提取 mihomo YAML 或订阅中的节点，输出 `proxy.toml`。需要完整代理和规则配置时显式添加 `--include-config`；不支持的配置项会跳过并输出提示，无需运行 mihomo 或 Python：
 
 ```sh
 cargo build --release -p astra-convert
-target/<本机 Rust target>/release/astra-convert your-mihomo.yaml -o converted
+target/<本机 Rust target>/release/astra-convert your-mihomo.yaml --include-config -o converted
 # 可选：--select '代理组=成员'、--check、--rule-socket /tmp/custom.sock
 target/<本机 Rust target>/release/astra-rule --check converted/rule.toml
 target/<本机 Rust target>/release/astra-proxy --check converted/proxy.toml
 ```
 
-保留 select、url-test、fallback 和轮询 load-balance 代理组，以及混合端口、入站认证和来源 CIDR 限制；未知规则会跳过。详见 [转换范围和使用说明](docs/MIHOMO_CONVERTER.md)，本地示例见 [mihomo-example.yaml](configs/mihomo-example.yaml)。
+`--include-config` 保留 select、url-test、fallback 和轮询 load-balance 代理组，以及混合端口、入站认证和来源 CIDR 限制；未知规则会跳过。默认节点模式不导入来源的组、规则、DNS 或监听设置。详见 [转换范围和使用说明](docs/MIHOMO_CONVERTER.md)，本地示例见 [mihomo-example.yaml](configs/mihomo-example.yaml)。
 
 ### Astra 配置
 
@@ -196,7 +196,7 @@ IPC 默认 8 个持久通道，每通道一条在途请求。一次决策的总�
 
 ## 资源与排障
 
-远程订阅、proxy-provider、规则集与 GeoIP/GeoSite 下载支持 HTTP(S)（URL 中不得包含账号密码）；明文 HTTP 内容可被链路篡改，建议优先使用 HTTPS。配置为 HTTPS 的地址，重定向不得降级为 HTTP。远程订阅不能引用本机 `type: file` provider，导入其 `dns` 段时不会采用其中的 `listen`。DNS 监听与代理入站使用同一套来源准入（LAN 开关、`lan_allowed_ips` / `lan_disallowed_ips`）。规则核心冷启动时直接使用已过期但有效的资源缓存，并在启动后立即于后台刷新。
+远程订阅、proxy-provider、规则集与 GeoIP/GeoSite 下载支持 HTTP(S)（URL 中不得包含账号密码）；明文 HTTP 内容可被链路篡改，建议优先使用 HTTPS。配置为 HTTPS 的地址，重定向不得降级为 HTTP。远程订阅不能引用本机 `type: file` provider；订阅更新不导入远端 DNS 设置，保留本地 DNS 配置。DNS 监听与代理入站使用同一套来源准入（LAN 开关、`lan_allowed_ips` / `lan_disallowed_ips`）。规则核心冷启动时直接使用已过期但有效的资源缓存，并在启动后立即于后台刷新。
 
 默认 `max_connections = 4096`；空闲监听器不占用会话额度。UDP 默认全局最多 512 个流、每个关联最多 32 个目标，每流发送队列 4 个包，空闲 120 秒回收。UDP 关联随 TCP 控制连接关闭，禁止 SOCKS 分片并固定客户端来源；超限丢包，不无限积压。
 
