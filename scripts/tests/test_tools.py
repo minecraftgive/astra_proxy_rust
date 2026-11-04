@@ -1,5 +1,7 @@
 """Independent infrastructure tests; no proxy settings, TUN or installed cores."""
 import ast
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -206,7 +208,8 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(violations, [])
 
     def test_runner_records_failure_and_stops(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        # Outside GitHub Actions: an expected failure must not publish an error annotation.
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {'GITHUB_ACTIONS': ''}):
             report = Path(temporary) / 'report.json'
             results = run_steps([Step('fail',[sys.executable,'-c','raise SystemExit(7)']),
                                  Step('never',[sys.executable,'-c','raise SystemExit(0)'])],
@@ -214,6 +217,20 @@ class DependencyTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]['exit_code'], 7)
             self.assertFalse(json.loads(report.read_text())['passed'])
+
+
+    def test_annotated_runner_passes_non_utf8_output_through(self):
+        # cp1252 bytes, as a Windows runner child writes them; not valid UTF-8.
+        code = r"import sys; sys.stdout.buffer.write(b'caf\xe9 panicked at x\n'); raise SystemExit(5)"
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), \
+             patch('astra_tools.runner._annotate_failure') as annotate, \
+             contextlib.redirect_stdout(io.StringIO()) as printed:
+            results = run_steps([Step('bytes', [sys.executable, '-c', code])], env=dict(os.environ))
+        self.assertEqual(results[0]['exit_code'], 5)
+        self.assertIn('caf� panicked at x', printed.getvalue())
+        name, context = annotate.call_args.args
+        self.assertEqual(name, 'bytes')
+        self.assertIn('caf� panicked at x', context)
 
 
 if __name__ == '__main__':
