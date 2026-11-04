@@ -79,6 +79,17 @@ pub fn network_color(network: &str) -> Color {
         Color::Cyan
     }
 }
+/// Newly observed connections use teal while retaining route and status colors.
+pub fn connection_row_style(selected: bool, fresh: bool) -> Style {
+    match (selected, fresh) {
+        (false, false) => Style::default(),
+        (true, false) => selected_keep_colors(),
+        (false, true) => Style::default().bg(Color::Rgb(10, 36, 32)),
+        (true, true) => Style::default()
+            .bg(Color::Rgb(16, 48, 42))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    }
+}
 /// Byte counters: idle flows fade, heavy ones stand out.
 pub fn volume_style(bytes: u64) -> Style {
     if bytes < 1024 {
@@ -92,6 +103,42 @@ pub fn volume_style(bytes: u64) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_connection_background_preserves_colored_text_and_selection() {
+        use ratatui::{
+            buffer::Buffer,
+            layout::Rect,
+            text::{Line, Span},
+            widgets::{Paragraph, Widget},
+        };
+
+        assert_eq!(connection_row_style(false, false), Style::default());
+        assert_eq!(connection_row_style(true, false), selected_keep_colors());
+        let fresh = connection_row_style(false, true);
+        let selected_fresh = connection_row_style(true, true);
+        assert_ne!(fresh.bg, selected_keep_colors().bg);
+        assert_ne!(fresh.bg, selected_fresh.bg);
+        assert!(selected_fresh.add_modifier.contains(Modifier::UNDERLINED));
+
+        let colors = [BLUE, MUTED, Color::Red, Color::Green];
+        for style in [fresh, selected_fresh] {
+            let line = Line::from(
+                colors
+                    .iter()
+                    .map(|color| Span::styled("x", Style::default().fg(*color)))
+                    .collect::<Vec<_>>(),
+            );
+            let area = Rect::new(0, 0, colors.len() as u16, 1);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(line).style(style).render(area, &mut buffer);
+            for (x, color) in colors.iter().enumerate() {
+                let cell = &buffer[(x as u16, 0)];
+                assert_eq!(cell.fg, *color);
+                assert_eq!(Some(cell.bg), style.bg);
+                assert_ne!(cell.fg, cell.bg);
+            }
+        }
+    }
     #[test]
     fn key_hints_separate_keys_from_descriptions() {
         let parts = |text: &str| -> Vec<(String, bool)> {

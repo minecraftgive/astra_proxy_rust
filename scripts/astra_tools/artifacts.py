@@ -9,7 +9,7 @@ import shutil
 import tarfile
 import tempfile
 from .platform import executable
-from .workspace import ROOT
+from .workspace import ROOT, cargo_profile as resolve_cargo_profile
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,27 @@ COMPONENT_PACKAGES = {
 }
 
 
+def role_binaries(roles):
+    return sorted({binary for role in roles for binary in ROLES[role].binaries})
+
+
 def role_packages(roles):
-    return sorted({COMPONENT_PACKAGES.get(binary, binary) for role in roles for binary in ROLES[role].binaries})
+    return sorted({COMPONENT_PACKAGES.get(binary, binary) for binary in role_binaries(roles)})
+
+
+def _build_metadata(profile, mode, cargo_profile, *, manifest=False):
+    if profile is not None:
+        resolve_cargo_profile(profile, mode)
+    if manifest and profile is not None and mode is None and cargo_profile is None:
+        raise ValueError('Build metadata requires profile, mode and cargo_profile together')
+    if mode is None and cargo_profile is None:
+        return {}
+    if mode is None or cargo_profile is None or profile is None:
+        raise ValueError('Build metadata requires profile, mode and cargo_profile together')
+    expected = resolve_cargo_profile(profile, mode)
+    if cargo_profile != expected:
+        raise ValueError(f'Cargo profile {cargo_profile} does not match {profile}/{mode}: expected {expected}')
+    return {'mode': mode, 'cargo_profile': cargo_profile}
 
 
 def sha256(path):
@@ -42,7 +61,11 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def write_release_manifest(directory, label, target, versions, *, role='client'):
+def write_release_manifest(directory, label, target, versions, *, role='client',
+                           profile=None, mode=None, cargo_profile=None):
+    build = _build_metadata(profile, mode, cargo_profile, manifest=True)
+    if profile is not None:
+        build['profile'] = profile
     directory = Path(directory)
     files = []
     for path in sorted(directory.iterdir()):
@@ -52,17 +75,19 @@ def write_release_manifest(directory, label, target, versions, *, role='client')
             raise ValueError(f'Unexpected release entry: {path}')
         files.append({'path': path.name, 'size': path.stat().st_size, 'sha256': sha256(path)})
     components = {name: versions[COMPONENT_PACKAGES.get(name, name)] for name in ROLES[role].binaries}
-    identity = json.dumps({'target': target, 'role': role, 'components': components, 'files': files},
+    identity = json.dumps({'target': target, 'role': role, 'components': components, 'files': files, **build},
                           sort_keys=True, separators=(',', ':')).encode()
     digest = hashlib.sha256(identity).hexdigest()[:16]
     manifest = {'schema_version': 1, 'role': role, 'release_id': f'{label[:64]}-{target}-{digest}',
                 'target': target, 'host_protocol': {'min': 1, 'max': 1},
-                'components': components, 'files': files}
+                'components': components, 'files': files, **build}
     (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     return manifest
 
 
-def stage(role, bin_dir, destination, *, target, versions, label):
+def stage(role, bin_dir, destination, *, target, versions, label,
+          profile=None, mode=None, cargo_profile=None):
+    _build_metadata(profile, mode, cargo_profile, manifest=True)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     for binary in ROLES[role].binaries:
@@ -71,7 +96,8 @@ def stage(role, bin_dir, destination, *, target, versions, label):
         shutil.copy2(ROOT / 'configs' / ROLES[role].example, destination / ROLES[role].example)
     if role == 'client' and os.name == 'nt' and (Path(bin_dir) / 'wintun.dll').is_file():
         shutil.copy2(Path(bin_dir) / 'wintun.dll', destination / 'wintun.dll')
-    write_release_manifest(destination, label, target, versions, role=role)
+    write_release_manifest(destination, label, target, versions, role=role,
+                           profile=profile, mode=mode, cargo_profile=cargo_profile)
     return destination
 
 
@@ -92,16 +118,17 @@ class ArtifactIndex:
     entries: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-    def add(self, *, role, profile, binary_dir, staged, archive=None):
+    def add(self, *, role, profile, binary_dir, staged, archive=None, mode=None, cargo_profile=None):
         if role not in ROLES or profile not in ('debug', 'release'):
             raise ValueError('Unknown artifact role or profile')
+        build = _build_metadata(profile, mode, cargo_profile)
         if any(e['role'] == role and e['profile'] == profile for e in self.entries):
             raise ValueError(f'Duplicate artifact entry: {role}/{profile}')
         self.entries.append({'role': role, 'profile': profile, 'binary_dir': str(Path(binary_dir).resolve()),
                              'staged': Path(staged).resolve().relative_to(self.directory.resolve()).as_posix(),
                              'archive': Path(archive).resolve().relative_to(self.directory.resolve()).as_posix() if archive else None,
                              'archive_sha256': sha256(archive) if archive else None,
-                             'binaries': list(ROLES[role].binaries)})
+                             'binaries': list(ROLES[role].binaries), **build})
 
     def save(self):
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -129,6 +156,12 @@ class ArtifactIndex:
             pair = (entry['role'], entry['profile'])
             if pair in seen or pair[0] not in ROLES or pair[1] not in ('debug', 'release'):
                 raise ValueError(f'Invalid or duplicate artifact selection: {pair}')
+            if ('mode' in entry) != ('cargo_profile' in entry):
+                raise ValueError('Artifact mode and cargo_profile must be present together')
+            if 'mode' in entry:
+                if entry['mode'] is None or entry['cargo_profile'] is None:
+                    raise ValueError('Artifact mode and cargo_profile cannot be null')
+                _build_metadata(entry['profile'], entry['mode'], entry['cargo_profile'])
             seen.add(pair)
             for name in ('staged', 'archive'):
                 if entry.get(name) is not None:

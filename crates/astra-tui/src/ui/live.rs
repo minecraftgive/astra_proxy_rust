@@ -1,4 +1,5 @@
 //! Proxies and Connections pages, driven by the active profile's runtime snapshot.
+use super::connections::{ConnectionRow, ConnectionRowKey, ConnectionTarget};
 use super::dashboard::{card, Target, BLUE, MUTED};
 use super::shell::{CONNECTIONS, OVERVIEW, PROXIES};
 use super::*;
@@ -13,6 +14,7 @@ use ratatui::{
     style::Modifier,
     widgets::{Cell, Row as TableRow, Table, TableState},
 };
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub(super) struct LiveState {
@@ -20,6 +22,9 @@ pub(super) struct LiveState {
     baseline: Option<(Snapshot, RuntimeTelemetry)>,
     received: Option<Instant>,
     selected: Option<u64>,
+    selected_target: Option<ConnectionTarget>,
+    expanded_targets: HashSet<ConnectionTarget>,
+    fresh_connections: HashMap<u64, Instant>,
     frozen: Option<Snapshot>,
     frozen_telemetry: Option<RuntimeTelemetry>,
     frozen_at: Option<String>,
@@ -27,12 +32,14 @@ pub(super) struct LiveState {
     rates_valid: bool,
     detail_open: bool,
     detail_scroll: u16,
-    viewports: [std::cell::Cell<usize>; 5],
+    viewports: [std::cell::Cell<usize>; 6],
+    offsets: [std::cell::Cell<usize>; 6],
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Viewport {
     Overview,
+    OverviewGroups,
     Groups,
     Members,
     Connections,
@@ -135,6 +142,75 @@ impl Ui {
     fn live_page_size(&self, view: Viewport) -> usize {
         self.live_state.viewports[view as usize].get().max(1)
     }
+    /// Retain the viewport until the selection crosses one of its edges.
+    pub(super) fn live_list_offset(
+        &self,
+        view: Viewport,
+        selected: Option<usize>,
+        count: usize,
+        rows: usize,
+    ) -> usize {
+        self.record_live_viewport(view, rows);
+        let rows = rows.max(1);
+        let saved = &self.live_state.offsets[view as usize];
+        let mut offset = saved.get().min(count.saturating_sub(rows));
+        if let Some(selected) = selected.filter(|&index| index < count) {
+            if selected < offset {
+                offset = selected;
+            } else if selected >= offset.saturating_add(rows) {
+                offset = selected + 1 - rows;
+            }
+        }
+        saved.set(offset);
+        offset
+    }
+    fn overview_group_cursor(&self) -> Option<usize> {
+        let count = self.connection_rows().len();
+        (self.overview_cursor >= count && self.overview_cursor < self.overview_item_count.get())
+            .then(|| self.overview_cursor - count)
+    }
+    fn sync_overview_cursor(&mut self, group: Option<usize>) {
+        if let Some(index) = self.selected_connection_row_index() {
+            self.connection_selection = index;
+        }
+        if self.page == OVERVIEW {
+            self.overview_cursor = group.map_or(self.connection_selection, |group| {
+                self.connection_rows().len().saturating_add(group)
+            });
+        }
+    }
+    fn track_new_connections(&mut self, snapshot: &Snapshot) {
+        let Some(previous) = &self.runtime_snapshot else {
+            return;
+        };
+        let known: HashSet<_> = previous.connections.iter().map(|c| c.id).collect();
+        let now = Instant::now();
+        for connection in &snapshot.connections {
+            // Older entries reappearing in a partial sample are not new connections.
+            if !known.contains(&connection.id) && connection.elapsed_ms < 5000 {
+                self.live_state
+                    .fresh_connections
+                    .entry(connection.id)
+                    .or_insert(now + Duration::from_secs(5));
+            }
+        }
+    }
+    pub(super) fn next_connection_expiry(&self) -> Option<Instant> {
+        self.live_state.fresh_connections.values().copied().min()
+    }
+    pub(super) fn expire_connection_highlights(&mut self) -> bool {
+        let group = self.overview_group_cursor();
+        let now = Instant::now();
+        let count = self.live_state.fresh_connections.len();
+        self.live_state
+            .fresh_connections
+            .retain(|_, until| *until > now);
+        let changed = count != self.live_state.fresh_connections.len();
+        if changed {
+            self.sync_overview_cursor(group);
+        }
+        changed
+    }
     fn disabled_live_alias(&self, key: event::KeyEvent) -> bool {
         !self.vim_keys
             && !key
@@ -180,7 +256,7 @@ impl Ui {
         self.rates = [0, 0];
         self.direct_rates = [0, 0];
         self.connection_selection = 0;
-        self.overview_scroll = 0;
+        self.overview_cursor = 0;
     }
     pub(super) fn accept_runtime_view(&mut self, name: String, view: RuntimeView) {
         let RuntimeView {
@@ -204,8 +280,10 @@ impl Ui {
         }
         // Command replies without source metadata must not replace a hosted source clock.
         if telemetry.is_none() && self.live_state.telemetry.is_some() && !identity_changed {
+            self.track_new_connections(&snapshot);
             self.runtime_instance = name;
             self.runtime_snapshot = Some(snapshot);
+            self.sync_overview_cursor(None);
             return;
         }
         if let Some(meta) = telemetry {
@@ -262,20 +340,17 @@ impl Ui {
         self.live_state.received = Some(Instant::now());
         self.live_state.disconnected = false;
         self.runtime_sample = Instant::now();
+        let overview_group = self.overview_group_cursor();
+        self.track_new_connections(&snapshot);
         self.runtime_instance = name;
         self.runtime_snapshot = Some(snapshot);
         self.group_selection = self
             .group_selection
             .min(self.live().map_or(0, |s| s.groups.len().saturating_sub(1)));
-        let ids: Vec<_> = self.visible_connections().iter().map(|c| c.id).collect();
-        if let Some(id) = self.live_state.selected {
-            if let Some(index) = ids.iter().position(|value| *value == id) {
-                self.connection_selection = index;
-            }
-        } else if let Some(id) = ids.first() {
-            self.live_state.selected = Some(*id);
+        if self.live_state.selected.is_none() && self.live_state.selected_target.is_none() {
             self.select_connection(0);
         }
+        self.sync_overview_cursor(overview_group);
         self.runtime_error.clear();
     }
     fn set_runtime_rates(&mut self, old: &Snapshot, snapshot: &Snapshot, elapsed: f64) {
@@ -465,6 +540,7 @@ impl Ui {
         })
     }
     pub(super) fn toggle_live_pause(&mut self) -> Input {
+        let overview_group = self.overview_group_cursor();
         if self.live_state.frozen.take().is_none() {
             self.live_state.frozen = self.live().cloned();
             self.live_state.frozen_telemetry = self.live_state.telemetry.clone();
@@ -478,24 +554,80 @@ impl Ui {
             self.live_state.frozen_telemetry = None;
             self.live_state.frozen_at = None;
         }
-        if let Some(id) = self.live_state.selected {
-            if let Some(index) = self.visible_connections().iter().position(|c| c.id == id) {
-                self.connection_selection = index;
-            }
-        }
+        self.sync_overview_cursor(overview_group);
         Input::Idle
     }
     pub(super) fn connection_snapshot(&self) -> Option<&Snapshot> {
         self.live()?;
         self.live_state.frozen.as_ref().or_else(|| self.live())
     }
-    pub(super) fn select_connection(&mut self, index: usize) {
-        let id = self.visible_connections().get(index).map(|c| c.id);
-        if self.live_state.selected != id {
+    pub(super) fn connection_rows(&self) -> Vec<ConnectionRow> {
+        let now = Instant::now();
+        let fresh = self
+            .live_state
+            .fresh_connections
+            .iter()
+            .filter_map(|(&id, &until)| (until > now).then_some(id))
+            .collect();
+        connections::build_rows(
+            self.visible_connections(),
+            &self.live_state.expanded_targets,
+            &fresh,
+        )
+    }
+    pub(super) fn selected_connection_row_key(&self) -> Option<ConnectionRowKey> {
+        let rows = self.connection_rows();
+        if let Some(target) = &self.live_state.selected_target {
+            return rows
+                .iter()
+                .find(|r| {
+                    r.key == ConnectionRowKey::Target(target.clone())
+                        || (r.parent.as_ref() == Some(target) && !r.is_group())
+                })
+                .map(|r| r.key.clone());
+        }
+        let id = self.live_state.selected?;
+        let key = ConnectionRowKey::Connection(id);
+        if rows.iter().any(|r| r.key == key) {
+            return Some(key);
+        }
+        let target = self
+            .visible_connections()
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(ConnectionTarget::of)?;
+        rows.iter()
+            .find(|r| r.key == ConnectionRowKey::Target(target.clone()))
+            .map(|r| r.key.clone())
+    }
+    fn selected_connection_row_index(&self) -> Option<usize> {
+        let key = self.selected_connection_row_key()?;
+        self.connection_rows().iter().position(|r| r.key == key)
+    }
+    pub(super) fn select_connection_row_key(&mut self, key: ConnectionRowKey) {
+        if self.selected_connection_row_key().as_ref() != Some(&key) {
             self.live_state.detail_scroll = 0;
         }
-        self.connection_selection = index;
-        self.live_state.selected = id;
+        match key {
+            ConnectionRowKey::Target(target) => {
+                self.live_state.selected_target = Some(target);
+                self.live_state.selected = None;
+            }
+            ConnectionRowKey::Connection(id) => {
+                self.live_state.selected_target = None;
+                self.live_state.selected = Some(id);
+            }
+        }
+        self.sync_overview_cursor(None);
+    }
+    pub(super) fn select_connection(&mut self, index: usize) {
+        if let Some(key) = self.connection_rows().get(index).map(|r| r.key.clone()) {
+            self.select_connection_row_key(key);
+        } else {
+            self.live_state.selected = None;
+            self.live_state.selected_target = None;
+            self.connection_selection = 0;
+        }
     }
     pub(super) fn select_connection_id(&mut self, id: u64) {
         if !self.visible_connections().iter().any(|c| c.id == id)
@@ -505,21 +637,72 @@ impl Ui {
         {
             self.connection_filter.clear();
         }
-        if let Some(index) = self.visible_connections().iter().position(|c| c.id == id) {
-            self.select_connection(index);
+        if let Some(target) = self
+            .visible_connections()
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(ConnectionTarget::of)
+        {
+            self.live_state.expanded_targets.insert(target);
+            self.select_connection_row_key(ConnectionRowKey::Connection(id));
         }
     }
     pub(super) fn reveal_selected_connection(&mut self) {
         if let Some(id) = self.live_state.selected {
-            self.select_connection_id(id);
+            if !self.visible_connections().iter().any(|c| c.id == id)
+                && self
+                    .connection_snapshot()
+                    .is_some_and(|s| s.connections.iter().any(|c| c.id == id))
+            {
+                self.connection_filter.clear();
+            }
         }
+        self.sync_overview_cursor(None);
     }
+    #[cfg(test)]
     pub(super) fn connection_is_selected(&self, id: u64) -> bool {
         self.live_state.selected == Some(id)
     }
     fn selected_connection(&self) -> Option<&astra_model::runtime::Connection> {
-        let id = self.live_state.selected?;
+        let ConnectionRowKey::Connection(id) = self.selected_connection_row_key()? else {
+            return None;
+        };
         self.visible_connections().into_iter().find(|c| c.id == id)
+    }
+    pub(super) fn toggle_connection_group(&mut self) -> bool {
+        let Some(ConnectionRowKey::Target(target)) = self.selected_connection_row_key() else {
+            return false;
+        };
+        if !self.live_state.expanded_targets.remove(&target) {
+            self.live_state.expanded_targets.insert(target.clone());
+        }
+        self.select_connection_row_key(ConnectionRowKey::Target(target));
+        true
+    }
+    fn expand_connection_group(&mut self) {
+        if let Some(ConnectionRowKey::Target(target)) = self.selected_connection_row_key() {
+            self.live_state.expanded_targets.insert(target);
+            self.sync_overview_cursor(None);
+        }
+    }
+    fn collapse_connection_group(&mut self) {
+        let key = self.selected_connection_row_key();
+        let row = self
+            .connection_rows()
+            .into_iter()
+            .find(|r| Some(&r.key) == key.as_ref());
+        let Some(row) = row else {
+            return;
+        };
+        let target = match row.key {
+            ConnectionRowKey::Target(target) => Some(target),
+            ConnectionRowKey::Connection(_) => row.parent,
+        };
+        if let Some(target) = target {
+            if self.live_state.expanded_targets.remove(&target) {
+                self.select_connection_row_key(ConnectionRowKey::Target(target));
+            }
+        }
     }
     pub(super) fn runtime_action(&mut self, command: Command) -> Input {
         if matches!(command, Command::Tun(true)) {
@@ -628,7 +811,7 @@ impl Ui {
         }
         if self.page == OVERVIEW {
             let count = self.live()?.groups.len();
-            let page = self.live_page_size(Viewport::Groups);
+            let page = self.live_page_size(Viewport::OverviewGroups);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.group_selection = (self.group_selection + 1).min(count.saturating_sub(1))
@@ -803,52 +986,54 @@ impl Ui {
             };
         }
         let snapshot = self.live()?.clone();
+        if matches!(self.page, OVERVIEW | CONNECTIONS) {
+            let group = self.overview_group_cursor();
+            self.sync_overview_cursor(group);
+            match key.code {
+                KeyCode::Right => {
+                    self.expand_connection_group();
+                    return Some(Input::Idle);
+                }
+                KeyCode::Left => {
+                    self.collapse_connection_group();
+                    return Some(Input::Idle);
+                }
+                KeyCode::Enter if self.toggle_connection_group() => return Some(Input::Idle),
+                _ => {}
+            }
+        }
         if self.page == OVERVIEW {
+            let connection_count = self.connection_rows().len();
             let page = self.live_page_size(Viewport::Overview);
-            let count = self
-                .overview_scroll_limit
-                .get()
-                .max(snapshot.connections.len());
+            let count = self.overview_item_count.get().max(connection_count);
+            // The narrow overview continues through the group panel after the connections.
+            let current = if self.overview_cursor < connection_count {
+                self.connection_selection
+            } else {
+                self.overview_cursor
+            }
+            .min(count.saturating_sub(1));
+            let next = match key.code {
+                KeyCode::Char('j') | KeyCode::Down => Some(current.saturating_add(1)),
+                KeyCode::Char('k') | KeyCode::Up => Some(current.saturating_sub(1)),
+                KeyCode::PageDown => Some(current.saturating_add(page)),
+                KeyCode::PageUp => Some(current.saturating_sub(page)),
+                KeyCode::Home | KeyCode::Char('g') => Some(0),
+                KeyCode::End | KeyCode::Char('G') => Some(count.saturating_sub(1)),
+                _ => None,
+            };
+            if let Some(next) = next {
+                let next = next.min(count.saturating_sub(1));
+                self.select_connection(next.min(connection_count.saturating_sub(1)));
+                self.overview_cursor = next;
+                if next == 0 {
+                    self.live_state.offsets[Viewport::OverviewGroups as usize].set(0);
+                }
+                return Some(Input::Idle);
+            }
             match key.code {
                 KeyCode::Char('z') => {
                     self.traffic_expanded = !self.traffic_expanded;
-                    return Some(Input::Idle);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.overview_scroll = (self.overview_scroll + 1).min(count.saturating_sub(1));
-                    self.select_connection(
-                        self.overview_scroll
-                            .min(snapshot.connections.len().saturating_sub(1)),
-                    );
-                    return Some(Input::Idle);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
-                    self.select_connection(self.overview_scroll);
-                    return Some(Input::Idle);
-                }
-                KeyCode::PageDown => {
-                    self.overview_scroll =
-                        (self.overview_scroll + page).min(count.saturating_sub(1));
-                    self.select_connection(
-                        self.overview_scroll
-                            .min(snapshot.connections.len().saturating_sub(1)),
-                    );
-                    return Some(Input::Idle);
-                }
-                KeyCode::PageUp => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(page);
-                    self.select_connection(self.overview_scroll);
-                    return Some(Input::Idle);
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.overview_scroll = 0;
-                    self.select_connection(0);
-                    return Some(Input::Idle);
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.overview_scroll = count.saturating_sub(1);
-                    self.select_connection(snapshot.connections.len().saturating_sub(1));
                     return Some(Input::Idle);
                 }
                 KeyCode::Enter => return Some(self.navigate(CONNECTIONS)),
@@ -902,8 +1087,7 @@ impl Ui {
         }
         if self.page == CONNECTIONS {
             let page = self.live_page_size(Viewport::Connections);
-            let connections = self.visible_connections();
-            let count = connections.len();
+            let count = self.connection_rows().len();
             match key.code {
                 KeyCode::Char('/') => self.connection_filtering = true,
                 KeyCode::Esc => self.connection_filter.clear(),
@@ -931,7 +1115,14 @@ impl Ui {
                 }
                 KeyCode::Char('x') | KeyCode::Delete => {
                     let Some(id) = self.selected_connection().map(|c| c.id) else {
-                        self.message = "Selected connection is not present in this sample".into();
+                        self.message = if matches!(
+                            self.selected_connection_row_key(),
+                            Some(ConnectionRowKey::Target(_))
+                        ) {
+                            t("Expand the group to close an individual connection").into()
+                        } else {
+                            t("Selected connection is not present in this sample").into()
+                        };
                         return Some(Input::Idle);
                     };
                     if self.live_state.disconnected
@@ -946,7 +1137,7 @@ impl Ui {
                 }
                 KeyCode::Char(' ') => return Some(self.toggle_live_pause()),
                 KeyCode::Char('X') => {
-                    if !connections.is_empty() {
+                    if count > 0 {
                         let row = self.active_proxy()?;
                         let (name, pid) = (row.instance.name.clone(), row.pid);
                         self.prompt(Prompt::CloseAll { name, pid });
@@ -1203,6 +1394,12 @@ impl Ui {
             },
         );
         if groups_area.width > 0 {
+            *state.offset_mut() = self.live_list_offset(
+                Viewport::Groups,
+                state.selected(),
+                snapshot.groups.len(),
+                groups_area.height.saturating_sub(2) as usize / 2,
+            );
             f.render_stateful_widget(
                 List::new(items)
                     .block(card("Proxy groups").border_style(self.focus_border(
@@ -1271,6 +1468,12 @@ impl Ui {
             .collect();
         let mut state = ListState::default()
             .with_selected(cursor.map(|c| c.min(items.len().saturating_sub(1))));
+        *state.offset_mut() = self.live_list_offset(
+            Viewport::Members,
+            state.selected(),
+            group.members.len(),
+            members_area.height.saturating_sub(2) as usize,
+        );
         let title = format!(
             "{} · {}",
             group.name,
@@ -1317,8 +1520,13 @@ impl Ui {
             self.render_not_live(f, area, "Connections");
             return;
         };
-        let connections = self.visible_connections();
-        let selected = self.selected_connection();
+        let connections = self.connection_rows();
+        let selected_key = self.selected_connection_row_key();
+        let selected_index = connections
+            .iter()
+            .position(|r| Some(&r.key) == selected_key.as_ref());
+        let selected_row = selected_index.and_then(|index| connections.get(index));
+        let selected = selected_row.map(|row| &row.connection);
         if self.live_state.detail_open {
             self.record_live_viewport(Viewport::Details, area.height.saturating_sub(2) as usize);
             let before = f.buffer_mut().clone();
@@ -1348,9 +1556,10 @@ impl Ui {
             );
             let items: Vec<_> = connections
                 .iter()
-                .map(|c| {
+                .map(|row| {
+                    let c = &row.connection;
                     ListItem::new(vec![
-                        Line::raw(format!("{}:{}", c.host, c.port)),
+                        Line::raw(row.label()),
                         Line::raw(format!(
                             "{} · {} · ↑{} ↓{}",
                             c.outbound,
@@ -1359,12 +1568,16 @@ impl Ui {
                             bytes(c.download)
                         )),
                     ])
+                    .style(crate::theme::connection_row_style(
+                        Some(&row.key) == selected_key.as_ref(),
+                        row.fresh,
+                    ))
                 })
                 .collect();
             let title = format!(
                 "{}Connections {}/{}{}",
                 self.connection_badges(),
-                connections.len(),
+                self.visible_connections().len(),
                 snapshot.active,
                 if snapshot.truncated {
                     " · partial"
@@ -1372,17 +1585,22 @@ impl Ui {
                     ""
                 }
             );
-            let mut state =
-                ListState::default().with_selected(selected.map(|_| self.connection_selection));
+            let mut state = ListState::default().with_selected(selected_index);
+            *state.offset_mut() = self.live_list_offset(
+                Viewport::Connections,
+                state.selected(),
+                connections.len(),
+                area.height.saturating_sub(2) as usize / 2,
+            );
             let hint = if selected.is_none() && self.live_state.selected.is_some() {
                 "Selection not in sample · ↑↓ choose another".into()
             } else {
                 self.connection_pause_hint()
-                    .unwrap_or_else(|| " Enter details · Space pause ".into())
+                    .unwrap_or_else(|| t("←→ fold/unfold · Enter open · Space pause").into())
             };
             f.render_stateful_widget(
                 List::new(items)
-                    .highlight_style(crate::theme::selected())
+                    .highlight_style(Style::default())
                     .highlight_symbol("› ")
                     .block(
                         self.focused_card(&title, focus::Region::Main)
@@ -1391,7 +1609,18 @@ impl Ui {
                 area,
                 &mut state,
             );
-
+            let rows = astra_tui_kit::RenderedRows::fixed(
+                card("").inner(area),
+                state.offset(),
+                connections.len(),
+                2,
+            );
+            self.hits
+                .borrow_mut()
+                .bind_rows(&rows, |index| match &connections[index].key {
+                    ConnectionRowKey::Connection(id) => Target::Connection(*id),
+                    key => Target::ConnectionRow(key.clone()),
+                });
             return;
         }
         let (table_area, detail_area) = if area.width >= 120 {
@@ -1419,11 +1648,24 @@ impl Ui {
         let muted = Style::default().fg(MUTED);
         let rows: Vec<_> = connections
             .iter()
-            .map(|c| {
-                // Host stands out, port recedes; the active filter is marked in place.
-                let mut target =
-                    crate::theme::mark_matches(&c.host, &self.connection_filter, Style::default());
-                target.push(Span::styled(format!(":{}", c.port), muted));
+            .map(|row| {
+                let c = &row.connection;
+                let label = row.label();
+                let port = format!(":{}", c.port);
+                let split = label.rfind(&port).unwrap_or(label.len());
+                let mut target = crate::theme::mark_matches(
+                    &label[..split],
+                    &self.connection_filter,
+                    Style::default(),
+                );
+                if split < label.len() {
+                    target.push(Span::styled(port.clone(), muted));
+                    target.extend(crate::theme::mark_matches(
+                        &label[split + port.len()..],
+                        &self.connection_filter,
+                        Style::default(),
+                    ));
+                }
                 TableRow::new(vec![
                     Cell::from(Line::from(target)),
                     Cell::from(Line::from(vec![
@@ -1442,6 +1684,10 @@ impl Ui {
                     Cell::from(bytes(c.download)).style(crate::theme::volume_style(c.download)),
                     Cell::from(format!("{:.0}s", c.elapsed_ms as f64 / 1000.0)).style(muted),
                 ])
+                .style(crate::theme::connection_row_style(
+                    Some(&row.key) == selected_key.as_ref(),
+                    row.fresh,
+                ))
             })
             .collect();
         let title = format!(
@@ -1473,8 +1719,10 @@ impl Ui {
                     Span::styled(" · Enter ", muted),
                 ]
             } else if self.connection_filter.is_empty() {
-                let mut spans =
-                    crate::theme::key_hints(&format!(" {}", t("/ filter · x close · X close all")));
+                let mut spans = crate::theme::key_hints(&format!(
+                    " {}",
+                    t("←→ fold/unfold · / filter · x close · X close all")
+                ));
                 spans.push(Span::raw(" "));
                 spans
             } else {
@@ -1489,11 +1737,12 @@ impl Ui {
             },
         );
         let empty = rows.is_empty();
-        let mut state = TableState::default().with_selected(
-            selected.is_some().then_some(
-                self.connection_selection
-                    .min(connections.len().saturating_sub(1)),
-            ),
+        let mut state = TableState::default().with_selected(selected_index);
+        *state.offset_mut() = self.live_list_offset(
+            Viewport::Connections,
+            state.selected(),
+            connections.len(),
+            table_area.height.saturating_sub(3) as usize,
         );
         f.render_stateful_widget(
             Table::new(
@@ -1512,7 +1761,7 @@ impl Ui {
                 self.focused_card(&title, focus::Region::Main)
                     .title_bottom(footer),
             )
-            .row_highlight_style(crate::theme::selected()),
+            .row_highlight_style(Style::default()),
             table_area,
             &mut state,
         );
@@ -1539,7 +1788,10 @@ impl Ui {
         self.record_live_viewport(Viewport::Connections, geometry.visible_capacity);
         self.hits
             .borrow_mut()
-            .bind_rows(&geometry, |index| Target::Connection(connections[index].id));
+            .bind_rows(&geometry, |index| match &connections[index].key {
+                ConnectionRowKey::Connection(id) => Target::Connection(*id),
+                key => Target::ConnectionRow(key.clone()),
+            });
         if table_area.width >= 44 {
             self.button(
                 f,
@@ -1574,7 +1826,11 @@ impl Ui {
                     c.elapsed_ms as f64 / 1000.0
                 )),
                 Line::styled(
-                    t("x close · 4 then t explains a route"),
+                    if selected_row.is_some_and(|r| r.is_group()) {
+                        t("←→ fold/unfold · totals for this target")
+                    } else {
+                        t("x close · 4 then t explains a route")
+                    },
                     Style::default().fg(MUTED),
                 ),
             ];
@@ -1681,6 +1937,309 @@ mod tests {
     fn key(ui: &mut Ui, code: KeyCode) -> Input {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
     }
+    fn many_connections() -> Ui {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        let connection = snapshot.connections[0].clone();
+        snapshot.connections = (0..80)
+            .map(|id| Connection {
+                id,
+                host: format!("host-{id}.test"),
+                elapsed_ms: 10_000,
+                ..connection.clone()
+            })
+            .collect();
+        snapshot.active = 80;
+        ui.accept_runtime("proxy".into(), snapshot);
+        ui.select_connection(0);
+        ui
+    }
+    /// Return the rendered connection IDs, including the rows used for mouse hit testing.
+    fn draw_connections(ui: &Ui, terminal: &mut Terminal<TestBackend>) -> Vec<u64> {
+        ui.hits.borrow_mut().clear();
+        terminal
+            .draw(|frame| {
+                if ui.page == OVERVIEW {
+                    ui.render_overview(frame, frame.area());
+                } else {
+                    ui.render_connections(frame, frame.area());
+                }
+            })
+            .unwrap();
+        ui.hits
+            .borrow()
+            .iter()
+            .filter_map(|(_, target)| match target {
+                Target::Connection(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn connection_lists_scroll_only_when_selection_crosses_visible_edges() {
+        for page in [OVERVIEW, CONNECTIONS] {
+            for width in [140, 70] {
+                let mut ui = many_connections();
+                ui.navigate(page);
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                let first = draw_connections(&ui, &mut terminal);
+                let capacity = first.len();
+                assert!(capacity > 2);
+                assert_eq!(first[0], 0);
+                for _ in 1..capacity {
+                    key(&mut ui, KeyCode::Down);
+                    assert_eq!(draw_connections(&ui, &mut terminal), first);
+                }
+                key(&mut ui, KeyCode::Down);
+                let shifted = draw_connections(&ui, &mut terminal);
+                assert_eq!(shifted[0], 1);
+                assert_eq!(shifted.last(), Some(&(capacity as u64)));
+                for _ in 1..capacity {
+                    key(&mut ui, KeyCode::Up);
+                    assert_eq!(draw_connections(&ui, &mut terminal), shifted);
+                }
+                key(&mut ui, KeyCode::Up);
+                assert_eq!(draw_connections(&ui, &mut terminal), first);
+
+                key(&mut ui, KeyCode::PageDown);
+                assert_eq!(ui.connection_selection, capacity);
+                assert_eq!(draw_connections(&ui, &mut terminal)[0], 1);
+                key(&mut ui, KeyCode::End);
+                assert_eq!(draw_connections(&ui, &mut terminal).last(), Some(&79));
+                let last_page = draw_connections(&ui, &mut terminal);
+                key(&mut ui, KeyCode::Up);
+                assert_eq!(draw_connections(&ui, &mut terminal), last_page);
+                key(&mut ui, KeyCode::Home);
+                assert_eq!(draw_connections(&ui, &mut terminal), first);
+            }
+        }
+    }
+    #[test]
+    fn connection_viewports_follow_resize_refresh_and_shorter_samples() {
+        for page in [OVERVIEW, CONNECTIONS] {
+            let mut ui = many_connections();
+            ui.navigate(page);
+            ui.select_connection(40);
+            for (width, height) in [(140, 24), (70, 16), (140, 32)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                assert!(draw_connections(&ui, &mut terminal).contains(&40));
+            }
+            let mut snapshot = ui.live().unwrap().clone();
+            snapshot.connections[40].download += 1;
+            ui.accept_runtime("proxy".into(), snapshot.clone());
+            let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+            assert_eq!(draw_connections(&ui, &mut terminal)[0], 40);
+            snapshot.connections.retain(|connection| connection.id < 3);
+            ui.accept_runtime("proxy".into(), snapshot);
+            assert_eq!(draw_connections(&ui, &mut terminal), [0, 1, 2]);
+            key(&mut ui, KeyCode::Home);
+            assert_eq!(ui.selected_connection().unwrap().id, 0);
+        }
+    }
+    #[test]
+    fn overview_navigation_tracks_refreshed_and_frozen_connection_positions() {
+        let mut ui = many_connections();
+        ui.navigate(OVERVIEW);
+        ui.select_connection(40);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        draw_connections(&ui, &mut terminal);
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.connections.retain(|c| c.id >= 30 && c.id < 60);
+        ui.accept_runtime("proxy".into(), snapshot.clone());
+        draw_connections(&ui, &mut terminal);
+        key(&mut ui, KeyCode::Down);
+        assert_eq!(ui.selected_connection().unwrap().id, 41);
+
+        ui.toggle_live_pause();
+        snapshot.connections.truncate(1);
+        ui.accept_runtime("proxy".into(), snapshot);
+        draw_connections(&ui, &mut terminal);
+        key(&mut ui, KeyCode::End);
+        assert_eq!(ui.selected_connection().unwrap().id, 59);
+        key(&mut ui, KeyCode::Up);
+        assert_eq!(ui.selected_connection().unwrap().id, 58);
+
+        let mut ui = many_connections();
+        ui.navigate(OVERVIEW);
+        ui.select_connection(40);
+        draw_connections(&ui, &mut terminal);
+        ui.toggle_live_pause();
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.connections.retain(|c| c.id >= 30 && c.id < 60);
+        ui.accept_runtime("proxy".into(), snapshot);
+        ui.toggle_live_pause();
+        draw_connections(&ui, &mut terminal);
+        key(&mut ui, KeyCode::Down);
+        assert_eq!(ui.selected_connection().unwrap().id, 41);
+    }
+    #[test]
+    fn proxy_group_and_member_lists_keep_the_viewport_when_reversing_direction() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        let mut group = snapshot.groups[0].clone();
+        group.members = (0..30)
+            .map(|id| Member {
+                name: format!("member-{id}"),
+                delay_ms: None,
+                alive: None,
+            })
+            .collect();
+        group.selected = Some("member-0".into());
+        snapshot.groups = (0..30)
+            .map(|id| Group {
+                name: format!("group-{id}"),
+                ..group.clone()
+            })
+            .collect();
+        ui.accept_runtime("proxy".into(), snapshot);
+        ui.navigate(PROXIES);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        for members in [false, true] {
+            if members {
+                ui.open_runtime_group();
+            }
+            let mut draw = |ui: &Ui| -> Vec<usize> {
+                ui.hits.borrow_mut().clear();
+                terminal
+                    .draw(|f| ui.render_live_groups(f, f.area()))
+                    .unwrap();
+                ui.hits
+                    .borrow()
+                    .iter()
+                    .filter_map(|(_, target)| match target {
+                        Target::Member(index) if members => Some(*index),
+                        Target::Group(index) if !members => Some(*index),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let first = draw(&ui);
+            for _ in 1..first.len() {
+                key(&mut ui, KeyCode::Down);
+                assert_eq!(draw(&ui), first);
+            }
+            key(&mut ui, KeyCode::Down);
+            let shifted = draw(&ui);
+            assert_eq!(shifted[0], 1);
+            for _ in 1..first.len() {
+                key(&mut ui, KeyCode::Up);
+                assert_eq!(draw(&ui), shifted);
+            }
+            key(&mut ui, KeyCode::Up);
+            assert_eq!(draw(&ui), first);
+        }
+    }
+    #[test]
+    fn grouped_connections_expand_keep_selection_and_only_close_individual_flows() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        let mut second = snapshot.connections[0].clone();
+        second.id = 8;
+        second.source = Some("second-source".into());
+        snapshot.connections.push(second);
+        ui.accept_runtime("proxy".into(), snapshot.clone());
+        ui.navigate(CONNECTIONS);
+        let rows = ui.connection_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].connection.upload, 4096);
+        assert_eq!(rows[0].connection.download, 16384);
+        for width in [140, 70] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            draw_connections(&ui, &mut terminal);
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("(2)") && text.contains("4.0 KiB") && text.contains("16.0 KiB"));
+        }
+        ui.select_connection(0);
+        assert!(matches!(key(&mut ui, KeyCode::Delete), Input::Idle));
+        assert!(ui.message.contains("individual") || !ui.message.is_empty());
+        key(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.connection_rows().len(), 3);
+        key(&mut ui, KeyCode::Down);
+        let selected_id = ui.selected_connection().unwrap().id;
+        assert!(
+            matches!(key(&mut ui, KeyCode::Delete), Input::Run(Action::Runtime {
+            command: Command::Disconnect(Some(id)), ..
+        }, _) if id == selected_id)
+        );
+        snapshot.connections[0].download += 100;
+        ui.accept_runtime("proxy".into(), snapshot);
+        assert_eq!(ui.connection_rows().len(), 3);
+        assert_eq!(ui.selected_connection().unwrap().id, selected_id);
+        key(&mut ui, KeyCode::Left);
+        assert_eq!(ui.connection_rows().len(), 1);
+        assert!(matches!(
+            ui.selected_connection_row_key(),
+            Some(ConnectionRowKey::Target(_))
+        ));
+        ui.connection_filter = "second-source".into();
+        ui.select_connection(0);
+        assert_eq!(ui.connection_rows().len(), 1);
+        assert_eq!(ui.selected_connection().unwrap().id, 8);
+    }
+    #[test]
+    fn fresh_connections_pin_for_five_seconds_without_resetting_on_updates() {
+        let mut ui = sample();
+        ui.navigate(CONNECTIONS);
+        let mut snapshot = ui.live().unwrap().clone();
+        let mut new = snapshot.connections[0].clone();
+        new.id = 9;
+        new.host = "new.test".into();
+        new.upload = 1;
+        new.download = 2;
+        new.elapsed_ms = 0;
+        snapshot.connections.push(new);
+        let before = Instant::now();
+        ui.accept_runtime("proxy".into(), snapshot.clone());
+        let deadline = ui.next_connection_expiry().unwrap();
+        assert!(deadline >= before + Duration::from_secs(5));
+        assert_eq!(ui.connection_rows()[0].connection.id, 9);
+        assert!(ui.connection_rows()[0].fresh);
+        assert_eq!(ui.selected_connection().unwrap().id, 7);
+        assert_eq!(ui.connection_selection, 1);
+        ui.accept_runtime("proxy".into(), snapshot);
+        assert_eq!(ui.next_connection_expiry(), Some(deadline));
+        ui.live_state
+            .fresh_connections
+            .insert(9, Instant::now() - Duration::from_millis(1));
+        assert!(ui.expire_connection_highlights());
+        assert_eq!(ui.next_connection_expiry(), None);
+        assert_eq!(ui.connection_rows()[0].connection.id, 7);
+        assert!(ui.connection_rows().iter().all(|r| !r.fresh));
+        assert_eq!(ui.connection_selection, 0);
+        assert!(!ui.expire_connection_highlights());
+    }
+    #[test]
+    fn a_new_flow_pins_its_collapsed_target_and_old_sample_entries_do_not_pin() {
+        let mut ui = sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        let mut old = snapshot.connections[0].clone();
+        old.id = 10;
+        old.host = "busy.test".into();
+        old.download = 1 << 30;
+        old.elapsed_ms = 60_000;
+        snapshot.connections.push(old);
+        ui.accept_runtime("proxy".into(), snapshot.clone());
+        assert!(ui.next_connection_expiry().is_none());
+        let mut new = snapshot.connections[0].clone();
+        new.id = 11;
+        new.elapsed_ms = 0;
+        snapshot.connections.push(new);
+        ui.accept_runtime("proxy".into(), snapshot);
+        let rows = ui.connection_rows();
+        assert!(rows[0].is_group() && rows[0].fresh);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[1].connection.host, "busy.test");
+        ui.reset_live_identity();
+        assert!(ui.next_connection_expiry().is_none());
+        assert!(ui.live_state.expanded_targets.is_empty());
+    }
     fn telemetry(snapshot: Snapshot, boot: &str, sequence: u64, time: u64) -> RuntimeView {
         RuntimeView {
             snapshot,
@@ -1704,6 +2263,7 @@ mod tests {
                 let mut row = connection.clone();
                 row.id = id;
                 row.host = format!("host-{id}.test");
+                row.elapsed_ms = 10_000;
                 row
             })
             .collect();
@@ -1756,13 +2316,13 @@ mod tests {
         ui.navigate(OVERVIEW);
         // Narrow Controls places profile actions on a second row.
         for (width, step) in [(140, 18), (70, 5)] {
-            ui.overview_scroll = 0;
+            ui.overview_cursor = 0;
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|f| ui.render_overview(f, f.area())).unwrap();
             key(&mut ui, KeyCode::PageDown);
-            assert_eq!(ui.overview_scroll, step);
+            assert_eq!(ui.overview_cursor, step);
             key(&mut ui, KeyCode::PageUp);
-            assert_eq!(ui.overview_scroll, 0);
+            assert_eq!(ui.overview_cursor, 0);
         }
         ui.focus.region = focus::Region::Secondary;
         key(&mut ui, KeyCode::PageDown);
@@ -1890,6 +2450,7 @@ mod tests {
         let mut snapshot = ui.live().unwrap().clone();
         let mut newer = snapshot.connections[0].clone();
         newer.id = 99;
+        newer.host = "newer.test".into();
         newer.download = u64::MAX / 2;
         snapshot.connections.insert(0, newer);
         ui.accept_runtime("proxy".into(), snapshot.clone());

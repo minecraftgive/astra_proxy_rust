@@ -37,6 +37,76 @@ fn package_roles_preserve_legacy_clients_and_reject_service_bundles() {
     unknown["role"] = "unknown".into();
     assert!(serde_json::from_value::<ReleaseManifest>(unknown).is_err());
 }
+
+#[test]
+fn legacy_manifests_roundtrip_without_build_metadata() {
+    let fixture = Fixture::new("legacy-build");
+    let manifest = fixture.manifest();
+    let encoded = serde_json::to_value(&manifest).unwrap();
+    for field in ["profile", "mode", "cargo_profile"] {
+        assert!(encoded.get(field).is_none());
+    }
+    let decoded: ReleaseManifest = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, manifest);
+    decoded.validate(&ImportOptions::default()).unwrap();
+    assert_eq!(fixture.import().unwrap().manifest, manifest);
+
+    let mut unknown = encoded;
+    unknown["unknown_build_field"] = "not supported".into();
+    assert!(serde_json::from_value::<ReleaseManifest>(unknown).is_err());
+}
+
+#[test]
+fn imports_all_build_modes_and_preserves_metadata() {
+    for (profile, mode, cargo_profile) in [
+        ("debug", "fast", "dev"),
+        ("release", "fast", "release-fast"),
+        ("debug", "runtime", "dev-runtime"),
+        ("release", "runtime", "release-runtime"),
+    ] {
+        let fixture = Fixture::new("build-metadata");
+        fixture.edit(|manifest| {
+            manifest.profile = Some(profile.into());
+            manifest.mode = Some(mode.into());
+            manifest.cargo_profile = Some(cargo_profile.into());
+        });
+        let manifest = fixture.manifest();
+        let encoded = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(encoded["profile"], profile);
+        assert_eq!(encoded["mode"], mode);
+        assert_eq!(encoded["cargo_profile"], cargo_profile);
+        let imported = fixture.import().unwrap();
+        assert_eq!(imported.manifest, manifest);
+        assert_eq!(fixture.import().unwrap().manifest, manifest);
+    }
+}
+
+#[test]
+fn rejects_incomplete_or_mismatched_build_metadata() {
+    let fixture = Fixture::new("invalid-build-metadata");
+    for (profile, mode, cargo_profile) in [
+        (None, Some("fast"), Some("dev")),
+        (Some("debug"), None, Some("dev")),
+        (Some("debug"), Some("fast"), None),
+        (Some("debug"), Some("fast"), Some("release-fast")),
+        (Some("release"), Some("runtime"), Some("dev-runtime")),
+        (Some("release"), Some("unknown"), Some("release")),
+        (Some("unknown"), Some("fast"), Some("dev")),
+        (Some("debug"), Some("fast"), Some("unknown")),
+    ] {
+        fixture.edit(|manifest| {
+            manifest.profile = profile.map(str::to_owned);
+            manifest.mode = mode.map(str::to_owned);
+            manifest.cargo_profile = cargo_profile.map(str::to_owned);
+        });
+        let error = fixture.import().unwrap_err();
+        assert!(format!("{error:#}")
+            .to_lowercase()
+            .contains("build metadata"));
+        fixture.assert_not_installed();
+    }
+}
+
 impl Fixture {
     fn new(id: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -55,6 +125,9 @@ impl Fixture {
             host_protocol: ProtocolRange { min: 1, max: 1 },
             components: BTreeMap::new(),
             files: Vec::new(),
+            profile: None,
+            mode: None,
+            cargo_profile: None,
         };
         for component in ["astra-proxy", "astra-rule", "astra-tui", "astra-host"] {
             let bytes = format!("test-only-{id}-{component}").into_bytes();

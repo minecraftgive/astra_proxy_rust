@@ -15,6 +15,7 @@ import tempfile
 import time
 from astra_tools.workspace import ROOT
 from astra_tools.net import free_port
+from astra_tools.platform import executable
 from astra_tools.processes import process, wait_port
 from astra_tools.processes import wait_socket
 
@@ -46,7 +47,9 @@ async def query(proxy_port, target_port):
         assert await reader.readexactly(2) == b'\x05\x00'
         writer.write(b'\x05\x01\x00\x01\x7f\x00\x00\x01' + target_port.to_bytes(2, 'big'))
         await writer.drain()
-        assert (await reader.readexactly(10))[1] == 0
+        reply = await reader.readexactly(10)
+        if reply[1] != 0:
+            raise RuntimeError(f'SOCKS5 CONNECT failed with status {reply[1]} (0x{reply[1]:02x})')
         connected = time.perf_counter()
         data = bytes(range(256)) * 4
         writer.write(data)
@@ -65,12 +68,19 @@ async def samples(port, target, count, concurrency):
         async with gate:
             return await asyncio.wait_for(query(port, target), 10)
     start = time.perf_counter()
-    result = await asyncio.gather(*(one() for _ in range(count)))
+    tasks = [asyncio.create_task(one()) for _ in range(count)]
+    try:
+        result = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return result, time.perf_counter() - start
 
 
 def rules_text(count, sock):
-    rows = [f'socket="{sock}"\ndefault_action="direct"\n']
+    rows = [f'socket={json.dumps(str(sock), ensure_ascii=False)}\ndefault_action="direct"\n']
     for index in range(count):
         kind, value = [
             ('domain_exact', f'host{index}.example.invalid'),
@@ -87,7 +97,7 @@ async def run(args):
     report = {
         'platform': platform.platform(), 'machine': platform.machine(),
         'logical_cpus': os.cpu_count(), 'python': platform.python_version(),
-        'binary_sha256': {name: digest(binaries / name) for name in ('astra-proxy', 'astra-rule')},
+        'binary_sha256': {name: digest(binaries / executable(name)) for name in ('astra-proxy', 'astra-rule')},
         'connections_per_round': args.connections, 'rounds': args.rounds,
         'scope': 'Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.',
         'results': [],
@@ -98,16 +108,17 @@ async def run(args):
         for count in args.rules:
             with tempfile.TemporaryDirectory(prefix='astra-bench-') as td, contextlib.ExitStack() as stack:
                 directory = pathlib.Path(td)
+                environment = {'ASTRA_RUNTIME_DIR': str(directory / 'runtime')}
                 sock = directory / 'rules.sock'
                 rule_path = directory / 'rules.toml'
-                rule_path.write_text(rules_text(count, sock))
-                rule, log = stack.enter_context(process([str(binaries/'astra-rule'), str(rule_path)], directory, 'rule'))
-                wait_socket(sock, rule, log)
+                rule_path.write_text(rules_text(count, sock), encoding='utf-8')
+                rule, log = stack.enter_context(process([str(binaries/executable('astra-rule')), str(rule_path)], directory, 'rule', env=environment))
+                wait_socket(sock, rule, log, timeout=20)
                 for ttl in (0, 60):
                     port = free_port()
                     proxy_path = directory / 'proxy.toml'
-                    proxy_path.write_text(f'rule_socket="{sock}"\nsocks5_listen="127.0.0.1:{port}"\ndecision_cache_ttl_secs={ttl}\nmax_connections=4096\nshutdown_timeout_secs=1\n')
-                    with process([str(binaries/'astra-proxy'), str(proxy_path)], directory, f'proxy-{ttl}') as (proxy, proxy_log):
+                    proxy_path.write_text(f'rule_socket={json.dumps(str(sock), ensure_ascii=False)}\nsocks5_listen="127.0.0.1:{port}"\ndecision_cache_ttl_secs={ttl}\nmax_connections=4096\nshutdown_timeout_secs=1\n', encoding='utf-8')
+                    with process([str(binaries/executable('astra-proxy')), str(proxy_path)], directory, f'proxy-{ttl}', env=environment) as (proxy, proxy_log):
                         wait_port(port, proxy, proxy_log)
                         for concurrency in args.concurrency:
                             await samples(port, target, 32, min(32, concurrency))
@@ -126,7 +137,7 @@ async def run(args):
                             report['results'].append(row)
                             print(json.dumps(row), flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2) + '\n')
+    args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 
 
 def main():

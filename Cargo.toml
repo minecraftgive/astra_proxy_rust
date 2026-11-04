@@ -20,3 +20,40 @@ anyhow = "1"
 meow-common = { path = "vendor/meow-common" }
 meow-proxy = { path = "vendor/meow-proxy" }
 netstack-smoltcp = { path = "vendor/netstack-smoltcp" }
+
+# Fast local iteration, retaining file/line information in panic backtraces.
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+lto = "off"
+codegen-units = 256
+incremental = true
+panic = "unwind"
+
+# Release semantics with compilation speed taking priority over runtime speed.
+# Keep the standard `release` profile unchanged for ordinary cargo --release.
+[profile.release-fast]
+inherits = "release"
+opt-level = 0
+debug = 0
+lto = "off"
+codegen-units = 256
+incremental = true
+panic = "unwind"
+
+# Optimized debug builds retain dev assertions, overflow checks and line info.
+[profile.dev-runtime]
+inherits = "dev"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "unwind"
+
+[profile.release-runtime]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "unwind"

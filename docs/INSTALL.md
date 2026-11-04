@@ -21,8 +21,8 @@
 Controller 包包含独立 `astra-manager`；Web 包包含独立 `astra-web`，编译时嵌入 React 构建产物。二者运行时不需要 Node/Python。Web 构建需要 Node/npm，其他三个角色不需要。配置模板和初始化流程见 [MANAGEMENT.md](MANAGEMENT.md)；没有预置 Agent token 或管理员密码。
 
 ```sh
-python scripts/build.py --role controller --package
-python scripts/build.py --role web --package
+python scripts/build.py --role controller --mode runtime --profile release --package
+python scripts/build.py --role web --mode runtime --profile release --package
 ```
 
 首次迁移前备份旧状态、配置、更新目录和凭据，正常退出旧管理服务。新的角色配置与 v2 API 不保证旧管理程序兼容；不可让两个管理进程共用同一状态目录。
@@ -34,14 +34,13 @@ python scripts/build.py --role web --package
 需要 Rust MSVC 工具链、Visual Studio C++ 构建工具及 Windows SDK、CMake、NASM（x64 的 BoringSSL 依赖）、libclang 和 Python 3.11+。NASM 可从 [官方发布目录](https://www.nasm.us/pub/nasm/releasebuilds/) 获取；将 `nasm.exe` 加入 PATH。libclang 可通过 LLVM 安装或 `python -m pip install --target .build-tools/windows/python libclang` 提供，系统安装时设置 `LIBCLANG_PATH` 指向包含 `libclang.dll` 的目录。构建脚本会识别项目内 `.build-tools/windows/nasm-*/nasm.exe` 和 `.build-tools/windows/python/clang/native/libclang.dll`。
 
 ```powershell
-./scripts/build.ps1                         # release 构建客户端（不测试、不打包）
-./scripts/build.ps1 --debug                 # debug 构建
+./scripts/build.ps1                         # fast + debug 客户端（不测试、不打包）
+./scripts/build.ps1 --mode runtime --profile release --package
 ./target/x86_64-pc-windows-msvc/debug/astra-tui.exe
-python scripts/test.py --debug              # 测试 debug 构建：单元、live 与本地回归
-# 已有普通 cargo build 的产物：
-python scripts/windows_regression.py --bin-dir target/debug
-python scripts/astra.py --debug --check
-python scripts/astra.py --debug
+python scripts/test.py --debug --mode fast   # 单元、live 与本地回归
+python scripts/windows_regression.py --bin-dir target/x86_64-pc-windows-msvc/debug
+python scripts/astra.py --debug --mode fast --check
+python scripts/astra.py --debug --mode fast
 ```
 
 归档仍使用 `.tar.gz`，程序带 `.exe` 后缀；可使用 Windows 自带 `tar` 解压。TUI 默认状态目录是 `%LOCALAPPDATA%/.astra/tui`，配置目录是 `%LOCALAPPDATA%/.astra/config`，订阅和远程资源缓存位于 `%LOCALAPPDATA%/.astra/runtime`（缺少 LOCALAPPDATA 时回退 USERPROFILE）。可分别用 `--state-dir`、`--config-dir` 和 `ASTRA_RUNTIME_DIR` 自定义，配置与状态目录不能重合或嵌套；支持空格、中文及超过 Unix socket 长度限制的状态路径。命名管道仅允许当前用户访问，状态文件和 TUI 保存的配置使用当前用户 ACL。
@@ -58,7 +57,7 @@ Windows 系统接管示例见 `configs/windows.toml`，两种模式默认均关�
 
 ```powershell
 # 仅下载并核对 SHA-256、复制 DLL 与许可；此命令不加载或安装驱动。
-python scripts/install_wintun.py --bin-dir target/debug
+python scripts/install_wintun.py --bin-dir target/x86_64-pc-windows-msvc/debug
 # 离线时用 --archive 指向官方 wintun-0.14.1.zip。
 # 构建脚本会把缓存中的 DLL 与许可复制进新产物：
 ./scripts/build.ps1 --debug
@@ -74,29 +73,62 @@ python scripts/install_wintun.py --bin-dir target/debug
 ./scripts/build.sh
 ```
 
-`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖构建本机 release 版本的客户端程序，**不运行测试、不打包**。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
+`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖，以 `fast` 模式构建本机 `debug` 客户端程序，**不运行测试、不打包**。交互菜单可分别选择模式、debug/release、角色及是否打包；自动化调用使用 `--non-interactive` 跳过菜单。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
 
-```sh
-./scripts/build.sh --debug                        # 调试构建
-./scripts/build.sh --role server                  # 构建服务端（client / server / controller / web / all）
-./scripts/build.sh --role all --package           # 构建并按四个角色分别生成压缩包
-./scripts/build.sh --package --label 0.1.0-tui --output-dir dist
+```powershell
+# 默认：极速 debug
+./scripts/build.ps1
+
+# 极速 release
+./scripts/build.ps1 --profile release --mode fast
+
+# 高强度运行优化、可分发的 release
+./scripts/build.ps1 --profile release --mode runtime
+
+# 同时生成两种类型并记录耗时
+./scripts/build.ps1 --profile both --mode fast --timings
 ```
 
-二进制输出位于 `target/<本机 Rust target>/release/`（调试版本为 `debug/`），支持 `CARGO_TARGET_DIR`。脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自客户端程序共同的 Cargo 版本，`--label` 可覆盖；分发目录仅生成 `.tar.gz`，SHA-256 输出到控制台。每次构建使用独立时间戳目录并生成 artifacts.json；有多次产物时，通过 --artifact-dir 明确选择待验证的目录。四个角色分别打包，Web 与 Controller 不被嵌入 Core。
+```sh
+./scripts/build.sh --mode fast --profile both --timings   # 测量快速 debug 和 release
+./scripts/build.sh --role server                         # 快速 debug 服务端
+./scripts/build.sh --mode runtime --profile release --role all --package
+./scripts/build.sh --mode runtime --profile release --package --label 0.1.0-tui --output-dir dist --non-interactive
+```
+
+`--mode fast|runtime` 与 `--profile debug|release|both` 独立；`--debug` 是 `--profile debug` 的别名。四种组合使用不同 Cargo profile 和缓存目录，切换后首次需要编译，之后可复用对应缓存：
+
+| 模式 / 版本 | Cargo profile | 二进制目录（相对 `target/<本机 Rust target>/`） | 用途 |
+|---|---|---|---|
+| fast / debug（默认） | `dev` | `debug/` | 关闭优化、增量编译，保留断言与溢出检查 |
+| fast / release | `release-fast` | `release-fast/` | 关闭优化、增量编译，采用 release 的断言与溢出检查设置 |
+| runtime / debug | `dev-runtime` | `dev-runtime/` | 三级优化、完整 LTO，保留断言与溢出检查 |
+| runtime / release | `release-runtime` | `release-runtime/` | 三级优化、完整 LTO，采用 release 的断言与溢出检查设置 |
+
+fast 使用 256 个代码生成单元并关闭 LTO；**fast release 也不优化运行速度**，适合快速验证，吞吐和 CPU 开销可能明显逊于优化版本。runtime 使用单个代码生成单元并关闭增量编译，以更长编译与链接时间换取运行优化。两种 debug 都只保留回溯文件与行号，不保留完整变量和类型调试信息；需要变量级调试时，可在独立终端设置 `CARGO_PROFILE_DEV_DEBUG=2`（runtime debug 为 `CARGO_PROFILE_DEV_RUNTIME_DEBUG=2`），退出该终端即可恢复默认。改变这些设置会触发对应缓存重编译。
+
+所有模式保留完整协议功能和 `panic = "unwind"`，不改变数据库线程及任务的故障处理。runtime 使用目标平台默认 CPU 基线，不设置 `target-cpu=native`，不引入 nightly、PGO 或跨语言 LTO；它是运行优化预设，实际提升仍需在目标机器测量。配置选项及其取舍见 [Cargo profile 官方文档](https://doc.rust-lang.org/cargo/reference/profiles.html)。BoringSSL、AWS-LC 等原生依赖仍需编译。
+
+仓库的 `.cargo/config.toml` 将默认目标设为 `host-tuple`，因此普通 `cargo build` 与脚本共用 `target/<本机 Rust target>/` 布局；已有 `target/debug`、`target/release` 不会自动迁移。普通 `cargo build --release` 仍使用原始标准 release 优化设置，输出至 `target/<本机 Rust target>/release/`。也可直接执行 `cargo build --profile release-fast`、`--profile dev-runtime` 或 `--profile release-runtime`。
+
+输出支持 `CARGO_TARGET_DIR`；脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自所选程序共同的 Cargo 版本，`--label` 可覆盖；分发目录生成 `.tar.gz`，SHA-256 输出到控制台。每次构建使用独立时间戳目录并生成 `artifacts.json`，记录角色、debug/release、构建模式和 Cargo profile；有多次产物时，通过 `--artifact-dir` 明确选择待验证的目录。四个角色分别打包，Web 与 Controller 不被嵌入 Core。
+
+新安装包的 `manifest.json` 也记录构建模式与 Cargo profile。本次更新后的导入器仍接受旧安装包；更新前的导入器会拒绝这些新增字段，因此首次升级到此版本须正常退出程序后手动解压、替换程序，不能通过旧程序的包导入功能升级。
+
+加 `--timings` 生成 Cargo HTML 编译报告，并将每个 profile 的报告保存到 `dist/<本次构建目录>/cargo-timing-<Cargo profile>.html`；脚本打印确切路径，原始报告也保留在目标目录的 `cargo-timings/` 中。对比时保持角色、目标、工具链和机器一致，分别记录空缓存首次构建、无改动重复构建，以及修改 Rust 文件后的增量构建；冷构建可用独立 `CARGO_TARGET_DIR`，无需删除日常缓存。仅切换 profile 后的首次耗时不能代表稳定的增量速度。构建脚本不会自动运行性能测试。
 
 解压包中的程序位于对应角色目录；client/server 包另含 Core 示例，TUI 使用旁边的管理程序和 Core。
 
 ### 测试
 
-测试与构建分开，由 `scripts/test.py` 针对 `build.py` 的产物运行；使用与构建相同的 `--debug` 选择：
+测试与构建分开，由 `scripts/test.py` 针对 `build.py` 的产物运行。debug 产物添加 `--debug`，release 产物不加；`--mode` 选择同一构建模式。指定 `--artifact-dir` 时可从索引推断模式，未指定索引和模式时保留原有 debug/release 路径选择，不会把普通 release 静默替换为 fast release。启动器 `scripts/astra.py` 使用相同的 `--debug`、`--mode` 与 `--artifact-dir` 选择规则。
 
 ```sh
-python3 scripts/test.py                  # 默认：unit live client
-python3 scripts/test.py --debug unit     # 只跑工作区单元/集成测试
-python3 scripts/test.py server           # 服务端回归（先 build.py --role server）
-python3 scripts/test.py package          # 解压 dist/ 中的压缩包并启动验证（先 build.py --package）
-python3 scripts/test.py --keep-going     # 失败后继续，最后汇总
+python3 scripts/test.py --debug --mode fast             # 默认套件：unit live client
+python3 scripts/test.py --debug --mode fast unit        # 只跑工作区单元/集成测试
+python3 scripts/test.py --mode runtime --artifact-dir dist/<本次构建目录> server
+python3 scripts/test.py --artifact-dir dist/<本次构建目录> package
+python3 scripts/test.py --debug --mode fast --keep-going # 失败后继续，最后汇总
 ```
 
 | 套件 | 内容 |
@@ -108,6 +140,6 @@ python3 scripts/test.py --keep-going     # 失败后继续，最后汇总
 | `package` | 归档文件集合、完整配置、TUI 管理 IPC、核心启动及 SOCKS5 回显；客户端报告写入 `.test-tools/` |
 | `release` | 完整协议矩阵门禁（`release_check.py`），需先用 `install_test_servers.py` 准备参考服务端 |
 
-单个回归脚本仍可直接运行，例如 `python scripts/windows_regression.py --bin-dir target/debug`。
+单个回归脚本仍可直接运行，例如 `python scripts/windows_regression.py --bin-dir target/x86_64-pc-windows-msvc/debug`。旧目录或外部产物可显式传 `--bin-dir`；它不会转换产物的构建模式。
 
 本机性能基线见 [PERFORMANCE.md](PERFORMANCE.md)。这些数字包含本地测试端开销，不能当作加密代理生产容量承诺。

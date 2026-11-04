@@ -398,7 +398,7 @@ impl Ui {
                         },
                     ));
                 } else if self.page == shell::CONNECTIONS && !self.connection_filter.is_empty() {
-                    let count = self.visible_connections().len();
+                    let count = self.connection_rows().len();
                     if count > 0 {
                         let current = self.connection_selection.min(count - 1);
                         self.select_connection(if backwards {

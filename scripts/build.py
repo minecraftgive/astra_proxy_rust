@@ -13,9 +13,8 @@ import shutil
 import subprocess
 import sys
 import time
-from astra_tools.workspace import ROOT, BuildLayout, build_environment
-from astra_tools.artifacts import ROLES, ArtifactIndex, role_packages, stage, package
-from astra_tools.platform import executable
+from astra_tools.workspace import ROOT, BUILD_MODES, BuildLayout, build_environment, cargo_profile
+from astra_tools.artifacts import ROLES, ArtifactIndex, role_binaries, role_packages, stage, package
 
 def interactive_options(args):
     """Single-key menu; every key restarts the inactivity deadline."""
@@ -42,9 +41,10 @@ def interactive_options(args):
     with keyboard() as read_key:
         while True:
             remaining = max(0, int(deadline - time.monotonic() + 0.999))
-            status = (args.profile, args.role, args.package, remaining)
+            status = (args.profile, args.mode, args.role, args.package, remaining)
             if status != previous:
                 print(f"\r[P] Profile: {args.profile:7}  [R] Role: {args.role:6}  "
+                      f"[M] Mode: {args.mode:7}  "
                       f"[A] Archive: {'yes' if args.package else 'no ':3}  "
                       f"[Enter] Build  [Q] Quit  Idle: {remaining:2}s   ", end='', flush=True)
                 previous = status
@@ -64,8 +64,10 @@ def interactive_options(args):
                 print()
                 return
             if key == 'p':
-                values = ('both', 'debug', 'release')
+                values = ('debug', 'release', 'both')
                 args.profile = values[(values.index(args.profile) + 1) % len(values)]
+            elif key == 'm':
+                args.mode = BUILD_MODES[(BUILD_MODES.index(args.mode) + 1) % len(BUILD_MODES)]
             elif key == 'r':
                 values = ('client', 'server', 'controller', 'web', 'all')
                 args.role = values[(values.index(args.role) + 1) % len(values)]
@@ -84,15 +86,30 @@ def build_web_assets(env):
         raise RuntimeError('Web build did not produce apps/web/dist/index.html')
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--debug', action='store_true', help='alias for --profile debug')
     parser.add_argument('--role', choices=(*ROLES, 'all'), default='client')
     parser.add_argument('--package', action='store_true')
     parser.add_argument('--output-dir', type=Path, default=ROOT / 'dist')
     parser.add_argument('--label', help='archive label (default: selected component version)')
-    parser.add_argument('--profile', choices=('debug', 'release', 'both'), default='both')
+    parser.add_argument('--profile', choices=('debug', 'release', 'both'), default='debug')
+    parser.add_argument('--mode', choices=BUILD_MODES, default='fast',
+                        help='fast: shortest compilation; runtime: portable runtime optimization (default: fast)')
+    parser.add_argument('--timings', action='store_true', help='save Cargo HTML timing reports with the distribution')
     parser.add_argument('--non-interactive', action='store_true')
+    return parser
+
+
+def build_command(roles, target, profile, mode, *, timings=False):
+    crates = [item for name in role_packages(roles) for item in ('-p', name)]
+    binaries = [item for name in role_binaries(roles) for item in ('--bin', name)]
+    return ['cargo', 'build', '--locked', *crates, *binaries, '--target', target,
+            '--profile', cargo_profile(profile, mode), *(['--timings'] if timings else [])]
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     if args.debug:
         args.profile = 'debug'
@@ -103,7 +120,7 @@ def main():
         if not shutil.which(tool, path=env['PATH']):
             parser.error(f'{tool} is required; see docs/INSTALL.md')
     layout, metadata = BuildLayout.discover(env)
-    if env.get('CARGO_BUILD_TARGET', layout.target) != layout.target:
+    if env.get('CARGO_BUILD_TARGET', layout.target) not in (layout.target, 'host-tuple'):
         parser.error('Native builds require CARGO_BUILD_TARGET to match the Rust host')
     if os.name == 'nt' and platform.machine().lower() in ('amd64', 'x86_64') and not shutil.which('nasm', path=env['PATH']):
         parser.error('NASM is required by BoringSSL on Windows x64; see docs/INSTALL.md')
@@ -128,11 +145,19 @@ def main():
     index = ArtifactIndex(run_dir, layout.target, revision.stdout.strip() if revision.returncode == 0 else '')
     profiles = ('debug', 'release') if args.profile == 'both' else (args.profile,)
     for profile in profiles:
-        bin_dir = layout.binary_dir(profile)
-        flags = ['--profile', 'dev'] if profile == 'debug' else ['--release']
-        crates = [item for name in packages for item in ('-p', name)]
-        subprocess.run(['cargo', 'build', '--locked', *crates, '--bins', '--target', layout.target, *flags],
+        selected_profile = cargo_profile(profile, args.mode)
+        bin_dir = layout.binary_dir(profile, args.mode)
+        print(f'Building {", ".join(roles)}: {args.mode} {profile} (Cargo profile: {selected_profile})', flush=True)
+        started = time.perf_counter()
+        subprocess.run(build_command(roles, layout.target, profile, args.mode, timings=args.timings),
                        check=True, cwd=ROOT, env=env)
+        elapsed = time.perf_counter() - started
+        if args.timings:
+            report = layout.target_directory / 'cargo-timings' / 'cargo-timing.html'
+            if report.is_file():
+                destination = run_dir / f'cargo-timing-{selected_profile}.html'
+                shutil.copy2(report, destination)
+                print(f'Timing report: {destination}')
         if 'client' in roles and os.name == 'nt':
             arch = {'amd64': 'amd64', 'x86_64': 'amd64', 'arm64': 'arm64', 'aarch64': 'arm64', 'x86': 'x86', 'i686': 'x86'}.get(platform.machine().lower())
             wintun = ROOT / '.build-tools/windows/wintun' / str(arch)
@@ -140,11 +165,13 @@ def main():
                 if (wintun / name).is_file():
                     shutil.copy2(wintun / name, bin_dir / name)
         for role in roles:
-            staged = stage(role, bin_dir, run_dir / profile / role, target=layout.target, versions=versions, label=label)
+            staged = stage(role, bin_dir, run_dir / profile / role, target=layout.target, versions=versions,
+                           label=label, profile=profile, mode=args.mode, cargo_profile=selected_profile)
             archive = package(role, staged, run_dir / profile, label, target=layout.target) if args.package else None
-            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive)
+            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive,
+                      mode=args.mode, cargo_profile=selected_profile)
             index.save()
-        print(f'Built {", ".join(roles)} in {bin_dir}')
+        print(f'Built {", ".join(roles)} in {elapsed:.2f}s: {bin_dir}')
     print(f'Distribution: {run_dir}\nArtifact index: {run_dir / "artifacts.json"}')
 
 

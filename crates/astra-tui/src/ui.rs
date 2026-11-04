@@ -1,5 +1,6 @@
 mod animation;
 mod commands;
+mod connections;
 mod drafts;
 mod event_loop;
 mod focus;
@@ -400,9 +401,9 @@ struct Ui {
     group_selection: usize,
     profile_viewport: std::cell::Cell<usize>,
     connection_selection: usize,
-    overview_scroll: usize,
+    overview_cursor: usize,
     /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
-    overview_scroll_limit: std::cell::Cell<usize>,
+    overview_item_count: std::cell::Cell<usize>,
     traffic_expanded: bool,
     /// First time each warning was shown; warnings hide after a short delay.
     notice_since: std::cell::RefCell<HashMap<String, Instant>>,
@@ -554,8 +555,8 @@ impl Ui {
             group_selection: 0,
             profile_viewport: std::cell::Cell::new(1),
             connection_selection: 0,
-            overview_scroll: 0,
-            overview_scroll_limit: Default::default(),
+            overview_cursor: 0,
+            overview_item_count: Default::default(),
             traffic_expanded: false,
             notice_since: Default::default(),
             connection_filter: String::new(),

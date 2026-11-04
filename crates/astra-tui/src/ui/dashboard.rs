@@ -1,4 +1,5 @@
 //! Overview page and shared mouse hit testing. Never synthesize telemetry.
+use super::connections::{ConnectionRow, ConnectionRowKey};
 use super::shell::{duration, CONNECTIONS, LOGS, PAGES, PROXIES};
 use super::*;
 use astra_model::runtime::Mode;
@@ -24,6 +25,7 @@ pub(super) enum Target {
     Group(usize),
     Member(usize),
     Connection(u64),
+    ConnectionRow(ConnectionRowKey),
     Connect,
     Palette(usize),
     NetTools,
@@ -547,13 +549,12 @@ impl Ui {
     }
 
     fn render_overview_main(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
+        let connection_count = self.connection_rows().len();
         if area.width >= 120 {
             let columns =
                 Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
                     .split(area);
-            if let Some(snapshot) = self.live() {
-                self.overview_scroll_limit.set(snapshot.connections.len());
-            }
+            self.overview_item_count.set(connection_count);
             self.render_overview_connections(f, columns[0], false);
             self.render_snapshot(f, columns[1]);
             return;
@@ -563,14 +564,13 @@ impl Ui {
         let groups_visible = groups_height >= 4;
         let (limit, groups_start) = match self.live() {
             Some(snapshot) if narrow && groups_visible => (
-                snapshot.connections.len() + snapshot.groups.len(),
-                self.overview_scroll
-                    .saturating_sub(snapshot.connections.len()),
+                connection_count + snapshot.groups.len(),
+                self.overview_cursor.saturating_sub(connection_count),
             ),
-            Some(snapshot) => (snapshot.connections.len(), 0),
+            Some(_) => (connection_count, 0),
             None => (0, 0),
         };
-        self.overview_scroll_limit.set(limit);
+        self.overview_item_count.set(limit);
         if groups_visible {
             let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(groups_height)])
                 .split(area);
@@ -679,7 +679,7 @@ impl Ui {
 
     fn render_group_rows(&self, f: &mut Frame<'_>, area: Rect, start: usize) {
         self.record_live_viewport(
-            live::Viewport::Groups,
+            live::Viewport::OverviewGroups,
             if area.width > 0 {
                 area.height as usize
             } else {
@@ -716,13 +716,16 @@ impl Ui {
             .min(18);
         let visible = area.height as usize;
         let total = snapshot.groups.len();
-        let start = if self.focus.region == focus::Region::Secondary {
-            self.group_selection
-                .saturating_sub(visible.saturating_sub(1))
+        let selected = if self.focus.region == focus::Region::Secondary {
+            Some(self.group_selection)
+        } else if self.overview_cursor >= self.connection_rows().len()
+            && self.overview_cursor < self.overview_item_count.get()
+        {
+            Some(start)
         } else {
-            start
-        }
-        .min(total.saturating_sub(visible.max(1)));
+            None
+        };
+        let start = self.live_list_offset(live::Viewport::OverviewGroups, selected, total, visible);
         for (offset, group) in snapshot.groups.iter().skip(start).take(visible).enumerate() {
             let selected = group.selected.as_deref().unwrap_or("—");
             let member = group.members.iter().find(|m| m.name == selected);
@@ -803,7 +806,7 @@ impl Ui {
         self.hit(area, Target::Page(CONNECTIONS));
         self.render_border_sparkline(f, area, &title);
 
-        let Some(snapshot) = self.connection_snapshot() else {
+        let Some(_) = self.connection_snapshot() else {
             f.render_widget(
                 Paragraph::new(t("Connections appear after connecting."))
                     .style(Style::default().fg(MUTED)),
@@ -811,8 +814,7 @@ impl Ui {
             );
             return;
         };
-        let mut connections: Vec<_> = snapshot.connections.iter().collect();
-        connections.sort_by_key(|c| (std::cmp::Reverse(c.upload.saturating_add(c.download)), c.id));
+        let connections = self.connection_rows();
         if connections.is_empty() {
             f.render_widget(
                 Paragraph::new(t("No active connections")).style(Style::default().fg(MUTED)),
@@ -836,10 +838,10 @@ impl Ui {
             let text = if let Some(hint) = self.connection_pause_hint() {
                 hint
             } else if narrow {
-                tr!("↑↓ select · Enter details · Space pause")
+                tr!("↑↓ select · Enter expand/details · Space pause")
             } else {
                 tr!(
-                    "Enter open · Space pause · total traffic ↓ · {}",
+                    "Enter expand/open · ←→ fold · Space pause · {}",
                     if self.traffic_expanded {
                         t("z collapse")
                     } else {
@@ -854,21 +856,21 @@ impl Ui {
         }
     }
 
-    fn render_connection_rows(
-        &self,
-        f: &mut Frame<'_>,
-        area: Rect,
-        connections: &[&astra_model::runtime::Connection],
-    ) {
+    fn render_connection_rows(&self, f: &mut Frame<'_>, area: Rect, connections: &[ConnectionRow]) {
         let visible = area.height as usize;
-        self.record_live_viewport(live::Viewport::Overview, visible);
-        let start = self
-            .overview_scroll
-            .min(connections.len().saturating_sub(visible.max(1)));
+        let selected_key = self.selected_connection_row_key();
+        let start = self.live_list_offset(
+            live::Viewport::Overview,
+            connections
+                .iter()
+                .position(|row| selected_key.as_ref() == Some(&row.key)),
+            connections.len(),
+            visible,
+        );
         let fit = |text: String, width: usize| fit_cells(&text, width);
         let outbound_width = connections
             .iter()
-            .map(|c| Line::from(c.outbound.as_str()).width())
+            .map(|row| Line::from(row.connection.outbound.as_str()).width())
             .max()
             .unwrap_or(0)
             .clamp(6, 24);
@@ -879,8 +881,9 @@ impl Ui {
             .iter()
             .skip(start)
             .take(visible)
-            .map(|c| {
-                let target = fit(format!("{}:{}", c.host, c.port), host_width);
+            .map(|row| {
+                let c = &row.connection;
+                let target = fit(row.label(), host_width);
                 let outbound = fit(c.outbound.clone(), outbound_width);
                 Line::from(vec![
                     Span::raw(format!(" {} ", pad_cells(&target, host_width))),
@@ -899,18 +902,20 @@ impl Ui {
                         crate::theme::volume_style(c.upload),
                     ),
                 ])
-                .style(if self.connection_is_selected(c.id) {
-                    crate::theme::selected_keep_colors()
-                } else {
-                    Style::default()
-                })
+                .style(crate::theme::connection_row_style(
+                    selected_key.as_ref() == Some(&row.key),
+                    row.fresh,
+                ))
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
         for index in 0..connections.len().saturating_sub(start).min(visible) {
             self.hit(
                 Rect::new(area.x + 1, area.y + index as u16, area.width - 2, 1),
-                Target::Connection(connections[start + index].id),
+                match &connections[start + index].key {
+                    ConnectionRowKey::Connection(id) => Target::Connection(*id),
+                    key => Target::ConnectionRow(key.clone()),
+                },
             );
         }
     }
@@ -919,15 +924,25 @@ impl Ui {
         &self,
         f: &mut Frame<'_>,
         area: Rect,
-        connections: &[&astra_model::runtime::Connection],
+        connections: &[ConnectionRow],
     ) {
-        let visible = (area.height as usize / 2).max(1);
-        self.record_live_viewport(live::Viewport::Overview, area.height as usize / 2);
-        let start = self
-            .overview_scroll
-            .min(connections.len().saturating_sub(visible));
+        let visible = area.height as usize / 2;
+        let selected_key = self.selected_connection_row_key();
+        let start = self.live_list_offset(
+            live::Viewport::Overview,
+            connections
+                .iter()
+                .position(|row| selected_key.as_ref() == Some(&row.key)),
+            connections.len(),
+            visible,
+        );
         let fit = |text: String, width: usize| fit_cells(&text, width);
-        for (offset, c) in connections.iter().skip(start).take(visible).enumerate() {
+        for (offset, row) in connections.iter().skip(start).take(visible).enumerate() {
+            let c = &row.connection;
+            let row_style = crate::theme::connection_row_style(
+                selected_key.as_ref() == Some(&row.key),
+                row.fresh,
+            );
             let y = area.y + (offset * 2) as u16;
             if y + 1 >= area.bottom() {
                 break;
@@ -935,13 +950,9 @@ impl Ui {
             f.render_widget(
                 Paragraph::new(Line::from(Span::raw(format!(
                     " {}",
-                    fit(format!("{}:{}", c.host, c.port), area.width as usize - 2)
+                    fit(row.label(), area.width as usize - 2)
                 ))))
-                .style(if self.connection_is_selected(c.id) {
-                    crate::theme::selected_keep_colors()
-                } else {
-                    Style::default()
-                }),
+                .style(row_style),
                 Rect::new(area.x, y, area.width, 1),
             );
             let counters = format!("↓{}  ↑{}", live::bytes(c.download), live::bytes(c.upload));
@@ -969,12 +980,15 @@ impl Ui {
                 ),
             ];
             f.render_widget(
-                Paragraph::new(Line::from(route_spans)),
+                Paragraph::new(Line::from(route_spans)).style(row_style),
                 Rect::new(area.x, y + 1, area.width, 1),
             );
             self.hit(
                 Rect::new(area.x + 1, y, area.width.saturating_sub(2), 2),
-                Target::Connection(connections[start + offset].id),
+                match &row.key {
+                    ConnectionRowKey::Connection(id) => Target::Connection(*id),
+                    key => Target::ConnectionRow(key.clone()),
+                },
             );
         }
     }
@@ -1161,6 +1175,12 @@ impl Ui {
                 Input::Idle
             }
             Some(Target::Member(index)) => self.choose_runtime_member(index),
+            Some(Target::ConnectionRow(key)) => {
+                self.focus.region = focus::Region::Main;
+                self.select_connection_row_key(key);
+                self.toggle_connection_group();
+                Input::Idle
+            }
             Some(Target::Connection(id)) => {
                 self.focus.region = focus::Region::Main;
                 self.select_connection_id(id);
@@ -1551,7 +1571,7 @@ mod tests {
             }
             ui.accept_runtime("proxy-00".into(), snapshot);
             let _ = render(&ui, 70, 30);
-            let limit = ui.overview_scroll_limit.get();
+            let limit = ui.overview_item_count.get();
             assert_eq!(limit, 15);
             for _ in 0..limit {
                 ui.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -1561,6 +1581,68 @@ mod tests {
                 text.contains("GROUP-9"),
                 "proxy groups did not scroll: {text}"
             );
+        });
+    }
+    #[test]
+    fn overview_folds_shared_targets_and_renders_aggregate_traffic() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            for width in [140, 70] {
+                let mut ui = live_sample();
+                let mut snapshot = ui.live().unwrap().clone();
+                let mut first = snapshot.connections[0].clone();
+                first.id = 10;
+                first.host = "chatgpt.com".into();
+                first.port = 443;
+                first.upload = 1024;
+                first.download = 2048;
+                let mut second = first.clone();
+                second.id = 11;
+                second.upload = 2048;
+                second.download = 4096;
+                snapshot.connections = vec![first, second];
+                snapshot.active = 2;
+                ui.accept_runtime("proxy-00".into(), snapshot);
+                let text = screen(&render(&ui, width, 30));
+                assert!(text.contains("▸ chatgpt.com:443 (2)"), "{text}");
+                assert!(text.contains("3.0 KiB") && text.contains("6.0 KiB"));
+                assert!(!ui
+                    .hits
+                    .borrow()
+                    .iter()
+                    .any(|(_, target)| matches!(target, Target::Connection(_))));
+                let header = ui
+                    .hits
+                    .borrow()
+                    .iter()
+                    .find_map(|(area, target)| {
+                        matches!(target, Target::ConnectionRow(_)).then_some(*area)
+                    })
+                    .unwrap();
+                ui.mouse(click(header));
+                assert_eq!(ui.page, OVERVIEW);
+                let text = screen(&render(&ui, width, 30));
+                assert!(text.contains("▾ chatgpt.com:443 (2)"), "{text}");
+                for id in [10, 11] {
+                    assert!(ui.hits.borrow().iter().any(
+                        |(_, target)| matches!(target, Target::Connection(value) if *value == id)
+                    ));
+                }
+                let header = ui
+                    .hits
+                    .borrow()
+                    .iter()
+                    .find_map(|(area, target)| {
+                        matches!(target, Target::ConnectionRow(_)).then_some(*area)
+                    })
+                    .unwrap();
+                ui.mouse(click(header));
+                render(&ui, width, 30);
+                assert!(!ui
+                    .hits
+                    .borrow()
+                    .iter()
+                    .any(|(_, target)| matches!(target, Target::Connection(_))));
+            }
         });
     }
     #[test]

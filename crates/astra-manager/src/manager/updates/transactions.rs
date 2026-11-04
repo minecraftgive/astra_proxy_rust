@@ -604,6 +604,9 @@ mod tests {
                 host_protocol: astra_update::ProtocolRange { min: 1, max: 1 },
                 components,
                 files,
+                profile: None,
+                mode: None,
+                cargo_profile: None,
             };
             fs::write(
                 directory.join(astra_update::MANIFEST_FILE),

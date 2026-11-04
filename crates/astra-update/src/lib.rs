@@ -5,7 +5,7 @@
 mod package;
 mod store;
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub use store::{
@@ -45,6 +45,13 @@ pub struct ReleaseManifest {
     pub host_protocol: ProtocolRange,
     pub components: BTreeMap<String, String>,
     pub files: Vec<ReleaseFile>,
+    /// Build metadata is absent from legacy release manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_profile: Option<String>,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +140,24 @@ impl ReleaseManifest {
             self.schema_version == 1,
             "Unsupported release manifest schema"
         );
+        match (
+            self.profile.as_deref(),
+            self.mode.as_deref(),
+            self.cargo_profile.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(profile), Some(mode), Some(cargo_profile)) => ensure!(
+                matches!(
+                    (profile, mode, cargo_profile),
+                    ("debug", "fast", "dev")
+                        | ("release", "fast", "release-fast")
+                        | ("debug", "runtime", "dev-runtime")
+                        | ("release", "runtime", "release-runtime")
+                ),
+                "Invalid build metadata: profile={profile}, mode={mode}, cargo_profile={cargo_profile}"
+            ),
+            _ => bail!("Build metadata requires profile, mode and cargo_profile together"),
+        }
         ensure!(self.role == ReleaseRole::Client,
             "This is a {:?} package, not a client worker update; install it through the corresponding service maintenance restart", self.role);
         validate_id(&self.release_id)?;

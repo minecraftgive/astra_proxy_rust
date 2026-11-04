@@ -460,6 +460,9 @@ mod tests {
                 },
                 components: Default::default(),
                 files: Vec::new(),
+                profile: None,
+                mode: None,
+                cargo_profile: None,
             };
             let mut components = vec!["astra-proxy", "astra-rule", "astra-tui"];
             if host {

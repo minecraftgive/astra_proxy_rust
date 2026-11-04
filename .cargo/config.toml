@@ -1,0 +1,3 @@
+[build]
+# Share the native target layout used by the build and test scripts.
+target = "host-tuple"

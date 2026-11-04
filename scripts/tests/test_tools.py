@@ -35,13 +35,15 @@ class LayoutTests(unittest.TestCase):
                 file.touch()
             instances = [{'installationVersion': '18.2.0', 'installationPath': str(removed)},
                          {'installationVersion': '18.1.0', 'installationPath': str(actual)}]
-            env = {'ProgramFiles(x86)': str(root), 'PATH': 'original'}
+            env = {'ProgramFiles(x86)': str(root), 'PATH': 'original',
+                   'VS180COMNTOOLS': str(removed / 'Common7/Tools')}
             replies = [Mock(stdout=json.dumps(instances)), Mock(stdout='Path=compiler-path\nINCLUDE=include-path\nPRIVATE_TOKEN=must-not-copy\n')]
             with patch('astra_tools.workspace.subprocess.run', side_effect=replies), patch('astra_tools.workspace.platform.machine', return_value='AMD64'):
                 _windows_toolchain(env)
             self.assertEqual(env['CC'], str(compiler))
             self.assertEqual(env['CMAKE_GENERATOR_INSTANCE'], str(actual))
             self.assertEqual(env['CMAKE_GENERATOR'], 'Visual Studio 18 2026')
+            self.assertEqual(env['VS180COMNTOOLS'], str(actual / 'Common7/Tools'))
             self.assertEqual(env['PATH'], 'compiler-path')
             self.assertNotIn('PRIVATE_TOKEN', env)
 

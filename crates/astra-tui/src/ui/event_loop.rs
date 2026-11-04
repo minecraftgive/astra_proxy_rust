@@ -125,6 +125,10 @@ pub(super) async fn run_local(
         let checkpoint_deadline = tokio::time::Instant::from_std(
             checkpoint_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
         );
+        let connection_expiry = ui.next_connection_expiry();
+        let connection_deadline = tokio::time::Instant::from_std(
+            connection_expiry.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
+        );
         let event = tokio::select! {
             result = &mut shutdown => break 'ui result.map_err(Into::into),
             event = events.as_mut().expect("terminal input is attached").next() => {
@@ -136,6 +140,10 @@ pub(super) async fn run_local(
             }
             _ = animation::notify().notified() => { refresh = true; continue; }
             _ = maintenance.tick() => { refresh = true; continue; }
+            _ = tokio::time::sleep_until(connection_deadline), if connection_expiry.is_some() => {
+                redraw |= ui.expire_connection_highlights();
+                continue;
+            }
             _ = tokio::time::sleep_until(deadline), if scheduled => { redraw = true; continue; }
             _ = tokio::time::sleep_until(checkpoint_deadline), if checkpoint_at.is_some() => {
                 checkpoint_at = None;
