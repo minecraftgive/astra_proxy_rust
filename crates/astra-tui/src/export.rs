@@ -249,13 +249,16 @@ pub fn current_shell_commands(text: &str) -> Result<String> {
     #[cfg(windows)]
     {
         let shell = std::env::var_os("ComSpec")
-            .and_then(|value| value.to_str().map(str::to_ascii_lowercase))
+            .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Ok(if shell.contains("powershell") || shell.contains("pwsh") {
-            commands.powershell
-        } else {
-            commands.cmd
-        })
+        // PowerShell normally inherits ComSpec=cmd.exe. Prefer the nearest
+        // actual shell ancestor, including launches through cargo/rustup.
+        Ok(
+            match windows_shell(std::process::id(), &windows_processes(), &shell) {
+                WindowsShell::PowerShell => commands.powershell,
+                WindowsShell::Cmd => commands.cmd,
+            },
+        )
     }
     #[cfg(not(windows))]
     {
@@ -268,6 +271,80 @@ pub fn current_shell_commands(text: &str) -> Result<String> {
             commands.posix
         })
     }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsShell {
+    PowerShell,
+    Cmd,
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell(mut pid: u32, processes: &[(u32, u32, String)], fallback: &str) -> WindowsShell {
+    let identify = |name: &str| match name
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "powershell.exe" | "pwsh.exe" => Some(WindowsShell::PowerShell),
+        "cmd.exe" => Some(WindowsShell::Cmd),
+        _ => None,
+    };
+    // Bound traversal even when a parent has exited or a PID was recycled.
+    for _ in 0..32 {
+        let Some((_, parent, _)) = processes.iter().find(|(id, _, _)| *id == pid) else {
+            break;
+        };
+        let Some((_, _, name)) = processes.iter().find(|(id, _, _)| id == parent) else {
+            break;
+        };
+        if let Some(shell) = identify(name) {
+            return shell;
+        }
+        pid = *parent;
+    }
+    identify(fallback).unwrap_or(WindowsShell::Cmd)
+}
+
+#[cfg(windows)]
+fn windows_processes() -> Vec<(u32, u32, String)> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut processes = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut available = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while available {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..length]),
+        ));
+        available = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    processes
 }
 
 /// Write export data without overwriting an existing destination.
@@ -485,6 +562,57 @@ payload = ["+.ads.example"]
         assert!(selected_rule_by_value(CONFIG, "example.com")
             .unwrap()
             .contains("domain_suffix"));
+    }
+
+    #[test]
+    fn windows_shell_detects_powershell_through_launchers() {
+        for shell in ["powershell.exe", "PwSh.EXE"] {
+            let processes = [
+                (4, 3, "astra-tui.exe".into()),
+                (3, 2, "cargo.exe".into()),
+                (2, 1, "rustup.exe".into()),
+                (1, 0, shell.into()),
+            ];
+            assert_eq!(
+                windows_shell(4, &processes, r"C:\Windows\System32\cmd.exe"),
+                WindowsShell::PowerShell
+            );
+        }
+    }
+
+    #[test]
+    fn windows_shell_prefers_nearest_shell_when_nested() {
+        for (nearest, outer, expected) in [
+            ("cmd.exe", "powershell.exe", WindowsShell::Cmd),
+            ("pwsh.exe", "cmd.exe", WindowsShell::PowerShell),
+        ] {
+            let processes = [
+                (3, 2, "astra-tui.exe".into()),
+                (2, 1, nearest.into()),
+                (1, 0, outer.into()),
+            ];
+            assert_eq!(windows_shell(3, &processes, "cmd.exe"), expected);
+        }
+    }
+
+    #[test]
+    fn windows_shell_falls_back_when_ancestors_are_unavailable() {
+        let processes = [(3, 2, "astra-tui.exe".into())];
+        assert_eq!(
+            windows_shell(3, &processes, r"C:\Windows\System32\cmd.exe"),
+            WindowsShell::Cmd
+        );
+        assert_eq!(
+            windows_shell(3, &processes, r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            WindowsShell::PowerShell
+        );
+        assert_eq!(windows_shell(3, &[], ""), WindowsShell::Cmd);
+    }
+
+    #[test]
+    fn windows_shell_bounds_cyclic_parent_records() {
+        let processes = [(3, 2, "astra-tui.exe".into()), (2, 3, "cargo.exe".into())];
+        assert_eq!(windows_shell(3, &processes, "cmd.exe"), WindowsShell::Cmd);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub(super) enum Id {
     Palette,
     Help,
     Profiles,
+    CopyTerminal,
     Search,
     NextMatch,
     PreviousMatch,
@@ -66,6 +67,13 @@ pub(super) const SPECS: &[Spec] = &[
         id: Id::Profiles,
         label: "Switch current profile",
         key: "Ctrl-P / p",
+        scope: Scope::Global,
+        repeat: Repeat::Once,
+    },
+    Spec {
+        id: Id::CopyTerminal,
+        label: "Copy terminal proxy commands to clipboard",
+        key: "F4",
         scope: Scope::Global,
         repeat: Repeat::Once,
     },
@@ -229,6 +237,7 @@ fn shortcut(key: event::KeyEvent) -> Option<Id> {
     match key.code {
         KeyCode::F(1) => Some(Id::Help),
         KeyCode::F(2) => Some(Id::Palette),
+        KeyCode::F(4) if key.modifiers.is_empty() => Some(Id::CopyTerminal),
         KeyCode::F(6) => Some(Id::Tasks),
         KeyCode::F(7) => Some(Id::Logs),
         KeyCode::F(9) => Some(Id::Monitor),
@@ -310,6 +319,10 @@ impl Ui {
             return Some("Open connections or logs first");
         }
         match id {
+            Id::CopyTerminal if self.prompt.is_some() => {
+                Some("Finish or cancel the current prompt first")
+            }
+            Id::CopyTerminal if self.terminal_export_profile().is_none() => Some("No profile yet"),
             Id::ReadExternal | Id::Import
                 if self
                     .editor
@@ -340,6 +353,7 @@ impl Ui {
         }
         let plain = |code| event::KeyEvent::new(code, KeyModifiers::NONE);
         match id {
+            Id::CopyTerminal => self.copy_terminal_commands(),
             Id::Palette => {
                 let was_open = self.palette.is_some();
                 self.close_replaceable_overlays();

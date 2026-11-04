@@ -37,6 +37,10 @@ impl Tasks {
     pub(super) fn notice_message(&mut self, message: &str) {
         self.notice = Some((message.into(), progress::now_ms()));
     }
+    pub(super) fn notice_result(&mut self, message: &str, failed: bool) {
+        self.notice_message(message);
+        self.verdict = Some((message.into(), failed));
+    }
     fn event(&mut self, id: u64, event: Progress) {
         if let Some(record) = self.records.iter_mut().find(|r| r.id == id) {
             let count = match (event.current, event.total) {

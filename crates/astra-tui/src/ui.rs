@@ -18,6 +18,7 @@ mod pages;
 mod shell;
 #[cfg(test)]
 mod stack_tests;
+mod terminal_export;
 #[cfg(test)]
 mod test_rpc;
 mod update;
@@ -171,7 +172,7 @@ impl Operation {
             Self::NetTools => "Network tools",
             Self::Explain => "Route explanation",
             Self::ExportConfig => "Export config",
-            Self::ExportTerminal => "Export terminal proxy commands",
+            Self::ExportTerminal => "Copy terminal proxy commands to clipboard · F4",
         })
     }
 }
@@ -405,8 +406,10 @@ struct Ui {
     /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
     overview_item_count: std::cell::Cell<usize>,
     traffic_expanded: bool,
-    /// First time each warning was shown; warnings hide after a short delay.
+    /// First time each transient notice was shown; errors remain until resolved.
     notice_since: std::cell::RefCell<HashMap<String, Instant>>,
+    /// Next expiry from the last rendered notices, consumed once to wake an idle UI.
+    notice_expiry: std::cell::Cell<Option<Instant>>,
     connection_filter: String,
     connection_filtering: bool,
     runtime_picker: Option<(String, usize)>,
@@ -559,6 +562,7 @@ impl Ui {
             overview_item_count: Default::default(),
             traffic_expanded: false,
             notice_since: Default::default(),
+            notice_expiry: Default::default(),
             connection_filter: String::new(),
             connection_filtering: false,
             runtime_picker: None,
@@ -783,14 +787,7 @@ impl Ui {
                 None
             }
             Operation::ExportTerminal => {
-                let text = std::fs::read_to_string(&row.instance.config)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|text| crate::export::current_shell_commands(&text));
-                match text {
-                    Ok(text) => self.prompt(Prompt::ExportTerminal { text }),
-                    Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
-                }
-                None
+                return self.copy_terminal_commands();
             }
             Operation::Remove => {
                 if running {

@@ -1,4 +1,5 @@
 mod availability;
+mod clipboard;
 mod diagnostics;
 mod editor;
 mod entry;

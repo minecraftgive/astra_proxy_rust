@@ -129,6 +129,10 @@ pub(super) async fn run_local(
         let connection_deadline = tokio::time::Instant::from_std(
             connection_expiry.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
         );
+        let notice_expiry = ui.next_notice_expiry();
+        let notice_deadline = tokio::time::Instant::from_std(
+            notice_expiry.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
+        );
         let event = tokio::select! {
             result = &mut shutdown => break 'ui result.map_err(Into::into),
             event = events.as_mut().expect("terminal input is attached").next() => {
@@ -142,6 +146,10 @@ pub(super) async fn run_local(
             _ = maintenance.tick() => { refresh = true; continue; }
             _ = tokio::time::sleep_until(connection_deadline), if connection_expiry.is_some() => {
                 redraw |= ui.expire_connection_highlights();
+                continue;
+            }
+            _ = tokio::time::sleep_until(notice_deadline), if notice_expiry.is_some() => {
+                redraw |= ui.expire_notices();
                 continue;
             }
             _ = tokio::time::sleep_until(deadline), if scheduled => { redraw = true; continue; }

@@ -145,6 +145,10 @@ macro_rules! tr {
     ($source:literal $(, $arg:expr)* $(,)?) => { $crate::i18n::message($source, &[$(format!("{}", $arg)),*]) };
 }
 const CATALOG: &[(&str, &str, &str, &str)] = &[
+    ("Copy terminal proxy commands to clipboard", "Copy terminal proxy commands to clipboard", "复制终端代理环境变量到剪贴板", "複製終端機代理環境變數至剪貼簿"),
+    ("Copy terminal proxy commands to clipboard · F4", "Copy terminal proxy commands to clipboard · F4", "复制终端代理环境变量到剪贴板 · F4", "複製終端機代理環境變數至剪貼簿 · F4"),
+    ("Terminal proxy commands copied to clipboard", "Terminal proxy commands copied to clipboard", "终端代理环境变量已复制到剪贴板", "終端機代理環境變數已複製至剪貼簿"),
+    ("Cannot copy terminal proxy commands: {}", "Cannot copy terminal proxy commands: {}", "无法复制终端代理环境变量：{}", "無法複製終端機代理環境變數：{}"),
     ("Performance / memory / network monitor", "Performance / memory / network monitor", "性能 / 内存 / 网络监视器", "效能 / 記憶體 / 網絡監視器"),
     ("Core internal metrics · epoch", "Core internal metrics · epoch", "核心内部统计 · 统计周期", "核心內部統計 · 統計週期"),
     ("Core internal metrics unavailable", "Core internal metrics unavailable", "核心内部统计暂不可用", "核心內部統計暫時無法取得"),

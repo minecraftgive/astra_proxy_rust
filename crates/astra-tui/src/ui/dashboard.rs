@@ -118,8 +118,9 @@ impl Ui {
         self.hit(area, target);
     }
 
-    /// Problems that need the user, each naming the key that fixes it.
+    /// Recovery feedback and problems that need the user's attention.
     fn notices(&self) -> Vec<(Color, String)> {
+        self.notice_expiry.set(None);
         let mut notices = Vec::new();
         let Some(row) = self.active_proxy() else {
             return notices;
@@ -196,16 +197,47 @@ impl Ui {
         {
             notices.push((Color::Red, t("Configuration unavailable · e edit").into()));
         }
-        // Warnings that persist still disappear after a short delay; errors stay until fixed.
+        // Successes and warnings recede after 15 seconds; errors stay until fixed.
         let now = Instant::now();
         let mut seen = self.notice_since.borrow_mut();
         seen.retain(|message, _| notices.iter().any(|(_, text)| text == message));
         notices.retain(|(color, message)| {
-            *color != Color::Yellow
-                || now.duration_since(*seen.entry(message.clone()).or_insert(now))
-                    < Duration::from_secs(15)
+            if !matches!(color, Color::Yellow | Color::Green) {
+                return true;
+            }
+            let deadline = *seen.entry(message.clone()).or_insert(now) + Duration::from_secs(15);
+            if deadline <= now {
+                return false;
+            }
+            self.notice_expiry.set(Some(
+                self.notice_expiry
+                    .get()
+                    .map_or(deadline, |next| next.min(deadline)),
+            ));
+            true
         });
         notices
+    }
+
+    pub(super) fn next_notice_expiry(&self) -> Option<Instant> {
+        if self.page == shell::OVERVIEW && self.kind != Kind::Server {
+            self.notice_expiry.get()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn expire_notices(&self) -> bool {
+        if self
+            .next_notice_expiry()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            // Keep first-seen times so a later redraw cannot revive expired notices.
+            self.notice_expiry.set(None);
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn overview_header_height(&self, _width: u16) -> u16 {
@@ -1415,7 +1447,79 @@ mod tests {
             );
             assert!(notices[1].1.contains("retained"));
             assert!(notices[2].1.contains("C:/Astra/recovery.json"));
+            assert!(ui.next_notice_expiry().is_none());
+            let old = Instant::now().checked_sub(Duration::from_secs(16)).unwrap();
+            for (_, message) in &notices {
+                ui.notice_since.borrow_mut().insert(message.clone(), old);
+            }
+            assert_eq!(ui.notices(), notices, "conflicts never time out");
+            ui.details
+                .get_mut("proxy-00")
+                .unwrap()
+                .network_recovery
+                .as_mut()
+                .unwrap()
+                .state = astra_model::recovery::RecoveryState::Pending;
+            let pending = ui.notices();
+            assert_eq!(pending.len(), 3);
+            assert!(pending.iter().all(|(color, _)| *color == Color::Red));
+            assert!(ui.next_notice_expiry().is_none());
         });
+    }
+    #[test]
+    fn network_recovery_success_expires_without_reviving_on_redraw() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut ui = sample();
+            ui.details.get_mut("proxy-00").unwrap().network_recovery =
+                Some(astra_model::recovery::Notice {
+                    state: astra_model::recovery::RecoveryState::Recovered,
+                    timestamp_ms: 1700000000000,
+                    message: "Owned network settings restored".into(),
+                    journal: "C:/Astra/recovery.json".into(),
+                    boot_id: "boot".into(),
+                });
+            let text = screen(&render(&ui, 140, 40));
+            assert!(text.contains("Attention"));
+            assert!(text.contains("Network settings recovered"));
+            assert!(text.contains("Owned network settings restored"));
+            assert!(text.contains("C:/Astra/recovery.json"));
+            assert_eq!(ui.notices().len(), 3);
+            assert!(ui.next_notice_expiry().is_some());
+            assert!(!ui.expire_notices(), "not due yet");
+
+            let old = Instant::now().checked_sub(Duration::from_secs(16)).unwrap();
+            for shown in ui.notice_since.borrow_mut().values_mut() {
+                *shown = old;
+            }
+            ui.notice_expiry.set(Some(old + Duration::from_secs(15)));
+            assert!(ui.expire_notices(), "wake even without input or telemetry");
+            assert!(ui.next_notice_expiry().is_none());
+            assert!(!ui.expire_notices(), "consume the idle wakeup only once");
+            for _ in 0..2 {
+                let text = screen(&render(&ui, 140, 40));
+                assert!(!text.contains("Attention"));
+                assert!(!text.contains("Network settings recovered"));
+                assert!(!text.contains("Owned network settings restored"));
+                assert!(!text.contains("C:/Astra/recovery.json"));
+                assert!(ui.next_notice_expiry().is_none());
+            }
+            assert!(ui.details["proxy-00"].network_recovery.is_some());
+        });
+    }
+    #[test]
+    fn overview_notice_expiry_waits_until_overview_is_visible() {
+        let mut ui = sample();
+        ui.rows[0].changed = true;
+        assert_eq!(ui.notices().len(), 1);
+        let deadline = ui.next_notice_expiry().unwrap();
+        ui.page = PROFILES;
+        assert!(ui.next_notice_expiry().is_none());
+        assert!(!ui.expire_notices());
+        ui.page = OVERVIEW;
+        assert_eq!(ui.next_notice_expiry(), Some(deadline));
+        ui.rows[0].changed = false;
+        assert!(ui.notices().is_empty());
+        assert!(ui.next_notice_expiry().is_none());
     }
     #[test]
     fn overview_attention_hides_warnings_but_keeps_errors() {
@@ -1433,6 +1537,7 @@ mod tests {
             assert_eq!(notices.len(), 1, "warning timed out");
             assert_eq!(notices[0].0, Color::Red, "error persists");
             assert!(notices[0].1.contains("Core stopped unexpectedly"));
+            assert!(ui.next_notice_expiry().is_none());
         });
     }
     #[test]

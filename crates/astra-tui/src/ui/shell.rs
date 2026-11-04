@@ -714,13 +714,6 @@ impl Ui {
             Run::Op(Operation::ExportConfig),
             no_profile,
         );
-        add(
-            "Profile",
-            "Export terminal proxy commands",
-            "P",
-            Run::Op(Operation::ExportTerminal),
-            no_profile,
-        );
         for command in update::Command::ALL {
             add(
                 "Updates",
