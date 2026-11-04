@@ -7,6 +7,7 @@ pub(super) enum Id {
     Help,
     Profiles,
     CopyTerminal,
+    Settings,
     Search,
     NextMatch,
     PreviousMatch,
@@ -204,6 +205,13 @@ pub(super) const SPECS: &[Spec] = &[
         repeat: Repeat::Once,
     },
     Spec {
+        id: Id::Settings,
+        label: "Open settings",
+        key: "7",
+        scope: Scope::Global,
+        repeat: Repeat::Once,
+    },
+    Spec {
         id: Id::VimKeys,
         label: "Toggle optional Vim navigation aliases",
         key: "",
@@ -261,7 +269,7 @@ pub(super) fn repeatable(key: event::KeyEvent) -> bool {
     })
 }
 pub(super) fn help() -> String {
-    let mut text = String::from(t("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–6  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n"));
+    let mut text = String::from(t("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–7  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n"));
     for spec in SPECS.iter().filter(|s| !s.key.is_empty()) {
         text.push_str(&format!("{}  {}\n", spec.key, t(spec.label)));
     }
@@ -533,14 +541,7 @@ impl Ui {
                 }
             }
             Id::VimKeys => {
-                self.vim_keys = !self.vim_keys;
-                let enabled = self.vim_keys;
-                for viewer in [&mut self.viewer, &mut self.tui_viewer]
-                    .into_iter()
-                    .flatten()
-                {
-                    viewer.set_vim_navigation(enabled);
-                }
+                self.change_preferences(|p| p.vim_keys = !p.vim_keys);
                 self.message = if self.vim_keys {
                     "Vim aliases enabled"
                 } else {
@@ -555,9 +556,13 @@ impl Ui {
                     Id::MotionReduced => animation::MotionMode::Reduced,
                     _ => animation::MotionMode::Off,
                 };
-                self.motion = mode;
-                self.animations.set_mode(mode);
+                self.change_preferences(|p| p.motion = mode);
                 Input::Idle
+            }
+            Id::Settings => {
+                self.close_replaceable_overlays();
+                self.suspend_editor();
+                self.navigate(shell::SETTINGS)
             }
         }
     }
@@ -622,7 +627,7 @@ impl Ui {
         }
         if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
-                KeyCode::Char(c @ '1'..='6') => {
+                KeyCode::Char(c @ '1'..='7') => {
                     self.suspend_editor();
                     self.focus = Default::default();
                     return Some(self.navigate((c as u8 - b'1') as usize));

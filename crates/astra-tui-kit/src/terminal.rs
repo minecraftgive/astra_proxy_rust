@@ -102,6 +102,16 @@ impl<O: Operations> Session<O> {
         }
         result
     }
+    fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        self.options.mouse = enabled;
+        // While suspended the next resume applies the option.
+        if !self.alternate || self.mouse == enabled {
+            return Ok(());
+        }
+        self.operations.mouse(enabled)?;
+        self.mouse = enabled;
+        Ok(())
+    }
     fn suspend(&mut self) -> io::Result<()> {
         let mut error = None;
         macro_rules! reset {
@@ -149,6 +159,10 @@ impl TerminalSession {
     }
     pub fn resume(&mut self) -> io::Result<()> {
         self.0.resume()
+    }
+    /// Turn mouse capture on or off; off lets the terminal select text again.
+    pub fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        self.0.set_mouse(enabled)
     }
 }
 
@@ -227,5 +241,30 @@ mod tests {
         assert_eq!(calls.borrow().last().unwrap(), "alternate:true");
         drop(session);
         assert_eq!(calls.borrow().last().unwrap(), "raw:false");
+    }
+    #[test]
+    fn mouse_capture_toggles_live_and_survives_suspend() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut session = Session::enter(
+            Fake {
+                calls: calls.clone(),
+                failure: None,
+            },
+            TerminalOptions {
+                mouse: true,
+                bracketed_paste: false,
+            },
+        )
+        .unwrap();
+        session.set_mouse(false).unwrap();
+        assert_eq!(calls.borrow().last().unwrap(), "mouse:false");
+        let count = calls.borrow().len();
+        session.set_mouse(false).unwrap();
+        assert_eq!(calls.borrow().len(), count, "no repeated toggles");
+        session.suspend().unwrap();
+        session.set_mouse(true).unwrap();
+        assert!(!calls.borrow()[count..].contains(&"mouse:true".to_string()));
+        session.resume().unwrap();
+        assert_eq!(calls.borrow().last().unwrap(), "mouse:true");
     }
 }

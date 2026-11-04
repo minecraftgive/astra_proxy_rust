@@ -12,13 +12,15 @@ pub(super) const CONNECTIONS: usize = 2;
 pub(super) const RULES: usize = 3;
 pub(super) const LOGS: usize = 4;
 pub(super) const PROFILES: usize = 5;
-pub(super) const PAGES: [&str; 6] = [
+pub(super) const SETTINGS: usize = 6;
+pub(super) const PAGES: [&str; 7] = [
     "Overview",
     "Proxies",
     "Connections",
     "Rules",
     "Logs",
     "Profiles",
+    "Settings",
 ];
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -260,7 +262,7 @@ impl Ui {
             return None;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='6') => return Some(self.navigate(c as usize - '1' as usize)),
+            KeyCode::Char(c @ '1'..='7') => return Some(self.navigate(c as usize - '1' as usize)),
             KeyCode::Char('p') => {
                 self.palette = Some(Palette::profiles(self.kind));
                 return Some(Input::Idle);
@@ -460,7 +462,7 @@ impl Ui {
                 let name = self.log_source(key.code == KeyCode::Char('['))?;
                 Some(self.open_logs(name))
             }
-            KeyCode::Char(c @ '1'..='6') => Some(self.navigate(c as usize - '1' as usize)),
+            KeyCode::Char(c @ '1'..='7') => Some(self.navigate(c as usize - '1' as usize)),
             KeyCode::Char(':') => {
                 self.palette = Some(Palette::default());
                 Some(Input::Idle)
@@ -509,7 +511,7 @@ impl Ui {
             entries.push(Entry {
                 scope: "Go to",
                 label: t(page).into(),
-                key: ["1", "2", "3", "4", "5", "6"][index],
+                key: ["1", "2", "3", "4", "5", "6", "7"][index],
                 run: Run::Page(index),
                 unavailable: None,
             });
@@ -1141,6 +1143,7 @@ impl Ui {
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
                 RULES => "t test a route · / search rules · e edit rules",
                 LOGS => "Enter open · [ proxy log · ] rule core log · F7 TUI log",
+                SETTINGS => "↑↓ select · ←→ change · Enter next · Delete default",
                 _ => "↑↓ browse · Ctrl-P activate profile · Enter actions · e edit · Insert new · Delete remove",
             }
         };

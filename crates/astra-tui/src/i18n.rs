@@ -15,6 +15,8 @@ pub enum Language {
     Traditional,
 }
 static LANGUAGE: AtomicU8 = AtomicU8::new(1);
+/// `--lang` on the command line outranks the saved preference for this run.
+static COMMAND_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 thread_local! { static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) }; }
 impl Language {
@@ -72,20 +74,35 @@ pub fn init() -> anyhow::Result<()> {
             selected = Some(value);
         }
     }
-    let locale = selected
-        .or_else(|| {
-            std::env::var("ASTRA_LANG")
-                .ok()
-                .filter(|value| !value.is_empty())
-        })
+    COMMAND_LINE.store(selected.is_some(), Ordering::Relaxed);
+    let locale = selected.unwrap_or_else(environment_locale);
+    LANGUAGE.store(Language::resolve(&locale) as u8, Ordering::Relaxed);
+    Ok(())
+}
+pub fn command_line_language() -> bool {
+    COMMAND_LINE.load(Ordering::Relaxed)
+}
+/// Switch the interface language now; `None` follows the environment again.
+pub fn set_language(language: Option<Language>) {
+    let language = language.unwrap_or_else(|| Language::resolve(&environment_locale()));
+    // Tests run in parallel; keep a change on the calling test's thread.
+    #[cfg(test)]
+    {
+        TEST_LANGUAGE.set(Some(language));
+    }
+    #[cfg(not(test))]
+    LANGUAGE.store(language as u8, Ordering::Relaxed);
+}
+fn environment_locale() -> String {
+    std::env::var("ASTRA_LANG")
+        .ok()
+        .filter(|value| !value.is_empty())
         .or_else(|| {
             ["LC_ALL", "LC_MESSAGES", "LANG"]
                 .iter()
                 .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
         })
-        .unwrap_or_else(system_locale);
-    LANGUAGE.store(Language::resolve(&locale) as u8, Ordering::Relaxed);
-    Ok(())
+        .unwrap_or_else(system_locale)
 }
 fn system_locale() -> String {
     #[cfg(windows)]
@@ -177,7 +194,7 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("selected · v toggle · V all/clear · K/J move · m move before cursor", "selected · v toggle · V all/clear · K/J move · m move before cursor", "条已选 · v 勾选 · V 全选/清空 · K/J 移动 · m 移到光标前", "條已選 · v 勾選 · V 全選/清空 · K/J 移動 · m 移到游標前"),
     ("Opened in a new window", "Opened in a new window", "已在新窗口打开", "已在新視窗開啟"),
     ("Cannot open a new window", "Cannot open a new window", "无法打开新窗口", "無法開啟新視窗"),
-    ("Use Alt+1–6 to open a page; the current draft stays here", "Use Alt+1–6 to open a page; the current draft stays here", "使用 Alt+1～6 打开页面；当前草稿保留在此窗口", "使用 Alt+1～6 開啟頁面；目前草稿保留在此視窗"),
+    ("Use Alt+1–7 to open a page; the current draft stays here", "Use Alt+1–7 to open a page; the current draft stays here", "使用 Alt+1～7 打开页面；当前草稿保留在此窗口", "使用 Alt+1～7 開啟頁面；目前草稿保留在此視窗"),
     ("Instance unavailable: {}", "Instance unavailable: {}", "实例已不可用：{}", "實例已無法使用：{}"),
 
     ("Task details · F6 / Esc back · ↑↓ scroll", "Task details · F6 / Esc back · ↑↓ scroll", "任务进度与详情 · F6 / Esc 返回 · ↑↓ 滚动", "任務進度與詳情 · F6 / Esc 返回 · ↑↓ 捲動"),
@@ -997,7 +1014,7 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Tab / ←→ choose · Enter apply · Esc cancel", "Tab / ←→ choose · Enter apply · Esc cancel", "Tab／←→ 选择 · Enter 执行 · Esc 取消", "Tab／←→ 選取 · Enter 執行 · Esc 取消"),
     ("Enter edit · Space toggle · Ctrl-S save · Ctrl-Z/Y undo/redo · Esc retain draft", "Enter edit · Space toggle · Ctrl-S save · Ctrl-Z/Y undo/redo · Esc retain draft", "Enter 编辑 · 空格切换 · Ctrl-S 保存 · Ctrl-Z/Y 撤销/重做 · Esc 保留草稿", "Enter 編輯 · 空白鍵切換 · Ctrl-S 儲存 · Ctrl-Z/Y 復原/重做 · Esc 保留草稿"),
     ("↑↓ browse · Ctrl-P activate profile · Enter actions · e edit · Insert new · Delete remove", "↑↓ browse · Ctrl-P activate profile · Enter actions · e edit · Insert new · Delete remove", "↑↓ 浏览 · Ctrl-P 切换配置档 · Enter 操作 · e 编辑 · Insert 新建 · Delete 删除", "↑↓ 瀏覽 · Ctrl-P 切換設定檔 · Enter 操作 · e 編輯 · Insert 新增 · Delete 刪除"),
-    ("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–6  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n", "Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–6  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n", "Tab / Shift-Tab  切换焦点区域\n↑↓ / Home / End / PgUp / PgDn  导航\nEnter  执行焦点项\nEsc  返回；保留配置草稿\n1–6  切换页面（文字输入以外）\nCtrl-Z / Ctrl-Y  撤销／重做草稿\nInsert / Delete  添加／删除选中项\n\n", "Tab / Shift-Tab  切換焦點區域\n↑↓ / Home / End / PgUp / PgDn  導覽\nEnter  執行焦點項目\nEsc  返回；保留設定草稿\n1–6  切換頁面（文字輸入以外）\nCtrl-Z / Ctrl-Y  復原／重做草稿\nInsert / Delete  新增／刪除選取項目\n\n"),
+    ("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–7  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n", "Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–7  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n", "Tab / Shift-Tab  切换焦点区域\n↑↓ / Home / End / PgUp / PgDn  导航\nEnter  执行焦点项\nEsc  返回；保留配置草稿\n1–7  切换页面（文字输入以外）\nCtrl-Z / Ctrl-Y  撤销／重做草稿\nInsert / Delete  添加／删除选中项\n\n", "Tab / Shift-Tab  切換焦點區域\n↑↓ / Home / End / PgUp / PgDn  導覽\nEnter  執行焦點項目\nEsc  返回；保留設定草稿\n1–7  切換頁面（文字輸入以外）\nCtrl-Z / Ctrl-Y  復原／重做草稿\nInsert / Delete  新增／刪除選取項目\n\n"),
     ("\nAll other actions are in the command palette. Q, R and 0 no longer execute destructive actions.\n", "\nAll other actions are in the command palette. Q, R and 0 no longer execute destructive actions.\n", "\n其他操作都在命令面板中。Q、R 和 0 不再执行破坏性操作。\n", "\n其他操作都在命令面板中。Q、R 和 0 不再執行破壞性操作。\n"),
     ("Keyboard layout updated\n\nTab / Shift-Tab now moves focus. Enter activates the focused item.\nSpace pauses connections and logs, or toggles a checkbox.\nF2 / Ctrl-K opens every command. Q, R and 0 no longer run destructive actions.\nEsc, page changes and quitting retain configuration drafts.\n\nF1 opens the complete key map. Enter / Esc dismisses this notice.", "Keyboard layout updated\n\nTab / Shift-Tab now moves focus. Enter activates the focused item.\nSpace pauses connections and logs, or toggles a checkbox.\nF2 / Ctrl-K opens every command. Q, R and 0 no longer run destructive actions.\nEsc, page changes and quitting retain configuration drafts.\n\nF1 opens the complete key map. Enter / Esc dismisses this notice.", "键盘布局已更新\n\nTab / Shift-Tab 现在切换焦点。Enter 执行焦点项。\n空格暂停连接和日志显示，或切换复选框。\nF2 / Ctrl-K 打开全部命令。Q、R 和 0 不再执行破坏性操作。\nEsc、切换页面和退出都会保留配置草稿。\n\nF1 打开完整键表。Enter / Esc 关闭此提示。", "鍵盤配置已更新\n\nTab / Shift-Tab 現在切換焦點。Enter 執行焦點項目。\n空白鍵暫停連線和日誌顯示，或切換核取方塊。\nF2 / Ctrl-K 開啟全部命令。Q、R 和 0 不再執行破壞性操作。\nEsc、切換頁面和離開都會保留設定草稿。\n\nF1 開啟完整按鍵表。Enter / Esc 關閉此提示。"),
     ("Reconnecting · last received data", "Reconnecting · last received data", "正在重连 · 显示最后收到的数据", "正在重新連線 · 顯示最後收到的資料"),
@@ -1018,6 +1035,43 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Update {} · {} · {}", "Update {} · {} · {}", "更新 {} · {} · {}", "更新 {} · {} · {}"),
     ("Host restarted; previous connection targets and paused data were cleared", "Host restarted; previous connection targets and paused data were cleared", "宿主已重启；已清除先前选中的连接和暂停显示的数据", "宿主已重新啟動；已清除先前選取的連線及暫停顯示的資料"),
     ("Type", "Type", "类型", "類型"),
+    ("Settings", "Settings", "设置", "設定"),
+    ("Appearance", "Appearance", "外观", "外觀"),
+    ("Interaction", "Interaction", "交互", "互動"),
+    ("Language", "Language", "语言", "語言"),
+    ("Accent color", "Accent color", "强调色", "強調色"),
+    ("Colors", "Colors", "色彩", "色彩"),
+    ("Motion", "Motion", "动效", "動效"),
+    ("Vim navigation", "Vim navigation", "Vim 导航", "Vim 導覽"),
+    ("Mouse", "Mouse", "鼠标", "滑鼠"),
+    ("Start page", "Start page", "启动页面", "啟動頁面"),
+    ("System", "System", "跟随系统", "跟隨系統"),
+    ("Indigo", "Indigo", "靛蓝", "靛藍"),
+    ("Teal", "Teal", "青绿", "青綠"),
+    ("Green", "Green", "绿色", "綠色"),
+    ("Violet", "Violet", "紫罗兰", "紫羅蘭"),
+    ("Rose", "Rose", "玫红", "玫紅"),
+    ("Amber", "Amber", "琥珀", "琥珀"),
+    ("Auto", "Auto", "自动", "自動"),
+    ("True color", "True color", "真彩色", "全彩"),
+    ("256 colors", "256 colors", "256 色", "256 色"),
+    ("16 colors", "16 colors", "16 色", "16 色"),
+    ("Monochrome", "Monochrome", "单色", "單色"),
+    ("Normal", "Normal", "正常", "正常"),
+    ("Reduced", "Reduced", "减弱", "減弱"),
+    ("none", "none", "无", "無"),
+    ("Open settings", "Open settings", "打开设置", "開啟設定"),
+    ("↑↓ select · ←→ change · Enter next · Delete default", "↑↓ select · ←→ change · Enter next · Delete default", "↑↓ 选择 · ←→ 更改 · Enter 下一项 · Delete 恢复默认", "↑↓ 選擇 · ←→ 變更 · Enter 下一項 · Delete 還原預設"),
+    ("Cannot read preferences, using defaults: {}", "Cannot read preferences, using defaults: {}", "无法读取偏好设置，已使用默认值：{}", "無法讀取偏好設定，已使用預設值：{}"),
+    ("Cannot save preferences: {}", "Cannot save preferences: {}", "无法保存偏好设置：{}", "無法儲存偏好設定：{}"),
+    ("Saved automatically to {}", "Saved automatically to {}", "自动保存到 {}", "自動儲存至 {}"),
+    ("Interface language. System follows ASTRA_LANG, LANG and the OS locale; --lang on the command line wins for that run.", "Interface language. System follows ASTRA_LANG, LANG and the OS locale; --lang on the command line wins for that run.", "界面语言。“跟随系统”依次参考 ASTRA_LANG、LANG 和系统区域设置；命令行 --lang 在该次运行中优先。", "介面語言。「跟隨系統」依序參考 ASTRA_LANG、LANG 與系統地區設定；命令列 --lang 在該次執行中優先。"),
+    ("Color of the active page tab, key badges and selections.", "Color of the active page tab, key badges and selections.", "当前页面标签、按键徽标和选中项的颜色。", "目前頁面標籤、按鍵徽標與選取項目的顏色。"),
+    ("Auto uses what the terminal reports. Pick fewer colors if highlights look wrong over SSH or in a basic console.", "Auto uses what the terminal reports. Pick fewer colors if highlights look wrong over SSH or in a basic console.", "“自动”使用终端报告的能力。若通过 SSH 或在简易控制台中高亮显示异常，请选择较少的颜色。", "「自動」使用終端機回報的能力。若透過 SSH 或在簡易主控台中醒目提示顯示異常，請選擇較少的顏色。"),
+    ("Normal animates overlays opening and closing. Reduced and Off show every change at once.", "Normal animates overlays opening and closing. Reduced and Off show every change at once.", "“正常”会为弹出层的打开和关闭加入动画；“减弱”和“关闭”会立即显示所有变化。", "「正常」會為彈出層的開啟與關閉加入動畫；「減弱」與「關閉」會立即顯示所有變化。"),
+    ("h j k l g G move in lists and logs, in addition to the arrow keys.", "h j k l g G move in lists and logs, in addition to the arrow keys.", "除方向键外，还可用 h j k l g G 在列表和日志中移动。", "除方向鍵外，也可用 h j k l g G 在清單與日誌中移動。"),
+    ("Off returns the mouse to the terminal so you can select and copy text.", "Off returns the mouse to the terminal so you can select and copy text.", "关闭后鼠标交还给终端，可直接选择并复制文字。", "關閉後滑鼠交還給終端機，可直接選取並複製文字。"),
+    ("Page shown when a window opens without --view.", "Page shown when a window opens without --view.", "未指定 --view 打开窗口时显示的页面。", "未指定 --view 開啟視窗時顯示的頁面。"),
 ];
 
 #[cfg(test)]

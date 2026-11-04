@@ -1,10 +1,19 @@
 //! Presentation-only motion. Sampling and operations never use this clock.
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Modifier},
-    Frame,
-};
+//!
+//! Perceptual rules this module follows — breaking them reads as flicker:
+//! - Content that stays on screen never changes brightness. Dimming something
+//!   and bringing it back (focus pulses, page fades, emphasis blinks) is seen as
+//!   the screen blinking, not as motion.
+//! - Frequent keyboard actions (moving focus, switching pages, folding fields)
+//!   are instant; the content change itself is the feedback.
+//! - Only things that enter or leave space move: overlays reveal from their
+//!   anchor edge and exit faster than they enter.
+//! - Color changes are one-way and slow enough to read as settling (≥ 12
+//!   frames), never a quick round trip.
+//! - At ~30 fps a transition shorter than about 5 frames cannot be seen as
+//!   motion; such transitions are not animated at all.
+use astra_tui_kit::theme::BLUE;
+use ratatui::{buffer::Buffer, layout::Rect, style::Color, Frame};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -31,27 +40,24 @@ pub(super) enum MotionMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
-    Focus,
-    Page,
     Palette,
     Drawer,
     Detail,
-    Accordion,
-    Sample,
-    Feedback,
+    /// A settled notice fading to the muted tone instead of switching at once.
+    Recede,
 }
 impl Kind {
     fn duration(self) -> Duration {
         Duration::from_millis(match self {
-            Self::Focus => 100,
-            Self::Page => 140,
-            Self::Palette => 160,
-            Self::Drawer | Self::Detail => 200,
-            Self::Accordion => 180,
-            Self::Sample | Self::Feedback => 160,
+            Self::Palette => 180,
+            Self::Drawer | Self::Detail => 220,
+            Self::Recede => 600,
         })
     }
 }
+/// Exits are quicker than entrances: the user has already decided.
+const EXIT: Duration = Duration::from_millis(140);
+
 struct Track {
     kind: Kind,
     from: f32,
@@ -99,17 +105,29 @@ struct State {
     area: Rect,
     final_frame: bool,
 }
+/// How finished frames are colored: the accent replacing the default blue and
+/// the color depth the terminal is limited to. Changes apply on the next frame,
+/// all at once — restyling the whole screen is never animated.
+#[derive(Clone, Copy)]
+struct Palette {
+    accent: Option<Color>,
+    no_color: bool,
+    color_count: u16,
+}
 pub(super) struct Motion {
     state: RefCell<State>,
     epoch: Instant,
     frame: Duration,
-    no_color: bool,
-    color_count: u16,
+    detected_no_color: bool,
+    detected_colors: u16,
+    palette: std::cell::Cell<Palette>,
 }
 impl Motion {
     pub(super) fn new(mode: MotionMode) -> Self {
         let remote =
             std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+        let color_count = crossterm::style::available_color_count();
         Self {
             state: RefCell::new(State {
                 mode,
@@ -120,9 +138,33 @@ impl Motion {
             }),
             epoch: Instant::now(),
             frame: Duration::from_millis(if remote { 67 } else { 34 }),
-            no_color: std::env::var_os("NO_COLOR").is_some(),
-            color_count: crossterm::style::available_color_count(),
+            detected_no_color: no_color,
+            detected_colors: color_count,
+            palette: std::cell::Cell::new(Palette {
+                accent: None,
+                no_color,
+                color_count,
+            }),
         }
+    }
+    pub(super) fn set_palette(&self, accent: Color, depth: super::settings::ColorDepth) {
+        use super::settings::ColorDepth;
+        let (no_color, color_count) = match depth {
+            ColorDepth::Auto => (self.detected_no_color, self.detected_colors),
+            ColorDepth::TrueColor => (false, u16::MAX),
+            ColorDepth::Ansi256 => (false, 256),
+            ColorDepth::Ansi16 => (false, 16),
+            ColorDepth::Monochrome => (true, self.detected_colors),
+        };
+        self.palette.set(Palette {
+            accent: (accent != BLUE).then_some(accent),
+            no_color,
+            color_count,
+        });
+    }
+    /// What the terminal reported, shown next to the Auto color choice.
+    pub(super) fn detected_colors(&self) -> Option<u16> {
+        (!self.detected_no_color).then_some(self.detected_colors)
     }
     pub(super) fn set_mode(&self, mode: MotionMode) {
         let mut state = self.state.borrow_mut();
@@ -171,7 +213,7 @@ impl Motion {
                 return;
             }
         }
-        self.transition(kind, 1.0, 0.0, Duration::from_millis(120));
+        self.transition(kind, 1.0, 0.0, EXIT);
     }
     fn transition(&self, kind: Kind, initial: f32, to: f32, duration: Duration) {
         let now = Instant::now();
@@ -180,6 +222,7 @@ impl Motion {
             state.surfaces.retain(|s| !s.closing);
             return;
         }
+        // Retarget from where the motion is now; never restart from the edge.
         let from = state
             .tracks
             .iter()
@@ -197,6 +240,16 @@ impl Motion {
             duration,
         });
     }
+    /// Eased progress of a running track, `None` once settled (or with motion off).
+    pub(super) fn progress(&self, kind: Kind) -> Option<f32> {
+        let now = Instant::now();
+        self.state
+            .borrow()
+            .tracks
+            .iter()
+            .find(|t| t.kind == kind && !t.done(now))
+            .map(|t| t.value(now))
+    }
     pub(super) fn spinner(&self) -> &'static str {
         if self.mode() != MotionMode::Normal {
             return "⟳";
@@ -204,29 +257,9 @@ impl Motion {
         const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
         FRAMES[(self.epoch.elapsed().as_millis() / 80 % 8) as usize]
     }
-    pub(super) fn emphasize_sample(&self, f: &mut Frame<'_>, rect: Rect) {
-        if !self
-            .state
-            .borrow()
-            .tracks
-            .iter()
-            .any(|t| t.kind == Kind::Sample && !t.done(Instant::now()))
-        {
-            return;
-        }
-        let rect = rect.intersection(f.area());
-        if rect.width == 0 {
-            return;
-        }
-        for y in rect.y..rect.bottom() {
-            let cell = &mut f.buffer_mut()[(rect.right() - 1, y)];
-            if cell.symbol() != " " {
-                cell.modifier.insert(Modifier::BOLD);
-            }
-        }
-    }
-    /// Render at the final size, then reveal rows. The first three rows (including
-    /// the command input) are always visible; hit targets keep their final geometry.
+    /// Render at the final size, then reveal rows from the top edge. The first
+    /// three rows (including the command input) are always visible; hit targets
+    /// keep their final geometry.
     pub(super) fn surface(&self, f: &mut Frame<'_>, kind: Kind, rect: Rect, before: &Buffer) {
         let now = Instant::now();
         let mut state = self.state.borrow_mut();
@@ -234,9 +267,6 @@ impl Motion {
             return;
         }
         let rect = rect.intersection(f.area());
-        if kind == Kind::Accordion && !state.tracks.iter().any(|t| t.kind == kind && !t.done(now)) {
-            return;
-        }
         let mut full = Buffer::empty(rect);
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
@@ -248,19 +278,7 @@ impl Motion {
             .iter()
             .find(|t| t.kind == kind)
             .map_or(1.0, |t| t.value(now));
-        let mut visible = (rect.height as f32 * value).ceil() as u16;
-        if kind == Kind::Accordion {
-            // The selected field must be usable even on the first reveal frame.
-            for y in rect.y..rect.bottom() {
-                for x in rect.x..rect.right() {
-                    let cell = &full[(x, y)];
-                    if matches!(cell.symbol(), "›" | "▶" | "▸" | "▏") || cell.bg != Color::Reset
-                    {
-                        visible = visible.max(y - rect.y + 1);
-                    }
-                }
-            }
-        }
+        let visible = (rect.height as f32 * value).ceil() as u16;
         for y in rect.y + visible.max(3).min(rect.height)..rect.bottom() {
             for x in rect.x..rect.right() {
                 if before.area.contains((x, y).into()) {
@@ -283,55 +301,8 @@ impl Motion {
             state.tracks.clear();
             state.surfaces.clear();
         }
-        let focus = state
-            .tracks
-            .iter()
-            .find(|t| t.kind == Kind::Focus && !t.done(now))
-            .map(|t| t.value(now));
-        let page = state
-            .tracks
-            .iter()
-            .find(|t| t.kind == Kind::Page && !t.done(now))
-            .map(|t| t.value(now));
-        let feedback = state
-            .tracks
-            .iter()
-            .find(|t| t.kind == Kind::Feedback)
-            .is_some_and(|t| !t.done(now));
         let area = f.area();
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                let cell = &mut f.buffer_mut()[(x, y)];
-                if (focus.is_some()
-                    && (matches!(cell.symbol(), "›" | "▶" | "▸")
-                        || cell.fg == Color::Cyan
-                            && matches!(
-                                cell.symbol(),
-                                "─" | "│" | "┌" | "┐" | "└" | "┘" | "╭" | "╮" | "╰" | "╯"
-                            )))
-                    || (page.is_some() && y <= area.y + 1)
-                {
-                    let rgb = match cell.fg {
-                        Color::Rgb(r, g, b) => Some((r, g, b)),
-                        Color::Cyan => Some((0, 215, 215)),
-                        Color::White => Some((230, 230, 230)),
-                        _ => None,
-                    };
-                    if let Some((r, g, b)) = rgb {
-                        let p = if y <= area.y + 1 {
-                            page.unwrap_or(1.0)
-                        } else {
-                            focus.unwrap_or(1.0)
-                        };
-                        let mix = |c: u8| (110.0 + (c as f32 - 110.0) * p) as u8;
-                        cell.set_fg(Color::Rgb(mix(r), mix(g), mix(b)));
-                    }
-                }
-                if feedback && y == area.bottom().saturating_sub(1) {
-                    cell.modifier.insert(Modifier::BOLD);
-                }
-            }
-        }
+        // A closing overlay retracts toward its top edge over what is now below it.
         for surface in state.surfaces.iter().filter(|s| s.closing) {
             let value = state
                 .tracks
@@ -352,17 +323,62 @@ impl Motion {
         state
             .surfaces
             .retain(|s| !s.closing || active.contains(&s.kind));
-        if self.no_color {
+        let palette = self.palette.get();
+        if let Some(accent) = palette.accent {
+            for cell in &mut f.buffer_mut().content {
+                if cell.fg == BLUE {
+                    cell.set_fg(accent);
+                }
+                if cell.bg == BLUE {
+                    cell.set_bg(accent);
+                }
+            }
+        }
+        if palette.no_color {
             for cell in &mut f.buffer_mut().content {
                 cell.set_fg(Color::Reset);
                 cell.set_bg(Color::Reset);
             }
-        } else if self.color_count < u16::MAX {
+        } else if palette.color_count < u16::MAX {
             for cell in &mut f.buffer_mut().content {
-                cell.set_fg(terminal_color(cell.fg, self.color_count));
-                cell.set_bg(terminal_color(cell.bg, self.color_count));
+                cell.set_fg(terminal_color(cell.fg, palette.color_count));
+                cell.set_bg(terminal_color(cell.bg, palette.color_count));
             }
         }
+    }
+}
+
+fn rgb(color: Color) -> Option<(u8, u8, u8)> {
+    Some(match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Red => (205, 49, 49),
+        Color::LightRed => (241, 76, 76),
+        Color::Green => (13, 188, 121),
+        Color::LightGreen => (35, 209, 139),
+        Color::Yellow => (229, 229, 16),
+        Color::LightYellow => (245, 245, 67),
+        Color::Blue => (36, 114, 200),
+        Color::LightBlue => (59, 142, 234),
+        Color::Magenta => (188, 63, 188),
+        Color::LightMagenta => (214, 112, 214),
+        Color::Cyan => (0, 215, 215),
+        Color::LightCyan => (41, 184, 219),
+        Color::Gray => (204, 204, 204),
+        Color::White => (230, 230, 230),
+        _ => return None,
+    })
+}
+fn mix(from: (u8, u8, u8), to: (u8, u8, u8), p: f32) -> Color {
+    let p = p.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * p).round() as u8;
+    Color::Rgb(lerp(from.0, to.0), lerp(from.1, to.1), lerp(from.2, to.2))
+}
+/// Interpolate between two foreground colors; colors without a known RGB value
+/// (Reset, indexed) switch at the end rather than guessing.
+pub(super) fn blend(from: Color, to: Color, p: f32) -> Color {
+    match (rgb(from), rgb(to)) {
+        (Some(a), Some(b)) if p < 1.0 => mix(a, b, p),
+        _ => to,
     }
 }
 
@@ -411,6 +427,13 @@ fn terminal_color(color: Color, count: u16) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, style::Style, widgets::Paragraph, Terminal};
+
+    fn expire(motion: &Motion) {
+        for t in &mut motion.state.borrow_mut().tracks {
+            t.start = Instant::now() - Duration::from_secs(1);
+        }
+    }
     #[test]
     fn low_color_terminals_receive_supported_styles() {
         assert!(matches!(
@@ -432,6 +455,18 @@ mod tests {
         assert!(ease_out(0.5) > 0.9);
     }
     #[test]
+    fn every_animation_is_long_enough_to_read_as_motion() {
+        let frame = Motion::new(MotionMode::Normal).frame_interval();
+        for kind in [Kind::Palette, Kind::Drawer, Kind::Detail, Kind::Recede] {
+            assert!(kind.duration() >= frame * 5, "{kind:?} would only blink");
+        }
+        assert!(EXIT >= frame * 4);
+        assert!(
+            Kind::Recede.duration() >= frame * 12,
+            "color settles slowly"
+        );
+    }
+    #[test]
     fn interruptions_retarget_without_queueing() {
         let motion = Motion::new(MotionMode::Normal);
         for _ in 0..100 {
@@ -446,10 +481,92 @@ mod tests {
         for mode in [MotionMode::Reduced, MotionMode::Off] {
             let motion = Motion::new(mode);
             motion.open(Kind::Drawer);
-            motion.trigger(Kind::Focus);
+            motion.trigger(Kind::Recede);
             assert!(!motion.active());
+            assert!(motion.progress(Kind::Recede).is_none());
             assert_eq!(motion.spinner(), "⟳");
         }
+    }
+    #[test]
+    fn blend_reaches_both_ends_and_skips_unknown_colors() {
+        assert_eq!(
+            blend(Color::Rgb(0, 0, 0), Color::Rgb(200, 100, 50), 0.0),
+            Color::Rgb(0, 0, 0)
+        );
+        assert_eq!(
+            blend(Color::Green, Color::Rgb(1, 2, 3), 1.0),
+            Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(blend(Color::Reset, Color::Red, 0.5), Color::Red);
+    }
+    #[test]
+    fn persistent_content_is_never_restyled() {
+        let motion = Motion::new(MotionMode::Normal);
+        let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
+        let paint = |f: &mut Frame<'_>| {
+            let area = f.area();
+            f.render_widget(Paragraph::new("› item\n│ border"), area);
+            f.buffer_mut()
+                .set_style(area, Style::default().fg(Color::Cyan));
+        };
+        terminal
+            .draw(|f| {
+                paint(f);
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        let settled = terminal.backend().buffer().clone();
+        // Overlay motion elsewhere must not touch cells it does not own.
+        motion.trigger(Kind::Recede);
+        terminal
+            .draw(|f| {
+                paint(f);
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &settled);
+    }
+    #[test]
+    fn accent_and_depth_restyle_finished_frames() {
+        let motion = Motion::new(MotionMode::Normal);
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        let paint = |f: &mut Frame<'_>| {
+            let area = f.area();
+            f.buffer_mut()
+                .set_style(area, Style::default().bg(BLUE).fg(Color::Rgb(1, 2, 3)));
+        };
+        motion.set_palette(
+            Color::Rgb(21, 128, 61),
+            super::super::settings::ColorDepth::TrueColor,
+        );
+        terminal
+            .draw(|f| {
+                paint(f);
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(0, 0)];
+        assert_eq!(cell.bg, Color::Rgb(21, 128, 61));
+        assert_eq!(cell.fg, Color::Rgb(1, 2, 3), "other colors untouched");
+        motion.set_palette(BLUE, super::super::settings::ColorDepth::Monochrome);
+        terminal
+            .draw(|f| {
+                paint(f);
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
+        motion.set_palette(BLUE, super::super::settings::ColorDepth::Ansi256);
+        terminal
+            .draw(|f| {
+                paint(f);
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        assert!(matches!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            Color::Indexed(_)
+        ));
     }
     #[test]
     fn resize_discards_old_geometry() {
@@ -461,7 +578,6 @@ mod tests {
     }
     #[test]
     fn reveal_keeps_input_visible_and_exits_from_final_geometry() {
-        use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
         for (width, height) in [(24, 8), (100, 30)] {
             let motion = Motion::new(MotionMode::Normal);
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -481,12 +597,7 @@ mod tests {
                 .unwrap();
             assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "Q");
             motion.close(Kind::Palette);
-            {
-                let mut state = motion.state.borrow_mut();
-                for t in &mut state.tracks {
-                    t.start = Instant::now() - Duration::from_secs(1);
-                }
-            }
+            expire(&motion);
             terminal.draw(|f| motion.finish_frame(f)).unwrap();
             assert!(motion.active(), "expiry schedules a final unmodified frame");
             terminal.draw(|f| motion.finish_frame(f)).unwrap();

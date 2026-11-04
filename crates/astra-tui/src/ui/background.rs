@@ -500,8 +500,12 @@ impl Ui {
                 _ => "•",
             };
             // Results older than a few seconds recede so a new one draws the eye.
+            // A new result appears at full color at once; only the recession is a
+            // slow one-way fade, so the line never dims and returns.
             let color = if age.is_some_and(|age| age > 6000) && color != Color::Red {
-                MUTED
+                self.animations
+                    .progress(animation::Kind::Recede)
+                    .map_or(MUTED, |p| animation::blend(color, MUTED, p))
             } else {
                 color
             };

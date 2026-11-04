@@ -4,7 +4,7 @@ use crate::windows::{Launch, View};
 impl Ui {
     pub(super) fn window_key(&mut self, key: event::KeyEvent) -> Option<Input> {
         let explicit = if key.modifiers.contains(KeyModifiers::ALT) {
-            if let KeyCode::Char(c @ '1'..='6') = key.code {
+            if let KeyCode::Char(c @ '1'..='7') = key.code {
                 Some(View::from_page(c as usize - '1' as usize))
             } else {
                 None
@@ -28,7 +28,7 @@ impl Ui {
                 || self.explanation.is_some()
                 || self.help_scroll.is_some()
             {
-                self.message = t("Use Alt+1–6 to open a page; the current draft stays here").into();
+                self.message = t("Use Alt+1–7 to open a page; the current draft stays here").into();
                 self.tasks.notice_message(&self.message);
                 return Some(Input::Idle);
             } else {

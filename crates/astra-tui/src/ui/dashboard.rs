@@ -29,6 +29,8 @@ pub(super) enum Target {
     Connect,
     Palette(usize),
     NetTools,
+    /// A settings row and, when every choice is shown, the clicked choice.
+    Setting(usize, Option<usize>),
 }
 
 fn fit_cells(text: &str, width: usize) -> String {
@@ -1055,7 +1057,6 @@ impl Ui {
                 .style(Style::default().fg(Color::Cyan)),
             chart,
         );
-        self.animations.emphasize_sample(f, chart);
     }
 
     fn render_traffic(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
@@ -1135,9 +1136,6 @@ impl Ui {
                     .style(Style::default().fg(color)),
                 chart,
             );
-            if self.runtime_rates_available() {
-                self.animations.emphasize_sample(f, chart);
-            }
         }
     }
 
@@ -1222,6 +1220,7 @@ impl Ui {
                 Input::Idle
             }
             Some(Target::Page(page)) if self.can_switch_page() => self.navigate(page),
+            Some(Target::Setting(row, choice)) => self.click_setting(row, choice),
             Some(Target::Row(index)) => {
                 let slot = self.index();
                 self.selections[slot] = index;

@@ -17,6 +17,7 @@ pub enum View {
     Rules,
     Logs,
     Profiles,
+    Settings,
     TuiLog,
     Diagnostics,
 }
@@ -30,6 +31,7 @@ impl View {
             "rules" | "tools" => Self::Rules,
             "logs" => Self::Logs,
             "profiles" => Self::Profiles,
+            "settings" => Self::Settings,
             "tui-log" => Self::TuiLog,
             "diagnostics" => Self::Diagnostics,
             _ => anyhow::bail!("Unknown view: {value}"),
@@ -43,11 +45,12 @@ impl View {
             Self::Rules => "rules",
             Self::Logs => "logs",
             Self::Profiles => "profiles",
+            Self::Settings => "settings",
             Self::TuiLog => "tui-log",
             Self::Diagnostics => "diagnostics",
         }
     }
-    /// Page index shared by the page bar, 1–6 and Alt+1–6.
+    /// Page index shared by the page bar, 1–7 and Alt+1–7.
     pub fn page(self) -> Option<usize> {
         match self {
             Self::Dashboard => Some(0),
@@ -56,6 +59,7 @@ impl View {
             Self::Rules => Some(3),
             Self::Logs => Some(4),
             Self::Profiles => Some(5),
+            Self::Settings => Some(6),
             _ => None,
         }
     }
@@ -67,7 +71,8 @@ impl View {
             Self::Rules,
             Self::Logs,
             Self::Profiles,
-        ][index.min(5)]
+            Self::Settings,
+        ][index.min(6)]
     }
 }
 #[derive(Debug, Clone, Default)]
@@ -353,6 +358,7 @@ mod tests {
             View::Rules,
             View::Logs,
             View::Profiles,
+            View::Settings,
             View::TuiLog,
             View::Diagnostics,
         ] {

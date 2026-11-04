@@ -18,6 +18,9 @@ pub(super) async fn run_local(
             ui
         }
     };
+    // Preferences are per user, shared by every window and remote target.
+    ui.load_preferences(context.home.join(settings::FILE));
+    ui.page = ui.preferences.start_page.page();
     if let Some(view) = launch.view {
         if let Some(page) = view.page() {
             ui.page = page;
@@ -28,11 +31,12 @@ pub(super) async fn run_local(
     }
     let mut initial = Some(launch);
     let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+    ui.mouse_request = None;
     let mut screen = TerminalSession::enter(TerminalOptions {
-        mouse: true,
+        mouse: ui.preferences.mouse,
         bracketed_paste: true,
     })?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = astra_tui_kit::frame::screen()?;
     let mut jobs = background::Jobs::new(&socket);
     let mut feeds = background::Feeds::new(&socket);
     if let Some(name) = ui.active_log.clone() {
@@ -98,12 +102,15 @@ pub(super) async fn run_local(
             }
             // One redraw when a successful notice recedes, never a permanent idle timer.
             let notice = (ui.message.clone(), ui.tasks.notice_is_old());
+            if notice.1 && !last_notice.1 && notice.0 == last_notice.0 {
+                ui.animations.trigger(animation::Kind::Recede);
+            }
             redraw |= notice != last_notice;
             last_notice = notice;
             let health = (ui.runtime_health(), ui.runtime_rates_available());
             redraw |= health != last_health;
             last_health = health;
-            previous.apply(&ui, false);
+            previous.apply(&ui);
             refresh = false;
         }
         if redraw && last_frame.elapsed() >= ui.animations.frame_interval() {
@@ -214,7 +221,9 @@ pub(super) async fn run_local(
             Input::Idle => false,
             Input::OpenWindow(launch) => {
                 if opening.len() < 4 {
-                    let context = context.clone();
+                    let mut context = context.clone();
+                    // New windows open in the language chosen in Settings now.
+                    context.language = crate::i18n::language();
                     opening.push(tokio::task::spawn_blocking(move || {
                         let result = context.open(&launch);
                         super::wake();
@@ -239,7 +248,7 @@ pub(super) async fn run_local(
                     })();
                     // Always restore the TUI, including when the executable cannot start.
                     screen.resume()?;
-                    terminal.clear()?;
+                    terminal.backend_mut().writer_mut().invalidate();
                     launched?;
                     ui.read_external()
                 })();
@@ -254,7 +263,12 @@ pub(super) async fn run_local(
                 false
             }
         };
-        previous.apply(&ui, true);
+        previous.apply(&ui);
+        if let Some(mouse) = ui.mouse_request.take() {
+            if let Err(error) = screen.set_mouse(mouse) {
+                ui.message = format!("{error:#}");
+            }
+        }
         refresh = true;
         if quit || checkpoint_now {
             checkpoint_at = None;
@@ -345,52 +359,21 @@ mod exit_tests {
     }
 }
 
+/// Only overlays entering or leaving are animated; page, focus, fold and
+/// message changes are instant (see the rules in `animation`).
 struct MotionState {
-    page: usize,
-    focus: String,
     palette: bool,
     drawer: bool,
-    fold: Option<String>,
-    message: String,
 }
 impl MotionState {
     fn of(ui: &Ui) -> Self {
         Self {
-            page: ui.page,
-            focus: format!(
-                "{:?}:{}:{:?}:{}:{}:{:?}",
-                ui.focus.region,
-                ui.focus.cursor,
-                ui.selections,
-                ui.connection_selection,
-                ui.group_selection,
-                ui.runtime_picker
-            ),
             palette: ui.palette.is_some(),
             drawer: ui.tasks.showing_details(),
-            fold: ui.editor.as_ref().map(|e| e.fold_signature()),
-            message: ui.message.clone(),
         }
     }
-    fn apply(self, ui: &Ui, input: bool) {
+    fn apply(self, ui: &Ui) {
         use animation::Kind;
-        if self.page != ui.page {
-            ui.animations.trigger(Kind::Page);
-        }
-        if input
-            && self.focus
-                != format!(
-                    "{:?}:{}:{:?}:{}:{}:{:?}",
-                    ui.focus.region,
-                    ui.focus.cursor,
-                    ui.selections,
-                    ui.connection_selection,
-                    ui.group_selection,
-                    ui.runtime_picker
-                )
-        {
-            ui.animations.trigger(Kind::Focus);
-        }
         match (self.palette, ui.palette.is_some()) {
             (false, true) => ui.animations.open(Kind::Palette),
             (true, false) => ui.animations.close(Kind::Palette),
@@ -400,12 +383,6 @@ impl MotionState {
             (false, true) => ui.animations.open(Kind::Drawer),
             (true, false) => ui.animations.close(Kind::Drawer),
             _ => {}
-        }
-        if self.fold != ui.editor.as_ref().map(|e| e.fold_signature()) {
-            ui.animations.trigger(Kind::Accordion);
-        }
-        if self.message != ui.message {
-            ui.animations.trigger(Kind::Feedback);
         }
     }
 }

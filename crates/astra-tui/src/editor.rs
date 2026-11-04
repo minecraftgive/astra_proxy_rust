@@ -678,16 +678,6 @@ impl Editor {
             && !rule_set_name(&path).is_some_and(|name| self.form.expanded_rule_sets.iter().any(|v|v==name))
             && !path.first().is_some_and(|part| matches!(part,Part::Key(key) if self.form.expanded_collections.contains(key)))
     }
-    pub fn fold_signature(&self) -> String {
-        format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}",
-            self.form.expanded_nodes,
-            self.form.expanded_rule_sets,
-            self.form.expanded_collections,
-            self.form.expanded_rule_groups,
-            self.form.expanded_proxy_groups
-        )
-    }
     pub fn find_again(&mut self, backwards: bool) -> Result<()> {
         let query = self.form.last_search.clone();
         if query.is_empty() {

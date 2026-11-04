@@ -321,9 +321,6 @@ impl Ui {
                         self.set_runtime_rates(&old, &snapshot, elapsed);
                         self.live_state.rates_valid = true;
                         self.record_runtime_rates();
-                        if !self.connections_paused() {
-                            self.animations.trigger(animation::Kind::Sample);
-                        }
                     }
                 } else {
                     self.live_state.rates_valid = false;
@@ -549,7 +546,6 @@ impl Ui {
                 .frozen
                 .as_ref()
                 .map(|_| chrono::Local::now().format("%H:%M:%S").to_string());
-            self.animations.finish(animation::Kind::Sample);
         } else {
             self.live_state.frozen_telemetry = None;
             self.live_state.frozen_at = None;

@@ -184,7 +184,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
                 println!("{program} [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
                 println!("update PATH: apply a local update package\nupdate-status: show release and drain status\nrollback: return new sessions to the previous release\nastra-host runs the background manager by default; host updates take effect after an intentional restart");
                 println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
-                println!("--view overview|proxies|connections|rules|logs|profiles|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–6: page in a new window");
+                println!("--view overview|proxies|connections|rules|logs|profiles|settings|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–7: page in a new window");
                 return Ok(());
             }
             _ => anyhow::bail!("Unknown argument: {arg}"),

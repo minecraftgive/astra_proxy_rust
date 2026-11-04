@@ -15,6 +15,7 @@ mod live;
 mod monitor;
 mod operations;
 mod pages;
+mod settings;
 mod shell;
 #[cfg(test)]
 mod stack_tests;
@@ -29,19 +30,20 @@ use crate::{i18n::t, tr};
 use anyhow::{Context, Result};
 use astra_tui_kit::{TerminalOptions, TerminalSession};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+#[cfg(test)]
+use ratatui::Terminal;
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame,
 };
 use serde::{Deserialize, Serialize};
 use shell::{LOGS, PROFILES};
 use std::{
     collections::HashMap,
-    io::{self, Stdout},
+    io,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -442,6 +444,11 @@ struct Ui {
     last_find: String,
     /// Open the editor's search as soon as a requested editor arrives.
     search_on_open: bool,
+    preferences: settings::Preferences,
+    preferences_path: Option<PathBuf>,
+    settings_cursor: usize,
+    /// Mouse capture change for the event loop, which owns the terminal.
+    mouse_request: Option<bool>,
 }
 impl std::ops::Deref for Ui {
     type Target = Session;
@@ -593,6 +600,10 @@ impl Ui {
             ready_editors: HashMap::new(),
             last_find: String::new(),
             search_on_open: false,
+            preferences: Default::default(),
+            preferences_path: None,
+            settings_cursor: 0,
+            mouse_request: None,
         }
     }
     fn index(&self) -> usize {
@@ -1270,6 +1281,11 @@ impl Ui {
         if let Some(input) = self.viewer_page_key(key) {
             return input;
         }
+        if self.page == shell::SETTINGS && self.live_input() {
+            if let Some(input) = self.settings_key(key) {
+                return input;
+            }
+        }
         if self.live_input() {
             if let Some(input) = self.live_key(key) {
                 return input;
@@ -1757,8 +1773,8 @@ impl Ui {
             },
         )
     }
-    fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        terminal.draw(|frame| {
+    fn draw(&self, terminal: &mut astra_tui_kit::Screen) -> Result<()> {
+        astra_tui_kit::frame::draw(terminal, |frame| {
             self.render(frame);
             self.animations.finish_frame(frame);
         })?;
@@ -1898,14 +1914,13 @@ impl Ui {
                 area,
             );
         } else if let Some(editor) = &self.editor {
-            let before = f.buffer_mut().clone();
             editor.render(f, area);
-            self.animations
-                .surface(f, animation::Kind::Accordion, area, &before);
         } else if self.page == LOGS {
             self.render_logs_page(f, area);
         } else if let Some(viewer) = &self.viewer {
             viewer.render(f, area);
+        } else if self.page == shell::SETTINGS {
+            self.render_settings(f, area);
         } else if self.kind == Kind::Server && self.page != PROFILES {
             self.render_server(f, area);
         } else {
@@ -2217,7 +2232,7 @@ async fn elevate(
     socket: &std::path::Path,
     name: String,
     expected_pid: Option<u32>,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut astra_tui_kit::Screen,
     screen: &mut TerminalSession,
 ) {
     let reply = match call(
@@ -2264,7 +2279,7 @@ async fn elevate(
     // Always restore the TUI, including when sudo or the terminal setup fails.
     let restored = (|| -> Result<()> {
         screen.resume()?;
-        terminal.clear()?;
+        terminal.backend_mut().writer_mut().invalidate();
         Ok(())
     })();
     if let Err(error) = restored {
@@ -2316,7 +2331,7 @@ async fn elevate(
     _socket: &std::path::Path,
     _name: String,
     _expected_pid: Option<u32>,
-    _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    _terminal: &mut astra_tui_kit::Screen,
     _screen: &mut TerminalSession,
 ) {
     ui.message = t("TUN elevation is only available on Linux").into();
