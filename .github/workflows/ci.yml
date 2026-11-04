@@ -38,7 +38,7 @@ jobs:
         # Logs need a GitHub login; lint findings are also published as annotations.
         run: |
           set -o pipefail
-          cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings 2>&1 | tee clippy.log || {
+          cargo clippy --workspace --all-targets --locked --color never --message-format=short -- -D warnings 2>&1 | tee clippy.log || {
             grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.log | sort -u | head -50 |
               sed -E 's/^([^:]+):([0-9]+):([0-9]+): (error|warning)(\[[^]]*\])?: (.*)$/::error file=\1,line=\2,col=\3::\6/'
             exit 1
