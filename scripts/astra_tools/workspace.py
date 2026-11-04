@@ -8,40 +8,16 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD_MODES = ('fast', 'runtime')
+# The workspace defines exactly these two Cargo profiles (see Cargo.toml).
+CARGO_PROFILES = {'debug': 'dev', 'release': 'release'}
 
 
-def cargo_profile(profile='release', mode=None):
-    """Map a logical artifact profile and build mode to a Cargo profile."""
-    if profile not in ('debug', 'release'):
-        raise ValueError(f'Unsupported build profile: {profile}')
-    if mode is not None and mode not in BUILD_MODES:
-        raise ValueError(f'Unsupported build mode: {mode}')
-    if mode is None:
-        return 'dev' if profile == 'debug' else 'release'
-    if mode == 'fast':
-        return 'dev' if profile == 'debug' else 'release-fast'
-    return 'dev-runtime' if profile == 'debug' else 'release-runtime'
-
-
-def _selected_build_mode(entries, mode):
-    modes = {entry.get('mode') for entry in entries}
-    if len(modes) != 1:
-        raise ValueError('Selected artifacts have inconsistent build modes; choose --role')
-    selected = modes.pop()
-    if mode is not None and mode != selected:
-        raise ValueError(f'Requested build mode {mode} conflicts with artifact mode {selected or "legacy"}')
-    return selected
-
-
-def resolve_build_mode(artifact_dir=None, *, profile='release', role=None, mode=None):
-    """Infer the selected artifact mode, retaining None for legacy indexes."""
-    cargo_profile(profile, mode)
-    if artifact_dir is None:
-        return mode
-    from .artifacts import ArtifactIndex
-    entries = ArtifactIndex.load(artifact_dir).select(profile=profile, role=role)
-    return _selected_build_mode(entries, mode)
+def cargo_profile(profile='release'):
+    """Map a logical artifact profile (debug/release) to its Cargo profile (dev/release)."""
+    try:
+        return CARGO_PROFILES[profile]
+    except KeyError:
+        raise ValueError(f'Unsupported build profile: {profile}') from None
 
 
 def reference_engine_dir(explicit=None, *, env=None):
@@ -148,9 +124,9 @@ class BuildLayout:
             cwd=ROOT, env=env, text=True))
         return cls(Path(metadata['target_directory']), host_target(env)), metadata
 
-    def binary_dir(self, profile='release', mode=None):
-        selected = cargo_profile(profile, mode)
-        return self.target_directory / self.target / ('debug' if selected == 'dev' else selected)
+    def binary_dir(self, profile='release'):
+        cargo_profile(profile)
+        return self.target_directory / self.target / profile
 
 
 def binary_dir(env, debug):
@@ -158,12 +134,11 @@ def binary_dir(env, debug):
     return layout.binary_dir('debug' if debug else 'release'), metadata
 
 
-def resolve_binary_dir(explicit=None, *, artifact_dir=None, profile='release', role=None, env=None, mode=None):
-    cargo_profile(profile, mode)
+def resolve_binary_dir(explicit=None, *, artifact_dir=None, profile='release', role=None, env=None):
+    cargo_profile(profile)
     if artifact_dir is not None:
         from .artifacts import ArtifactIndex
         entries = ArtifactIndex.load(artifact_dir).select(profile=profile, role=role)
-        _selected_build_mode(entries, mode)
         if explicit is not None:
             return Path(explicit).resolve()
         paths = {Path(entry['binary_dir']).resolve() for entry in entries}
@@ -173,4 +148,4 @@ def resolve_binary_dir(explicit=None, *, artifact_dir=None, profile='release', r
     if explicit is not None:
         return Path(explicit).resolve()
     layout, _ = BuildLayout.discover(env or build_environment())
-    return layout.binary_dir(profile, mode)
+    return layout.binary_dir(profile)

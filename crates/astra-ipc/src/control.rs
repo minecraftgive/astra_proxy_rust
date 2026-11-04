@@ -48,12 +48,10 @@ impl Control {
         let listener = match &path {
             Some(path) => {
                 let listener = astra_platform::platform::bind_listener(path)?;
-                if let Err(e) = astra_platform::platform::set_private(
+                astra_platform::platform::set_private(
                     astra_platform::platform::endpoint_path(path),
                     0o600,
-                ) {
-                    return Err(e);
-                }
+                )?;
                 Some(listener)
             }
             None => None,
@@ -195,7 +193,9 @@ fn peer_pool(pool: &std::sync::Mutex<ControlPeers>) -> std::sync::MutexGuard<'_,
 }
 async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Result<Response> {
     let lane = match &command {
-        Command::Monitor | Command::Status | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
+        Command::Monitor
+        | Command::Status
+        | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
         Command::GetConfig | Command::ExplainRoute(_) => 2,
         _ => 1,
     };
@@ -301,7 +301,9 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
 pub async fn monitor(path: &std::path::Path) -> io::Result<astra_model::monitor::InternalSnapshot> {
     match rpc(path, Command::Monitor, 4).await? {
         Response::Monitor(result) => result.map_err(io::Error::other),
-        _ => Err(io::Error::other("internal monitoring is unavailable; update the core")),
+        _ => Err(io::Error::other(
+            "internal monitoring is unavailable; update the core",
+        )),
     }
 }
 pub async fn config_snapshot(path: &std::path::Path) -> io::Result<ConfigSnapshot> {
@@ -392,15 +394,27 @@ mod tests {
     }
     #[tokio::test]
     async fn monitor_reads_internal_counters_without_changing_status() {
-        let path = std::env::temp_dir().join(format!("astra-monitor-test-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("astra-monitor-test-{}.sock", std::process::id()));
         let control = Control::bind(Some(path.clone())).unwrap();
-        let task = tokio::spawn(async move { control.shutdown().await.unwrap(); });
+        let task = tokio::spawn(async move {
+            control.shutdown().await.unwrap();
+        });
         astra_observe::counter!("test.monitor_requests", "测试请求").add(1);
         let snapshot = monitor(&path).await.unwrap();
         assert_eq!(snapshot.epoch, astra_platform::lifecycle::boot_id());
-        assert!(snapshot.metrics.iter().any(|m| m.name == "test.monitor_requests" && m.value == "1"));
-        assert!(snapshot.metrics.iter().any(|m| m.name == "runtime.control_queue"));
-        assert_eq!(request(&path, Command::Status).await.unwrap().pid, std::process::id());
+        assert!(snapshot
+            .metrics
+            .iter()
+            .any(|m| m.name == "test.monitor_requests" && m.value == "1"));
+        assert!(snapshot
+            .metrics
+            .iter()
+            .any(|m| m.name == "runtime.control_queue"));
+        assert_eq!(
+            request(&path, Command::Status).await.unwrap().pid,
+            std::process::id()
+        );
         request(&path, Command::Stop).await.unwrap();
         task.await.unwrap();
     }

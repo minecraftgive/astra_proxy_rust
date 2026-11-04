@@ -52,7 +52,13 @@ pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Resu
     let mut remote = app
         .connect_tracked(&target, &action, inbound, stream.peer_addr().ok())
         .await?;
-    tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut stream,
+        &mut remote,
+        COPY_BUFFER_SIZE,
+        COPY_BUFFER_SIZE,
+    )
+    .await?;
     Ok(())
 }
 pub struct PreparedUdp {

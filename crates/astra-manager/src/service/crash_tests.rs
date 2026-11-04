@@ -105,7 +105,7 @@ async fn live_manager_crash_preserves_committed_cores_and_reaps_uncommitted_cand
             &rule,
             format!(
                 "socket={}\ndefault_action='direct'\n",
-                toml::Value::String(route.to_string_lossy().into()).to_string()
+                toml::Value::String(route.to_string_lossy().into())
             ),
         )?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -116,7 +116,7 @@ async fn live_manager_crash_preserves_committed_cores_and_reaps_uncommitted_cand
             &proxy,
             format!(
                 "rule_socket={}\nsocks5_listen='{proxy_addr}'\ndecision_cache_ttl_secs=0\n",
-                toml::Value::String(route.to_string_lossy().into()).to_string()
+                toml::Value::String(route.to_string_lossy().into())
             ),
         )?;
         for (name, kind, path) in [

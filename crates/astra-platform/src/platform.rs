@@ -124,7 +124,7 @@ pub fn documents_dir() -> io::Result<PathBuf> {
         use std::{ffi::OsString, os::windows::ffi::OsStringExt};
         use windows_sys::Win32::{
             System::Com::CoTaskMemFree,
-            UI::Shell::{FOLDERID_Documents, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath},
+            UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY},
         };
         let mut path = std::ptr::null_mut();
         let status = unsafe {
@@ -146,9 +146,9 @@ pub fn documents_dir() -> io::Result<PathBuf> {
                 while *path.add(length) != 0 {
                     length += 1;
                 }
-                Ok(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
-                    path, length,
-                ))))
+                Ok(PathBuf::from(OsString::from_wide(
+                    std::slice::from_raw_parts(path, length),
+                )))
             }
         };
         // Free the returned allocation even when folder lookup fails.
@@ -613,7 +613,10 @@ mod windows {
         // Force relaxes only the abandoned marker's owner, never its type,
         // links or liveness. Keep the checked parent fixed until deletion.
         let _parent = if force {
-            Some(crate::elevation::force_recovery_parent(&marker_handle, &marker)?)
+            Some(crate::elevation::force_recovery_parent(
+                &marker_handle,
+                &marker,
+            )?)
         } else {
             crate::elevation::validate_user_file(&marker_handle, &marker)?;
             None

@@ -1099,12 +1099,20 @@ async fn serve(
 }
 async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
     Some(match action {
-        Action::Monitor { name } => async {
-            let route = hub.route(name)?;
-            let snapshot = crate::monitor::core(name, route.instance.kind, route.pid, &route.socket).await?;
-            anyhow::ensure!(hub.route(name)?.pid == route.pid, "Core PID changed during monitor sample");
-            Ok(Reply::text(serde_json::to_string(&snapshot)?))
-        }.await,
+        Action::Monitor { name } => {
+            async {
+                let route = hub.route(name)?;
+                let snapshot =
+                    crate::monitor::core(name, route.instance.kind, route.pid, &route.socket)
+                        .await?;
+                anyhow::ensure!(
+                    hub.route(name)?.pid == route.pid,
+                    "Core PID changed during monitor sample"
+                );
+                Ok(Reply::text(serde_json::to_string(&snapshot)?))
+            }
+            .await
+        }
         Action::List => Ok(hub.list.borrow().clone()),
         Action::UpdateStatus => serde_json::to_string(&*hub.updates.borrow())
             .map(Reply::text)

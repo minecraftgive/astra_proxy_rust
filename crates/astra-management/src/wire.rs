@@ -395,8 +395,10 @@ mod tests {
         };
         let encoded = serde_json::to_value(force).unwrap();
         assert_eq!(encoded["type"], "force_start");
-        assert!(matches!(serde_json::from_value::<crate::v2::Command>(encoded).unwrap(),
-            crate::v2::Command::ForceStart { instance } if instance == "proxy"));
+        assert!(
+            matches!(serde_json::from_value::<crate::v2::Command>(encoded).unwrap(),
+            crate::v2::Command::ForceStart { instance } if instance == "proxy")
+        );
     }
 
     #[tokio::test]

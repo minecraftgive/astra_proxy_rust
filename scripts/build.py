@@ -13,66 +13,78 @@ import shutil
 import subprocess
 import sys
 import time
-from astra_tools.workspace import ROOT, BUILD_MODES, BuildLayout, build_environment, cargo_profile
+from astra_tools.workspace import ROOT, BuildLayout, build_environment, cargo_profile
 from astra_tools.artifacts import ROLES, ArtifactIndex, role_binaries, role_packages, stage, package
 
+
+FORM_FIELDS = (
+    ('profile', 'Profile', (('debug', 'debug'), ('release', 'release'), ('both', 'debug + release'))),
+    ('arch', 'Architecture', (('native', 'native - current Rust host'),
+                              ('64bits', '64bits - require a 64-bit native target'))),
+    ('role', 'Role', tuple((name, name) for name in (*ROLES, 'all'))),
+    ('package', 'Package', ((False, 'no'), (True, 'yes'))),
+    ('timings', 'Timing report', ((False, 'no'), (True, 'yes'))),
+)
+
+
+def _form_input(prompt):
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt) as error:
+        print('\nBuild cancelled.')
+        raise SystemExit(130 if isinstance(error, KeyboardInterrupt) else 0) from None
+    if answer in ('q', 'quit', 'cancel'):
+        print('Build cancelled.')
+        raise SystemExit(0)
+    return answer
+
+
 def interactive_options(args):
-    """Single-key menu; every key restarts the inactivity deadline."""
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
+    """Editable terminal form; only an explicit Build starts compilation."""
+    if not args.interactive and (not sys.stdin.isatty() or not sys.stdout.isatty()):
         return
-    import contextlib
-    @contextlib.contextmanager
-    def keyboard():
-        if os.name == 'nt':
-            import msvcrt
-            yield lambda: msvcrt.getwch() if msvcrt.kbhit() else None
-        else:
-            import select
-            import termios
-            import tty
-            old = termios.tcgetattr(sys.stdin)
-            try:
-                tty.setcbreak(sys.stdin.fileno())
-                yield lambda: sys.stdin.read(1) if select.select([sys.stdin], [], [], 0)[0] else None
-            finally:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-    deadline = time.monotonic() + 10
-    previous = None
-    with keyboard() as read_key:
+    while True:
+        print('\nAstra build form')
+        print('-' * 64)
+        for number, (name, label, choices) in enumerate(FORM_FIELDS, 1):
+            selected = next(text for value, text in choices if value == getattr(args, name))
+            print(f'  {number}. {label:14} {selected}')
+        profiles = ('debug', 'release') if args.profile == 'both' else (args.profile,)
+        print('  Cargo profiles: ' + ', '.join(cargo_profile(profile) for profile in profiles))
+        print(f'  Output: {args.output_dir.resolve()}')
+        selection = _form_input('Field number to edit | B: Build | Q: Cancel > ')
+        if selection in ('b', 'build'):
+            return
+        if not selection:
+            continue
+        if selection not in {str(number) for number in range(1, len(FORM_FIELDS) + 1)}:
+            print('Enter a field number, B to build, or Q to cancel.')
+            continue
+        name, label, choices = FORM_FIELDS[int(selection) - 1]
+        print(f'\n{label}:')
+        for number, (value, text) in enumerate(choices, 1):
+            selected = ' [selected]' if value == getattr(args, name) else ''
+            print(f'  {number}. {text}{selected}')
         while True:
-            remaining = max(0, int(deadline - time.monotonic() + 0.999))
-            status = (args.profile, args.mode, args.role, args.package, remaining)
-            if status != previous:
-                print(f"\r[P] Profile: {args.profile:7}  [R] Role: {args.role:6}  "
-                      f"[M] Mode: {args.mode:7}  "
-                      f"[A] Archive: {'yes' if args.package else 'no ':3}  "
-                      f"[Enter] Build  [Q] Quit  Idle: {remaining:2}s   ", end='', flush=True)
-                previous = status
-            if time.monotonic() >= deadline:
-                print()
-                return
-            key = read_key()
-            if key is None:
-                time.sleep(0.05)
-                continue
-            deadline = time.monotonic() + 10
-            key = key.lower()
-            if key in ('q', '\x03', '\x1b'):
-                print()
-                raise SystemExit(0)
-            if key in ('\r', '\n'):
-                print()
-                return
-            if key == 'p':
-                values = ('debug', 'release', 'both')
-                args.profile = values[(values.index(args.profile) + 1) % len(values)]
-            elif key == 'm':
-                args.mode = BUILD_MODES[(BUILD_MODES.index(args.mode) + 1) % len(BUILD_MODES)]
-            elif key == 'r':
-                values = ('client', 'server', 'controller', 'web', 'all')
-                args.role = values[(values.index(args.role) + 1) % len(values)]
-            elif key == 'a':
-                args.package = not args.package
+            answer = _form_input('Select number/value (Enter: keep current, Q: cancel) > ')
+            if not answer:
+                break
+            matches = [value for number, (value, text) in enumerate(choices, 1)
+                       if answer in (str(number), text.split(' ')[0], str(value).lower())]
+            if matches:
+                setattr(args, name, matches[0])
+                break
+            print('Invalid choice; select one of the listed values.')
+
+
+def validate_architecture(arch, target, env):
+    if arch == 'native':
+        return
+    cfg = subprocess.check_output(['rustc', '--print', 'cfg', '--target', target],
+                                  cwd=ROOT, env=env, text=True)
+    if 'target_pointer_width="64"' not in cfg.splitlines():
+        raise ValueError(f'64bits requires a 64-bit Rust host target; current target: {target}. '
+                         'Select a 64-bit native Rust toolchain; cross-compilation is not supported.')
 
 
 def build_web_assets(env):
@@ -93,19 +105,23 @@ def argument_parser():
     parser.add_argument('--package', action='store_true')
     parser.add_argument('--output-dir', type=Path, default=ROOT / 'dist')
     parser.add_argument('--label', help='archive label (default: selected component version)')
-    parser.add_argument('--profile', choices=('debug', 'release', 'both'), default='debug')
-    parser.add_argument('--mode', choices=BUILD_MODES, default='fast',
-                        help='fast: shortest compilation; runtime: portable runtime optimization (default: fast)')
+    parser.add_argument('--profile', choices=('debug', 'release', 'both'), default='debug',
+                        help='debug: Cargo dev, fastest compilation; release: Cargo release, '
+                             'fastest runtime (default: debug)')
+    parser.add_argument('--arch', choices=('native', '64bits'), default='native',
+                        help='native Rust host, or require a 64-bit native target (x86_64/ARM64)')
     parser.add_argument('--timings', action='store_true', help='save Cargo HTML timing reports with the distribution')
-    parser.add_argument('--non-interactive', action='store_true')
+    interaction = parser.add_mutually_exclusive_group()
+    interaction.add_argument('--interactive', action='store_true', help='always show the build form')
+    interaction.add_argument('--non-interactive', action='store_true', help='build directly without the form')
     return parser
 
 
-def build_command(roles, target, profile, mode, *, timings=False):
+def build_command(roles, target, profile, *, timings=False):
     crates = [item for name in role_packages(roles) for item in ('-p', name)]
     binaries = [item for name in role_binaries(roles) for item in ('--bin', name)]
     return ['cargo', 'build', '--locked', *crates, *binaries, '--target', target,
-            '--profile', cargo_profile(profile, mode), *(['--timings'] if timings else [])]
+            '--profile', cargo_profile(profile), *(['--timings'] if timings else [])]
 
 
 def main():
@@ -122,6 +138,11 @@ def main():
     layout, metadata = BuildLayout.discover(env)
     if env.get('CARGO_BUILD_TARGET', layout.target) not in (layout.target, 'host-tuple'):
         parser.error('Native builds require CARGO_BUILD_TARGET to match the Rust host')
+    try:
+        validate_architecture(args.arch, layout.target, env)
+    except (ValueError, subprocess.CalledProcessError) as error:
+        parser.error(str(error))
+    print(f'Target: {layout.target} (architecture: {args.arch})', flush=True)
     if os.name == 'nt' and platform.machine().lower() in ('amd64', 'x86_64') and not shutil.which('nasm', path=env['PATH']):
         parser.error('NASM is required by BoringSSL on Windows x64; see docs/INSTALL.md')
     roles = tuple(ROLES) if args.role == 'all' else (args.role,)
@@ -145,11 +166,11 @@ def main():
     index = ArtifactIndex(run_dir, layout.target, revision.stdout.strip() if revision.returncode == 0 else '')
     profiles = ('debug', 'release') if args.profile == 'both' else (args.profile,)
     for profile in profiles:
-        selected_profile = cargo_profile(profile, args.mode)
-        bin_dir = layout.binary_dir(profile, args.mode)
-        print(f'Building {", ".join(roles)}: {args.mode} {profile} (Cargo profile: {selected_profile})', flush=True)
+        selected_profile = cargo_profile(profile)
+        bin_dir = layout.binary_dir(profile)
+        print(f'Building {", ".join(roles)}: {profile} (Cargo profile: {selected_profile})', flush=True)
         started = time.perf_counter()
-        subprocess.run(build_command(roles, layout.target, profile, args.mode, timings=args.timings),
+        subprocess.run(build_command(roles, layout.target, profile, timings=args.timings),
                        check=True, cwd=ROOT, env=env)
         elapsed = time.perf_counter() - started
         if args.timings:
@@ -166,10 +187,9 @@ def main():
                     shutil.copy2(wintun / name, bin_dir / name)
         for role in roles:
             staged = stage(role, bin_dir, run_dir / profile / role, target=layout.target, versions=versions,
-                           label=label, profile=profile, mode=args.mode, cargo_profile=selected_profile)
+                           label=label, profile=profile)
             archive = package(role, staged, run_dir / profile, label, target=layout.target) if args.package else None
-            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive,
-                      mode=args.mode, cargo_profile=selected_profile)
+            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive)
             index.save()
         print(f'Built {", ".join(roles)} in {elapsed:.2f}s: {bin_dir}')
     print(f'Distribution: {run_dir}\nArtifact index: {run_dir / "artifacts.json"}')

@@ -33,7 +33,11 @@ fn internal_snapshot(
         MetricKind::{Counter, Gauge},
     };
     let mut result = astra_observe::snapshot(astra_platform::lifecycle::boot_id());
-    let sampled_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().to_string();
+    let sampled_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
     let mut metric = |name: &str, value: u64, kind, unit: &str, description: &str| {
         result.metrics.push(Metric {
             sampled_at_ms: Some(sampled_at_ms.clone()),

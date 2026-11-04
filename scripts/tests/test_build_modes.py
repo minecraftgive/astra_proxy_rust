@@ -1,4 +1,4 @@
-"""Build mode and artifact integration tests without invoking Rust or native tools."""
+"""Build profile and artifact integration tests without invoking Rust or native tools."""
 import contextlib
 import importlib.util
 import io
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import Mock, patch
 
@@ -14,7 +15,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 from astra_tools.artifacts import ArtifactIndex, ROLES, role_packages, stage, write_release_manifest
 from astra_tools.platform import executable
-from astra_tools.workspace import BuildLayout, cargo_profile, resolve_binary_dir, resolve_build_mode
+from astra_tools.workspace import BuildLayout, cargo_profile, resolve_binary_dir
 
 def load_cli(name):
     """Load each command entrypoint as a test subject, never as a scenario dependency."""
@@ -29,8 +30,8 @@ astra = load_cli('astra')
 test_cli = load_cli('test')
 
 
-def artifact_fixture(root, *, profile='release', mode='runtime', role='client'):
-    bins = root / 'custom-target' / 'host' / cargo_profile(profile, mode)
+def artifact_fixture(root, *, profile='release', role='client'):
+    bins = root / 'custom-target' / 'host' / profile
     bins.mkdir(parents=True, exist_ok=True)
     for binary in ROLES[role].binaries:
         (bins / executable(binary)).write_bytes(b'executable fixture')
@@ -38,93 +39,84 @@ def artifact_fixture(root, *, profile='release', mode='runtime', role='client'):
     archive = index.directory / 'fixture.tar.gz'
     archive.parent.mkdir(parents=True, exist_ok=True)
     archive.write_bytes(b'archive fixture')
-    metadata = {} if mode is None else {'mode': mode, 'cargo_profile': cargo_profile(profile, mode)}
-    index.add(role=role, profile=profile, binary_dir=bins, staged=index.directory / profile / role,
-              archive=archive, **metadata)
+    index.add(role=role, profile=profile, binary_dir=bins, staged=index.directory / profile / role, archive=archive)
     index.save()
     return index, bins.resolve()
 
 
-class ModeResolutionTests(unittest.TestCase):
-    def test_distinct_profile_directories_under_custom_target(self):
+class ProfileResolutionTests(unittest.TestCase):
+    def test_only_dev_and_release_cargo_profiles_exist(self):
         layout = BuildLayout(Path('custom-target'), 'host')
-        expected = {('debug', 'fast'): ('dev', 'debug'),
-                    ('release', 'fast'): ('release-fast', 'release-fast'),
-                    ('debug', 'runtime'): ('dev-runtime', 'dev-runtime'),
-                    ('release', 'runtime'): ('release-runtime', 'release-runtime')}
-        for (profile, mode), (cargo, directory) in expected.items():
-            with self.subTest(profile=profile, mode=mode):
-                self.assertEqual(cargo_profile(profile, mode), cargo)
-                self.assertEqual(layout.binary_dir(profile, mode), Path('custom-target/host') / directory)
-        self.assertEqual(layout.binary_dir('debug'), Path('custom-target/host/debug'))
-        self.assertEqual(layout.binary_dir('release'), Path('custom-target/host/release'))
-        for profile, mode in [('invalid', 'fast'), ('debug', 'invalid')]:
-            with self.assertRaises(ValueError):
-                layout.binary_dir(profile, mode)
+        for profile, cargo in [('debug', 'dev'), ('release', 'release')]:
+            with self.subTest(profile=profile):
+                self.assertEqual(cargo_profile(profile), cargo)
+                self.assertEqual(layout.binary_dir(profile), Path('custom-target/host') / profile)
+        for profile in ('invalid', 'dev', 'release-fast', 'release-runtime', 'dev-runtime'):
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                layout.binary_dir(profile)
 
-    def test_new_and_legacy_artifacts_resolve_without_cargo(self):
+    def test_workspace_manifests_define_only_dev_and_release(self):
+        manifest = tomllib.loads((SCRIPTS.parent / 'Cargo.toml').read_text(encoding='utf-8'))
+        self.assertEqual(set(manifest['profile']), {'dev', 'release'})
+        for path in SCRIPTS.parent.glob('crates/*/Cargo.toml'):
+            with self.subTest(crate=path.parent.name):
+                self.assertNotIn('profile', tomllib.loads(path.read_text(encoding='utf-8')))
+        config = tomllib.loads((SCRIPTS.parent / '.cargo/config.toml').read_text(encoding='utf-8'))
+        self.assertNotIn('profile', config)
+        # build.incremental would override the release profile's incremental = false.
+        self.assertNotIn('incremental', config.get('build', {}))
+
+    def test_artifacts_resolve_without_cargo(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for mode in ('fast', 'runtime', None):
-                with self.subTest(mode=mode):
-                    index, bins = artifact_fixture(root / str(mode), mode=mode)
-                    with patch.object(BuildLayout, 'discover', side_effect=AssertionError('must not run Cargo')):
-                        self.assertEqual(resolve_build_mode(index.directory), mode)
-                        self.assertEqual(resolve_binary_dir(artifact_dir=index.directory), bins)
-                        explicit = root / 'explicit'
-                        self.assertEqual(resolve_binary_dir(explicit, artifact_dir=index.directory), explicit.resolve())
-                    conflicting = 'fast' if mode != 'fast' else 'runtime'
-                    with self.assertRaisesRegex(ValueError, 'conflicts'):
-                        resolve_binary_dir(root / 'explicit', artifact_dir=index.directory, mode=conflicting)
+            index, bins = artifact_fixture(root)
+            with patch.object(BuildLayout, 'discover', side_effect=AssertionError('must not run Cargo')):
+                self.assertEqual(resolve_binary_dir(artifact_dir=index.directory), bins)
+                explicit = root / 'explicit'
+                self.assertEqual(resolve_binary_dir(explicit, artifact_dir=index.directory), explicit.resolve())
+            self.assertEqual(index.entries[0]['cargo_profile'], 'release')
 
-    def test_invalid_and_partial_artifact_metadata_rejected(self):
+    def test_artifacts_from_removed_profiles_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             index, _ = artifact_fixture(Path(temporary))
             path = index.directory / 'artifacts.json'
             original = json.loads(path.read_text())
-            for fields in ({'mode': 'runtime'}, {'mode': 'runtime', 'cargo_profile': 'release-fast'},
-                           {'mode': 'invalid', 'cargo_profile': 'release'},
-                           {'mode': None, 'cargo_profile': None}):
-                with self.subTest(fields=fields):
+            for cargo in ('release-runtime', 'release-fast', 'dev', None):
+                with self.subTest(cargo=cargo):
                     data = json.loads(json.dumps(original))
-                    data['entries'][0].pop('mode')
-                    data['entries'][0].pop('cargo_profile')
-                    data['entries'][0].update(fields)
+                    data['entries'][0]['cargo_profile'] = cargo
                     path.write_text(json.dumps(data))
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(ValueError, 'removed Cargo profile'):
                         ArtifactIndex.load(index.directory)
 
-    def test_partial_manifest_metadata_rejected_before_staging(self):
+    def test_manifest_records_derived_cargo_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for fields in ({'profile': 'debug'}, {'mode': 'fast'}, {'cargo_profile': 'dev'},
-                           {'profile': 'debug', 'mode': 'fast'}):
-                with self.subTest(fields=fields):
-                    with self.assertRaisesRegex(ValueError, 'requires profile, mode and cargo_profile together'):
-                        stage('controller', root / 'bins', root / 'staged', target='host',
-                              versions={'astra-manager': '0.1.0'}, label='0.1.0', **fields)
-                    self.assertFalse((root / 'staged').exists())
-                    with self.assertRaisesRegex(ValueError, 'requires profile, mode and cargo_profile together'):
-                        write_release_manifest(root, '0.1.0', 'host', {'astra-manager': '0.1.0'},
-                                               role='controller', **fields)
-                    self.assertFalse((root / 'manifest.json').exists())
+            (root / 'payload.bin').write_bytes(b'x')
+            manifest = write_release_manifest(root, '0.1.0', 'host', {'astra-manager': '0.1.0'},
+                                              role='controller', profile='debug')
+            self.assertEqual((manifest['profile'], manifest['cargo_profile']), ('debug', 'dev'))
+            with self.assertRaises(ValueError):
+                stage('controller', root / 'bins', root / 'staged', target='host',
+                      versions={'astra-manager': '0.1.0'}, label='0.1.0', profile='invalid')
+            self.assertFalse((root / 'staged').exists())
 
 
 class BuildCommandTests(unittest.TestCase):
     def test_default_and_role_selection(self):
         args = build.argument_parser().parse_args([])
-        self.assertEqual((args.profile, args.mode, args.role), ('debug', 'fast', 'client'))
+        self.assertEqual((args.profile, args.role), ('debug', 'client'))
         for roles in [('client',), ('controller',), tuple(ROLES)]:
             with self.subTest(roles=roles):
-                command = build.build_command(roles, 'host', 'release', 'fast', timings=True)
+                command = build.build_command(roles, 'host', 'release', timings=True)
                 binaries = [command[i + 1] for i, item in enumerate(command) if item == '--bin']
                 self.assertEqual(set(binaries), {binary for role in roles for binary in ROLES[role].binaries})
                 self.assertEqual(len(binaries), len(set(binaries)))
                 self.assertNotIn('--bins', command)
                 self.assertIn('--timings', command)
-                self.assertEqual(command[command.index('--profile') + 1], 'release-fast')
+                self.assertEqual(command[command.index('--profile') + 1], 'release')
 
-    def run_build(self, root, arguments):
+    def run_build(self, root, arguments, *, form_answers=None, cfg='target_pointer_width="64"\n'):
         layout = BuildLayout(root / 'custom-target', 'host')
         versions = [{'name': name, 'version': '0.1.0'} for name in role_packages(tuple(ROLES))]
         calls = []
@@ -148,12 +140,15 @@ class BuildCommandTests(unittest.TestCase):
                 calls.append(command)
             return Mock(returncode=0, stdout='revision\n')
 
-        argv = ['build.py', '--non-interactive', '--output-dir', str(root / 'dist'), *arguments]
+        interaction = '--non-interactive' if form_answers is None else '--interactive'
+        argv = ['build.py', interaction, '--output-dir', str(root / 'dist'), *arguments]
         with patch.object(sys, 'argv', argv), patch.object(build, 'ROOT', root), \
+             patch('builtins.input', side_effect=form_answers or AssertionError('must not prompt')), \
              patch.object(build, 'build_environment', return_value={'PATH': os.environ.get('PATH', '')}), \
              patch.object(build.BuildLayout, 'discover', return_value=(layout, {'packages': versions})), \
              patch.object(build.shutil, 'which', return_value='tool'), \
              patch.object(build.subprocess, 'run', side_effect=run), \
+             patch.object(build.subprocess, 'check_output', return_value=cfg), \
              patch.object(build, 'build_web_assets', side_effect=lambda env: web_built.append(True)), \
              contextlib.redirect_stdout(io.StringIO()):
             build.main()
@@ -161,33 +156,48 @@ class BuildCommandTests(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         return calls, ArtifactIndex.load(runs[0])
 
-    def test_default_build_only_emits_fast_debug_with_metadata(self):
+    def test_default_build_only_emits_debug_with_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             calls, index = self.run_build(Path(temporary), [])
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][calls[0].index('--profile') + 1], 'dev')
             entry, = index.entries
-            self.assertEqual((entry['profile'], entry['mode'], entry['cargo_profile']), ('debug', 'fast', 'dev'))
+            self.assertEqual((entry['profile'], entry['cargo_profile']), ('debug', 'dev'))
+            self.assertNotIn('mode', entry)
             manifest = json.loads((index.directory / entry['staged'] / 'manifest.json').read_text())
-            self.assertEqual(manifest['mode'], 'fast')
             self.assertEqual(manifest['cargo_profile'], 'dev')
+            self.assertNotIn('mode', manifest)
 
-    def test_both_modes_preserve_web_guard_and_copy_each_timing_report(self):
+    def test_both_profiles_preserve_web_guard_and_copy_each_timing_report(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for mode, profiles in [('fast', ['dev', 'release-fast']),
-                                   ('runtime', ['dev-runtime', 'release-runtime'])]:
-                with self.subTest(mode=mode):
-                    calls, index = self.run_build(Path(temporary) / mode,
-                                                 ['--profile', 'both', '--role', 'web', '--mode', mode, '--timings'])
-                    self.assertEqual([c[c.index('--profile') + 1] for c in calls], profiles)
-                    self.assertEqual([entry['profile'] for entry in index.entries], ['debug', 'release'])
-                    for selected in profiles:
-                        self.assertTrue((index.directory / f'cargo-timing-{selected}.html').is_file())
+            calls, index = self.run_build(Path(temporary), ['--profile', 'both', '--role', 'web', '--timings'])
+            self.assertEqual([c[c.index('--profile') + 1] for c in calls], ['dev', 'release'])
+            self.assertEqual([entry['profile'] for entry in index.entries], ['debug', 'release'])
+            for selected in ('dev', 'release'):
+                self.assertTrue((index.directory / f'cargo-timing-{selected}.html').is_file())
 
     def test_debug_alias_overrides_release_selection(self):
         with tempfile.TemporaryDirectory() as temporary:
-            calls, _ = self.run_build(Path(temporary), ['--profile', 'release', '--mode', 'runtime', '--debug'])
-            self.assertEqual(calls[0][calls[0].index('--profile') + 1], 'dev-runtime')
+            calls, _ = self.run_build(Path(temporary), ['--profile', 'release', '--debug'])
+            self.assertEqual(calls[0][calls[0].index('--profile') + 1], 'dev')
+
+    def test_form_choices_drive_build_profiles_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, index = self.run_build(Path(temporary), [], form_answers=[
+                '1', 'both', '2', '64bits', '3', 'controller', '5', 'yes', 'b'])
+            self.assertEqual([c[c.index('--profile') + 1] for c in calls], ['dev', 'release'])
+            self.assertTrue(all('--timings' in c for c in calls))
+            self.assertEqual([(e['role'], e['profile']) for e in index.entries],
+                             [('controller', 'debug'), ('controller', 'release')])
+
+    def test_64bits_rejects_32bit_target_before_creating_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stderr(io.StringIO()):
+            root = Path(temporary)
+            with self.assertRaises(SystemExit) as error:
+                self.run_build(root, ['--arch', '64bits'], cfg='target_pointer_width="32"\n')
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse((root / 'dist').exists())
+            self.assertFalse((root / 'custom-target').exists())
 
 
 class ConsumerCommandTests(unittest.TestCase):
@@ -204,12 +214,11 @@ class ConsumerCommandTests(unittest.TestCase):
             commands = [s.command for s in steps if s.command[0] == 'cargo']
             self.assertEqual(len(commands), 2)
             for command in commands:
-                self.assertEqual(command[command.index('--profile') + 1], 'release-runtime')
+                self.assertEqual(command[command.index('--profile') + 1], 'release')
             self.assertEqual(runner.call_args.kwargs['env']['ASTRA_UPDATE_TEST_BIN'], str(bins))
 
-    def test_test_cli_without_mode_retains_legacy_profiles(self):
-        for extra, expected in [([], 'release'), (['--debug'], 'dev'),
-                                (['--mode', 'fast'], 'release-fast')]:
+    def test_test_cli_selects_dev_or_release(self):
+        for extra, expected in [([], 'release'), (['--debug'], 'dev')]:
             with self.subTest(extra=extra), patch.object(sys, 'argv', ['test.py', 'check', *extra]), \
                  patch.object(test_cli, 'build_environment', return_value={}), \
                  patch.object(test_cli, 'host_target', return_value='host'), \
@@ -219,18 +228,14 @@ class ConsumerCommandTests(unittest.TestCase):
                 command = runner.call_args.args[0][0].command
                 self.assertEqual(command[command.index('--profile') + 1], expected)
 
-    def test_package_discovery_cannot_bypass_mode_conflict(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            index, _ = artifact_fixture(Path(temporary), role='controller')
-            with patch.object(sys, 'argv', ['test.py', 'package', '--mode', 'fast']), \
-                 patch.object(test_cli, 'discover_index', return_value=index), \
-                 patch.object(test_cli, 'run_steps') as runner, contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as error:
-                    test_cli.main()
-                self.assertEqual(error.exception.code, 2)
-                runner.assert_not_called()
+    def test_mode_option_was_removed_from_consumers(self):
+        for module, name in [(test_cli, 'test.py'), (astra, 'astra.py')]:
+            with self.subTest(command=name), patch.object(sys, 'argv', [name, '--mode', 'fast']), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                module.main()
+            self.assertEqual(error.exception.code, 2)
 
-    def test_legacy_web_contract_check_stays_in_dev_profile(self):
+    def test_web_contract_check_stays_in_dev_profile(self):
         with patch.object(sys, 'argv', ['test.py', 'web']), \
              patch.object(test_cli, 'host_target', return_value='host'), \
              patch.object(test_cli, 'run_steps', return_value=[]) as runner, \
@@ -239,7 +244,7 @@ class ConsumerCommandTests(unittest.TestCase):
         command = runner.call_args.args[0][0].command
         self.assertEqual(command[command.index('--profile') + 1], 'dev')
 
-    def test_launcher_uses_index_path_and_rejects_explicit_conflicting_mode(self):
+    def test_launcher_uses_index_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             index, bins = artifact_fixture(Path(temporary))
             argv = ['astra.py', '--check', '--artifact-dir', str(index.directory)]
@@ -249,12 +254,6 @@ class ConsumerCommandTests(unittest.TestCase):
                 astra.main()
             self.assertEqual(routing.call_args.args[0][0], str(bins / executable('astra-proxy')))
             self.assertEqual(validate.call_args.args[0][0], str(bins / executable('astra-proxy')))
-            with patch.object(sys, 'argv', [*argv, '--bin-dir', str(bins), '--mode', 'fast']), \
-                 patch.object(astra.subprocess, 'run') as validate, contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as error:
-                    astra.main()
-                self.assertEqual(error.exception.code, 2)
-                validate.assert_not_called()
 
 
 if __name__ == '__main__':

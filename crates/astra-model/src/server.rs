@@ -6,10 +6,17 @@ pub const VERSION: u16 = 2;
 pub enum Action {
     Status,
     Stop,
-    Reload { path: Option<PathBuf> },
+    Reload {
+        path: Option<PathBuf>,
+    },
     Logs,
-    StopIdentified { boot_id: String, force: bool },
-    CommitService { boot_id: String },
+    StopIdentified {
+        boot_id: String,
+        force: bool,
+    },
+    CommitService {
+        boot_id: String,
+    },
     /// Additive command; returns internal diagnostics as JSON in Reply.logs.
     Monitor,
 }

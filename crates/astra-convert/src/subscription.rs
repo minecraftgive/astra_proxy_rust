@@ -37,13 +37,10 @@ pub fn download(url: &str, user_agent: &str) -> Result<String> {
             .call()
             .or_else(|error| match error {
                 ureq::Error::Status(_, response) => Ok(response),
-                error => Err(error),
-            })
-            .map_err(|error| {
-                anyhow::anyhow!(
+                error => Err(anyhow::anyhow!(
                     "subscription transport: {}",
                     diagnostics::error(&anyhow::anyhow!(error.to_string()))
-                )
+                )),
             })?;
         let status = response.status();
         let encoding = response

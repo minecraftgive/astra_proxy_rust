@@ -132,10 +132,8 @@ impl io::Write for Line {
 }
 impl Drop for Line {
     fn drop(&mut self) {
-        if !self.0.is_empty() {
-            if !enqueue(writer(), Message::Line(std::mem::take(&mut self.0))) {
-                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if !self.0.is_empty() && !enqueue(writer(), Message::Line(std::mem::take(&mut self.0))) {
+            DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

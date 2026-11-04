@@ -412,11 +412,10 @@ fn cli_defaults_to_nodes_only_for_files_stdin_and_bound_subscriptions() {
             assert!(proxy.get("mixed_listen").is_some());
             assert!(proxy["proxy_groups"].get("Proxy").is_some());
             assert!(
-                toml(&fs::read_to_string(output.join("rule.toml")).unwrap())["rules"]
+                !toml(&fs::read_to_string(output.join("rule.toml")).unwrap())["rules"]
                     .as_array()
                     .unwrap()
-                    .len()
-                    > 0
+                    .is_empty()
             );
         } else {
             assert!(proxy.get("dns").is_none());

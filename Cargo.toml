@@ -21,38 +21,36 @@ meow-common = { path = "vendor/meow-common" }
 meow-proxy = { path = "vendor/meow-proxy" }
 netstack-smoltcp = { path = "vendor/netstack-smoltcp" }
 
-# Fast local iteration, retaining file/line information in panic backtraces.
+# Exactly two build profiles are supported: `dev` and `release`.
+# Do not add custom [profile.*] sections; the built-in `test` and `bench`
+# profiles inherit from `dev` and `release` respectively.
+
+# dev: minimum compile time. No optimization, no debug info, maximal codegen
+# parallelism and incremental reuse. Assertions and overflow checks stay on.
 [profile.dev]
 opt-level = 0
-debug = "line-tables-only"
+debug = false
+debug-assertions = true
+overflow-checks = true
 lto = "off"
 codegen-units = 256
 incremental = true
 panic = "unwind"
 
-# Release semantics with compilation speed taking priority over runtime speed.
-# Keep the standard `release` profile unchanged for ordinary cargo --release.
-[profile.release-fast]
-inherits = "release"
+[profile.dev.build-override]
 opt-level = 0
-debug = 0
-lto = "off"
+debug = false
 codegen-units = 256
-incremental = true
-panic = "unwind"
 
-# Optimized debug builds retain dev assertions, overflow checks and line info.
-[profile.dev-runtime]
-inherits = "dev"
+# release: maximum runtime performance. Whole-program fat LTO with a single
+# codegen unit. `panic = "unwind"` is kept because astra-manager relies on
+# catch_unwind and tokio isolates task panics. No target-cpu=native, so
+# binaries stay portable to any CPU of the target architecture.
+[profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
-incremental = false
-panic = "unwind"
-
-[profile.release-runtime]
-inherits = "release"
-opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
 lto = "fat"
 codegen-units = 1
 incremental = false

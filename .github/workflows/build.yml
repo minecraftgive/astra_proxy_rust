@@ -1,0 +1,81 @@
+name: Build
+# Compile the release (runtime-optimized) packages of every role on each
+# native platform and keep them as workflow artifacts. Nothing is published:
+# no GitHub Release, tag or package registry upload.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  release:
+    name: release (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+          - name: windows-x86_64
+            runner: windows-latest
+          - name: macos-arm64
+            runner: macos-15
+          - name: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Dependencies only; workspace crates always rebuild with fat LTO.
+          shared-key: release-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config
+      - name: Install native build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm llvm --no-progress -y
+      - name: Install native build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja nasm llvm pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Add NASM and LLVM to PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+          echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+      - name: Build and package all roles with the release profile
+        run: python scripts/build.py --role all --profile release --package --non-interactive --output-dir dist
+      - name: Locate the build run
+        run: |
+          run_dir=$(python -c "import sys; sys.path.insert(0, 'scripts'); from astra_tools.artifacts import discover_index; print(discover_index().directory.as_posix())")
+          echo "RUN_DIR=$run_dir" >> "$GITHUB_ENV"
+          ls -la "$run_dir/release"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: astra-${{ matrix.name }}-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.RUN_DIR }}/artifacts.json
+            ${{ env.RUN_DIR }}/release/*.tar.gz

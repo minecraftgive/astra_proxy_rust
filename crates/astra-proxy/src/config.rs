@@ -107,11 +107,16 @@ mod inbound_acl_tests {
         let default: ProxyConfig = toml::from_str("socks5_listen='127.0.0.1:1080'").unwrap();
         assert!(!default.experimental.network_recovery);
         assert!(!toml::to_string(&default).unwrap().contains("experimental"));
-        let enabled: ProxyConfig =
-            toml::from_str("[experimental]
-network_recovery=true").unwrap();
+        let enabled: ProxyConfig = toml::from_str(
+            "[experimental]
+network_recovery=true",
+        )
+        .unwrap();
         assert!(enabled.experimental.network_recovery);
-        assert!(toml::from_str::<ProxyConfig>("[experimental]
-unknown=true").is_err());
+        assert!(toml::from_str::<ProxyConfig>(
+            "[experimental]
+unknown=true"
+        )
+        .is_err());
     }
 }

@@ -128,7 +128,7 @@ pub(super) struct Preferences {
 }
 
 /// Hidden until Ctrl+Home is held for three seconds on the accent color row.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct MarqueePreferences {
     pub(super) unlocked: bool,
@@ -137,9 +137,31 @@ pub(super) struct MarqueePreferences {
     pub(super) background: bool,
     pub(super) status: bool,
     pub(super) indicator: bool,
-    pub(super) speed: MarqueeSpeed,
-    pub(super) width: MarqueeWidth,
+    /// Hue degrees per second.
+    #[serde(deserialize_with = "speed_or_preset")]
+    pub(super) speed: u16,
+    /// Cells one whole rainbow spans.
+    #[serde(deserialize_with = "width_or_preset")]
+    pub(super) width: u16,
+    /// Frames per second while only the marquee is moving.
+    pub(super) fps: u16,
     pub(super) true_color: bool,
+}
+impl Default for MarqueePreferences {
+    fn default() -> Self {
+        Self {
+            unlocked: false,
+            border: false,
+            text: false,
+            background: false,
+            status: false,
+            indicator: false,
+            speed: SPEED.default,
+            width: WIDTH.default,
+            fps: FPS.default,
+            true_color: false,
+        }
+    }
 }
 impl MarqueePreferences {
     /// What actually runs: nothing while the section is hidden.
@@ -151,52 +173,92 @@ impl MarqueePreferences {
             status: self.unlocked && self.status,
             indicator: self.unlocked && self.indicator,
             true_color: self.true_color,
-            speed: self.speed.degrees_per_second(),
-            width: self.width.cells(),
+            speed: f32::from(SPEED.clamp(self.speed)),
+            width: f32::from(WIDTH.clamp(self.width)),
+            fps: FPS.clamp(self.fps),
         }
     }
 }
-/// How fast the colors run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum MarqueeSpeed {
-    Slow,
-    #[default]
-    Normal,
-    Fast,
-    VeryFast,
+/// A preference adjusted in steps rather than picked from named choices.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Range {
+    min: u16,
+    max: u16,
+    step: u16,
+    /// Step with Shift held.
+    big: u16,
+    default: u16,
+    unit: &'static str,
 }
-impl MarqueeSpeed {
-    const ALL: [Self; 4] = [Self::Slow, Self::Normal, Self::Fast, Self::VeryFast];
-    fn degrees_per_second(self) -> f32 {
-        match self {
-            Self::Slow => 60.0,
-            Self::Normal => 160.0,
-            Self::Fast => 320.0,
-            Self::VeryFast => 640.0,
-        }
+impl Range {
+    fn clamp(self, value: u16) -> u16 {
+        value.clamp(self.min, self.max)
+    }
+    fn nudge(self, value: u16, up: bool, big: bool) -> u16 {
+        let step = if big { self.big } else { self.step };
+        self.clamp(if up {
+            value.saturating_add(step)
+        } else {
+            value.saturating_sub(step)
+        })
     }
 }
-/// How many cells one whole rainbow spans.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum MarqueeWidth {
-    Narrow,
-    #[default]
-    Normal,
-    Wide,
-    ExtraWide,
+const SPEED: Range = Range {
+    min: 0,
+    max: 1800,
+    step: 10,
+    big: 100,
+    default: 160,
+    unit: "\u{b0}/s",
+};
+const WIDTH: Range = Range {
+    min: 2,
+    max: 400,
+    step: 1,
+    big: 10,
+    default: 30,
+    unit: "cells",
+};
+const FPS: Range = Range {
+    min: 1,
+    max: 120,
+    step: 1,
+    big: 10,
+    default: 20,
+    unit: "fps",
+};
+/// A number, or a preset name saved by an earlier build.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NumberOrPreset {
+    Number(u64),
+    Preset(String),
 }
-impl MarqueeWidth {
-    const ALL: [Self; 4] = [Self::Narrow, Self::Normal, Self::Wide, Self::ExtraWide];
-    fn cells(self) -> f32 {
-        match self {
-            Self::Narrow => 12.0,
-            Self::Normal => 30.0,
-            Self::Wide => 60.0,
-            Self::ExtraWide => 120.0,
-        }
-    }
+fn number_or_preset<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    range: Range,
+    preset: fn(&str) -> Option<u16>,
+) -> Result<u16, D::Error> {
+    Ok(match NumberOrPreset::deserialize(d)? {
+        NumberOrPreset::Number(n) => range.clamp(n.min(u64::from(u16::MAX)) as u16),
+        NumberOrPreset::Preset(name) => preset(&name).unwrap_or(range.default),
+    })
+}
+fn speed_or_preset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    number_or_preset(d, SPEED, |name| match name {
+        "slow" => Some(60),
+        "fast" => Some(320),
+        "very_fast" => Some(640),
+        _ => None,
+    })
+}
+fn width_or_preset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    number_or_preset(d, WIDTH, |name| match name {
+        "narrow" => Some(12),
+        "wide" => Some(60),
+        "extra_wide" => Some(120),
+        _ => None,
+    })
 }
 /// How long Ctrl+Home must be held, and the longest gap between key repeats
 /// that still counts as holding (the first repeat waits for the OS delay).
@@ -234,9 +296,10 @@ pub(super) enum Field {
     MarqueeIndicator,
     MarqueeSpeed,
     MarqueeWidth,
+    MarqueeFps,
     MarqueeTrueColor,
 }
-const ALL_FIELDS: [Field; 15] = [
+const ALL_FIELDS: [Field; 16] = [
     Field::Language,
     Field::Accent,
     Field::Colors,
@@ -251,6 +314,7 @@ const ALL_FIELDS: [Field; 15] = [
     Field::MarqueeIndicator,
     Field::MarqueeSpeed,
     Field::MarqueeWidth,
+    Field::MarqueeFps,
     Field::MarqueeTrueColor,
 ];
 /// Row of the first marquee field.
@@ -266,7 +330,7 @@ fn fields(p: &Preferences) -> &'static [Field] {
 const SECTIONS: [(&str, std::ops::Range<usize>); 3] = [
     ("Appearance", 0..4),
     ("Interaction", 4..7),
-    ("Marquee", 7..15),
+    ("Marquee", 7..16),
 ];
 
 impl Field {
@@ -286,6 +350,7 @@ impl Field {
             Self::MarqueeIndicator => "Status indicator",
             Self::MarqueeSpeed => "Marquee speed",
             Self::MarqueeWidth => "Gradient width",
+            Self::MarqueeFps => "Frame rate",
             Self::MarqueeTrueColor => "Always true color",
         }
     }
@@ -303,8 +368,9 @@ impl Field {
             Self::MarqueeBackground => "A rainbow runs across the background of the selected row.",
             Self::MarqueeStatus => "A rainbow runs across the status text at the bottom of the window.",
             Self::MarqueeIndicator => "A rainbow runs across the connection dot and state word, only while connected.",
-            Self::MarqueeSpeed => "How fast the marquee colors run. Reduced or Off motion holds them still.",
-            Self::MarqueeWidth => "How many cells one whole rainbow spans; wider is a gentler gradient.",
+            Self::MarqueeSpeed => "Hue degrees per second, 0–1800; at 360 one whole rainbow passes each cell per second. ←→ ±10, Shift ±100. Reduced or Off motion holds the colors still.",
+            Self::MarqueeWidth => "Cells one whole rainbow spans, 2–400; wider is a gentler gradient. ←→ ±1, Shift ±10.",
+            Self::MarqueeFps => "Redraws per second while the marquee moves, 1–120. Higher is smoother but sends more to the terminal; over SSH keep it low. ←→ ±1, Shift ±10.",
             Self::MarqueeTrueColor => "Marquee colors ignore the Colors setting and are always sent as 24-bit color. Needs a terminal with true color.",
         }
     }
@@ -329,8 +395,7 @@ impl Field {
             | Self::MarqueeStatus
             | Self::MarqueeIndicator
             | Self::MarqueeTrueColor => &["On", "Off"],
-            Self::MarqueeSpeed => &["Slow", "Normal", "Fast", "Very fast"],
-            Self::MarqueeWidth => &["Narrow", "Normal", "Wide", "Extra wide"],
+            Self::MarqueeSpeed | Self::MarqueeWidth | Self::MarqueeFps => &[],
             Self::StartPage => &shell::PAGES,
         }
     }
@@ -353,14 +418,18 @@ impl Field {
             Self::MarqueeBackground => usize::from(!p.marquee.background),
             Self::MarqueeStatus => usize::from(!p.marquee.status),
             Self::MarqueeIndicator => usize::from(!p.marquee.indicator),
-            Self::MarqueeSpeed => p.marquee.speed as usize,
-            Self::MarqueeWidth => p.marquee.width as usize,
+            Self::MarqueeSpeed => usize::from(p.marquee.speed),
+            Self::MarqueeWidth => usize::from(p.marquee.width),
+            Self::MarqueeFps => usize::from(p.marquee.fps),
             Self::MarqueeTrueColor => usize::from(!p.marquee.true_color),
         }
     }
     fn set(self, p: &mut Preferences, index: usize) {
         use animation::MotionMode;
-        let index = index.min(self.choices().len() - 1);
+        let index = match self.range() {
+            Some(range) => usize::from(range.clamp(index.min(usize::from(u16::MAX)) as u16)),
+            None => index.min(self.choices().len() - 1),
+        };
         match self {
             Self::Language => {
                 p.language = [
@@ -391,9 +460,26 @@ impl Field {
             Self::MarqueeBackground => p.marquee.background = index == 0,
             Self::MarqueeStatus => p.marquee.status = index == 0,
             Self::MarqueeIndicator => p.marquee.indicator = index == 0,
-            Self::MarqueeSpeed => p.marquee.speed = MarqueeSpeed::ALL[index],
-            Self::MarqueeWidth => p.marquee.width = MarqueeWidth::ALL[index],
+            Self::MarqueeSpeed => p.marquee.speed = index as u16,
+            Self::MarqueeWidth => p.marquee.width = index as u16,
+            Self::MarqueeFps => p.marquee.fps = index as u16,
             Self::MarqueeTrueColor => p.marquee.true_color = index == 0,
+        }
+    }
+    /// Numeric preferences have a range instead of choices.
+    fn range(self) -> Option<Range> {
+        match self {
+            Self::MarqueeSpeed => Some(SPEED),
+            Self::MarqueeWidth => Some(WIDTH),
+            Self::MarqueeFps => Some(FPS),
+            _ => None,
+        }
+    }
+    /// The current value as shown in the row and in notices.
+    fn value_label(self, p: &Preferences) -> String {
+        match self.range() {
+            Some(range) => format!("{} {}", self.get(p), t(range.unit)),
+            None => self.choice_label(self.get(p)).to_owned(),
         }
     }
     fn choice_label(self, index: usize) -> &'static str {
@@ -592,7 +678,7 @@ impl Ui {
         self.message = format!(
             "{}: {}",
             t(field.label()),
-            field.choice_label(field.get(&self.preferences))
+            field.value_label(&self.preferences)
         );
     }
     pub(super) fn click_setting(&mut self, row: usize, choice: Option<usize>) -> Input {
@@ -600,8 +686,12 @@ impl Ui {
         self.settings_view.follow_selection.set(true);
         self.settings_cursor = row.min(fields(&self.preferences).len() - 1);
         let field = self.settings_field();
-        let count = field.choices().len();
-        let index = choice.unwrap_or((field.get(&self.preferences) + 1) % count);
+        let current = field.get(&self.preferences);
+        let index = match field.range() {
+            // The arrows either side of the value: 0 lowers it, anything else raises it.
+            Some(range) => usize::from(range.nudge(current as u16, choice != Some(0), false)),
+            None => choice.unwrap_or((current + 1) % field.choices().len()),
+        };
         self.choose_setting(field, index);
         Input::Idle
     }
@@ -633,6 +723,26 @@ impl Ui {
         }
         let field = self.settings_field();
         let current = field.get(&self.preferences);
+        if let Some(range) = field.range() {
+            let big = key.modifiers.contains(KeyModifiers::SHIFT);
+            let up = match key.code {
+                KeyCode::Left | KeyCode::Char('h') => Some(false),
+                KeyCode::Right | KeyCode::Char('l') => Some(true),
+                _ => None,
+            };
+            if let Some(up) = up {
+                let value = range.nudge(current as u16, up, big);
+                if usize::from(value) != current {
+                    self.choose_setting(field, usize::from(value));
+                }
+                self.settings_view.follow_selection.set(true);
+                return Some(Input::Idle);
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                self.settings_view.follow_selection.set(true);
+                return Some(Input::Idle);
+            }
+        }
         let count = field.choices().len();
         match key.code {
             KeyCode::Char('r') => {
@@ -846,6 +956,45 @@ impl Ui {
             ),
         ];
         let prefix: usize = spans.iter().map(Span::width).sum();
+        if let Some(range) = field.range() {
+            let arrow = |enabled: bool| {
+                Style::default().fg(if enabled {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })
+            };
+            let value = format!(" {} ", field.value_label(&self.preferences));
+            let value_width = Line::from(value.as_str()).width() as u16;
+            let x = rect.x + prefix as u16;
+            self.hit(
+                Rect::new(x, rect.y, 2, 1).intersection(rect),
+                Target::Setting(row, Some(0)),
+            );
+            self.hit(
+                Rect::new(x + 2 + value_width, rect.y, 2, 1).intersection(rect),
+                Target::Setting(row, Some(1)),
+            );
+            spans.push(Span::styled("‹ ", arrow(current > usize::from(range.min))));
+            spans.push(Span::styled(
+                value,
+                Style::default()
+                    .bg(BLUE)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ›", arrow(current < usize::from(range.max))));
+            // Where the value sits in its range.
+            let filled = (current.saturating_sub(usize::from(range.min)) * 10
+                / usize::from(range.max - range.min).max(1))
+            .min(10);
+            spans.push(Span::styled(
+                format!("  {}{}", "█".repeat(filled), "░".repeat(10 - filled)),
+                Style::default().fg(Color::DarkGray),
+            ));
+            f.render_widget(Paragraph::new(Line::from(spans)), rect);
+            return;
+        }
         let swatch = |index: usize| (field == Field::Accent).then(|| Accent::ALL[index].color());
         let chip = |index: usize| -> Vec<Span<'static>> {
             let mut name = field.choice_label(index).to_owned();
@@ -957,6 +1106,62 @@ mod tests {
                 assert_eq!(field.get(&p), index, "{field:?}");
             }
         }
+    }
+    #[test]
+    fn numeric_marquee_settings_step_clamp_and_read_old_presets() {
+        let (mut ui, _dir) = settings_ui();
+        ui.change_preferences(|p| p.marquee.unlocked = true);
+        let speed = ALL_FIELDS
+            .iter()
+            .position(|f| *f == Field::MarqueeSpeed)
+            .unwrap();
+        ui.settings_cursor = speed;
+        press(&mut ui, KeyCode::Right);
+        assert_eq!(ui.preferences.marquee.speed, 170);
+        ui.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(ui.preferences.marquee.speed, 70);
+        for _ in 0..3 {
+            ui.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+        assert_eq!(ui.preferences.marquee.speed, 0, "clamped at the minimum");
+        assert_eq!(ui.animations.marquee().speed, 0.0);
+        press(&mut ui, KeyCode::Delete);
+        assert_eq!(ui.preferences.marquee.speed, SPEED.default);
+        // Width: clicks on the arrows.
+        ui.click_setting(speed + 1, Some(1));
+        assert_eq!(ui.preferences.marquee.width, 31);
+        ui.click_setting(speed + 1, Some(0));
+        ui.click_setting(speed + 1, Some(0));
+        assert_eq!(ui.preferences.marquee.width, 29);
+        // Frame rate reaches the animation clock.
+        ui.settings_cursor = speed + 2;
+        assert_eq!(ui.settings_field(), Field::MarqueeFps);
+        ui.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert_eq!(ui.preferences.marquee.fps, 30);
+        assert_eq!(ui.animations.marquee().fps, 30);
+        let mut p = Preferences::default();
+        Field::MarqueeWidth.set(&mut p, 10_000);
+        assert_eq!(p.marquee.width, WIDTH.max);
+        Field::MarqueeFps.set(&mut p, 0);
+        assert_eq!(p.marquee.fps, FPS.min);
+        // Earlier builds saved preset names; numbers out of range are clamped.
+        let old: MarqueePreferences =
+            serde_json::from_str(r#"{"speed":"fast","width":"extra_wide"}"#).unwrap();
+        assert_eq!((old.speed, old.width, old.fps), (320, 120, FPS.default));
+        let big: MarqueePreferences = serde_json::from_str(r#"{"speed":99999,"width":1}"#).unwrap();
+        assert_eq!((big.speed, big.width), (SPEED.max, WIDTH.min));
+        // The row renders the value with its unit.
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        ui.settings_cursor = speed;
+        terminal.draw(|f| ui.render(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("160"), "speed value is shown");
     }
     #[test]
     fn keys_change_apply_and_persist_preferences() {

@@ -9,7 +9,7 @@ import tempfile
 import time
 from astra_tools.platform import executable, process_flags
 from astra_tools.launcher import stop_children, finish_state
-from astra_tools.workspace import BUILD_MODES, cargo_profile, resolve_binary_dir, resolve_build_mode
+from astra_tools.workspace import cargo_profile, resolve_binary_dir
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -18,19 +18,17 @@ def main():
     parser.add_argument('--proxy', type=pathlib.Path, default=ROOT / 'configs/proxy.toml')
     parser.add_argument('--rules', type=pathlib.Path, default=ROOT / 'configs/rule.toml')
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--mode', choices=BUILD_MODES, help='build mode (inferred from artifacts; otherwise legacy profiles)')
     parser.add_argument('--bin-dir', type=pathlib.Path, help='directory containing Astra executables (only astra-proxy is needed for standalone)')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--artifact-dir', type=pathlib.Path, help='build run containing artifacts.json')
     args = parser.parse_args()
     profile = 'debug' if args.debug else 'release'
     try:
-        build_mode = resolve_build_mode(args.artifact_dir, profile=profile, role='client', mode=args.mode)
         binary_dir = resolve_binary_dir(args.bin_dir, artifact_dir=args.artifact_dir,
-                                        profile=profile, role='client', mode=build_mode)
+                                        profile=profile, role='client')
     except (ValueError, OSError) as error:
         parser.error(str(error))
-    build_hint = 'Build first: cargo build --profile ' + cargo_profile(profile, build_mode)
+    build_hint = 'Build first: cargo build --profile ' + cargo_profile(profile)
     env = dict(os.environ)
     proxy_command = [str(binary_dir / executable('astra-proxy')), str(args.proxy.resolve())]
     if not pathlib.Path(proxy_command[0]).is_file():

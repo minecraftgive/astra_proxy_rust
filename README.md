@@ -113,23 +113,25 @@ python3 scripts/astra.py --check --proxy example_proxy.toml --rules example_rule
 
 目标平台：Linux/macOS/Windows。Windows 本地 IPC 使用仅当前用户可访问的命名管道，支持双核心、独立代理及 TUI；已加入 Wintun 与当前用户系统 HTTP/HTTPS 代理实现，已通过系统 HTTP/HTTPS、恢复和 TUN 双栈专用地址转发检查，全局路由接管尚未验收。透明代理 TPROXY/REDIRECT 仍仅限 Linux。加密协议矩阵的既有验收环境为 macOS arm64，Windows 本地验证范围见 [安装说明](docs/INSTALL.md)。需要 Rust 工具链、CMake、Clang/C++ 与 libclang；Windows x64 另需 MSVC C++ 工具和 NASM。Python 3 用于构建、启动和测试脚本。
 
-编译客户端原生程序（默认 `fast + debug + client`，不测试、不打包）：
+编译客户端原生程序（默认 `debug + client`，不测试、不打包）：
 
 ```sh
 ./scripts/build.sh
-python3 scripts/test.py --debug --mode fast    # 测试与构建分开运行
+python3 scripts/test.py --debug    # 测试与构建分开运行
 ```
 
 Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；两者都转调 `python scripts/build.py`。默认构建后运行 `./target/x86_64-pc-windows-msvc/debug/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
 
-`--mode fast|runtime` 选择编译速度或运行优化，独立于 `--profile debug|release|both`；`--debug` 是 `--profile debug` 的别名。`fast` 关闭优化并启用增量编译，快速 release 的运行速度可能明显降低；`runtime` 使用三级优化、完整 LTO 和单个代码生成单元，编译尤其链接会更慢。两者保留相同功能与 panic 展开机制，runtime 不启用本机专用 CPU 指令。debug 保留断言、溢出检查与回溯行号，不生成完整变量调试信息；普通 `cargo build --release` 仍使用标准 release 配置。
+终端运行时显示构建表单，输入字段编号选择 profile、架构、角色、打包和耗时报告，`B` 回车开始，`Q` 回车取消，不再倒计时自动构建。`--arch 64bits` 要求当前 Rust 本机目标为 64 位（x86_64/ARM64）；`--non-interactive` 跳过表单。
+
+工作区只有两个 Cargo profile：`--profile debug` 对应 `dev`，以编译速度为唯一目标（不优化、无调试信息、256 个代码生成单元、增量编译，保留断言与溢出检查）；`--profile release` 对应 `release`，以运行性能为唯一目标（三级优化、完整 LTO、单个代码生成单元）。`--debug` 是 `--profile debug` 的别名；`--profile both` 依次构建两者。两者都保留 panic 展开，release 不启用本机专用 CPU 指令，产物可分发。直接 `cargo build` / `cargo build --release` 与脚本使用完全相同的配置。
 
 加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--role client|server|controller|web|all`、`--label`、`--output-dir` 和 `--timings`；完整参数、输出路径及测量方法见 [构建与打包说明](docs/INSTALL.md)。
 
 ```sh
-./scripts/build.sh --mode fast --profile both --timings
-./scripts/build.sh --mode runtime --profile release --package
-python3 scripts/test.py --mode runtime --artifact-dir dist/<本次构建目录>
+./scripts/build.sh --profile both --timings
+./scripts/build.sh --profile release --package
+python3 scripts/test.py --artifact-dir dist/<本次构建目录>
 ```
 
 原生 Rust TUI（无需 Python）：
@@ -143,11 +145,11 @@ python3 scripts/test.py --mode runtime --artifact-dir dist/<本次构建目录>
 本地直连示例：
 
 ```sh
-python3 scripts/astra.py --debug --mode fast --check
-python3 scripts/astra.py --debug --mode fast
+python3 scripts/astra.py --debug --check
+python3 scripts/astra.py --debug
 ```
 
-规则模式启动器先校验两个配置，再启动两个 Astra 可执行文件；任一进程退出时停止另一进程。收到停止信号后，先让代理停止接受连接并等待现有会话，再停止规则进程。启动器和测试脚本使用 debug 产物时添加 `--debug`；可传 `--artifact-dir dist/<本次构建目录>` 从索引读取构建模式，未提供索引和 `--mode` 时保留原来的 debug/release 路径选择。
+规则模式启动器先校验两个配置，再启动两个 Astra 可执行文件；任一进程退出时停止另一进程。收到停止信号后，先让代理停止接受连接并等待现有会话，再停止规则进程。启动器和测试脚本使用 debug 产物时添加 `--debug`；可传 `--artifact-dir dist/<本次构建目录>` 从索引读取程序目录。
 
 连接自有节点时，先填写 `configs/native.toml` 或 `configs/tuic.toml` 的服务器、凭据与 TLS 配置，然后选择代理规则：
 

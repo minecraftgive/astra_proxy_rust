@@ -11,15 +11,14 @@ Suites (default: unit live client):
   package  boot the archives in dist/; build first with build.py --package
   release  full protocol gate; needs reference servers (install_test_servers.py)
 
-Use the same --debug and --mode choices as the build, or pass --artifact-dir
-to infer its mode. Without either mode or an index, legacy paths are used.
+Use the same --debug choice as the build (Cargo profile dev; default release),
+or pass --artifact-dir to test a build run from scripts/build.py.
 """
 import argparse
 import os
 import pathlib
 import sys
-from astra_tools.workspace import (ROOT, BUILD_MODES, resolve_binary_dir, build_environment,
-                                   host_target, cargo_profile, resolve_build_mode)
+from astra_tools.workspace import ROOT, resolve_binary_dir, build_environment, host_target, cargo_profile
 from astra_tools.artifacts import ROLES, ArtifactIndex, discover_index
 from astra_tools.runner import Step, run_steps, timestamped_report
 
@@ -37,7 +36,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('suites', nargs='*', choices=SUITES, metavar='SUITE', help='suites to run')
     parser.add_argument('--debug', action='store_true', help='test the debug build (default: release)')
-    parser.add_argument('--mode', choices=BUILD_MODES, help='build mode (inferred from artifacts; otherwise legacy profiles)')
     parser.add_argument('--bin-dir', type=pathlib.Path, help='executables to test (default: build.py output)')
     parser.add_argument('--artifact-dir', type=pathlib.Path, help='build run directory containing artifacts.json')
     parser.add_argument('--role', choices=tuple(ROLES), help='restrict artifact/package selection')
@@ -57,15 +55,14 @@ def main():
         if 'package' in suites:
             index = ArtifactIndex.load(artifact_dir) if artifact_dir else discover_index()
             artifact_dir = index.directory
-        mode = resolve_build_mode(artifact_dir, profile=profile, role=args.role, mode=args.mode)
         bin_dir = resolve_binary_dir(args.bin_dir, artifact_dir=artifact_dir, profile=profile,
-                                     role=args.role, env=env, mode=mode) if needs_bins else None
+                                     role=args.role, env=env) if needs_bins else None
     except (ValueError, OSError) as error:
         parser.error(str(error))
     if any(suite in suites for suite in ('unit', 'live')):
         env['ASTRA_UPDATE_TEST_BIN'] = str(bin_dir)
     host = host_target(env) if any(s in suites for s in ('check', 'unit', 'live', 'web')) else None
-    cargo = ['--locked', '--target', host, '--profile', cargo_profile(profile, mode)]
+    cargo = ['--locked', '--target', host, '--profile', cargo_profile(profile)]
     python = [sys.executable]
 
     steps = []
@@ -105,7 +102,8 @@ def main():
             else:
                 steps.append((archive.name, python + [SCRIPTS/'service_package_regression.py', archive, '--role', role]))
     if 'web' in suites:
-        contract_flags = cargo if mode is not None else ['--locked', '--target', host, '--profile', 'dev']
+        # A codegen tool: always the fast-compiling dev profile.
+        contract_flags = ['--locked', '--target', host, '--profile', 'dev']
         steps.append(('contracts', ['cargo', 'run', *contract_flags, '-p', 'astra-management', '--bin', 'export-contracts', '--', '--check']))
         npm = 'npm.cmd' if os.name == 'nt' else 'npm'
         for script in ('typecheck', 'test', 'build'):

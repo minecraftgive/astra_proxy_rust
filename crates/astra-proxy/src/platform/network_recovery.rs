@@ -142,7 +142,7 @@ pub(super) fn validate_file(file: &File, path: &Path) -> Result<()> {
             info.nNumberOfLinks == 1 && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
             "network lock cannot be a link/reparse point"
         );
-        astra_platform::elevation::validate_user_file(&file, path)?;
+        astra_platform::elevation::validate_user_file(file, path)?;
     }
     Ok(())
 }
@@ -852,6 +852,8 @@ mod tests {
         journal.owner = Some(astra_platform::lifecycle::capture(std::process::id()).unwrap());
         journal.boot_id = astra_platform::lifecycle::boot_id().to_owned();
         save(&path, &journal).unwrap();
+        // Deliberately never waited: this owner process parks until it is killed.
+        #[allow(clippy::zombie_processes)]
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

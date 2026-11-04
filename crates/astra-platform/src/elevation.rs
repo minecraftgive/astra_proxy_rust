@@ -332,24 +332,45 @@ pub fn create_private_directory(path: &Path) -> io::Result<()> {
             || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || owner_sid(directory.0)? != user
         {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "existing private directory must be a real directory owned by the user"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "existing private directory must be a real directory owned by the user",
+            ));
         }
         return Ok(());
     }
-    let parent = path.parent().ok_or_else(|| io::Error::other("private directory has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("private directory has no parent"))?;
     create_private_directory(parent)?;
     match std::fs::create_dir(path) {
-        Ok(()) => {},
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return create_private_directory(path),
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return create_private_directory(path)
+        }
         Err(error) => return Err(error),
     }
     let directory = open_user_object(path, WRITE_OWNER | FILE_READ_ATTRIBUTES)?;
     let info = file_information(directory.0)?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 { return Err(io::Error::other("new private directory was replaced")); }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(io::Error::other("new private directory was replaced"));
+    }
     let token = token_information(TokenUser)?;
     let sid = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
-    let error = unsafe { windows_sys::Win32::Security::Authorization::SetSecurityInfo(directory.0, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
-    if error != 0 { return Err(io::Error::from_raw_os_error(error as i32)); }
+    let error = unsafe {
+        windows_sys::Win32::Security::Authorization::SetSecurityInfo(
+            directory.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
     crate::platform::set_private(path, 0o700)
 }
 /// Open an existing user object (see `ensure_user_object`) for `access`.
@@ -512,7 +533,9 @@ pub struct ElevatedChild {
 }
 impl ElevatedChild {
     /// Successful readiness transfers lifecycle responsibility to the service.
-    pub fn detach(&mut self) { self.detached = true; }
+    pub fn detach(&mut self) {
+        self.detached = true;
+    }
     pub fn id(&self) -> Option<u32> {
         Some(unsafe { GetProcessId(self.handle.0) })
     }
@@ -726,10 +749,15 @@ pub fn bootstrap() -> io::Result<Option<OsString>> {
     }
     let hosted = hosted_argument(args.get(10))?;
     if let Some(owner) = args.get(11) {
-        let text = owner.to_str().ok_or_else(|| io::Error::other("invalid startup owner"))?;
-        let _: astra_model::control::ProcessIdentity = serde_json::from_str(text).map_err(io::Error::other)?;
+        let text = owner
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid startup owner"))?;
+        let _: astra_model::control::ProcessIdentity =
+            serde_json::from_str(text).map_err(io::Error::other)?;
         std::env::set_var("ASTRA_SERVICE_OWNER", text);
-    } else { std::env::remove_var("ASTRA_SERVICE_OWNER"); }
+    } else {
+        std::env::remove_var("ASTRA_SERVICE_OWNER");
+    }
     // This core is driven by its non-elevated launcher (manager/TUI).
     crate::platform::allow_unelevated_clients();
     std::env::set_current_dir(&args[6])?;

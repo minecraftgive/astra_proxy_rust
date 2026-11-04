@@ -1,5 +1,6 @@
 [build]
 # Share the native target layout used by the build and test scripts.
 target = "host-tuple"
-jobs = 32           
-incremental = true
+# Do not set `jobs` or `incremental` here: `build.incremental` overrides the
+# profiles (release must stay non-incremental with one codegen unit), and Cargo
+# already defaults to one job per CPU. Profiles live only in Cargo.toml.

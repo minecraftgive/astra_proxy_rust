@@ -19,13 +19,48 @@ fn program_info() -> ProgramInfo {
     ProgramInfo::collect(
         astra_platform::build_info!(),
         vec![
-            Feature::new("instances", "Instance management", true, "Manage proxy, rule and server instances; core binaries are installed separately."),
-            Feature::new("documents", "Configuration editor", true, "Typed configuration schemas, drafts and validation."),
-            Feature::new("monitor", "Monitoring", true, "Process metrics, connections and logs; live data requires a running core."),
-            Feature::new("diagnostics", "Network diagnostics", true, "Core-provided diagnostics and routing explanations."),
-            Feature::new("subscriptions", "Subscriptions", true, "Subscription and rule data management."),
-            Feature::new("updates", "Update management", true, "Update planning and status; execution depends on update policy and installation."),
-            Feature::new("remote_management", "Remote management", true, "Controller/agent transport; requires configured credentials and connectivity."),
+            Feature::new(
+                "instances",
+                "Instance management",
+                true,
+                "Manage proxy, rule and server instances; core binaries are installed separately.",
+            ),
+            Feature::new(
+                "documents",
+                "Configuration editor",
+                true,
+                "Typed configuration schemas, drafts and validation.",
+            ),
+            Feature::new(
+                "monitor",
+                "Monitoring",
+                true,
+                "Process metrics, connections and logs; live data requires a running core.",
+            ),
+            Feature::new(
+                "diagnostics",
+                "Network diagnostics",
+                true,
+                "Core-provided diagnostics and routing explanations.",
+            ),
+            Feature::new(
+                "subscriptions",
+                "Subscriptions",
+                true,
+                "Subscription and rule data management.",
+            ),
+            Feature::new(
+                "updates",
+                "Update management",
+                true,
+                "Update planning and status; execution depends on update policy and installation.",
+            ),
+            Feature::new(
+                "remote_management",
+                "Remote management",
+                true,
+                "Controller/agent transport; requires configured credentials and connectivity.",
+            ),
         ],
     )
 }
@@ -320,7 +355,14 @@ impl AgentService {
                 let mut sample: MonitorSnapshot = if self.server_path(&instance).await?.is_some() {
                     crate::monitor::server(&instance, &self.server_endpoint(&instance)).await?
                 } else {
-                    serde_json::from_str(&self.call(old::Action::Monitor { name: instance.clone() }).await?.text)?
+                    serde_json::from_str(
+                        &self
+                            .call(old::Action::Monitor {
+                                name: instance.clone(),
+                            })
+                            .await?
+                            .text,
+                    )?
                 };
                 // Legacy management addresses instances by name. The v2 DTO
                 // must use the same durable identity returned by Instances.

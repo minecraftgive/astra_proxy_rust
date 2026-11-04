@@ -144,6 +144,8 @@ pub(super) struct Marquee {
     pub(super) speed: f32,
     /// Cells covered by one whole rainbow.
     pub(super) width: f32,
+    /// Frames per second while only the marquee moves.
+    pub(super) fps: u16,
 }
 impl Default for Marquee {
     fn default() -> Self {
@@ -156,6 +158,7 @@ impl Default for Marquee {
             true_color: false,
             speed: 160.0,
             width: 30.0,
+            fps: 30,
         }
     }
 }
@@ -203,6 +206,19 @@ impl Motion {
     }
     pub(super) fn marquee(&self) -> Marquee {
         self.marquee.get()
+    }
+    /// Time between marquee frames.
+    pub(super) fn marquee_interval(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / f32::from(self.marquee.get().fps.max(1)))
+    }
+    /// Shortest gap between two draws: the marquee may ask for more frames
+    /// than overlay motion uses.
+    pub(super) fn draw_interval(&self) -> Duration {
+        if self.marquee_running() {
+            self.frame.min(self.marquee_interval())
+        } else {
+            self.frame
+        }
     }
     /// The marquee needs frames of its own while it has something to move.
     pub(super) fn marquee_running(&self) -> bool {
@@ -295,7 +311,20 @@ impl Motion {
             }
         }
         let items = marquee.text || marquee.background;
+        // Text colors step once per visible character of a selected run, so a
+        // wide (CJK) character and the spaces between words do not skip hues.
+        let mut glyph = 0usize;
+        let mut in_run = false;
         for (index, cell) in cells.iter_mut().enumerate() {
+            let marked = matches!(cell.bg, SELECTED_MARK | SELECTED_KEEP_MARK);
+            if !marked || index % width == 0 {
+                in_run = false;
+            }
+            if marked && !in_run {
+                in_run = true;
+                glyph = 0;
+            }
+            let visible = !cell.symbol().trim().is_empty();
             if cell.fg == STATUS_MARK {
                 if marquee.status || marquee.indicator {
                     seen = true;
@@ -319,10 +348,14 @@ impl Motion {
             painted[index] = true;
             let (x, y) = at(index);
             let hue = (x as f32 + y as f32 * 2.0) * step - phase;
+            let text_hue = (glyph as f32 + y as f32 * 2.0) * step - phase;
+            if visible {
+                glyph += 1;
+            }
             match (marquee.text, marquee.background) {
                 (true, true) => {
                     cell.set_bg(hsl(hue, 0.7, 0.36));
-                    cell.set_fg(hsl(hue + 180.0, 0.9, 0.8));
+                    cell.set_fg(hsl(text_hue + 180.0, 0.9, 0.8));
                 }
                 (false, true) => {
                     cell.set_bg(hsl(hue, 0.7, 0.4));
@@ -330,7 +363,7 @@ impl Motion {
                 }
                 _ => {
                     cell.set_bg(original);
-                    cell.set_fg(hsl(hue, 0.9, 0.74));
+                    cell.set_fg(hsl(text_hue, 0.9, 0.74));
                 }
             }
         }
@@ -899,6 +932,32 @@ mod tests {
         // One rainbow per 12 cells: cell 0 and cell 12 share a color, cell 6 does not.
         assert_eq!(lit[(0, 0)].fg, lit[(12, 0)].fg);
         assert_ne!(lit[(0, 0)].fg, lit[(6, 0)].fg);
+    }
+    #[test]
+    fn text_marquee_steps_once_per_character() {
+        let motion = Motion::new(MotionMode::Off);
+        motion.marquee.set(Marquee {
+            text: true,
+            width: 12.0,
+            ..Default::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new(" 中 a b"), f.area());
+                f.buffer_mut()
+                    .set_style(Rect::new(0, 0, 10, 1), Style::default().bg(SELECTED_MARK));
+                motion.finish_frame(f);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // 30° per character: 中 is the first, a the second, b the third,
+        // although they sit at cells 1, 4 and 6.
+        let hue = |glyph: f32| hsl(glyph * 30.0, 0.9, 0.74);
+        assert_eq!(buffer[(1, 0)].fg, hue(0.0));
+        assert_eq!(buffer[(4, 0)].fg, hue(1.0));
+        assert_eq!(buffer[(6, 0)].fg, hue(2.0));
+        assert_eq!(buffer[(6, 0)].bg, BLUE, "text only keeps the background");
     }
     #[test]
     fn hsl_hits_primary_hues() {

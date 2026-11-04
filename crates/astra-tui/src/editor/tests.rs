@@ -67,7 +67,8 @@ mod node_selection_tests {
     }
 
     fn exported_tags(editor: &Editor) -> Vec<String> {
-        let document: toml::Value = toml::from_str(&editor.export_selected_node().unwrap()).unwrap();
+        let document: toml::Value =
+            toml::from_str(&editor.export_selected_node().unwrap()).unwrap();
         document["outbounds"]
             .as_array()
             .unwrap()

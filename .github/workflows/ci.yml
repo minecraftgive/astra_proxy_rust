@@ -13,20 +13,17 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - run: python scripts/test.py tools architecture
   rust:
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config
@@ -46,15 +43,20 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config
       - if: runner.os == 'Windows'
         run: choco install nasm llvm --no-progress -y
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+          echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
       - run: python scripts/test.py check --debug
       - name: Verify TUI Connect and Logs with a constrained Windows stack
         if: runner.os == 'Windows'
@@ -75,8 +77,8 @@ jobs:
       run:
         working-directory: apps/web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -88,17 +90,13 @@ jobs:
   management:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Test the debug behavior without packaging gigabytes of debug symbols.
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -112,7 +110,7 @@ jobs:
         run: |
           artifact_dir=$(python -c "import sys; sys.path.insert(0,'scripts'); from astra_tools.artifacts import discover_index; print(discover_index().directory)")
           python scripts/test.py package management --debug --artifact-dir "$artifact_dir" --browser --report .test-tools/management-ci.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: management-verification
@@ -143,24 +141,20 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       CARGO_INCREMENTAL: '0'
       RUST_TEST_THREADS: '1'
-      # Standard macOS runners have limited memory and disk. This remains a
-      # debug build; removing debug symbols leaves the tested behavior intact.
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_TARGET_DIR: /tmp/astra-target
       EXPECTED_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           # Download caches are optional; no local target directory, browser,
           # certificate or reference-server installation is assumed.
@@ -235,7 +229,7 @@ jobs:
         run: python scripts/test.py package management --debug --artifact-dir "$ASTRA_CI_ARTIFACT_DIR" --browser --keep-going --report .test-tools/macos-management.json 2>&1 | tee .test-tools/macos-management.log
       - name: Upload reports, manifests and browser screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: macos-acceptance-${{ matrix.arch }}
           retention-days: 14

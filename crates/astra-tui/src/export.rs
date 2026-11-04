@@ -79,7 +79,7 @@ pub fn selected_nodes_share(text: &str, tags: &[String]) -> Result<String> {
         let link = astra_convert::share::export_node(&node)
             .with_context(|| format!("Export share link for outbound {tag:?}"))?;
         ensure!(
-            output.len() + link.len() + 1 <= MAX_EXPORT_BYTES,
+            output.len() + link.len() < MAX_EXPORT_BYTES,
             "Share link export exceeds 480 KiB"
         );
         output.push_str(&link);
@@ -439,7 +439,10 @@ pub fn write_new(path: &Path, text: &str) -> Result<()> {
             .with_context(|| format!("Sync export {}", path.display()))?;
         drop(file);
         std::fs::hard_link(&temporary, path).with_context(|| {
-            format!("Commit export {} without overwriting an existing file", path.display())
+            format!(
+                "Commit export {} without overwriting an existing file",
+                path.display()
+            )
         })?;
         Ok(())
     })();
@@ -629,11 +632,9 @@ server = "[::1]:1081"
 
         let links = selected_nodes_share(NODES, &tags).unwrap();
         assert_eq!(links.lines().count(), 2);
-        let converted = astra_convert::share::convert_links(
-            &links,
-            &astra_convert::Options::default(),
-        )
-        .unwrap();
+        let converted =
+            astra_convert::share::convert_links(&links, &astra_convert::Options::default())
+                .unwrap();
         assert_eq!(converted.nodes, 2);
         let restored: toml::Value = toml::from_str(&converted.proxy).unwrap();
         assert_eq!(restored["outbounds"], value["outbounds"]);
@@ -641,7 +642,8 @@ server = "[::1]:1081"
 
     #[test]
     fn node_selection_rejects_missing_ambiguous_and_unsupported_items_as_a_whole() {
-        let ambiguous = format!("{NODES}\n[[outbounds]]\nkind='socks5'\ntag='second'\nserver='other:1080'\n");
+        let ambiguous =
+            format!("{NODES}\n[[outbounds]]\nkind='socks5'\ntag='second'\nserver='other:1080'\n");
         for export in [
             selected_nodes as fn(&str, &[String]) -> Result<String>,
             selected_nodes_share,
@@ -654,8 +656,8 @@ server = "[::1]:1081"
                 .contains("ambiguous"));
         }
         assert!(selected_node(&ambiguous, "second").is_err());
-        let error = selected_nodes_share(NODES, &["香港 first".into(), "unselected".into()])
-            .unwrap_err();
+        let error =
+            selected_nodes_share(NODES, &["香港 first".into(), "unselected".into()]).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("unselected"));
         assert!(message.contains("cannot be exported"));
@@ -820,7 +822,10 @@ server = "[::1]:1081"
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone=true\n");
         assert!(write_new(&path, "replacement").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone=true\n");
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
 
         let too_large = root.join("not created").join("deep").join("export.toml");
         assert!(write_new(&too_large, &"x".repeat(MAX_EXPORT_BYTES + 1)).is_err());

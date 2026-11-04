@@ -160,7 +160,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(directory.path().join("missing"), &path).unwrap();
         assert!(force_recover(&path).is_err());
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         std::fs::remove_file(&path).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();

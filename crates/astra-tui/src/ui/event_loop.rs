@@ -113,7 +113,7 @@ pub(super) async fn run_local(
             previous.apply(&ui);
             refresh = false;
         }
-        if redraw && last_frame.elapsed() >= ui.animations.frame_interval() {
+        if redraw && last_frame.elapsed() >= ui.animations.draw_interval() {
             if let Err(error) = ui.draw(&mut terminal) {
                 break Err(error);
             }
@@ -124,14 +124,14 @@ pub(super) async fn run_local(
         let spinner = ui.tasks.running() && ui.animations.mode() == animation::MotionMode::Normal;
         let marquee = ui.animations.marquee_running();
         let scheduled = redraw || animated || spinner || marquee;
-        let frame_time = if redraw || animated {
-            ui.animations.frame_interval()
-        } else if marquee {
-            ui.animations
+        let frame_time = match (redraw || animated, marquee) {
+            (true, true) => ui
+                .animations
                 .frame_interval()
-                .max(Duration::from_millis(50))
-        } else {
-            Duration::from_millis(80)
+                .min(ui.animations.marquee_interval()),
+            (true, false) => ui.animations.frame_interval(),
+            (false, true) => ui.animations.marquee_interval(),
+            (false, false) => Duration::from_millis(80),
         };
         let deadline = tokio::time::Instant::from_std(last_frame + frame_time);
         let checkpoint_deadline = tokio::time::Instant::from_std(
@@ -324,6 +324,34 @@ fn finish_session(
     Ok(())
 }
 
+/// Only overlays entering or leaving are animated; page, focus, fold and
+/// message changes are instant (see the rules in `animation`).
+struct MotionState {
+    palette: bool,
+    drawer: bool,
+}
+impl MotionState {
+    fn of(ui: &Ui) -> Self {
+        Self {
+            palette: ui.palette.is_some(),
+            drawer: ui.tasks.showing_details(),
+        }
+    }
+    fn apply(self, ui: &Ui) {
+        use animation::Kind;
+        match (self.palette, ui.palette.is_some()) {
+            (false, true) => ui.animations.open(Kind::Palette),
+            (true, false) => ui.animations.close(Kind::Palette),
+            _ => {}
+        }
+        match (self.drawer, ui.tasks.showing_details()) {
+            (false, true) => ui.animations.open(Kind::Drawer),
+            (true, false) => ui.animations.close(Kind::Drawer),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod exit_tests {
     use super::*;
@@ -365,33 +393,5 @@ mod exit_tests {
         )
         .unwrap();
         assert_eq!(*calls.borrow(), ["checkpoint", "restore"]);
-    }
-}
-
-/// Only overlays entering or leaving are animated; page, focus, fold and
-/// message changes are instant (see the rules in `animation`).
-struct MotionState {
-    palette: bool,
-    drawer: bool,
-}
-impl MotionState {
-    fn of(ui: &Ui) -> Self {
-        Self {
-            palette: ui.palette.is_some(),
-            drawer: ui.tasks.showing_details(),
-        }
-    }
-    fn apply(self, ui: &Ui) {
-        use animation::Kind;
-        match (self.palette, ui.palette.is_some()) {
-            (false, true) => ui.animations.open(Kind::Palette),
-            (true, false) => ui.animations.close(Kind::Palette),
-            _ => {}
-        }
-        match (self.drawer, ui.tasks.showing_details()) {
-            (false, true) => ui.animations.open(Kind::Drawer),
-            (true, false) => ui.animations.close(Kind::Drawer),
-            _ => {}
-        }
     }
 }
