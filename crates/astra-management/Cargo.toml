@@ -12,4 +12,4 @@ ts-rs = { version = "12", features = ["serde-json-impl"] }
 toml.workspace = true
 astra-ipc = { path = "../astra-ipc" }
 astra-model = { path = "../astra-model", features = ["bindings"] }
-astra-platform = { path = "../astra-platform" }
+astra-platform = { path = "../astra-platform", features = ["bindings"] }

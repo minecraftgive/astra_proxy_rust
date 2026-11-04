@@ -7,6 +7,19 @@ use super::dashboard::{Target, BLUE, MUTED};
 use super::*;
 use ratatui::{layout::Rect, style::Modifier};
 
+mod program_info;
+
+/// Information and preferences share one viewport. Explicit scrolling lets a
+/// short terminal inspect the header without changing a preference.
+#[derive(Default)]
+pub(super) struct View {
+    offset: std::cell::Cell<usize>,
+    height: std::cell::Cell<usize>,
+    total: std::cell::Cell<usize>,
+    follow_selection: std::cell::Cell<bool>,
+    selected_visible: std::cell::Cell<bool>,
+}
+
 pub(super) const FILE: &str = "ui-preferences.json";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +363,7 @@ impl Ui {
     }
     pub(super) fn click_setting(&mut self, row: usize, choice: Option<usize>) -> Input {
         self.focus = Default::default();
+        self.settings_view.follow_selection.set(true);
         self.settings_cursor = row.min(FIELDS.len() - 1);
         let field = self.settings_field();
         let count = field.choices().len();
@@ -366,17 +380,48 @@ impl Ui {
         {
             return None;
         }
+        // The information header can fill a short viewport. A change key first
+        // reveals the selected preference instead of changing a hidden value.
+        if self.settings_view.total.get() > 0
+            && !self.settings_view.selected_visible.get()
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('h' | 'l' | ' ')
+                    | KeyCode::Enter
+                    | KeyCode::Delete
+                    | KeyCode::Backspace
+            )
+        {
+            self.settings_view.follow_selection.set(true);
+            return Some(Input::Idle);
+        }
         let field = self.settings_field();
         let current = field.get(&self.preferences);
         let count = field.choices().len();
         match key.code {
+            KeyCode::Char('r') => {
+                self.refresh_program_info();
+                return Some(Input::Idle);
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let step = self.settings_view.height.get().saturating_sub(1).max(1);
+                self.move_settings_view(key.code == KeyCode::PageDown, step);
+                return Some(Input::Idle);
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_cursor = self.settings_cursor.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_cursor = (self.settings_cursor + 1).min(FIELDS.len() - 1)
             }
-            KeyCode::Home | KeyCode::Char('g') => self.settings_cursor = 0,
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.settings_cursor = 0;
+                self.settings_view.offset.set(0);
+                self.settings_view.follow_selection.set(false);
+                return Some(Input::Idle);
+            }
             KeyCode::End | KeyCode::Char('G') => self.settings_cursor = FIELDS.len() - 1,
             KeyCode::Left | KeyCode::Char('h') if current > 0 => {
                 self.choose_setting(field, current - 1)
@@ -394,7 +439,24 @@ impl Ui {
             }
             _ => return None,
         }
+        self.settings_view.follow_selection.set(true);
         Some(Input::Idle)
+    }
+
+    pub(super) fn scroll_settings(&mut self, down: bool) {
+        self.move_settings_view(down, 3);
+    }
+
+    fn move_settings_view(&mut self, down: bool, step: usize) {
+        let view = &self.settings_view;
+        let offset = if down {
+            view.offset.get().saturating_add(step)
+        } else {
+            view.offset.get().saturating_sub(step)
+        };
+        view.offset
+            .set(offset.min(view.total.get().saturating_sub(view.height.get())));
+        view.follow_selection.set(false);
     }
 
     pub(super) fn render_settings(&self, f: &mut Frame<'_>, area: Rect) {
@@ -402,6 +464,7 @@ impl Ui {
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.width < 4 || inner.height == 0 {
+            self.settings_view.selected_visible.set(false);
             return;
         }
         let selected = self.settings_cursor.min(FIELDS.len() - 1);
@@ -412,7 +475,12 @@ impl Ui {
             .unwrap_or(0)
             + 2;
         // (line, field row) — section titles and spacing have no row.
-        let mut lines: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+        let mut lines: Vec<(Line<'static>, Option<usize>)> = self
+            .settings_program_info(inner.width.saturating_sub(1))
+            .into_iter()
+            .map(|line| (line, None))
+            .collect();
+        lines.push((Line::raw(""), None));
         for (index, (title, range)) in SECTIONS.iter().enumerate() {
             if index > 0 {
                 lines.push((Line::raw(""), None));
@@ -451,23 +519,50 @@ impl Ui {
             as u16)
             .min(inner.height / 3);
         let list_height = inner.height.saturating_sub(description_height + 1).max(1) as usize;
-        // Keep the selected row visible in short terminals.
+        // Follow keyboard selection only after a preference action. On entry,
+        // show the program information at the top even in a short terminal.
         let selected_line = lines
             .iter()
             .position(|(_, row)| *row == Some(selected))
             .unwrap_or(0);
-        let offset = selected_line.saturating_sub(list_height.saturating_sub(1));
+        let view = &self.settings_view;
+        view.height.set(list_height);
+        view.total.set(lines.len());
+        let mut offset = view.offset.get();
+        if view.follow_selection.get() {
+            if selected_line < offset {
+                offset = selected_line;
+            } else if selected_line >= offset.saturating_add(list_height) {
+                offset = selected_line.saturating_sub(list_height.saturating_sub(1));
+            }
+        }
+        offset = offset.min(lines.len().saturating_sub(list_height));
+        view.offset.set(offset);
+        view.selected_visible
+            .set(selected_line >= offset && selected_line < offset + list_height);
         let focused = self.focus.region == focus::Region::Main
             && self.palette.is_none()
             && self.prompt.is_none();
         for (line_index, (line, row)) in lines.iter().enumerate().skip(offset).take(list_height) {
             let y = inner.y + (line_index - offset) as u16;
-            let rect = Rect::new(inner.x, y, inner.width, 1);
+            let rect = Rect::new(inner.x, y, inner.width.saturating_sub(1), 1);
             let Some(row) = *row else {
                 f.render_widget(Paragraph::new(line.clone()), rect);
                 continue;
             };
             self.render_setting_row(f, rect, row, row == selected && focused, label_width);
+        }
+        if lines.len() > list_height {
+            use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+            let mut state =
+                ScrollbarState::new(lines.len().saturating_sub(list_height) + 1).position(offset);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                Rect::new(inner.x, inner.y, inner.width, list_height as u16),
+                &mut state,
+            );
         }
         if description_height > 0 {
             f.render_widget(

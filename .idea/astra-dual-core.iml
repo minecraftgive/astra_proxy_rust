@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-app/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-convert/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-convert/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-dns/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-dns/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-ipc/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-management/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-manager/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-model/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-observe/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-platform/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-protocols/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-protocols/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-proxy/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-proxy/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-resource/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-rule-data/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-rule/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-rule/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-rule/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-server-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-tui-kit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-tui/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-update/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/astra-web/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

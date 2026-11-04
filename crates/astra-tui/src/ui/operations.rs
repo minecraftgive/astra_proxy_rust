@@ -711,6 +711,68 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn force_start_skips_configuration_preparation_that_blocks_unverified_sessions() {
+        use astra_management::v2 as v;
+        let fixture = crate::import::tests::Fixture::new();
+        let socket = fixture.0.join("management.sock");
+        let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut peers = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    peer = listener.accept() => peer.unwrap(),
+                    completed = peers.join_next(), if !peers.is_empty() => {
+                        completed.unwrap().unwrap();
+                        continue;
+                    }
+                };
+                peers.spawn(async move {
+                    let request: v::Request = astra_management::client::receive(&mut stream)
+                        .await
+                        .unwrap();
+                    let response = match &request.body {
+                    v::RequestBody::Execute {
+                        command: v::Command::ForceStart { instance }, ..
+                    } if instance == "proxy" => v::ResponseBody::Done {
+                        message: "Started after replacing previous session".into(),
+                    },
+                    v::RequestBody::Query(v::Query::Events { .. }) => {
+                        v::ResponseBody::Events(v::EventBatch {
+                            events: vec![],
+                            cursor: "0".into(),
+                            resync_required: false,
+                        })
+                    }
+                    other => panic!("Force start must reach the manager without preparing the blocked instance: {other:?}"),
+                    };
+                    test_rpc::reply(stream, request, response).await;
+                });
+            }
+        });
+        let ui = Ui::new(Session::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            perform(
+                &socket,
+                OperationInput::capture(&ui),
+                Action::ForceStart("proxy".into()),
+                Some((Prompt::ForceStart("proxy".into()), "yes".into())),
+            ),
+        )
+        .await;
+        server.abort();
+        let server_result = server.await;
+        assert!(server_result.unwrap_err().is_cancelled());
+        let result = result.unwrap();
+        assert!(
+            matches!(result, JobResult::Done { .. }),
+            "{}",
+            result.message()
+        );
+        astra_platform::platform::remove_socket(&socket);
+    }
+
+    #[tokio::test]
     async fn server_logs_read_chunks_without_requesting_capture_control() {
         use astra_management::v2 as v;
         let fixture = crate::import::tests::Fixture::new();

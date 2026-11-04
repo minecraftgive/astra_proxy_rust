@@ -6,6 +6,7 @@ import type { LogChunk, LogCursor } from "./generated/management";
 import Editor from "./components/Editor";
 import Login from "./components/Login";
 import Updates from "./components/Updates";
+import ProgramInfo from "./components/ProgramInfo";
 import NetworkRecovery from "./components/NetworkRecovery";
 import Monitor from "./components/Monitor";
 import { Details, Empty, Table } from "./components/common";
@@ -148,6 +149,8 @@ export default function App() {
         );
         if (!signal.aborted) setRuntime(r.data.snapshot);
       } catch (e) {
+        // Do not present the last successful snapshot as current after a read fails.
+        if (!signal.aborted) setRuntime(null);
         if (
           !signal.aborted &&
           !(e instanceof API.ApiError && e.code === "unsupported")
@@ -160,7 +163,7 @@ export default function App() {
       selected &&
       online &&
       current?.pid &&
-      !paused &&
+      (!paused || page === "settings") &&
       (current.kind === "proxy" || current.kind === "server")
       ? 5_000
       : null,
@@ -169,6 +172,7 @@ export default function App() {
       selected,
       online,
       paused,
+      page,
       current?.pid,
       current?.kind,
       authenticated,
@@ -1009,6 +1013,15 @@ export default function App() {
               )}
               {page === "settings" && (
                 <>
+                  <ProgramInfo
+                    key={agent}
+                    agent={agent}
+                    nodeName={node?.name}
+                    online={online}
+                    instance={current}
+                    runtime={runtime}
+                    onError={fail}
+                  />
                   <Updates
                     key={agent}
                     agent={agent}

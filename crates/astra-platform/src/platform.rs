@@ -57,9 +57,20 @@ pub fn remove_socket(path: &Path) {
 /// permission errors and live pipes must never be treated as stale markers.
 pub fn recover_stale_endpoint(path: &Path) -> io::Result<bool> {
     #[cfg(windows)]
-    return windows::recover_stale_manager_endpoint(path);
+    return windows::recover_stale_manager_endpoint(path, false);
     #[cfg(unix)]
     return unix_listener::recover(path);
+}
+
+/// Explicitly discard an abandoned control endpoint whose owner cannot be
+/// verified. The containing directory must satisfy the platform's user-owner
+/// policy; live endpoints, links and unrelated files are still preserved.
+/// This never stops a process.
+pub fn force_recover_control_endpoint(path: &Path) -> io::Result<bool> {
+    #[cfg(windows)]
+    return windows::recover_stale_manager_endpoint(path, true);
+    #[cfg(unix)]
+    return unix_listener::force_recover(path);
 }
 
 /// Compatibility alias for manager startup recovery.
@@ -103,6 +114,51 @@ pub fn home_dir() -> io::Result<PathBuf> {
             "User home directory is unavailable",
         )
     })
+}
+
+/// Locate the current user's Documents directory without creating it.
+/// Windows uses the known-folder location, including redirected/OneDrive paths.
+pub fn documents_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        use windows_sys::Win32::{
+            System::Com::CoTaskMemFree,
+            UI::Shell::{FOLDERID_Documents, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath},
+        };
+        let mut path = std::ptr::null_mut();
+        let status = unsafe {
+            SHGetKnownFolderPath(
+                &FOLDERID_Documents,
+                KF_FLAG_DONT_VERIFY as u32,
+                std::ptr::null_mut(),
+                &mut path,
+            )
+        };
+        let result = if status < 0 || path.is_null() {
+            Err(io::Error::other(format!(
+                "Cannot locate Documents directory (HRESULT 0x{:08X})",
+                status as u32
+            )))
+        } else {
+            let mut length = 0;
+            unsafe {
+                while *path.add(length) != 0 {
+                    length += 1;
+                }
+                Ok(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
+                    path, length,
+                ))))
+            }
+        };
+        // Free the returned allocation even when folder lookup fails.
+        unsafe { CoTaskMemFree(path.cast()) };
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(home_dir()?.join("Documents"))
+    }
 }
 
 pub fn set_private(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
@@ -510,11 +566,18 @@ mod windows {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         options
     }
-    pub(super) fn recover_stale_manager_endpoint(path: &Path) -> io::Result<bool> {
+    pub(super) fn recover_stale_manager_endpoint(path: &Path, force: bool) -> io::Result<bool> {
         let marker = endpoint_path(path);
         let metadata = match std::fs::symlink_metadata(&marker) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A missing marker is not proof the pipe has gone away. Force
+                // callers may discard process records after this succeeds.
+                if force {
+                    let _reservation = server(&pipe_name(&marker)?, true)?;
+                }
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
         if !metadata.file_type().is_file() || metadata.len() != 0 {
@@ -547,20 +610,48 @@ mod windows {
                 "IPC marker links are preserved",
             ));
         }
-        crate::elevation::validate_user_file(&marker_handle, &marker)?;
+        // Force relaxes only the abandoned marker's owner, never its type,
+        // links or liveness. Keep the checked parent fixed until deletion.
+        let _parent = if force {
+            Some(crate::elevation::force_recovery_parent(&marker_handle, &marker)?)
+        } else {
+            crate::elevation::validate_user_file(&marker_handle, &marker)?;
+            None
+        };
         let reservation = server(&pipe_name(&marker)?, true)?;
         remove_marker(&marker_handle)?;
         drop(reservation);
         drop(marker_handle);
         Ok(true)
     }
+    #[cfg(test)]
+    #[tokio::test]
+    async fn forced_recovery_without_marker_preserves_live_pipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = server(&pipe_name(&path).unwrap(), true).unwrap();
+        assert!(!path.exists());
+        assert!(super::force_recover_control_endpoint(&path).is_err());
+        drop(listener);
+        assert!(!super::force_recover_control_endpoint(&path).unwrap());
+    }
     impl LocalListener {
         pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{
+                Foundation::{GENERIC_READ, GENERIC_WRITE},
+                Storage::FileSystem::{DELETE, WRITE_OWNER},
+            };
             let marker = endpoint_path(path);
             let name = pipe_name(&marker)?;
             // Preserve Unix behavior: existing files/endpoints are never replaced.
-            let file = marker_options().create_new(true).open(&marker)?;
-            let result = set_private(&marker).and_then(|()| server(&name, true));
+            let file = marker_options()
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_OWNER)
+                .create_new(true)
+                .open(&marker)?;
+            let result = crate::elevation::set_new_marker_owner(&file, &marker)
+                .and_then(|()| set_private(&marker))
+                .and_then(|()| server(&name, true));
             match result {
                 Ok(server) => Ok(Self {
                     server: Mutex::new(server),
@@ -719,6 +810,79 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn forced_recovery_preserves_live_pipes_links_and_nonmarkers() {
+        let directory = std::env::temp_dir().join(format!(
+            "astra-force-recovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::elevation::create_private_directory(&directory).unwrap();
+        let path = directory.join("control.sock");
+        assert!(!force_recover_control_endpoint(&path).unwrap());
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(force_recover_control_endpoint(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+
+        let original = directory.join("original");
+        std::fs::write(&original, b"").unwrap();
+        std::fs::hard_link(&original, &path).unwrap();
+        assert!(force_recover_control_endpoint(&path).is_err());
+        assert!(path.exists() && original.exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&original).unwrap();
+
+        let listener = LocalListener::bind(&path).unwrap();
+        assert!(force_recover_control_endpoint(&path).is_err());
+        assert!(path.exists());
+        drop(listener);
+        std::fs::write(&path, b"").unwrap();
+        assert!(force_recover_control_endpoint(&path).unwrap());
+        assert!(!path.exists());
+        drop(LocalListener::bind(&path).unwrap());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_recovery_handles_nested_administrator_owned_markers() {
+        if !crate::elevation::is_elevated().unwrap() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "astra-force-owner-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::elevation::create_private_directory(&root).unwrap();
+        let directory = root.join("tui");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("control.sock");
+        std::fs::write(&path, b"").unwrap();
+        // UAC's default owner is Administrators. The directory passes the
+        // normal user-object policy through its user-owned parent, while the
+        // marker's immediate parent is Administrators and fails that policy.
+        let file = std::fs::File::open(&path).unwrap();
+        let rejected = crate::elevation::validate_user_file(&file, &path).is_err();
+        drop(file);
+        if rejected {
+            assert!(recover_stale_endpoint(&path).is_err());
+            assert!(path.exists());
+            assert!(force_recover_control_endpoint(&path).unwrap());
+            assert!(!path.exists());
+        } else {
+            // Some elevated tokens retain the concrete user as default owner.
+            assert!(recover_stale_endpoint(&path).unwrap());
+        }
+        let listener = LocalListener::bind(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        crate::elevation::validate_user_file(&file, &path).unwrap();
+        drop(file);
+        drop(listener);
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[tokio::test]
     async fn recovering_bind_handles_stale_markers_without_replacing_live_endpoints() {

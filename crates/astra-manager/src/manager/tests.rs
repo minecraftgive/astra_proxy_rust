@@ -668,6 +668,100 @@ fn instance_summary_contains_endpoints_modes_tags_and_no_credentials() {
 }
 #[tokio::test]
 #[ignore = "requires freshly built core binaries"]
+async fn live_force_start_replaces_blocked_bound_sessions_and_keeps_running_cores() {
+    let temp = Temp::new();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_address = reservation.local_addr().unwrap();
+    let home = temp.0.join("state");
+    private_dir(&home).unwrap();
+    private_dir(&home.join("processes")).unwrap();
+    let mut manager = Manager::load_with_runtime(
+        home.clone(),
+        temp.0.join("config"),
+        test_binaries(),
+        Some(temp.0.join("runtime")),
+    )
+    .unwrap();
+    let route = temp.0.join("rule.r");
+    for (name, kind, text) in [
+        (
+            "rules",
+            Kind::Rule,
+            format!(
+                "socket={:?}\ndefault_action='direct'\n",
+                route.to_string_lossy()
+            ),
+        ),
+        (
+            "proxy",
+            Kind::Proxy,
+            format!(
+                "rule_socket={:?}\nmixed_listen='{proxy_address}'\n",
+                route.to_string_lossy()
+            ),
+        ),
+    ] {
+        let config = temp.0.join(format!("{name}.toml"));
+        fs::write(&config, text).unwrap();
+        manager.registry.instances.push(Instance {
+            name: name.into(),
+            kind,
+            config,
+        });
+        fs::write(
+            home.join("processes").join(format!("{name}.json")),
+            b"invalid old session",
+        )
+        .unwrap();
+        #[cfg(windows)]
+        fs::write(manager.socket(name), b"").unwrap();
+        #[cfg(unix)]
+        drop(std::os::unix::net::UnixListener::bind(manager.socket(name)).unwrap());
+    }
+    manager
+        .registry
+        .start_bindings
+        .insert("proxy".into(), vec!["rules".into()]);
+    manager.recover_processes().await.unwrap();
+    assert!(manager.action(Action::Start("proxy".into())).await.is_err());
+    drop(reservation);
+    let result = manager.action(Action::ForceStart("proxy".into())).await;
+    let first: Vec<_> = ["rules", "proxy"]
+        .map(|name| manager.running.get(name).and_then(|run| run.child.id()))
+        .into();
+    let repeat = if result.is_ok() {
+        manager.action(Action::ForceStart("proxy".into())).await
+    } else {
+        Ok(Reply::text("not retried"))
+    };
+    let second: Vec<_> = ["rules", "proxy"]
+        .map(|name| manager.running.get(name).and_then(|run| run.child.id()))
+        .into();
+    let records: Vec<_> = ["rules", "proxy"]
+        .map(|name| fs::read(home.join("processes").join(format!("{name}.json"))).ok())
+        .into();
+    let cleared = manager.blocked.is_empty();
+    let cleanup = manager.stop_all().await;
+    result.unwrap();
+    repeat.unwrap();
+    cleanup.unwrap();
+    assert!(cleared);
+    assert!(first.iter().all(Option::is_some));
+    assert_eq!(
+        first, second,
+        "force start must reuse already managed running dependencies"
+    );
+    for bytes in records {
+        let record: serde_json::Value = serde_json::from_slice(&bytes.unwrap()).unwrap();
+        assert_eq!(record["version"], 1);
+        assert!(record["identity"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty()));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires freshly built core binaries"]
 async fn live_bound_start_reuses_running_dependencies_and_rolls_back_new_ones() {
     let temp = Temp::new();
     let bin = test_binaries();

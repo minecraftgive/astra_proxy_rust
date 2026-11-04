@@ -90,6 +90,9 @@ enum Run {
         kind: Kind,
     },
     Connect,
+    ForceStart,
+    NodeExport(bool),
+    NodeImport,
     Validate,
     Update(update::Command),
     Registered(commands::Id),
@@ -567,6 +570,22 @@ impl Ui {
             Run::Op(Operation::Restart),
             not_running,
         );
+        let force_target = if self.page == PROFILES {
+            self.selected()
+        } else {
+            profile
+        };
+        if let Some(row) =
+            force_target.filter(|row| row.pid.is_none() && row.instance.kind != Kind::Server)
+        {
+            add(
+                "Run",
+                &format!("{} · {}", t("Force start"), row.instance.name),
+                "",
+                Run::ForceStart,
+                None,
+            );
+        }
         for (label, mode) in [
             ("Mode: rule", Mode::Rule),
             ("Mode: global", Mode::Global),
@@ -716,6 +735,30 @@ impl Ui {
             Run::Op(Operation::ExportConfig),
             no_profile,
         );
+        if self.kind == Kind::Proxy && self.editor.as_ref().is_some_and(Editor::browsing) {
+            add("Nodes", "Import nodes", "Ctrl-I", Run::NodeImport, None);
+            let unavailable = self
+                .editor
+                .as_ref()
+                .unwrap()
+                .selected_node_tags()
+                .err()
+                .map(|_| "Select a node to export");
+            add(
+                "Nodes",
+                "Export selected nodes (TOML)",
+                "Ctrl-E",
+                Run::NodeExport(false),
+                unavailable,
+            );
+            add(
+                "Nodes",
+                "Export selected nodes (share links)",
+                "Ctrl-Shift-E",
+                Run::NodeExport(true),
+                unavailable,
+            );
+        }
         for command in update::Command::ALL {
             add(
                 "Updates",
@@ -907,6 +950,18 @@ impl Ui {
                 Input::Idle
             }
             Run::Connect => self.toggle_active(),
+            Run::ForceStart => {
+                if self.page == PROFILES {
+                    self.operation(Operation::ForceStart)
+                } else {
+                    self.active_operation(Operation::ForceStart)
+                }
+            }
+            Run::NodeExport(share) => self.start_node_export(share),
+            Run::NodeImport => {
+                self.prompt(Prompt::ImportNode(crate::import::MergeMode::Append));
+                Input::Idle
+            }
             Run::Validate => match self.active_proxy() {
                 Some(row) => Input::Run(Action::Validate(row.instance.name.clone()), None),
                 None => Input::Idle,
@@ -1143,7 +1198,7 @@ impl Ui {
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
                 RULES => "t test a route · / search rules · e edit rules",
                 LOGS => "Enter open · [ proxy log · ] rule core log · F7 TUI log",
-                SETTINGS => "↑↓ select · ←→ change · Enter next · Delete default",
+                SETTINGS => "↑↓ select · ←→ change · PgUp/PgDn scroll · Home top · r refresh",
                 _ => "↑↓ browse · Ctrl-P activate profile · Enter actions · e edit · Insert new · Delete remove",
             }
         };
@@ -1414,6 +1469,34 @@ mod palette_layout_tests {
     }
     fn press(ui: &mut Ui, code: KeyCode) -> Input {
         ui.key(event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn force_start_palette_targets_the_selected_core_or_active_profile() {
+        let mut ui = profile_ui();
+        for (page, kind, expected) in [
+            (PROFILES, Kind::Rule, "rules-a"),
+            (PROFILES, Kind::Proxy, "proxy-a"),
+            (OVERVIEW, Kind::Proxy, "proxy-b"),
+        ] {
+            ui.page = page;
+            ui.kind = kind;
+            ui.palette = Some(Palette::default());
+            let entries = ui.palette_matches();
+            let index = entries
+                .iter()
+                .position(|entry| matches!(entry.run, Run::ForceStart))
+                .unwrap();
+            assert!(entries[index].label.ends_with(expected));
+            assert!(matches!(ui.palette_run(index), Input::Idle));
+            assert!(matches!(&ui.prompt, Some(Prompt::ForceStart(name)) if name == expected));
+            assert!(!ui.confirmation_accept);
+            press(&mut ui, KeyCode::Esc);
+        }
+        ui.rows.iter_mut().for_each(|row| row.pid = Some(42));
+        assert!(!ui
+            .palette_entries()
+            .iter()
+            .any(|entry| matches!(entry.run, Run::ForceStart)));
     }
     #[test]
     fn configuration_type_control_selects_rules_without_changing_active_proxy() {

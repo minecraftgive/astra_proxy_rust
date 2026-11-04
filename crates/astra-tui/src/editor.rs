@@ -49,6 +49,9 @@ struct Form {
     vim_g: bool,
     #[serde(skip)]
     marked_rules: Vec<usize>,
+    /// Tags identify the chosen nodes even while unrelated rows fold or expand.
+    #[serde(skip)]
+    marked_nodes: Vec<String>,
     #[serde(skip)]
     vim_z: bool,
 }
@@ -494,6 +497,7 @@ impl Editor {
     }
     fn update(&mut self, mut doc: DocumentMut) {
         self.form.marked_rules.clear();
+        self.form.marked_nodes.clear();
         position_tables(doc.as_table_mut(), &mut 0);
         let text = doc.to_string();
         let previous = self.text();
@@ -523,6 +527,7 @@ impl Editor {
         };
         self.lines = text.split('\n').map(str::to_owned).collect();
         self.form.marked_rules.clear();
+        self.form.marked_nodes.clear();
         self.form.guide = None;
         let doc = self.document()?;
         let count = collection(&doc, &[Part::Key("outbounds".into())]).map_or(0, |a| a.len());
@@ -716,22 +721,41 @@ impl Editor {
             .context(t("Selected node has no tag"))
     }
 
-    /// Export the outbound represented by the currently selected visible row.
+    /// Marked nodes are exported in source order; without marks use the cursor row.
+    pub(crate) fn selected_node_tags(&self) -> Result<Vec<String>> {
+        if self.form.marked_nodes.is_empty() {
+            return Ok(vec![self.selected_node_tag()?]);
+        }
+        let doc = self.document()?;
+        let tags: Vec<_> = collection(&doc, &[Part::Key("outbounds".into())])
+            .into_iter()
+            .flat_map(|nodes| nodes.iter())
+            .filter_map(|node| node.get("tag").and_then(Item::as_str))
+            .filter(|tag| {
+                self.form
+                    .marked_nodes
+                    .iter()
+                    .any(|marked| marked.as_str() == *tag)
+            })
+            .map(str::to_owned)
+            .collect();
+        anyhow::ensure!(
+            tags.len() == self.form.marked_nodes.len()
+                && self.form.marked_nodes.iter().all(|marked| tags
+                    .iter()
+                    .filter(|tag| *tag == marked)
+                    .count()
+                    == 1),
+            t("Selected nodes changed; select them again")
+        );
+        Ok(tags)
+    }
+
     pub(crate) fn export_selected_node(&self) -> Result<String> {
-        let tag = self.selected_node_tag()?;
-        crate::export::selected_node(&self.text(), &tag)
+        crate::export::selected_nodes(&self.text(), &self.selected_node_tags()?)
     }
     pub(crate) fn export_selected_node_share(&self) -> Result<String> {
-        let tag = self.selected_node_tag()?;
-        let value: toml::Value = self.text().parse()?;
-        let node = value["outbounds"]
-            .as_array()
-            .and_then(|a| {
-                a.iter()
-                    .find(|n| n.get("tag").and_then(toml::Value::as_str) == Some(tag.as_str()))
-            })
-            .context(t("Selected node has no tag"))?;
-        astra_convert::share::export_node(node)
+        crate::export::selected_nodes_share(&self.text(), &self.selected_node_tags()?)
     }
 
     /// Return the zero-based rule index for the selected rule row.
@@ -2476,7 +2500,37 @@ impl Editor {
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
-                if let Some(("rules", index)) = item_index(&path) {
+                if matches!(selected, Some(FlatRow::Node { .. })) {
+                    self.form.marked_rules.clear();
+                    if key.code == KeyCode::Char('V') {
+                        let nodes = collection(&doc, &[Part::Key("outbounds".into())])
+                            .context(t("Select a node to export"))?;
+                        let tags: Vec<String> = nodes
+                            .iter()
+                            .map(|node| {
+                                node.get("tag")
+                                    .and_then(Item::as_str)
+                                    .map(str::to_owned)
+                                    .context(t("Selected node has no tag"))
+                            })
+                            .collect::<Result<_>>()?;
+                        if tags.len() == self.form.marked_nodes.len()
+                            && tags.iter().all(|tag| self.form.marked_nodes.contains(tag))
+                        {
+                            self.form.marked_nodes.clear();
+                        } else {
+                            self.form.marked_nodes = tags;
+                        }
+                    } else {
+                        let tag = self.selected_node_tag()?;
+                        if self.form.marked_nodes.contains(&tag) {
+                            self.form.marked_nodes.retain(|marked| *marked != tag);
+                        } else {
+                            self.form.marked_nodes.push(tag);
+                        }
+                    }
+                } else if let Some(("rules", index)) = item_index(&path) {
+                    self.form.marked_nodes.clear();
                     if key.code == KeyCode::Char('V') {
                         let count = doc["rules"].as_array_of_tables().map_or(0, |a| a.len());
                         if self.form.marked_rules.len() == count {
@@ -2608,6 +2662,13 @@ impl Editor {
         .any(|generic| t(generic) == help)
     }
     fn hint(&self, row: Option<&FlatRow>) -> String {
+        if !self.form.marked_nodes.is_empty() {
+            return format!(
+                "{} · {}",
+                self.form.marked_nodes.len(),
+                t("nodes selected · v toggle · V all/clear · F2 export")
+            );
+        }
         if !self.form.marked_rules.is_empty() {
             return format!(
                 "{} · {}",
@@ -2633,7 +2694,7 @@ impl Editor {
             }
             Some(FlatRow::Field { spec, .. }) => spec.help.clone(),
             Some(FlatRow::Node { .. }) => {
-                t("Enter fold · y duplicate · d delete · K/J move").into()
+                t("Enter fold · v select · V all/clear · y duplicate · d delete · K/J move").into()
             }
             Some(FlatRow::Rule { .. }) => {
                 t("v select · V all/clear · K/J move · m move selection here").into()
@@ -2665,6 +2726,15 @@ impl Editor {
             title.push(Span::styled(
                 tr!("● {} ", t("unsaved")),
                 Style::default().fg(Color::Yellow),
+            ));
+        }
+        if !self.form.marked_nodes.is_empty() {
+            title.push(Span::styled(
+                format!(
+                    " · {} ",
+                    tr!("{} nodes selected", self.form.marked_nodes.len())
+                ),
+                Style::default().fg(Color::Cyan),
             ));
         }
         let title = Line::from(title);
@@ -2942,6 +3012,12 @@ impl Editor {
                 );
                 if item_index(&row.path())
                     .is_some_and(|(kind, i)| kind == "rules" && self.form.marked_rules.contains(&i))
+                    || matches!(row, FlatRow::Node { index, .. }
+                        if collection(doc, &[Part::Key("outbounds".into())])
+                            .and_then(|nodes| nodes.get(*index))
+                            .and_then(|node| node.get("tag"))
+                            .and_then(Item::as_str)
+                            .is_some_and(|tag| self.form.marked_nodes.iter().any(|marked| marked == tag)))
                 {
                     spans.insert(0, Span::styled("✓ ", Style::default().fg(Color::Cyan)));
                 }

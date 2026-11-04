@@ -36,6 +36,173 @@ fn selected_node_export_uses_the_visible_node_row() {
     assert!(!output.contains("first"));
 }
 
+mod node_selection_tests {
+    use super::*;
+
+    fn editor() -> Editor {
+        Editor::new(
+            "proxy".into(),
+            format!(
+                "standalone=true\n{}",
+                ["first", "second", "third"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, tag)| format!(
+                        "[[outbounds]]\ntag='{tag}'\nkind='socks5'\nserver='127.0.0.1:{}'\n",
+                        1234 + index
+                    ))
+                    .collect::<String>()
+            ),
+        )
+    }
+
+    fn focus(editor: &mut Editor, index: usize) {
+        let doc = editor.document().unwrap();
+        editor.focus_item(&doc, "outbounds", index);
+    }
+
+    fn mark(editor: &mut Editor, index: usize) {
+        focus(editor, index);
+        press(editor, KeyCode::Char('v'));
+    }
+
+    fn exported_tags(editor: &Editor) -> Vec<String> {
+        let document: toml::Value = toml::from_str(&editor.export_selected_node().unwrap()).unwrap();
+        document["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["tag"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn node_selection_exports_marked_set_in_source_order_and_toggles_all() {
+        let mut editor = editor();
+        let original = editor.text();
+        mark(&mut editor, 2);
+        mark(&mut editor, 0);
+        assert_eq!(editor.form.marked_nodes, ["third", "first"]);
+        focus(&mut editor, 1);
+        assert_eq!(editor.selected_node_tags().unwrap(), ["first", "third"]);
+        assert_eq!(exported_tags(&editor), ["first", "third"]);
+        let links = editor.export_selected_node_share().unwrap();
+        let links: Vec<_> = links.lines().collect();
+        assert_eq!(links.len(), 2);
+        assert!(links[0].ends_with("#first"), "{}", links[0]);
+        assert!(links[1].ends_with("#third"), "{}", links[1]);
+
+        press(&mut editor, KeyCode::Char('V'));
+        assert_eq!(exported_tags(&editor), ["first", "second", "third"]);
+        press(&mut editor, KeyCode::Char('V'));
+        assert!(editor.form.marked_nodes.is_empty());
+        assert_eq!(exported_tags(&editor), ["second"]);
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('v'));
+        assert!(editor.form.marked_nodes.is_empty());
+        assert_eq!(editor.text(), original, "Selection must not edit the draft");
+    }
+
+    #[test]
+    fn node_selection_survives_folding_but_does_not_mark_child_rows() {
+        let mut editor = editor();
+        mark(&mut editor, 2);
+        press(&mut editor, KeyCode::Enter);
+        press(&mut editor, KeyCode::Down);
+        assert!(editor.selected_node_tag().is_err());
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('V'));
+        assert_eq!(editor.form.marked_nodes, ["third"]);
+        assert_eq!(exported_tags(&editor), ["third"]);
+        focus(&mut editor, 2);
+        press(&mut editor, KeyCode::Enter);
+        assert_eq!(editor.form.marked_nodes, ["third"]);
+    }
+
+    #[test]
+    fn node_selection_clears_after_edits_renames_reordering_duplication_and_deletion() {
+        for operation in ["edit", "rename", "move", "duplicate", "delete"] {
+            let mut editor = editor();
+            mark(&mut editor, 2);
+            mark(&mut editor, 0);
+            match operation {
+                "edit" | "rename" => {
+                    editor.form.expanded_nodes.push(0);
+                    editor.form.path = vec![Part::Key("outbounds".into()), Part::Index(0)];
+                    if operation == "edit" {
+                        field(&mut editor, "server", "127.0.0.1:9876");
+                    } else {
+                        field(&mut editor, "tag", "renamed");
+                    }
+                }
+                "move" => {
+                    focus(&mut editor, 2);
+                    press(&mut editor, KeyCode::Char('K'));
+                }
+                "duplicate" => press(&mut editor, KeyCode::Char('y')),
+                "delete" => press(&mut editor, KeyCode::Char('d')),
+                _ => unreachable!(),
+            }
+            assert!(editor.form.marked_nodes.is_empty(), "{operation}");
+        }
+    }
+
+    #[test]
+    fn node_selection_clears_after_undo_redo_import_and_session_restore() {
+        let mut editor = editor();
+        mark(&mut editor, 2);
+        press(&mut editor, KeyCode::Char('K'));
+        mark(&mut editor, 0);
+        editor.restore(false).unwrap();
+        assert!(editor.form.marked_nodes.is_empty());
+        mark(&mut editor, 0);
+        editor.restore(true).unwrap();
+        assert!(editor.form.marked_nodes.is_empty());
+        mark(&mut editor, 0);
+        let restored: Editor =
+            serde_json::from_str(&serde_json::to_string(&editor).unwrap()).unwrap();
+        assert!(restored.form.marked_nodes.is_empty());
+        editor
+            .import(editor.text().replace("first", "imported"))
+            .unwrap();
+        assert!(editor.form.marked_nodes.is_empty());
+    }
+
+    #[test]
+    fn node_selection_rejects_missing_tags_instead_of_exporting_the_cursor() {
+        let mut editor = editor();
+        focus(&mut editor, 0);
+        editor.form.marked_nodes = vec!["third".into(), "removed".into()];
+        assert!(editor.selected_node_tags().is_err());
+        assert!(editor.export_selected_node().is_err());
+        assert!(editor.export_selected_node_share().is_err());
+    }
+
+    #[test]
+    fn node_selection_renders_count_markers_and_selection_help() {
+        crate::i18n::with_language(crate::i18n::Language::English, || {
+            let mut editor = editor();
+            mark(&mut editor, 2);
+            mark(&mut editor, 0);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| editor.render(frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..40)
+                .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let text = rows.join("\n");
+            assert!(text.contains("2 nodes selected"), "{text}");
+            assert!(text.contains("V all/clear"), "{text}");
+            let marked: Vec<_> = rows.iter().filter(|row| row.contains('✓')).collect();
+            assert_eq!(marked.len(), 2, "{text}");
+            assert!(marked.iter().any(|row| row.contains("first")));
+            assert!(marked.iter().any(|row| row.contains("third")));
+        });
+    }
+}
+
 #[test]
 fn selected_rule_export_uses_the_visible_rule_row() {
     let mut editor = Editor::new(

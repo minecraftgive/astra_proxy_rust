@@ -92,6 +92,9 @@ impl Ui {
             self.close_viewer();
         }
         self.remember_page(page);
+        if page == shell::SETTINGS {
+            self.refresh_program_info();
+        }
         if page == CONNECTIONS {
             self.reveal_selected_connection();
         }
@@ -1162,6 +1165,14 @@ impl Ui {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
+            if self.page == shell::SETTINGS
+                && self.overview_input()
+                && !self.tasks.showing_details()
+                && self.tui_viewer.is_none()
+            {
+                self.scroll_settings(mouse.kind == MouseEventKind::ScrollDown);
+                return Input::Idle;
+            }
             return self.key(event::KeyEvent::new(
                 if mouse.kind == MouseEventKind::ScrollUp {
                     KeyCode::Up

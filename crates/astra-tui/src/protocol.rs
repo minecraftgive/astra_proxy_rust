@@ -154,6 +154,7 @@ fn call_plan(action: Action, local: bool) -> Result<CallPlan> {
         }),
         Action::Remove(instance) => CallPlan::execute(C::Remove { instance }),
         Action::Start(instance) => CallPlan::execute(C::Start { instance }),
+        Action::ForceStart(instance) => CallPlan::execute(C::ForceStart { instance }),
         Action::Stop(instance) => CallPlan::execute(C::Stop { instance }),
         Action::Restart(instance) => CallPlan::execute(C::Restart { instance }),
         Action::Reload(instance) => CallPlan::execute(C::Reload { instance }),
@@ -688,6 +689,24 @@ async fn stream_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_start_is_explicit_for_local_and_remote_targets() {
+        for local in [true, false] {
+            assert!(matches!(
+                call_plan(Action::ForceStart("proxy".into()), local).unwrap(),
+                CallPlan::Execute {
+                    command: v::Command::ForceStart { instance }, ..
+                } if instance == "proxy"
+            ));
+            assert!(matches!(
+                call_plan(Action::Start("proxy".into()), local).unwrap(),
+                CallPlan::Execute {
+                    command: v::Command::Start { instance }, ..
+                } if instance == "proxy"
+            ));
+        }
+    }
 
     #[test]
     fn monitor_is_a_read_only_query_for_local_and_remote_targets() {

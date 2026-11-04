@@ -4,6 +4,7 @@ pub mod elevation;
 pub mod lifecycle;
 pub mod logging;
 pub mod platform;
+pub mod program_info;
 pub mod storage;
 #[cfg(unix)]
 pub mod unix_handoff;

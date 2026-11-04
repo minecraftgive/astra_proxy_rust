@@ -13,6 +13,7 @@ mod dashboard;
 mod detached;
 mod live;
 mod monitor;
+mod node_transfer;
 mod operations;
 mod pages;
 mod settings;
@@ -55,6 +56,7 @@ enum Prompt {
     Config(String),
     Clone(String),
     Remove(String),
+    ForceStart(String),
     Shutdown,
     Discard,
     Import,
@@ -68,6 +70,19 @@ enum Prompt {
     ExportNode {
         text: String,
         share: bool,
+    },
+    ExportNodeDestination {
+        text: String,
+        share: bool,
+        clipboard: bool,
+    },
+    ImportNodeSelection {
+        name: String,
+        path: PathBuf,
+        candidates: crate::import::NodeImport,
+        selected: Vec<usize>,
+        cursor: usize,
+        mode: crate::import::MergeMode,
     },
     ExportRule {
         text: String,
@@ -93,10 +108,17 @@ enum Prompt {
     Find(usize),
 }
 impl Prompt {
+    fn picker(&self) -> bool {
+        matches!(
+            self,
+            Self::ExportNodeDestination { .. } | Self::ImportNodeSelection { .. }
+        )
+    }
     fn confirmation(&self) -> bool {
         matches!(
             self,
             Self::Remove(_)
+                | Self::ForceStart(_)
                 | Self::Shutdown
                 | Self::Discard
                 | Self::ImportConfirm { .. }
@@ -113,16 +135,18 @@ impl Prompt {
             Self::Config(_) => t("Configuration path"),
             Self::Clone(_) => t("Copy to path"),
             Self::Remove(_) => t("Remove instance? Configuration is kept."),
+            Self::ForceStart(_) => t("Force start and replace previous sessions?"),
             Self::Shutdown => t("Stop all instances?"),
             Self::Discard => t("Discard changes?"),
             Self::Import => t("Import config or proxy share links"),
             Self::UpdatePackage => t("Local update package path (.zip, .tar.gz or directory)"),
             Self::UpdateConfirm(_) => t("Apply this exact update target?"),
-            Self::ImportNode(_) => t("Import node TOML or share link"),
+            Self::ImportNode(_) => t("Import node files, TOML or share links"),
+            Self::ImportNodeSelection { .. } => t("Select nodes to import"),
             Self::ImportRule(_) => t("Import rules TOML"),
             Self::ExportConfig { .. } => t("Export configuration to path"),
-            Self::ExportNode { share: true, .. } => t("Export selected node as share link to path"),
-            Self::ExportNode { share: false, .. } => t("Export selected node TOML to path"),
+            Self::ExportNode { .. } => t("Export nodes to file or folder (missing folders are created)"),
+            Self::ExportNodeDestination { .. } => t("Export selected nodes"),
             Self::ExportRule { .. } => t("Export selected rule to path"),
             Self::ExportTerminal { .. } => t("Export terminal proxy commands to path"),
             Self::ImportConfirm { .. } => t("Replace editor draft?"),
@@ -141,6 +165,7 @@ impl Prompt {
 enum Operation {
     UpdateSubscriptions,
     Start,
+    ForceStart,
     Stop,
     Restart,
     Reload,
@@ -160,6 +185,7 @@ impl Operation {
     fn label(self) -> &'static str {
         t(match self {
             Self::Start => "Start",
+            Self::ForceStart => "Force start",
             Self::Stop => "Stop",
             Self::Restart => "Restart",
             Self::Reload => "Reload",
@@ -447,6 +473,8 @@ struct Ui {
     preferences: settings::Preferences,
     preferences_path: Option<PathBuf>,
     settings_cursor: usize,
+    settings_view: settings::View,
+    program_info: background::ProgramInformation,
     /// Mouse capture change for the event loop, which owns the terminal.
     mouse_request: Option<bool>,
 }
@@ -603,6 +631,8 @@ impl Ui {
             preferences: Default::default(),
             preferences_path: None,
             settings_cursor: 0,
+            settings_view: Default::default(),
+            program_info: Default::default(),
             mouse_request: None,
         }
     }
@@ -627,6 +657,9 @@ impl Ui {
         } else {
             vec![Operation::Start]
         };
+        if row.pid.is_none() && row.instance.kind != Kind::Server {
+            operations.push(Operation::ForceStart);
+        }
         operations.extend([Operation::Edit, Operation::Logs, Operation::ExportConfig]);
         if row.instance.kind != Kind::Server {
             operations.extend([
@@ -721,6 +754,12 @@ impl Ui {
                     self.message = "Already stopped".into();
                     None
                 }
+            }
+            Operation::ForceStart => {
+                if !running && row.instance.kind != Kind::Server {
+                    self.prompt(Prompt::ForceStart(name));
+                }
+                None
             }
             Operation::Restart => Some(if running {
                 Action::Restart(name)
@@ -841,7 +880,18 @@ impl Ui {
     }
     fn prompt(&mut self, prompt: Prompt) {
         self.confirmation_accept = false;
-        if matches!(
+        if matches!(prompt, Prompt::ExportNode { .. }) {
+            match astra_platform::platform::documents_dir() {
+                Ok(directory) => self.working_dir = directory,
+                Err(error) => {
+                    self.fail(
+                        format!("Locate Documents directory: {error}"),
+                        Resume::Editor,
+                    );
+                    return;
+                }
+            }
+        } else if matches!(
             prompt,
             Prompt::AddName
                 | Prompt::Config(_)
@@ -850,7 +900,6 @@ impl Ui {
                 | Prompt::ImportRule(_)
                 | Prompt::UpdatePackage
                 | Prompt::ExportConfig { .. }
-                | Prompt::ExportNode { .. }
                 | Prompt::ExportRule { .. }
                 | Prompt::ExportTerminal { .. }
         ) {
@@ -880,8 +929,12 @@ impl Ui {
                     target.to_string_lossy().into_owned()
                 })
                 .unwrap_or_default(),
+            Prompt::ExportNode { share, .. } => self
+                .working_dir
+                .join(if *share { "nodes.txt" } else { "nodes.toml" })
+                .to_string_lossy()
+                .into_owned(),
             Prompt::ExportConfig { .. }
-            | Prompt::ExportNode { .. }
             | Prompt::ExportRule { .. }
             | Prompt::ExportTerminal { .. } => String::new(),
             Prompt::Find(page) => self.searches.get(page).cloned().unwrap_or_default(),
@@ -892,16 +945,21 @@ impl Ui {
         self.prompt = Some(prompt);
     }
     fn paste_prompt(&mut self, text: &str) {
+        if self.prompt.as_ref().is_some_and(Prompt::picker) {
+            return;
+        }
         if self.prefilled_input {
             self.input.clear();
             self.input_cursor = 0;
             self.prefilled_input = false;
         }
-        let links =
-            matches!(self.prompt, Some(Prompt::Import)) && astra_convert::share::is_share(text);
+        let multiline = matches!(self.prompt, Some(Prompt::ImportNode(_)))
+            || matches!(self.prompt, Some(Prompt::Import)) && astra_convert::share::is_share(text);
         let inserted: String = text
             .chars()
-            .filter(|character| !character.is_control() || (links && *character == '\n'))
+            .filter(|character| {
+                !character.is_control() || (multiline && matches!(*character, '\n' | '\r' | '\t'))
+            })
             .collect();
         let byte = self.prompt_byte();
         self.input.insert_str(byte, &inserted);
@@ -1076,7 +1134,6 @@ impl Ui {
                 absolute(&input, &self.working_dir)?,
             )),
             Prompt::ExportConfig { text }
-            | Prompt::ExportNode { text, .. }
             | Prompt::ExportRule { text }
             | Prompt::ExportTerminal { text, .. } => {
                 let path = absolute(&input, &self.working_dir)?;
@@ -1084,7 +1141,15 @@ impl Ui {
                 self.message = tr!("Exported to {}", path.display());
                 None
             }
+            Prompt::ExportNode { text, share } => {
+                let path = node_transfer::export_path(&input, &self.working_dir, share)?;
+                crate::export::write_new(&path, &text)?;
+                self.message = tr!("Exported to {}", path.display());
+                None
+            }
+            Prompt::ExportNodeDestination { .. } | Prompt::ImportNodeSelection { .. } => None,
             Prompt::Remove(name) if input == "yes" => Some(Action::Remove(name)),
+            Prompt::ForceStart(name) if input == "yes" => Some(Action::ForceStart(name)),
 
             Prompt::Shutdown if input == "yes" => Some(Action::Shutdown),
             Prompt::Discard if input == "yes" => {
@@ -1115,16 +1180,7 @@ impl Ui {
                 request: crate::explanation::request(&input)?,
             }),
             Prompt::ImportNode(mode) => {
-                let editor = self.editor.as_ref().context("Missing editor")?;
-                let imported = crate::import::merge_at(
-                    &input,
-                    &self.working_dir,
-                    &editor.text(),
-                    Kind::Proxy,
-                    mode,
-                )?;
-                self.editor.as_mut().unwrap().import(imported.text)?;
-                self.message = "Imported nodes to draft · Ctrl-S save".into();
+                self.prepare_node_import(&input, mode)?;
                 None
             }
             Prompt::ImportRule(mode) => {
@@ -1142,19 +1198,14 @@ impl Ui {
             }
             Prompt::Import => {
                 let share = astra_convert::share::is_share(&input);
+                if share {
+                    self.prepare_node_import(&input, crate::import::MergeMode::Append)?;
+                    return Ok(None);
+                }
                 let editor = self.editor.as_ref().context("Missing editor")?;
-                let (imported, label) = if share {
-                    (
-                        crate::import::links(&input, self.kind, &editor.text())?,
-                        t("Import node links").to_owned(),
-                    )
-                } else {
-                    let path = crate::import::path(&input, &self.working_dir)?;
-                    (
-                        crate::import::load(&path, self.kind, &editor.text())?,
-                        path.display().to_string(),
-                    )
-                };
+                let path = crate::import::path(&input, &self.working_dir)?;
+                let imported = crate::import::load(&path, self.kind, &editor.text())?;
+                let label = path.display().to_string();
                 if editor.text() != editor.original || !imported.warnings.is_empty() {
                     let mut notices = vec![label];
                     if editor.text() != editor.original {
@@ -1364,6 +1415,9 @@ impl Ui {
         }
         if self.menu.is_some() {
             return self.key_operations_menu(key);
+        }
+        if let Some(input) = self.key_node_transfer(key) {
+            return input;
         }
         if self.prompt.as_ref().is_some_and(Prompt::confirmation) {
             return self.key_confirm_prompt(key);
@@ -1584,22 +1638,14 @@ impl Ui {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && editor.browsing()
         {
-            let share = key.code == KeyCode::Char('E') && editor_kind == Kind::Proxy;
-            let result = if editor_kind == Kind::Proxy {
-                if share {
-                    editor.export_selected_node_share()
-                } else {
-                    editor.export_selected_node()
-                }
-            } else {
-                editor.export_selected_rule()
-            };
+            let share =
+                key.code == KeyCode::Char('E') || key.modifiers.contains(KeyModifiers::SHIFT);
+            if editor_kind == Kind::Proxy {
+                return self.start_node_export(share);
+            }
+            let result = editor.export_selected_rule();
             match result {
-                Ok(text) => self.prompt(if editor_kind == Kind::Proxy {
-                    Prompt::ExportNode { text, share }
-                } else {
-                    Prompt::ExportRule { text }
-                }),
+                Ok(text) => self.prompt(Prompt::ExportRule { text }),
                 Err(error) => self.fail(format!("{error:#}"), Resume::Editor),
             }
         } else if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1890,6 +1936,8 @@ impl Ui {
         self.render_content(f, chunks[0]);
         self.render_detail(f, chunks[1], list_page);
         self.render_import_confirmation(f);
+        self.render_force_start_confirmation(f);
+        self.render_node_transfer(f);
         self.render_update_confirmation(f);
         if let Some(view) = &self.diagnostics {
             view.render(f, f.area());
@@ -1936,7 +1984,9 @@ impl Ui {
 
     fn render_detail(&self, f: &mut Frame<'_>, area: ratatui::layout::Rect, list_page: bool) {
         let detail: Text = if let Some(prompt) = &self.prompt {
-            if prompt.confirmation() {
+            if prompt.picker() {
+                prompt.title().into()
+            } else if prompt.confirmation() {
                 format!(
                     "{}\n{}   {} · Tab / ←→ select · Enter apply · Esc cancel",
                     prompt.title(),
@@ -1991,6 +2041,35 @@ impl Ui {
                         Block::default()
                             .borders(Borders::ALL)
                             .title(t("Replace editor draft?"))
+                            .title_bottom(if self.confirmation_accept {
+                                t("Cancel   [Confirm] · Tab select · Enter apply · Esc cancel")
+                            } else {
+                                t("[Cancel]   Confirm · Tab select · Enter apply · Esc cancel")
+                            }),
+                    ),
+                popup,
+            );
+        }
+    }
+
+    fn render_force_start_confirmation(&self, f: &mut Frame<'_>) {
+        if let Some(Prompt::ForceStart(name)) = &self.prompt {
+            let text = format!(
+                "{}\n\n{}\n\n{}",
+                name,
+                t("Replace previous session records for this instance and its stopped startup bindings. An unreachable previous process may still be running."),
+                t("Active or inaccessible control endpoints still prevent replacement.")
+            );
+            let popup = crate::help::popup(f.area(), &text);
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(t("Force start and replace previous sessions?"))
                             .title_bottom(if self.confirmation_accept {
                                 t("Cancel   [Confirm] · Tab select · Enter apply · Esc cancel")
                             } else {
@@ -2156,6 +2235,7 @@ pub(crate) fn action_description(action: &Action) -> String {
         Action::Create { name, .. } => ("Create", name.as_str()),
         Action::Add(instance) => ("Add", instance.name.as_str()),
         Action::Start(name) => ("Start", name.as_str()),
+        Action::ForceStart(name) => ("Force start", name.as_str()),
         Action::Stop(name) => ("Stop", name.as_str()),
         Action::Restart(name) => ("Restart", name.as_str()),
         Action::Reload(name) => ("Reload", name.as_str()),
@@ -2998,6 +3078,79 @@ mod tests {
         press(&mut ui, KeyCode::Esc);
         assert!(ui.binding_picker.is_none());
         assert_eq!(ui.details["proxy"].bindings, ["rules"]);
+    }
+    #[test]
+    fn force_start_requires_confirmation_and_is_only_offered_for_stopped_cores() {
+        let mut ui = sample_ui(false);
+        ui.rows[0].state = "Unresponsive or unverified core".into();
+        assert!(ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::ForceStart)));
+        assert!(matches!(ui.operation(Operation::ForceStart), Input::Idle));
+        assert!(matches!(&ui.prompt, Some(Prompt::ForceStart(name)) if name == "proxy"));
+        assert!(!ui.confirmation_accept);
+        assert!(matches!(press(&mut ui, KeyCode::Enter), Input::Idle));
+        assert!(ui.prompt.is_none());
+
+        ui.operation(Operation::ForceStart);
+        press(&mut ui, KeyCode::Tab);
+        assert!(matches!(
+            press(&mut ui, KeyCode::Enter),
+            Input::Run(Action::ForceStart(name), Some(origin))
+                if name == "proxy" && matches!(&origin.0, Prompt::ForceStart(_))
+        ));
+        ui.operation(Operation::ForceStart);
+        assert!(
+            !ui.confirmation_accept,
+            "Each replacement requires fresh confirmation"
+        );
+        press(&mut ui, KeyCode::Esc);
+        assert!(ui.prompt.is_none());
+
+        ui.kind = Kind::Rule;
+        assert!(ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::ForceStart)));
+        let mut ui = sample_ui(true);
+        assert!(!ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::ForceStart)));
+        assert!(matches!(ui.operation(Operation::ForceStart), Input::Idle));
+        assert!(ui.prompt.is_none());
+        ui.rows[0].pid = None;
+        ui.rows[0].instance.kind = Kind::Server;
+        ui.kind = Kind::Server;
+        assert!(!ui
+            .operations()
+            .iter()
+            .any(|op| matches!(op, Operation::ForceStart)));
+        assert!(matches!(ui.operation(Operation::ForceStart), Input::Idle));
+        assert!(ui.prompt.is_none());
+    }
+
+    #[test]
+    fn force_start_confirmation_explains_replacement_and_retained_processes() {
+        crate::i18n::with_language(crate::i18n::Language::Simplified, || {
+            let mut ui = sample_ui(false);
+            ui.operation(Operation::ForceStart);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let screen = screen.replace(' ', "");
+            assert!(screen.contains("强制启动并覆盖旧会话"));
+            assert!(screen.contains("proxy"));
+            assert!(screen.contains("旧会话记录"));
+            assert!(screen.contains("旧进程可能仍在运行"));
+        });
     }
     #[test]
     fn binding_picker_selects_one_rule_or_multiple_proxies() {

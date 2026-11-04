@@ -1,5 +1,6 @@
 //! Typed management v2. All counters and revisions crossing JSON are decimal strings.
 use crate::update_json;
+pub use astra_platform::program_info::ProgramInfo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use ts_rs::TS;
@@ -40,6 +41,7 @@ pub enum RequestBody {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Query {
     Hello,
+    ProgramInfo,
     Agents,
     Instances,
     Monitor {
@@ -120,6 +122,10 @@ pub enum Command {
         instance: String,
     },
     Start {
+        instance: String,
+    },
+    /// Discard old session metadata after explicit user confirmation.
+    ForceStart {
         instance: String,
     },
     Stop {
@@ -348,6 +354,7 @@ pub enum ResponseBody {
     Local(serde_json::Value),
     Cancellation(Cancellation),
     Hello(Hello),
+    ProgramInfo(ProgramInfo),
     Agents(Vec<Agent>),
     Instances(Vec<Instance>),
     Monitor(MonitorSnapshot),

@@ -239,6 +239,88 @@ pub fn validate_user_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
     ensure_user_object(&borrowed, path)
 }
 
+/// Force recovery may delete an abandoned foreign-owned marker, but only from
+/// an actual directory trusted for this user. Pin the parent against rename or
+/// replacement and compare resolved paths to the already-open marker.
+pub(crate) fn force_recovery_parent(file: &std::fs::File, path: &Path) -> io::Result<Handle> {
+    let absolute = std::path::absolute(path)?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC marker needs a parent"))?;
+    let name = wide(parent.as_os_str())?;
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = Handle(handle);
+    let info = file_information(directory.0)?;
+    let actual_parent = final_path(file.as_raw_handle())?
+        .parent()
+        .map(Path::to_path_buf);
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || actual_parent.as_ref() != Some(&final_path(directory.0)?)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "forced recovery requires a real parent directory owned by the current user",
+        ));
+    }
+    ensure_user_object(&directory, parent)?;
+    Ok(directory)
+}
+
+/// Give a newly-created, exclusively held IPC marker the concrete user's
+/// ownership. UAC otherwise defaults to Administrators, making a fresh marker
+/// inside an administrator-owned state directory fail later validation.
+/// Already user-owned markers need no change; ownership changes require the
+/// same trusted parent policy as explicit forced recovery.
+/// Callers must use create_new and retain that handle with WRITE_OWNER access.
+pub(crate) fn set_new_marker_owner(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    let info = file_information(file.as_raw_handle())?;
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || info.nNumberOfLinks != 1
+        || info.nFileSizeHigh != 0
+        || info.nFileSizeLow != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "new IPC marker changed",
+        ));
+    }
+    if owner_sid(file.as_raw_handle())? == user_sid()? {
+        return Ok(());
+    }
+    let _parent = force_recovery_parent(file, path)?;
+    let token = token_information(TokenUser)?;
+    let sid = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+    let error = unsafe {
+        windows_sys::Win32::Security::Authorization::SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    Ok(())
+}
+
 /// Create a private directory owned by the actual user, including under UAC.
 /// Existing objects are only validated; their ownership is never changed.
 pub fn create_private_directory(path: &Path) -> io::Result<()> {

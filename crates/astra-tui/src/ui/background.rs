@@ -4,6 +4,29 @@ use astra_ipc::progress;
 use astra_ipc::progress::Progress;
 use tokio::{sync::watch, task::JoinHandle};
 
+/// Cached local and selected-manager metadata. Read-only requests never enter
+/// the operation queue, and failures retain the last known manager data.
+pub(super) struct ProgramInformation {
+    pub(super) local: Option<astra_management::v2::ProgramInfo>,
+    pub(super) data: Option<astra_management::v2::ProgramInfo>,
+    pub(super) loading: bool,
+    pub(super) error: Option<String>,
+    pub(super) local_error: Option<String>,
+    refresh: bool,
+}
+impl Default for ProgramInformation {
+    fn default() -> Self {
+        Self {
+            local: None,
+            data: None,
+            loading: false,
+            error: None,
+            local_error: None,
+            refresh: true,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Tasks {
     records: std::collections::VecDeque<Record>,
@@ -277,6 +300,10 @@ impl Jobs {
     }
 }
 impl Ui {
+    pub(super) fn refresh_program_info(&mut self) {
+        self.program_info.refresh = true;
+    }
+
     pub(super) fn notice_host_restart(&mut self) {
         self.message =
             t("Host restarted; previous connection targets and paused data were cleared").into();
@@ -661,6 +688,9 @@ pub(super) struct Feeds {
     metadata_time: Instant,
     updates: Option<Feed>,
     update_probe: Option<JoinHandle<Option<crate::protocol::updates::UpdateStatus>>>,
+    program_info: Option<JoinHandle<Result<astra_management::v2::ProgramInfo, String>>>,
+    local_info: Option<JoinHandle<Result<astra_management::v2::ProgramInfo, String>>>,
+    list_online: bool,
 }
 impl Drop for Feeds {
     fn drop(&mut self) {
@@ -668,6 +698,12 @@ impl Drop for Feeds {
             task.abort();
         }
         if let Some(task) = &self.update_probe {
+            task.abort();
+        }
+        if let Some(task) = &self.program_info {
+            task.abort();
+        }
+        if let Some(task) = &self.local_info {
             task.abort();
         }
     }
@@ -703,6 +739,9 @@ impl Feeds {
             metadata_time: Instant::now() - Duration::from_secs(3),
             updates: None,
             update_probe: Some(update_probe),
+            program_info: None,
+            local_info: None,
+            list_online: false,
         }
     }
     pub(super) async fn poll(&mut self, ui: &mut Ui) -> bool {
@@ -737,11 +776,24 @@ impl Feeds {
             match result {
                 Ok(reply) => {
                     self.ready = true;
+                    if !self.list_online {
+                        ui.refresh_program_info();
+                    }
+                    self.list_online = true;
                     ui.update_rows(reply)
                 }
-                Err(error) => ui.runtime_error = error,
+                Err(error) => {
+                    self.list_online = false;
+                    // Cached platform information must not imply the manager
+                    // is still reachable after its state subscription fails.
+                    if ui.program_info.data.is_some() {
+                        ui.program_info.error = Some(error.clone());
+                    }
+                    ui.runtime_error = error;
+                }
             }
         }
+        changed |= self.poll_program_info(ui).await;
         // Runtime data always follows the active profile, whatever Profiles shows.
         let key = ui
             .active_proxy()
@@ -813,6 +865,95 @@ impl Feeds {
                 ));
                 self.metadata_time = Instant::now();
             }
+        }
+        changed
+    }
+
+    async fn poll_program_info(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        if self
+            .local_info
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            let result = self.local_info.take().unwrap().await;
+            match result {
+                Ok(Ok(info)) => {
+                    ui.program_info.local = Some(info);
+                    ui.program_info.local_error = None;
+                }
+                Ok(Err(error)) => ui.program_info.local_error = Some(error),
+                Err(error) => ui.program_info.local_error = Some(error.to_string()),
+            }
+            changed = true;
+        }
+        if self
+            .program_info
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            let result = self.program_info.take().unwrap().await;
+            ui.program_info.loading = false;
+            match result {
+                Ok(Ok(info)) => {
+                    ui.program_info.data = Some(info);
+                    ui.program_info.error = None;
+                }
+                Ok(Err(error)) => ui.program_info.error = Some(error),
+                Err(error) => ui.program_info.error = Some(error.to_string()),
+            }
+            changed = true;
+        }
+        if ui.page != shell::SETTINGS {
+            return changed;
+        }
+        if self.local_info.is_none()
+            && ui.program_info.local.is_none()
+            && (ui.program_info.local_error.is_none() || ui.program_info.refresh)
+        {
+            ui.program_info.local_error = None;
+            self.local_info = Some(tokio::spawn(async {
+                let result = tokio::task::spawn_blocking(|| {
+                    astra_management::v2::ProgramInfo::collect(
+                        astra_platform::build_info!(),
+                        vec![],
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string());
+                super::wake();
+                result
+            }));
+            changed = true;
+        }
+        if ui.program_info.refresh {
+            ui.program_info.refresh = false;
+            ui.program_info.loading = true;
+            ui.program_info.error = None;
+            if let Some(task) = self.program_info.take() {
+                task.abort();
+            }
+            let socket = self.socket.clone();
+            self.program_info = Some(tokio::spawn(async move {
+                use astra_management::v2::{Query, RequestBody, ResponseBody};
+                let result = async {
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        crate::protocol::request(&socket, RequestBody::Query(Query::ProgramInfo)),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| format!("{error:#}"))?;
+                    match response {
+                        ResponseBody::ProgramInfo(info) => Ok(info),
+                        _ => Err("Manager did not return program information".to_owned()),
+                    }
+                }
+                .await;
+                super::wake();
+                result
+            }));
+            changed = true;
         }
         changed
     }

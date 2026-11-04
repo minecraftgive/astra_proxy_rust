@@ -2010,6 +2010,34 @@ tr:last-child td {
 .schema-entry { padding: 12px 0; border-bottom: 1px solid var(--border); }
 @media(max-width:800px){.schema-field { grid-template-columns:1fr; gap:8px; }}
 
+/* Settings: build and host facts describe the selected managed node. */
+.program-info { min-width: 0; }
+.program-info-heading, .program-info-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.program-info-heading { justify-content: space-between; }
+.program-info .program-info-heading h2 { margin: 0 0 4px; }
+.program-info-heading p { margin: 0; overflow-wrap: anywhere; }
+.program-info h3 { margin: 0 0 10px; font-size: 12px; font-weight: 600; }
+.program-info-message { margin-bottom: 0; }
+.program-info-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-top: 20px; }
+.program-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; margin: 0; }
+.program-facts div { min-width: 0; }
+.program-facts dt { color: var(--muted); font-size: 11px; }
+.program-facts dd { margin: 3px 0 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.program-support, .program-runtime { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.program-feature-row { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 12px; margin-bottom: 12px; }
+.program-feature-row h3 { margin: 3px 0 0; }
+.program-indicators { display: flex; gap: 8px; flex-wrap: wrap; }
+.program-indicator { white-space: normal; padding-block: 3px; }
+.program-indicator-value { margin-left: 4px; font-size: 10px; }
+.program-support p, .program-runtime p { font-size: 12px; margin: 0; }
+@media (max-width: 900px) {
+  .program-info-columns { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+}
+@media (max-width: 480px) {
+  .program-feature-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .program-facts { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* Monitor: three aligned traces share a time axis for correlating load and traffic. */
 .monitor { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .monitor-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }

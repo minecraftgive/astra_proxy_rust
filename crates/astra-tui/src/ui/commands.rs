@@ -278,7 +278,9 @@ pub(super) fn help() -> String {
 }
 impl Ui {
     pub(super) fn text_input_active(&self) -> bool {
-        self.prompt.as_ref().is_some_and(|p| !p.confirmation())
+        self.prompt
+            .as_ref()
+            .is_some_and(|p| !p.confirmation() && !p.picker())
             || self.connection_filtering
             || self.editor.as_ref().is_some_and(|e| !e.browsing())
             || self.viewer.as_ref().is_some_and(|v| !v.browsing())
@@ -298,7 +300,7 @@ impl Ui {
             return true;
         }
         if let Some(prompt) = &self.prompt {
-            return !prompt.confirmation();
+            return !prompt.confirmation() && !prompt.picker();
         }
         if self.binding_picker.is_some() || self.menu.is_some() {
             return false;
@@ -598,7 +600,10 @@ impl Ui {
         {
             return None;
         }
-        if self.prompt.as_ref().is_some_and(Prompt::confirmation)
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.confirmation() || prompt.picker())
             || self.binding_picker.is_some()
             || self.menu.is_some()
             || self.recovery.is_some()

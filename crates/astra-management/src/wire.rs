@@ -184,6 +184,9 @@ pub enum Action {
     Monitor {
         name: String,
     },
+    /// Explicitly discard an unrecoverable session before starting its instance.
+    /// Append-only: preserve the bincode discriminants of existing actions.
+    ForceStart(String),
 }
 impl Action {
     /// Safe activity description: never includes configuration text, URLs or credentials.
@@ -191,6 +194,7 @@ impl Action {
         let label = match self {
             Self::List | Self::WatchList => "List instances",
             Self::Start(_) => "Start instance",
+            Self::ForceStart(_) => "Force start instance",
             Self::Stop(_) => "Stop instance",
             Self::Restart(_) => "Restart instance",
             Self::Reload(_) => "Reload configuration",
@@ -350,6 +354,50 @@ mod tests {
     use super::*;
     use astra_model::nettool::Egress;
     use astra_model::nettool::Probe;
+
+    #[tokio::test]
+    async fn force_start_is_explicit_and_preserves_existing_wire_actions() {
+        use tokio::io::AsyncReadExt;
+        let (mut client, mut server) = astra_platform::platform::stream_pair().await.unwrap();
+        for (action, expected) in [
+            (Action::Start("proxy".into()), 3u32),
+            (
+                Action::Monitor {
+                    name: "proxy".into(),
+                },
+                44u32,
+            ),
+            (Action::ForceStart("proxy".into()), 45u32),
+        ] {
+            astra_ipc::send_management(&mut client, &action)
+                .await
+                .unwrap();
+            let size = server.read_u32().await.unwrap() as usize;
+            let mut frame = vec![0; size];
+            server.read_exact(&mut frame).await.unwrap();
+            assert_eq!(&frame[..4], &expected.to_le_bytes());
+            astra_ipc::send_management(&mut client, &action)
+                .await
+                .unwrap();
+            let received: Action = astra_ipc::receive_management(&mut server).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(received).unwrap(),
+                serde_json::to_value(action).unwrap()
+            );
+        }
+        let normal: crate::v2::Command = serde_json::from_value(serde_json::json!({
+            "type": "start", "data": { "instance": "proxy" }
+        }))
+        .unwrap();
+        assert!(matches!(normal, crate::v2::Command::Start { .. }));
+        let force = crate::v2::Command::ForceStart {
+            instance: "proxy".into(),
+        };
+        let encoded = serde_json::to_value(force).unwrap();
+        assert_eq!(encoded["type"], "force_start");
+        assert!(matches!(serde_json::from_value::<crate::v2::Command>(encoded).unwrap(),
+            crate::v2::Command::ForceStart { instance } if instance == "proxy"));
+    }
 
     #[tokio::test]
     async fn update_actions_preserve_existing_discriminants_and_json_request_identity() {

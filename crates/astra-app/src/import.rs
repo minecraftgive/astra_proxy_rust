@@ -57,6 +57,234 @@ pub enum MergeMode {
     Overwrite(usize),
 }
 
+/// An import preview containing only node tables, in source order. It is safe
+/// to retain this snapshot while the user chooses nodes: applying the selection
+/// never reopens the source files or imports their unrelated configuration.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeImport {
+    pub text: String,
+    pub tags: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Parse pasted TOML, YAML, share links, or one or more dropped file paths.
+/// Duplicate names remain selectable; conflicts are checked only when applying
+/// the chosen rows to the current draft.
+pub fn node_candidates_at(input: &str, directory: &Path) -> Result<NodeImport> {
+    ensure!(input.len() <= LIMIT, t("Configuration exceeds 480 KiB"));
+    ensure!(!input.contains('\0'), t("Invalid configuration"));
+    let paths = node_input_paths(input, directory)?;
+    let mut incoming = toml_edit::ArrayOfTables::new();
+    let mut tags = Vec::new();
+    let mut warnings = Vec::new();
+    let mut input_size = 0;
+    let mut output_size = 0;
+    let mut warning_size = 0;
+    let count = paths.as_ref().map_or(1, Vec::len);
+    for index in 0..count {
+        let (source, base) = match &paths {
+            Some(paths) => {
+                read_file(&paths[index]).with_context(|| format!("Import source {}", index + 1))?
+            }
+            None => (input.to_owned(), directory.to_owned()),
+        };
+        input_size += source.len();
+        ensure!(input_size <= LIMIT, t("Configuration exceeds 480 KiB"));
+        let (mut doc, converted_warnings) =
+            node_source(&source, &base).with_context(|| format!("Import source {}", index + 1))?;
+        normalize_collection(&mut doc, "outbounds")?;
+        let nodes = doc
+            .get("outbounds")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .filter(|nodes| !nodes.is_empty())
+            .context(t("No imported nodes"))?;
+        let mut source_nodes = toml_edit::DocumentMut::new();
+        source_nodes["outbounds"] = toml_edit::Item::ArrayOfTables(nodes.clone());
+        crate::edit::position_tables(source_nodes.as_table_mut(), &mut 0);
+        output_size += source_nodes.to_string().len();
+        warning_size += converted_warnings.iter().map(String::len).sum::<usize>();
+        ensure!(
+            output_size <= LIMIT && warning_size <= LIMIT,
+            t("Configuration exceeds 480 KiB")
+        );
+        for node in nodes {
+            let tag = node
+                .get("tag")
+                .and_then(toml_edit::Item::as_str)
+                .context(t("Missing tag"))?;
+            tags.push(tag.to_owned());
+            incoming.push(node.clone());
+        }
+        warnings.extend(converted_warnings);
+    }
+    let mut doc = toml_edit::DocumentMut::new();
+    doc["outbounds"] = toml_edit::Item::ArrayOfTables(incoming);
+    crate::edit::position_tables(doc.as_table_mut(), &mut 0);
+    let text = finish_document(doc)?.text;
+    Ok(NodeImport {
+        text,
+        tags,
+        warnings,
+    })
+}
+
+/// Apply selected preview rows in their original order, retaining the usual
+/// duplicate-name and overwrite checks. A conflicting unselected node has no
+/// effect on this merge.
+pub fn merge_selected_nodes(
+    current: &str,
+    candidates: &NodeImport,
+    selected: &[usize],
+    mode: MergeMode,
+) -> Result<Imported> {
+    ensure!(
+        current.len() <= LIMIT && candidates.text.len() <= LIMIT,
+        t("Configuration exceeds 480 KiB")
+    );
+    ensure!(
+        candidates.warnings.iter().map(String::len).sum::<usize>() <= LIMIT,
+        t("Configuration exceeds 480 KiB")
+    );
+    ensure!(!selected.is_empty(), t("Select at least one node"));
+    let mut source: toml_edit::DocumentMut = candidates
+        .text
+        .parse()
+        .context(t("Invalid configuration"))?;
+    normalize_collection(&mut source, "outbounds")?;
+    let nodes = source
+        .get("outbounds")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .context(t("No imported nodes"))?;
+    ensure!(
+        nodes.len() == candidates.tags.len()
+            && nodes.iter().zip(&candidates.tags).all(|(node, tag)| node
+                .get("tag")
+                .and_then(toml_edit::Item::as_str)
+                == Some(tag.as_str())),
+        t("Imported nodes changed; review again")
+    );
+    ensure!(selected.len() <= nodes.len(), t("Invalid node selection"));
+    let mut indices = std::collections::BTreeSet::new();
+    for &index in selected {
+        ensure!(
+            index < nodes.len() && indices.insert(index),
+            t("Invalid node selection")
+        );
+    }
+    let mut incoming = toml_edit::DocumentMut::new();
+    incoming["outbounds"] = toml_edit::Item::ArrayOfTables(
+        indices
+            .into_iter()
+            .map(|index| nodes.get(index).unwrap().clone())
+            .collect(),
+    );
+    crate::edit::position_tables(incoming.as_table_mut(), &mut 0);
+    let mut imported = merge_document(incoming, current, Kind::Proxy, mode)?;
+    imported.warnings = candidates.warnings.clone();
+    Ok(imported)
+}
+
+fn node_source(source: &str, base: &Path) -> Result<(toml_edit::DocumentMut, Vec<String>)> {
+    let source = source.trim_start_matches('\u{feff}');
+    ensure!(!source.trim().is_empty(), t("No imported nodes"));
+    let converted = if astra_convert::share::is_share(source) {
+        astra_convert::share::convert_links(source, &Default::default())?
+    } else if let Ok(doc) = source.parse() {
+        return Ok((doc, Vec::new()));
+    } else {
+        astra_convert::convert(
+            source,
+            &astra_convert::Options {
+                base_dir: base.to_owned(),
+                strict_rules: true,
+                ..Default::default()
+            },
+        )
+        .context(t("Invalid configuration"))?
+    };
+    ensure!(
+        converted.proxy.len() <= LIMIT,
+        t("Configuration exceeds 480 KiB")
+    );
+    Ok((converted.proxy.parse()?, converted.warnings))
+}
+
+/// Prefer a single existing path so an unquoted filename containing spaces is
+/// never split. Otherwise recognize lists by at least one existing member;
+/// missing or unreadable members then fail the entire import.
+fn node_input_paths(input: &str, directory: &Path) -> Result<Option<Vec<PathBuf>>> {
+    if let Ok(single) = path(input, directory) {
+        if single.is_file() {
+            return Ok(Some(vec![single]));
+        }
+    }
+    let source = input.trim_start_matches('\u{feff}');
+    if astra_convert::share::is_share(source) || source.parse::<toml_edit::DocumentMut>().is_ok() {
+        return Ok(None);
+    }
+    // Quoted YAML keys are not path quotes. If tokenization does not fit a
+    // path list, let the configuration parser report/accept the actual input.
+    let Ok(tokens) = dropped_paths(input) else {
+        return Ok(None);
+    };
+    let paths: Vec<_> = tokens
+        .into_iter()
+        .map(|token| {
+            let path = PathBuf::from(token);
+            if path.is_absolute() {
+                path
+            } else {
+                directory.join(path)
+            }
+        })
+        .collect();
+    Ok(paths.iter().any(|path| path.is_file()).then_some(paths))
+}
+
+/// Tokenize terminal-dropped paths without interpreting escapes, expansion,
+/// command separators, or any other shell syntax. Backslashes remain literal.
+fn dropped_paths(input: &str) -> Result<Vec<String>> {
+    let input = input.trim().strip_prefix("& ").unwrap_or(input.trim());
+    let mut chars = input.chars().peekable();
+    let mut paths = Vec::new();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        let mut path = String::new();
+        if c == '\'' || c == '"' {
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == c {
+                    // PowerShell escapes a quote inside a single-quoted path
+                    // by doubling it; this still never evaluates shell code.
+                    if c == '\'' && chars.peek() == Some(&c) {
+                        chars.next();
+                        path.push(c);
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    path.push(next);
+                }
+            }
+            ensure!(
+                closed && chars.peek().is_none_or(|c| c.is_whitespace()),
+                t("Invalid dropped file paths")
+            );
+        } else {
+            path.push(c);
+            while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+                path.push(chars.next().unwrap());
+            }
+        }
+        ensure!(!path.is_empty(), t("Invalid dropped file paths"));
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 /// An input accepted by [`load_node`] and [`load_rules`].
 ///
 /// Strings are treated as pasted native TOML (or a share link), unless they
@@ -305,6 +533,20 @@ pub fn merge_at(
             }
         }
     }
+    merge_document(incoming, current, kind, mode)
+}
+
+fn merge_document(
+    incoming: toml_edit::DocumentMut,
+    current: &str,
+    kind: Kind,
+    mode: MergeMode,
+) -> Result<Imported> {
+    let key = if kind == Kind::Proxy {
+        "outbounds"
+    } else {
+        "rules"
+    };
     let mut doc: toml_edit::DocumentMut = current.parse()?;
     normalize_collection(&mut doc, key)?;
     let mut position = None;
@@ -614,6 +856,175 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn selected_nodes_keep_source_order_nested_tables_and_only_selected_conflicts() {
+        let current = "# keep draft\nstandalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\ntag='old'\nkind='direct'\n";
+        let source = "standalone=false\nsocks5_listen='0.0.0.0:9999'\n[[outbounds]]\ntag='old'\nkind='direct'\n[[outbounds]]\ntag='first'\nkind='native'\n[outbounds.config]\nprotocol='vless'\nserver='first.example'\n[outbounds.config.tls]\nserver_name='first.example'\n[[outbounds]]\ntag='second'\nkind='native'\n[outbounds.config]\nprotocol='trojan'\nserver='second.example'\n[outbounds.config.transport]\nkind='ws'\npath='/second'\n[subscriptions.remote]\nurl='https://example.test/sub'\n";
+        let candidates = node_candidates_at(source, Path::new(".")).unwrap();
+        assert_eq!(candidates.tags, ["old", "first", "second"]);
+        let preview: toml::Table = toml::from_str(&candidates.text).unwrap();
+        assert_eq!(preview.len(), 1);
+        let merged =
+            merge_selected_nodes(current, &candidates, &[2, 1], MergeMode::Append).unwrap();
+        assert!(merged.text.contains("# keep draft"));
+        let value: toml::Value = toml::from_str(&merged.text).unwrap();
+        assert_eq!(value["standalone"].as_bool(), Some(true));
+        assert_eq!(value["socks5_listen"].as_str(), Some("127.0.0.1:1080"));
+        assert!(value.get("subscriptions").is_none());
+        let nodes = value["outbounds"].as_array().unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|n| n["tag"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["old", "first", "second"]
+        );
+        assert_eq!(
+            nodes[1]["config"]["tls"]["server_name"].as_str(),
+            Some("first.example")
+        );
+        assert_eq!(
+            nodes[2]["config"]["transport"]["path"].as_str(),
+            Some("/second")
+        );
+        assert!(nodes[2]["config"].get("tls").is_none());
+        assert!(merge_selected_nodes(current, &candidates, &[0, 1], MergeMode::Append).is_err());
+    }
+
+    #[test]
+    fn selected_nodes_validate_indices_duplicate_tags_and_merge_modes() {
+        let source =
+            "outbounds=[{tag='edge',kind='socks5',server='new:1080'}, {tag='other',kind='direct'}]";
+        let mut candidates = node_candidates_at(source, Path::new(".")).unwrap();
+        let current = "standalone=true\noutbounds=[{tag='edge',kind='socks5',server='old:1080'}]";
+        for selected in [&[][..], &[0, 0][..], &[2][..]] {
+            assert!(
+                merge_selected_nodes(current, &candidates, selected, MergeMode::Append).is_err()
+            );
+        }
+        for selected in [&[1][..], &[0, 1][..]] {
+            assert!(
+                merge_selected_nodes(current, &candidates, selected, MergeMode::Overwrite(0))
+                    .is_err()
+            );
+        }
+        let replaced =
+            merge_selected_nodes(current, &candidates, &[0], MergeMode::Overwrite(0)).unwrap();
+        let value: toml::Value = toml::from_str(&replaced.text).unwrap();
+        assert_eq!(value["outbounds"][0]["server"].as_str(), Some("new:1080"));
+        assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
+        let replaced =
+            merge_selected_nodes(current, &candidates, &[1], MergeMode::Replace).unwrap();
+        let value: toml::Value = toml::from_str(&replaced.text).unwrap();
+        assert_eq!(value["outbounds"][0]["tag"].as_str(), Some("other"));
+        assert_eq!(value["standalone"].as_bool(), Some(true));
+        candidates.tags[0] = "changed".into();
+        assert!(merge_selected_nodes(current, &candidates, &[0], MergeMode::Overwrite(0)).is_err());
+
+        let duplicate = node_candidates_at(
+            "outbounds=[{tag='same',kind='direct'}, {tag='same',kind='direct'}]",
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(merge_selected_nodes("", &duplicate, &[1], MergeMode::Append).is_ok());
+        assert!(merge_selected_nodes("", &duplicate, &[0, 1], MergeMode::Append).is_err());
+    }
+
+    #[test]
+    fn node_candidates_accept_multiple_dropped_paths_and_snapshot_files() {
+        let fixture = Fixture::new();
+        let first = fixture.write("节点 one.toml", "outbounds=[{tag='one',kind='direct'}]");
+        fixture.write(
+            "two.yaml",
+            "proxies:\n  - {name: two, type: socks5, server: 127.0.0.1, port: 1080}\n",
+        );
+        for input in [
+            "\"节点 one.toml\" 'two.yaml'",
+            "& '节点 one.toml'\n\"two.yaml\"",
+        ] {
+            let candidates = node_candidates_at(input, &fixture.0).unwrap();
+            assert_eq!(candidates.tags, ["one", "two"]);
+        }
+        for input in ["节点 one.toml", "\"节点 one.toml\"", "& '节点 one.toml'"] {
+            assert_eq!(node_candidates_at(input, &fixture.0).unwrap().tags, ["one"]);
+        }
+        fixture.write(
+            "two.yaml three.toml",
+            "outbounds=[{tag='single path',kind='direct'}]",
+        );
+        assert_eq!(
+            node_candidates_at("two.yaml three.toml", &fixture.0)
+                .unwrap()
+                .tags,
+            ["single path"]
+        );
+        let candidates = node_candidates_at("\"节点 one.toml\" two.yaml", &fixture.0).unwrap();
+        std::fs::write(first, "broken after preview").unwrap();
+        let imported =
+            merge_selected_nodes("standalone=true", &candidates, &[0], MergeMode::Append).unwrap();
+        assert_eq!(
+            toml::from_str::<toml::Value>(&imported.text).unwrap()["outbounds"][0]["tag"].as_str(),
+            Some("one")
+        );
+        for input in ["two.yaml missing.toml", "two.yaml '节点 one.toml'"] {
+            assert!(node_candidates_at(input, &fixture.0).is_err());
+        }
+    }
+
+    #[test]
+    fn node_candidates_keep_conversion_warnings_and_support_share_links() {
+        let yaml = "\"proxies\":\n  - {name: good, type: socks5, server: 127.0.0.1, port: 1080}\n  - {name: unsupported, type: unknown, server: 127.0.0.1, port: 1080}\n";
+        let candidates = node_candidates_at(yaml, Path::new(".")).unwrap();
+        assert_eq!(candidates.tags, ["good"]);
+        assert!(candidates
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unsupported")));
+        let merged =
+            merge_selected_nodes("standalone=true", &candidates, &[0], MergeMode::Append).unwrap();
+        assert_eq!(merged.warnings, candidates.warnings);
+        let link = "vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&sni=example.com&type=ws&path=%2Fhello#first";
+        let links = format!("{link}\n{}", link.replace("#first", "#second"));
+        let candidates = node_candidates_at(&links, Path::new(".")).unwrap();
+        assert_eq!(candidates.tags, ["first", "second"]);
+        let merged =
+            merge_selected_nodes("standalone=true", &candidates, &[1], MergeMode::Append).unwrap();
+        let node = &toml::from_str::<toml::Value>(&merged.text).unwrap()["outbounds"][0];
+        assert_eq!(node["tag"].as_str(), Some("second"));
+        assert_eq!(node["config"]["transport"]["path"].as_str(), Some("/hello"));
+    }
+
+    #[test]
+    fn node_candidates_reject_bad_sources_and_bound_cumulative_file_sizes() {
+        let fixture = Fixture::new();
+        let padding = format!(
+            "# {}\noutbounds=[{{tag='edge',kind='direct'}}]",
+            "x".repeat(LIMIT / 2)
+        );
+        fixture.write("first.toml", &padding);
+        fixture.write("second.toml", &padding);
+        assert!(node_candidates_at("first.toml", &fixture.0).is_ok());
+        assert!(node_candidates_at("first.toml second.toml", &fixture.0).is_err());
+        fixture.write("bad.toml", "outbounds=[");
+        fixture.write("binary.toml", [0xff, 0xfe]);
+        for input in [
+            "first.toml bad.toml",
+            "first.toml binary.toml",
+            "",
+            "outbounds=[]",
+            "outbounds=[{kind='direct'}]",
+        ] {
+            assert!(node_candidates_at(input, &fixture.0).is_err(), "{input}");
+        }
+        assert!(node_candidates_at(&"x".repeat(LIMIT + 1), &fixture.0).is_err());
+        let candidates =
+            node_candidates_at("outbounds=[{tag='edge',kind='direct'}]", &fixture.0).unwrap();
+        assert!(
+            merge_selected_nodes(&"x".repeat(LIMIT + 1), &candidates, &[0], MergeMode::Append)
+                .is_err()
+        );
+    }
+
     #[test]
     fn share_links_append_without_replacing_draft_or_local_settings() {
         let link = "vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&sni=example.com&type=xhttp&mode=auto&path=%2Fhello#new-node";

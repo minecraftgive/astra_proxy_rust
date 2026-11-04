@@ -14,6 +14,22 @@ use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 #[cfg(test)]
 mod tests;
 
+fn program_info() -> ProgramInfo {
+    use astra_platform::program_info::FeatureSupport as Feature;
+    ProgramInfo::collect(
+        astra_platform::build_info!(),
+        vec![
+            Feature::new("instances", "Instance management", true, "Manage proxy, rule and server instances; core binaries are installed separately."),
+            Feature::new("documents", "Configuration editor", true, "Typed configuration schemas, drafts and validation."),
+            Feature::new("monitor", "Monitoring", true, "Process metrics, connections and logs; live data requires a running core."),
+            Feature::new("diagnostics", "Network diagnostics", true, "Core-provided diagnostics and routing explanations."),
+            Feature::new("subscriptions", "Subscriptions", true, "Subscription and rule data management."),
+            Feature::new("updates", "Update management", true, "Update planning and status; execution depends on update policy and installation."),
+            Feature::new("remote_management", "Remote management", true, "Controller/agent transport; requires configured credentials and connectivity."),
+        ],
+    )
+}
+
 pub struct AgentService {
     pub config: ManagerConfig,
     pub identity: Agent,
@@ -291,8 +307,10 @@ impl AgentService {
                     "artifacts".into(),
                     "tasks".into(),
                     "monitor".into(),
+                    "program_info".into(),
                 ],
             }),
+            Query::ProgramInfo => ResponseBody::ProgramInfo(program_info()),
             Query::Agents => ResponseBody::Agents(vec![Agent {
                 last_seen_ms: store::now(),
                 ..self.identity.clone()
@@ -723,6 +741,7 @@ impl AgentService {
         match &mut command {
             Command::Remove { instance }
             | Command::Start { instance }
+            | Command::ForceStart { instance }
             | Command::Stop { instance }
             | Command::Restart { instance }
             | Command::Reload { instance }
@@ -744,6 +763,7 @@ impl AgentService {
         let target = match &command {
             Command::Remove { instance }
             | Command::Start { instance }
+            | Command::ForceStart { instance }
             | Command::Stop { instance }
             | Command::Restart { instance }
             | Command::Reload { instance }
@@ -825,6 +845,7 @@ impl AgentService {
             }
             Command::Remove { instance } => old::Action::Remove(instance),
             Command::Start { instance } => old::Action::Start(instance),
+            Command::ForceStart { instance } => old::Action::ForceStart(instance),
             Command::Stop { instance } => old::Action::Stop(instance),
             Command::Restart { instance } => old::Action::Restart(instance),
             Command::Reload { instance } => old::Action::Reload(instance),

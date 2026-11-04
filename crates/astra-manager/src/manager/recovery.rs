@@ -113,6 +113,26 @@ impl Manager {
             Err(e) => Err(e.into()),
         }
     }
+    /// Explicitly abandon an unverified session, never a process owned by this
+    /// manager. The OS endpoint must be vacant before its identity is forgotten.
+    pub(super) fn replace_session(&mut self, name: &str) -> Result<()> {
+        self.registered_instance(name)?;
+        anyhow::ensure!(
+            !self.running.contains_key(name),
+            "Stop the managed instance before replacing its session"
+        );
+        let socket = self.socket(name);
+        astra_platform::platform::force_recover_control_endpoint(&socket).with_context(|| {
+            format!(
+                "Cannot replace session {name}: its control endpoint is active, inaccessible or not a replaceable marker; stop the previous core and retry. Its identity record was retained"
+            )
+        })?;
+        self.forget_process(name)?;
+        self.blocked.remove(name);
+        self.exits.remove(name);
+        astra_ipc::progress::report("Replace previous session", name.to_owned());
+        Ok(())
+    }
     pub(super) async fn recover_processes(&mut self) -> Result<()> {
         for instance in self.registry.instances.clone() {
             let name = instance.name.clone();
@@ -201,6 +221,113 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replacement_manager(root: &Path) -> Manager {
+        let home = root.join("state");
+        private_dir(&home).unwrap();
+        private_dir(&home.join("processes")).unwrap();
+        Manager::load_with_runtime(
+            home,
+            root.join("config"),
+            root.into(),
+            Some(root.join("runtime")),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn force_session_replacement_retains_records_until_endpoint_is_available() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = replacement_manager(root.path());
+        manager.registry.instances.push(Instance {
+            name: "proxy".into(),
+            kind: Kind::Proxy,
+            config: root.path().join("proxy.toml"),
+        });
+        let record = manager.process_record("proxy");
+        fs::write(&record, b"invalid previous session").unwrap();
+        manager.recover_processes().await.unwrap();
+        assert!(manager.instance("proxy").is_err());
+
+        let socket = manager.socket("proxy");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let error = manager.replace_session("proxy").unwrap_err();
+        assert!(format!("{error:#}").contains("identity record was retained"));
+        assert!(manager.blocked.contains_key("proxy"));
+        assert_eq!(fs::read(&record).unwrap(), b"invalid previous session");
+        assert!(socket.exists());
+        #[cfg(unix)]
+        {
+            fs::remove_file(&socket).unwrap();
+            assert!(manager.replace_session("proxy").is_err());
+            assert!(manager.blocked.contains_key("proxy"));
+            assert_eq!(fs::read(&record).unwrap(), b"invalid previous session");
+        }
+        drop(listener);
+
+        fs::write(&socket, b"unrelated data").unwrap();
+        assert!(manager.replace_session("proxy").is_err());
+        assert_eq!(fs::read(&socket).unwrap(), b"unrelated data");
+        assert!(record.exists());
+        fs::remove_file(&socket).unwrap();
+
+        manager.replace_session("proxy").unwrap();
+        assert!(!record.exists());
+        assert!(!manager.blocked.contains_key("proxy"));
+        assert!(!manager.exits.contains_key("proxy"));
+        assert!(manager.instance("proxy").is_ok());
+    }
+
+    #[tokio::test]
+    async fn force_start_keeps_blocked_session_when_configuration_cannot_be_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = replacement_manager(root.path());
+        manager.registry.instances.push(Instance {
+            name: "rules".into(),
+            kind: Kind::Rule,
+            config: root.path().join("missing.toml"),
+        });
+        let record = manager.process_record("rules");
+        fs::write(&record, b"invalid previous session").unwrap();
+        manager.recover_processes().await.unwrap();
+        assert!(manager
+            .action(Action::ForceStart("rules".into()))
+            .await
+            .is_err());
+        assert!(manager.blocked.contains_key("rules"));
+        assert_eq!(fs::read(record).unwrap(), b"invalid previous session");
+    }
+
+    #[test]
+    fn force_start_plan_includes_blocked_dependencies_without_forgetting_them() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = replacement_manager(root.path());
+        for (name, kind) in [("proxy", Kind::Proxy), ("rules", Kind::Rule)] {
+            manager.registry.instances.push(Instance {
+                name: name.into(),
+                kind,
+                config: root.path().join(format!("{name}.toml")),
+            });
+            manager.blocked.insert(name.into(), "unverified".into());
+        }
+        manager
+            .registry
+            .start_bindings
+            .insert("proxy".into(), vec!["rules".into()]);
+        assert!(manager.start_plan("proxy").is_err());
+        assert_eq!(
+            manager.start_plan_with("proxy", true).unwrap(),
+            ["rules", "proxy"]
+        );
+        assert_eq!(manager.blocked.len(), 2);
+        manager
+            .registry
+            .start_bindings
+            .insert("rules".into(), vec!["proxy".into()]);
+        assert!(manager.start_plan_with("proxy", true).is_err());
+        assert!(manager.start_plan_with("missing", true).is_err());
+    }
+
     #[tokio::test]
     async fn restart_adopts_verified_boot_and_rejects_changed_boot_without_killing_it() {
         // Control's applied snapshot is process-global. Isolate this fixture

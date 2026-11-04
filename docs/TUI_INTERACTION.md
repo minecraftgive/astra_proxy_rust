@@ -29,6 +29,29 @@ named commands. Destructive confirmations start on Cancel. Legacy `Q`, `R` and
 and shows a dismissible keyboard notice. Source files still use optimistic
 concurrency checks: an external edit is never silently overwritten.
 
+In the node editor, `v` selects the current node and `V` selects all or clears
+the selection. `Ctrl-E` exports selected nodes as TOML; `Ctrl-Shift-E` exports
+share links. Both offer **File or folder** and **Clipboard**, also available in
+the F2 command palette. Node file exports default to the current user's Documents
+folder (including redirected Windows Documents folders); the path can be edited.
+Relative export paths are resolved from that folder. File exports create missing parent directories and keep
+existing files intact. A directory (or a path without a filename extension) uses
+`nodes.toml` or `nodes.txt`; supply a full filename to choose another name.
+
+`Ctrl-I` accepts node files, pasted TOML/YAML, or multiple share links. Multiple
+file paths can be pasted together, quoting paths that contain spaces. Review the
+node list before importing: Space selects a row, `a` selects all or clears, Enter
+imports, and Esc cancels. Only selected nodes are appended to the draft; save
+with `Ctrl-S`. Imports remain undoable, and export selection clears after edits
+so it cannot silently point at changed nodes.
+
+For a stopped Proxy or Rules profile whose previous session cannot be recovered,
+choose **Force start** from its operations and confirm the replacement. This
+discards old session markers and identity records for the profile and stopped
+startup dependencies; managed running dependencies remain running. Normal Start
+retains its safety checks. Force start never kills a PID from an unverified
+record, and an active or inaccessible OS endpoint may still prevent replacement.
+
 Pause freezes a view, not the collectors. Logs continue to receive and apply
 rotation; runtime health and update outcomes continue to arrive. Resume shows the
 latest state without replaying intermediate frames. A missing connection remains
@@ -57,6 +80,19 @@ sample sequence and source time. Repeated cached samples do not add zero-speed
 points. Partial or old data is explicitly marked; a worker generation switch
 does not reset totals. Older hosts remain usable with source freshness marked as
 unverified.
+
+## Settings information
+
+Settings opens with read-only program information above the preferences. The
+local TUI build and system are labeled separately from the selected management
+node. Build timestamps are UTC; platform support describes implementation support,
+while TUN, system proxy and LAN indicators reflect fresh runtime samples. Missing
+or stale runtime data is shown as unknown. A failed metadata refresh retains the
+previous information with a cache warning.
+
+Use `Page Up` / `Page Down` or the mouse wheel to scroll the information and
+preferences, `Home` to return to the top, and `r` to refresh node information.
+Arrow keys still select and change preferences, keeping the selected row visible.
 
 ## Motion
 

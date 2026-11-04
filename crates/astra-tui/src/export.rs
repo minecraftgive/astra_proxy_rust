@@ -54,21 +54,65 @@ pub fn export_config(text: &str) -> Result<String> {
 /// The result is a valid TOML fragment containing exactly one `[[outbounds]]`
 /// entry. Credentials are retained because this is a configuration export;
 /// shell exports below intentionally do not use outbound fields.
+#[cfg(test)]
 pub fn selected_node(text: &str, tag: &str) -> Result<String> {
-    ensure_name(tag, "node tag")?;
+    selected_nodes(text, &[tag.to_owned()])
+}
+
+/// Extract selected outbounds in source order, preserving all native fields.
+/// Repeated selections are deduplicated; missing or ambiguous tags fail the
+/// entire export rather than silently omitting or choosing a node.
+pub fn selected_nodes(text: &str, tags: &[String]) -> Result<String> {
+    let nodes = matching_nodes(text, tags)?;
+    let mut table = toml::Table::new();
+    table.insert("outbounds".into(), toml::Value::Array(nodes));
+    serialize_fragment(table)
+}
+
+/// Export each selected node as one share URI, in source order. No output is
+/// returned unless every selected node is representable and fits the limit.
+pub fn selected_nodes_share(text: &str, tags: &[String]) -> Result<String> {
+    let nodes = matching_nodes(text, tags)?;
+    let mut output = String::new();
+    for node in nodes {
+        let tag = node["tag"].as_str().unwrap();
+        let link = astra_convert::share::export_node(&node)
+            .with_context(|| format!("Export share link for outbound {tag:?}"))?;
+        ensure!(
+            output.len() + link.len() + 1 <= MAX_EXPORT_BYTES,
+            "Share link export exceeds 480 KiB"
+        );
+        output.push_str(&link);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn matching_nodes(text: &str, tags: &[String]) -> Result<Vec<toml::Value>> {
+    ensure!(!tags.is_empty(), "Select at least one outbound node");
+    for tag in tags {
+        ensure_name(tag, "node tag")?;
+    }
+    let requested: BTreeSet<_> = tags.iter().map(String::as_str).collect();
     let value = parse(text)?;
     let nodes = value
         .get("outbounds")
         .and_then(toml::Value::as_array)
         .context("Configuration has no outbounds")?;
-    let node = nodes
-        .iter()
-        .find(|node| node.get("tag").and_then(toml::Value::as_str) == Some(tag))
-        .with_context(|| format!("Outbound node {tag:?} was not found"))?;
-
-    let mut table = toml::Table::new();
-    table.insert("outbounds".into(), toml::Value::Array(vec![node.clone()]));
-    serialize_fragment(table)
+    let mut matched = BTreeSet::new();
+    let mut selected = Vec::new();
+    for node in nodes {
+        if let Some(tag) = node.get("tag").and_then(toml::Value::as_str) {
+            if requested.contains(tag) {
+                ensure!(matched.insert(tag), "Outbound node {tag:?} is ambiguous");
+                selected.push(node.clone());
+            }
+        }
+    }
+    if let Some(tag) = requested.difference(&matched).next() {
+        bail!("Outbound node {tag:?} was not found");
+    }
+    Ok(selected)
 }
 
 /// Extract one rule by its zero-based position in `[[rules]]`.
@@ -349,16 +393,22 @@ fn windows_processes() -> Vec<(u32, u32, String)> {
 
 /// Write export data without overwriting an existing destination.
 ///
+/// Missing parent directories are created after validating the output size.
 /// The complete export is first written and synced to a private, same-directory
 /// temporary file. A hard link then commits it without replacing a destination
 /// created by another writer, so partial output is never exposed.
 pub fn write_new(path: &Path, text: &str) -> Result<()> {
     ensure_size(text)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .context("Export path has no file name")?
         .to_string_lossy();
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Create export directory {}", parent.display()))?;
 
     let (temporary, mut file) = loop {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -383,11 +433,14 @@ pub fn write_new(path: &Path, text: &str) -> Result<()> {
     };
 
     let result = (|| {
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("Write export {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Sync export {}", path.display()))?;
         drop(file);
-        std::fs::hard_link(&temporary, path)
-            .with_context(|| format!("Commit export {}", path.display()))?;
+        std::fs::hard_link(&temporary, path).with_context(|| {
+            format!("Commit export {} without overwriting an existing file", path.display())
+        })?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&temporary);
@@ -527,6 +580,25 @@ format = "yaml"
 payload = ["+.ads.example"]
 "#;
 
+    const NODES: &str = r#"mixed_listen = "127.0.0.1:7890"
+[[outbounds]]
+kind = "socks5"
+tag = "香港 first"
+server = "proxy.example:1080"
+username = "user"
+password = "pass word"
+
+[[outbounds]]
+kind = "http"
+tag = "unselected"
+server = "unrelated.example:8080"
+
+[[outbounds]]
+kind = "socks5"
+tag = "second"
+server = "[::1]:1081"
+"#;
+
     #[test]
     fn full_export_preserves_native_text() {
         let source = "# comment\nstandalone = true\n";
@@ -541,6 +613,67 @@ payload = ["+.ads.example"]
         assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
         assert_eq!(value["outbounds"][0]["tag"].as_str(), Some("secret-node"));
         assert!(!output.contains("other"));
+    }
+
+    #[test]
+    fn multiple_nodes_keep_source_order_and_share_links_roundtrip() {
+        let tags = vec!["second".into(), "香港 first".into(), "second".into()];
+        let output = selected_nodes(NODES, &tags).unwrap();
+        let value: toml::Value = toml::from_str(&output).unwrap();
+        let nodes = value["outbounds"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["tag"].as_str(), Some("香港 first"));
+        assert_eq!(nodes[1]["tag"].as_str(), Some("second"));
+        assert_eq!(value.as_table().unwrap().len(), 1);
+        assert!(!output.contains("unrelated"));
+
+        let links = selected_nodes_share(NODES, &tags).unwrap();
+        assert_eq!(links.lines().count(), 2);
+        let converted = astra_convert::share::convert_links(
+            &links,
+            &astra_convert::Options::default(),
+        )
+        .unwrap();
+        assert_eq!(converted.nodes, 2);
+        let restored: toml::Value = toml::from_str(&converted.proxy).unwrap();
+        assert_eq!(restored["outbounds"], value["outbounds"]);
+    }
+
+    #[test]
+    fn node_selection_rejects_missing_ambiguous_and_unsupported_items_as_a_whole() {
+        let ambiguous = format!("{NODES}\n[[outbounds]]\nkind='socks5'\ntag='second'\nserver='other:1080'\n");
+        for export in [
+            selected_nodes as fn(&str, &[String]) -> Result<String>,
+            selected_nodes_share,
+        ] {
+            assert!(export(NODES, &[]).is_err());
+            assert!(export(NODES, &["second".into(), "missing".into()]).is_err());
+            assert!(export(&ambiguous, &["second".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous"));
+        }
+        assert!(selected_node(&ambiguous, "second").is_err());
+        let error = selected_nodes_share(NODES, &["香港 first".into(), "unselected".into()])
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("unselected"));
+        assert!(message.contains("cannot be exported"));
+        assert!(!message.contains("socks5://"));
+        assert!(!message.contains("pass word"));
+    }
+
+    #[test]
+    fn share_export_bounds_expanded_output() {
+        let input = format!(
+            "[[outbounds]]\nkind='socks5'\ntag='large'\nserver='proxy.example:1080'\nusername='user'\npassword='{}'\n",
+            "中".repeat(MAX_EXPORT_BYTES / 5)
+        );
+        assert!(input.len() < MAX_EXPORT_BYTES);
+        assert!(selected_nodes_share(&input, &["large".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("480 KiB"));
     }
 
     #[test]
@@ -672,6 +805,45 @@ payload = ["+.ads.example"]
                 .file_name()
                 .to_string_lossy()
                 .starts_with(&temporary_prefix)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn write_new_creates_unicode_parents_and_validates_before_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "astra-tui-export-folders-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("导出 文件").join("节点 links.toml");
+        write_new(&path, "standalone=true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone=true\n");
+        assert!(write_new(&path, "replacement").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone=true\n");
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
+        let too_large = root.join("not created").join("deep").join("export.toml");
+        assert!(write_new(&too_large, &"x".repeat(MAX_EXPORT_BYTES + 1)).is_err());
+        assert!(!root.join("not created").exists());
+        let error = write_new(&path.join("child.toml"), "data").unwrap_err();
+        assert!(error.to_string().contains("Create export directory"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "standalone=true\n");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn write_new_accepts_a_bare_relative_filename() {
+        let filename = format!(
+            "astra-export-relative-{}-{}.toml",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = Path::new(&filename);
+        assert_eq!(path.parent(), Some(Path::new("")));
+        write_new(path, "standalone=true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "standalone=true\n");
         std::fs::remove_file(path).unwrap();
     }
 }

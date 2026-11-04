@@ -271,7 +271,7 @@ async fn prepare_control_endpoint(socket: &Path) -> Result<()> {
                     bail!("Control endpoint {} belongs to running core PID {}; it is not owned by this manager", socket.display(), status.pid);
                 }
                 return Err(error).with_context(|| format!(
-                    "Control endpoint could not be safely recovered: {}; it may be active or inaccessible; the marker was retained", socket.display()));
+                    "Control endpoint could not be safely recovered: {}; it may be active or inaccessible; the marker was retained. Use Force start to replace the previous session", socket.display()));
             }
         }
     }
@@ -709,8 +709,11 @@ impl Manager {
     }
     fn instance(&self, name: &str) -> Result<Instance> {
         if let Some(reason) = self.blocked.get(name) {
-            bail!("Instance {name} awaits identity verification: {reason}; its process and record were retained");
+            bail!("Instance {name} awaits identity verification: {reason}; its process and record were retained. Use Force start to replace the previous session");
         }
+        self.registered_instance(name)
+    }
+    fn registered_instance(&self, name: &str) -> Result<Instance> {
         self.registry
             .instances
             .iter()
@@ -778,14 +781,22 @@ impl Manager {
         Ok(())
     }
     fn start_plan(&self, name: &str) -> Result<Vec<String>> {
+        self.start_plan_with(name, false)
+    }
+    fn start_plan_with(&self, name: &str, force: bool) -> Result<Vec<String>> {
         fn visit(
             manager: &Manager,
             name: &str,
+            force: bool,
             active: &mut HashSet<String>,
             done: &mut HashSet<String>,
             plan: &mut Vec<String>,
         ) -> Result<()> {
-            let instance = manager.instance(name)?;
+            let instance = if force {
+                manager.registered_instance(name)?
+            } else {
+                manager.instance(name)?
+            };
             if done.contains(name) {
                 return Ok(());
             }
@@ -795,11 +806,11 @@ impl Manager {
             );
             if let Some(targets) = manager.registry.start_bindings.get(name) {
                 for target in targets {
-                    visit(manager, target, active, done, plan)?;
+                    visit(manager, target, force, active, done, plan)?;
                 }
             } else if let Some(rule) = manager.inferred_rule(&instance) {
                 // No explicit binding: start the Rule Core this proxy uses.
-                visit(manager, &rule, active, done, plan)?;
+                visit(manager, &rule, force, active, done, plan)?;
             }
             active.remove(name);
             done.insert(name.to_owned());
@@ -809,12 +820,12 @@ impl Manager {
         let mut plan = Vec::new();
         let mut active = HashSet::new();
         let mut done = HashSet::new();
-        visit(self, name, &mut active, &mut done, &mut plan)?;
+        visit(self, name, force, &mut active, &mut done, &mut plan)?;
         // Reverse links are expanded only for an explicitly started rule.
         // Starting one proxy never starts its sibling proxies.
-        if self.instance(name)?.kind == Kind::Rule {
+        if self.registered_instance(name)?.kind == Kind::Rule {
             for proxy in self.bound_proxies(name) {
-                visit(self, &proxy, &mut active, &mut done, &mut plan)?;
+                visit(self, &proxy, force, &mut active, &mut done, &mut plan)?;
             }
         }
         Ok(plan)
@@ -909,8 +920,11 @@ impl Manager {
         Ok(())
     }
     async fn start(&mut self, name: &str) -> Result<()> {
+        self.start_with_recovery(name, false).await
+    }
+    async fn start_with_recovery(&mut self, name: &str, force: bool) -> Result<()> {
         self.reap()?;
-        let plan = self.start_plan(name)?;
+        let plan = self.start_plan_with(name, force)?;
         // Validate the group before starting its first new process. Checks run
         // concurrently; a Rule Core is not pre-checked because its own start
         // compiles the same index (a failed start reports its log and rolls back).
@@ -925,7 +939,11 @@ impl Manager {
                     "Core PID mismatch: {item}"
                 );
             } else {
-                let instance = self.instance(item)?;
+                let instance = if force {
+                    self.registered_instance(item)?
+                } else {
+                    self.instance(item)?
+                };
                 if instance.kind != Kind::Rule {
                     checks.push((instance.kind, instance.config));
                 }
@@ -947,7 +965,12 @@ impl Manager {
             if self.running.contains_key(&item) {
                 continue;
             }
-            if let Err(error) = self.start_one(&item).await {
+            let result = if force {
+                self.start_with_options(&item, None, true).await
+            } else {
+                self.start_one(&item).await
+            };
+            if let Err(error) = result {
                 // Only processes created by this attempt are rolled back.
                 let mut rollback_errors = Vec::new();
                 if self.running.contains_key(&item) {
@@ -1007,17 +1030,34 @@ impl Manager {
     /// Start a core, or adopt `prepared`: an elevated replacement already
     /// approved through UAC that binds the endpoint once its predecessor exits.
     async fn start_with(&mut self, name: &str, prepared: Option<ManagedChild>) -> Result<()> {
+        self.start_with_options(name, prepared, false).await
+    }
+    async fn start_with_options(
+        &mut self,
+        name: &str,
+        prepared: Option<ManagedChild>,
+        force: bool,
+    ) -> Result<()> {
         self.reap()?;
         anyhow::ensure!(
             !self.running.contains_key(name),
             "Instance is already running"
         );
         astra_ipc::progress::report("Start core", name.to_owned());
-        let instance = self.instance(name)?;
+        let instance = if force {
+            self.registered_instance(name)?
+        } else {
+            self.instance(name)?
+        };
         let socket = self.socket(name);
         let adopted = prepared.is_some();
+        let config = read_config(&instance.config)?;
         if !adopted {
-            prepare_control_endpoint(&socket).await?;
+            if force {
+                self.replace_session(name)?;
+            } else {
+                prepare_control_endpoint(&socket).await?;
+            }
             // An adopted replacement already has the log open; never move it.
             rotate_log(&self.log(name));
         }
@@ -1026,7 +1066,6 @@ impl Manager {
             .append(true)
             .mode(0o600)
             .open(self.log(name))?;
-        let config = read_config(&instance.config)?;
         #[cfg(windows)]
         let elevate = adopted
             || instance.kind == Kind::Proxy
@@ -1583,6 +1622,7 @@ impl Manager {
             Action::BindStart { name, targets } => self.action_bind_start(name, targets).await,
             Action::Remove(name) => self.action_remove(name).await,
             Action::Start(name) => self.action_start(name).await,
+            Action::ForceStart(name) => self.action_force_start(name).await,
             Action::Stop(name) => self.action_stop(name).await,
             Action::UpdateSubscriptions(name) => self.action_update_subscriptions(name).await,
             Action::Reload(name) => self.action_reload(name).await,
@@ -1824,6 +1864,11 @@ impl Manager {
     async fn action_start(&mut self, name: String) -> Result<Reply> {
         self.start(&name).await?;
         Ok(Reply::text("Started"))
+    }
+
+    async fn action_force_start(&mut self, name: String) -> Result<Reply> {
+        self.start_with_recovery(&name, true).await?;
+        Ok(Reply::text("Started after replacing previous session"))
     }
 
     async fn action_stop(&mut self, name: String) -> Result<Reply> {
