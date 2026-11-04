@@ -22,6 +22,17 @@ use tokio::{
 };
 
 const MAX_PACKET: usize = 65507;
+
+/// macOS rejects UDP sends larger than the socket send buffer (9216 bytes by
+/// default) with EMSGSIZE. The relay must carry every datagram up to
+/// [`MAX_PACKET`]; larger platform defaults (Linux) are left untouched.
+fn allow_max_datagrams(socket: &UdpSocket) -> std::io::Result<()> {
+    let socket = socket2::SockRef::from(socket);
+    if socket.send_buffer_size()? < MAX_PACKET {
+        socket.set_send_buffer_size(MAX_PACKET)?;
+    }
+    Ok(())
+}
 const QUEUE_PACKETS: usize = 4;
 type Activity = tokio::sync::watch::Sender<Instant>;
 fn touch(activity: &Activity) {
@@ -57,7 +68,9 @@ where
         control.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         bail!("UDP association source must be an IP address");
     }
-    let socket = Arc::new(UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?);
+    let socket = UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
+    allow_max_datagrams(&socket)?;
+    let socket = Arc::new(socket);
     let local = socket.local_addr()?;
     let mut reply = vec![5, 0, 0];
     crate::outbound::append_socks_address(
@@ -264,6 +277,7 @@ pub(crate) async fn open_action(
                         "[::]:0"
                     })
                     .await?;
+                    allow_max_datagrams(&socket)?;
                     crate::egress::bind_interface(
                         &socket,
                         if destination.ip().is_loopback() {
@@ -381,8 +395,10 @@ mod group_policy_tests {
     async fn association_preserves_datagrams_across_receive_buffer_reuse() {
         timeout(Duration::from_secs(5), async {
             let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            allow_max_datagrams(&echo).unwrap();
             let destination = echo.local_addr().unwrap();
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            allow_max_datagrams(&socket).unwrap();
             let source = socket.local_addr().unwrap();
             let app = Arc::new(App::from_text(
                 std::path::Path::new("udp-buffers.toml"),
