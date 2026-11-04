@@ -34,7 +34,15 @@ jobs:
       - name: Allow ICMP echo sockets for the test runner group
         run: sudo sysctl -w net.ipv4.ping_group_range="$(id -g) $(id -g)"
       - run: python scripts/test.py unit --debug
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy
+        # Logs need a GitHub login; lint findings are also published as annotations.
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings 2>&1 | tee clippy.log || {
+            grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.log | sort -u | head -50 |
+              sed -E 's/^([^:]+):([0-9]+):([0-9]+): (error|warning)(\[[^]]*\])?: (.*)$/::error file=\1,line=\2,col=\3::\6/'
+            exit 1
+          }
   rust-platforms:
     strategy:
       fail-fast: false
