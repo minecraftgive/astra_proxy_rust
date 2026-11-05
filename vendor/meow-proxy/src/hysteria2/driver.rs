@@ -758,5 +758,5 @@ fn fail(ready_tx: &mut Option<oneshot::Sender<Result<bool>>>, _st: &mut State, e
 }
 
 #[cfg(test)]
-#[path = "driver_tests.rs"]
+#[path = "../test/hysteria2_driver_test.rs"]
 mod tests;

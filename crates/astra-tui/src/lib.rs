@@ -13,11 +13,14 @@ mod import;
 mod log_stream;
 mod logs;
 #[cfg(test)]
+#[path = "test/lib_manager_test.rs"]
 mod manager;
 mod nettools;
 mod network_interfaces;
 mod protocol;
 mod shell;
+#[cfg(windows)]
+mod startup;
 use astra_management::subscription_view;
 mod theme;
 use astra_platform::tui_log;
@@ -31,4 +34,10 @@ pub async fn run() -> anyhow::Result<()> {
 }
 pub async fn run_server() -> anyhow::Result<()> {
     entry::run(Some(protocol::Kind::Server)).await
+}
+
+/// Windows sign-in helper: leave the manager and requested instances running.
+#[cfg(windows)]
+pub async fn run_silent() -> anyhow::Result<()> {
+    entry::run_silent().await
 }

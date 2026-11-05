@@ -33,3 +33,7 @@ h2 = "0.4"
 subtle = "2"
 shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "security-replay-attack-detect"] }
 quiche = "0.30"
+
+[[test]]
+name = "handshakes"
+path = "src/test/handshakes_test.rs"

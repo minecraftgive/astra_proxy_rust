@@ -28,3 +28,27 @@ percent-encoding = "2"
 
 base64 = "0.22"
 serde_json = "1"
+
+[[test]]
+name = "conversion"
+path = "src/test/conversion_test.rs"
+
+[[test]]
+name = "dns"
+path = "src/test/dns_test.rs"
+
+[[test]]
+name = "download"
+path = "src/test/download_test.rs"
+
+[[test]]
+name = "share"
+path = "src/test/share_test.rs"
+
+[[test]]
+name = "share_export"
+path = "src/test/share_export_test.rs"
+
+[[test]]
+name = "subscription"
+path = "src/test/subscription_test.rs"

@@ -37,7 +37,9 @@ TCP 按连接固定 generation；SOCKS5 UDP 按控制关联固定，关联内后
 
 ## 本地包与命令
 
-客户端打包脚本会包含 `astra-tui`、`astra-manager`、`astra-host`、`astra-proxy`、`astra-rule`、转换工具和 `manifest.json`。导入器要求前述四个核心的可执行文件和版本声明齐全，缺少 `astra-host` 的旧三核心包不能作为更新包导入。清单记录目标平台、组件版本、宿主协议范围、文件大小和 SHA-256；SHA-256 用于检查包内容完整性，不表示发布者签名认证。支持解压后的版本目录、ZIP、`.tar.gz` 和 `.tgz`，不自动从网络下载版本。
+客户端打包脚本会包含 `astra-tui`、`astra-manager`、`astra-host`、`astra-proxy`、`astra-rule`、转换工具和 `manifest.json`；Windows 包还包含静默自启动辅助程序 `astra-tui-startup.exe` 和权限服务 `astra-service.exe`，其版本和文件摘要同样写入清单。导入器要求前述四个核心的可执行文件和版本声明齐全，缺少 `astra-host` 的旧三核心包不能作为更新包导入。清单记录目标平台、组件版本、宿主协议范围、文件大小和 SHA-256；SHA-256 用于检查包内容完整性，不表示发布者签名认证。支持解压后的版本目录、ZIP、`.tar.gz` 和 `.tgz`，不自动从网络下载版本。
+
+Windows 权限服务安装在受保护目录，其核心副本不会随普通版本导入自动替换。维护重启前若当前核心与服务副本版本不同，需先停止 TUN 实例，再在 TUI 设置中关闭、开启权限服务，重新通过 UAC 更新服务副本；服务启动失败不会隐式退回逐次 UAC。
 
 ```powershell
 # 默认行为：校验并暂存，不切换运行实例。

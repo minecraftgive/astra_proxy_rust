@@ -53,7 +53,7 @@ path = "examples/forward-offload-linux.rs"
 
 [[test]]
 name = "regression"
-path = "tests/regression.rs"
+path = "src/test/regression_test.rs"
 
 [dependencies.etherparse]
 version = "0.16"

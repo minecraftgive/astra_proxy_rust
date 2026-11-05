@@ -9,6 +9,9 @@ path = "src/main.rs"
 [[bin]]
 name = "astra-host"
 path = "src/host_main.rs"
+[[bin]]
+name = "astra-service"
+path = "src/service_main.rs"
 [dependencies]
 astra-platform = { path = "../astra-platform" }
 anyhow.workspace = true

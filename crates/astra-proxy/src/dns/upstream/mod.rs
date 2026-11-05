@@ -1,6 +1,7 @@
 mod https;
 mod tcp;
 #[cfg(test)]
+#[path = "../../test/dns_upstream_test.rs"]
 mod tests;
 mod tls;
 mod udp;

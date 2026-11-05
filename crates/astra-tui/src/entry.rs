@@ -85,7 +85,67 @@ fn set_operation(operation: &mut Option<protocol::Action>, next: protocol::Actio
     Ok(())
 }
 
+fn finish_launch(launch: &mut windows::Launch, default_kind: Option<protocol::Kind>) {
+    if let (Some(view), None) = (launch.view, &launch.window_id) {
+        launch.window_id = windows::Launch::detached(view, None, protocol::Kind::Proxy).window_id;
+    }
+    // The server's default page is still a primary launch. Only an explicitly
+    // requested --view creates an independent window session above.
+    if launch.view.is_none() && default_kind == Some(protocol::Kind::Server) {
+        launch.view = Some(windows::View::Profiles);
+    }
+}
+
 pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
+    run_mode(default_kind, false).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn run_silent() -> Result<()> {
+    run_mode(None, true).await
+}
+
+async fn run_mode(default_kind: Option<protocol::Kind>, silent_default: bool) -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut silent = silent_default;
+    let result = run_inner(default_kind, &mut silent).await;
+    if silent {
+        if let Err(error) = &result {
+            let home = args
+                .windows(2)
+                .rev()
+                .find(|pair| pair[0] == "--state-dir")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .or_else(|| {
+                    astra_platform::platform::home_dir()
+                        .ok()
+                        .map(|p| p.join(".astra/tui"))
+                });
+            if let Some(home) = home {
+                let _ = ui::log_startup(&home, &format!("Startup failed: {error:#}"));
+            }
+        }
+    }
+    result
+}
+
+fn validate_silent_launch(
+    silent: bool,
+    daemon: bool,
+    shutdown: bool,
+    operation: bool,
+    native_console: bool,
+    launch: &windows::Launch,
+) -> Result<()> {
+    if silent {
+        anyhow::ensure!(cfg!(windows), "Silent startup is supported only on Windows");
+        anyhow::ensure!(!daemon && !shutdown && !operation && !native_console && launch.view.is_none() && launch.window_id.is_none() && launch.instance.is_none(),
+            "--silent cannot be combined with manager, shutdown, update, native-console or window selection options");
+    }
+    Ok(())
+}
+
+async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> Result<()> {
     i18n::init()?;
     let executable = std::env::current_exe()?;
     let mut home = astra_platform::platform::home_dir()?.join(".astra/tui");
@@ -104,9 +164,6 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
         kind: default_kind,
         ..Default::default()
     };
-    if default_kind == Some(protocol::Kind::Server) {
-        launch.view = Some(windows::View::Profiles);
-    }
     let mut native_console = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -162,6 +219,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
                 launch.window_id = Some(args.next().context("--window-id requires an ID")?)
             }
             "--native-console" => native_console = true,
+            "--silent" => *silent = true,
             "--manager" => daemon = true,
             "--shutdown" => shutdown = true,
             "update" => {
@@ -184,12 +242,23 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
                 println!("{program} [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
                 println!("update PATH: apply a local update package\nupdate-status: show release and drain status\nrollback: return new sessions to the previous release\nastra-host runs the background manager by default; host updates take effect after an intentional restart");
                 println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
+                #[cfg(windows)]
+                println!("--silent: start the manager and configured auto-start instances without opening the TUI; errors are saved to STATE_DIR/startup.log");
                 println!("--view overview|proxies|connections|rules|logs|profiles|settings|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–7: page in a new window");
                 return Ok(());
             }
             _ => anyhow::bail!("Unknown argument: {arg}"),
         }
     }
+    let silent = *silent;
+    validate_silent_launch(
+        silent,
+        daemon,
+        shutdown,
+        operation.is_some(),
+        native_console,
+        &launch,
+    )?;
     anyhow::ensure!(
         !shutdown || operation.is_none(),
         "--shutdown cannot be combined with an update command"
@@ -198,6 +267,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
         *path = std::fs::canonicalize(&*path)
             .with_context(|| format!("Cannot open update package {}", path.display()))?;
     }
+    finish_launch(&mut launch, default_kind);
     #[cfg(windows)]
     if native_console {
         windows::attach_console_io()?;
@@ -211,9 +281,6 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
     }
     #[cfg(not(windows))]
     let _ = native_console;
-    if let (Some(view), None) = (launch.view, &launch.window_id) {
-        launch.window_id = windows::Launch::detached(view, None, protocol::Kind::Proxy).window_id;
-    }
     astra_platform::storage::private_dir(&home)?;
     home = std::fs::canonicalize(home)?;
     anyhow::ensure!(
@@ -257,7 +324,11 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
             bin,
             language: i18n::language(),
         };
-        return ui::run(endpoint, context, launch).await;
+        return if silent {
+            ui::run_silent(endpoint, context).await
+        } else {
+            ui::run(endpoint, context, launch).await
+        };
     }
     astra_platform::storage::private_dir(&config_home)?;
     config_home = std::fs::canonicalize(config_home)?;
@@ -281,7 +352,7 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
     bin = std::fs::canonicalize(bin)?;
     let socket = home.join("management.sock");
     astra_platform::platform::validate_state_directory(&home)?;
-    if !daemon && !shutdown && operation.is_none() {
+    if !silent && !daemon && !shutdown && operation.is_none() {
         if let Some(frontend) =
             selected_frontend(&executable, &bin, has_selected_release, explicit_bin)?
         {
@@ -353,6 +424,10 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
         .await
         .is_err()
     {
+        anyhow::ensure!(
+            manager_binary != executable,
+            "The separate astra-host executable is required; install a complete package"
+        );
         if socket.exists() {
             astra_platform::platform::recover_stale_manager_endpoint(&socket)
                 .with_context(|| format!("Manager endpoint is unavailable and could not be safely recovered: {}. Inspect {} and running cores", socket.display(), home.join("manager.log").display()))?;
@@ -414,159 +489,13 @@ pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
         bin,
         language: i18n::language(),
     };
-    ui::run(socket, context, launch).await
+    if silent {
+        ui::run_silent(socket, context).await
+    } else {
+        ui::run(socket, context, launch).await
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use astra_update::{
-        ImportOptions, ProtocolRange, ReleaseFile, ReleaseManifest, ReleaseStore,
-        HOST_PROTOCOL_VERSION, TARGET,
-    };
-    use sha2::{Digest, Sha256};
-
-    struct Directory {
-        path: PathBuf,
-        parent: PathBuf,
-    }
-    impl Directory {
-        fn new() -> Self {
-            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = parent.join(format!(
-                "astra-entry-{}-{nonce}-{sequence}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path).unwrap();
-            Self { path, parent }
-        }
-        fn install(&self, host: bool) -> (ReleaseStore, PathBuf) {
-            let source = self.path.join("source");
-            std::fs::create_dir(&source).unwrap();
-            let mut manifest = ReleaseManifest {
-                schema_version: 1,
-                role: Default::default(),
-                release_id: "selected".into(),
-                target: TARGET.into(),
-                host_protocol: ProtocolRange {
-                    min: HOST_PROTOCOL_VERSION,
-                    max: HOST_PROTOCOL_VERSION,
-                },
-                components: Default::default(),
-                files: Vec::new(),
-                profile: None,
-                mode: None,
-                cargo_profile: None,
-            };
-            let mut components = vec!["astra-proxy", "astra-rule", "astra-tui"];
-            if host {
-                components.push("astra-host");
-            }
-            for component in components {
-                let name = astra_platform::platform::executable(component);
-                std::fs::write(source.join(&name), b"fixture").unwrap();
-                manifest.components.insert(component.into(), "0.1.0".into());
-                manifest.files.push(ReleaseFile {
-                    path: name,
-                    size: 7,
-                    sha256: format!("{:x}", Sha256::digest(b"fixture")),
-                });
-            }
-            std::fs::write(
-                source.join("manifest.json"),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
-            let home = self.path.join("state");
-            let store = ReleaseStore::new(&home);
-            store.import(source, &ImportOptions::default()).unwrap();
-            store.commit_current("selected").unwrap();
-            (store, home)
-        }
-    }
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            if let Ok(target) = std::fs::canonicalize(&self.path) {
-                assert_eq!(target.parent(), Some(self.parent.as_path()));
-                let _ = std::fs::remove_dir_all(target);
-            }
-        }
-    }
-
-    #[test]
-    fn startup_uses_verified_current_host_and_explicit_bin_bypasses_selection() {
-        let fixture = Directory::new();
-        let (store, home) = fixture.install(true);
-        let (directory, host) = selected_startup_release(&home, false).unwrap().unwrap();
-        assert_eq!(directory, store.release_dir("selected").unwrap());
-        assert_eq!(
-            host,
-            directory.join(astra_platform::platform::executable("astra-host"))
-        );
-        std::fs::write(store.root().join("current.json"), b"invalid").unwrap();
-        assert!(selected_startup_release(&home, true).unwrap().is_none());
-        assert!(selected_startup_release(&home, false).is_err());
-    }
-
-    #[test]
-    fn startup_does_not_fall_back_when_selected_release_has_no_host() {
-        let fixture = Directory::new();
-        let (store, home) = fixture.install(true);
-        let manifest_path = store.release_dir("selected").unwrap().join("manifest.json");
-        let mut manifest: ReleaseManifest =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        manifest.components.remove("astra-host");
-        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(selected_startup_release(&home, false)
-            .unwrap_err()
-            .to_string()
-            .contains("astra-host"));
-        store.clear_current().unwrap();
-        assert!(selected_startup_release(&home, false).unwrap().is_none());
-    }
-
-    #[test]
-    fn daemon_redirect_requires_no_existing_endpoint_and_no_explicit_bin() {
-        let fixture = Directory::new();
-        let executable = fixture.path.join("old-host");
-        let selected = fixture.path.join("new-host");
-        let socket = fixture.path.join("manager.sock");
-        std::fs::write(&executable, b"old").unwrap();
-        std::fs::write(&selected, b"new").unwrap();
-        assert!(redirect_host(&executable, &selected, false, &socket).unwrap());
-        assert!(!redirect_host(&executable, &selected, true, &socket).unwrap());
-        assert!(!redirect_host(&selected, &selected, false, &socket).unwrap());
-        std::fs::write(&socket, b"existing endpoint").unwrap();
-        assert!(redirect_host(&executable, &selected, false, &socket).is_err());
-    }
-
-    #[test]
-    fn frontend_redirect_preserves_explicit_bin_and_allows_an_existing_manager() {
-        let fixture = Directory::new();
-        let (store, home) = fixture.install(true);
-        let bin = store.release_dir("selected").unwrap();
-        let original = fixture.path.join("old-tui");
-        std::fs::write(&original, b"old").unwrap();
-        std::fs::write(home.join("manager.sock"), b"live manager marker").unwrap();
-        let selected = bin.join(astra_platform::platform::executable("astra-tui"));
-        assert_eq!(
-            selected_frontend(&original, &bin, true, false).unwrap(),
-            Some(selected.clone())
-        );
-        assert!(selected_frontend(&original, &bin, true, true)
-            .unwrap()
-            .is_none());
-        assert!(selected_frontend(&original, &bin, false, false)
-            .unwrap()
-            .is_none());
-        assert!(selected_frontend(&selected, &bin, true, false)
-            .unwrap()
-            .is_none());
-    }
-}
+#[path = "test/entry_test.rs"]
+mod tests;

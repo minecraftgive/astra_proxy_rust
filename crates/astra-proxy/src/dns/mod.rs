@@ -2,6 +2,7 @@
 //! lifetime live here. OS socket binding is delegated to platform::egress.
 mod server;
 #[cfg(test)]
+#[path = "../test/dns_test.rs"]
 mod tests;
 mod upstream;
 use crate::App;

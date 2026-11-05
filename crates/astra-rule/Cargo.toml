@@ -34,3 +34,7 @@ prost = "0.14"
 [[bench]]
 name = "matching"
 harness = false
+
+[[test]]
+name = "route_audit"
+path = "src/test/route_audit_test.rs"

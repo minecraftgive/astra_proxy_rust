@@ -32,11 +32,11 @@ path = "src/lib.rs"
 
 [[test]]
 name = "common_test"
-path = "tests/common_test.rs"
+path = "src/test/common_test.rs"
 
 [[test]]
 name = "crate_publish_metadata_test"
-path = "tests/crate_publish_metadata_test.rs"
+path = "src/test/crate_publish_metadata_test.rs"
 
 [dependencies.async-trait]
 version = "0.1"

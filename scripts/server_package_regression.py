@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the independent server archive, its exact file list and clean extracted execution."""
 import argparse
+import os
 import pathlib
 import subprocess
 import sys
@@ -19,9 +20,12 @@ def main():
         roots=list(directory.iterdir());assert len(roots)==1;root=roots[0]
         actual={p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
         assert root.name=='server'
-        assert actual=={executable(n) for n in ('astra-server-core','astra-server-tui','astra-manager','astra-host')} | {'server.example.toml','manifest.json'},actual
+        expected={executable(n) for n in ('astra-server-core','astra-server-tui','astra-manager','astra-host')} | {'server.example.toml','manifest.json'}
+        if os.name == 'nt':expected.add('astra-tui-startup.exe')
+        assert actual==expected,actual
         assert {p.name for p in root.iterdir()}==actual
-        verify_manifest(root, 'server')
+        manifest=verify_manifest(root, 'server')
+        if os.name == 'nt':assert 'astra-tui-startup' in manifest['components']
         for name in ('astra-server-core','astra-server-tui','astra-manager','astra-host'):
             subprocess.run([str(root/executable(name)),'--help'],check=True,capture_output=True,timeout=10)
         binary=str(root/executable('astra-server-core'))

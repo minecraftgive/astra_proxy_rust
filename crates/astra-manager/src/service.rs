@@ -297,6 +297,8 @@ async fn serve_local(
     }
 }
 #[cfg(test)]
+#[path = "test/service_crash_test.rs"]
 mod crash_tests;
 #[cfg(test)]
+#[path = "test/service_test.rs"]
 mod tests;

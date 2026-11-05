@@ -120,6 +120,8 @@ python3 scripts/astra.py --check --proxy example_proxy.toml --rules example_rule
 python3 scripts/test.py --debug    # 测试与构建分开运行
 ```
 
+Rust 测试统一放在各 crate 的 `src/test/<testname>_test.rs`（包含 `vendor`）。单元测试通过 `#[cfg(test)]` 和 `#[path]` 保留原模块作用域；集成测试在 `Cargo.toml` 的 `[[test]]` 中声明路径，保留独立测试目标。
+
 Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同；两者都转调 `python scripts/build.py`。默认构建后运行 `./target/x86_64-pc-windows-msvc/debug/astra-tui.exe`。Windows TUI 默认状态目录为 `%LOCALAPPDATA%/.astra/tui`，支持 `--state-dir` 自定义路径。配置独立存放在 `%LOCALAPPDATA%/.astra/config`（`--config-dir`），订阅和远程规则缓存位于 `%LOCALAPPDATA%/.astra/runtime`（`ASTRA_RUNTIME_DIR`）。
 
 终端运行时显示构建表单，输入字段编号选择 profile、架构、角色、打包和耗时报告，`B` 回车开始，`Q` 回车取消，不再倒计时自动构建。`--arch 64bits` 要求当前 Rust 本机目标为 64 位（x86_64/ARM64）；`--non-interactive` 跳过表单。

@@ -1102,6 +1102,22 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Vim navigation", "Vim navigation", "Vim 导航", "Vim 導覽"),
     ("Mouse", "Mouse", "鼠标", "滑鼠"),
     ("Start page", "Start page", "启动页面", "啟動頁面"),
+    ("Startup", "Startup", "启动", "啟動"),
+    ("Auto-start instances", "Auto-start instances", "自动启动实例", "自動啟動執行個體"),
+    ("Start TUI with Windows", "Start TUI with Windows", "Windows 登录后启动 TUI", "Windows 登入後啟動 TUI"),
+    ("Silent startup", "Silent startup", "静默启动", "靜默啟動"),
+    ("Windows privilege service", "Windows privilege service", "Windows 权限服务", "Windows 權限服務"),
+    ("Cannot read Windows service: {}", "Cannot read Windows service: {}", "无法读取 Windows 服务状态：{}", "無法讀取 Windows 服務狀態：{}"),
+    ("Cannot change Windows service: {}", "Cannot change Windows service: {}", "无法更改 Windows 服务：{}", "無法變更 Windows 服務：{}"),
+    ("Windows service registration is in progress", "Windows service registration is in progress", "正在更改 Windows 服务注册，请稍候", "正在變更 Windows 服務註冊，請稍候"),
+    ("Open the local TUI to register the Windows privilege service", "Open the local TUI to register the Windows privilege service", "请打开本地 TUI 注册 Windows 权限服务", "請開啟本機 TUI 註冊 Windows 權限服務"),
+    ("Approve the Windows UAC prompt to change the privilege service", "Approve the Windows UAC prompt to change the privilege service", "请在 Windows UAC 提示中授权安装或卸载权限服务", "請在 Windows UAC 提示中授權安裝或解除安裝權限服務"),
+    ("Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.", "Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.", "通过一次 UAC 授权注册本机 Windows 服务，之后 TUN 可静默启动。需要管理员账户；卸载或更新受保护的服务仍需再次授权。", "透過一次 UAC 授權註冊本機 Windows 服務，之後 TUN 可靜默啟動。需要管理員帳戶；解除安裝或更新受保護的服務仍需再次授權。"),
+    ("At Windows sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.", "At Windows sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.", "Windows 登录后在后台启动，不显示终端窗口。实例是否启动仍由“自动启动实例”控制。可手动打开 TUI 管理；失败记录在 startup.log。", "Windows 登入後在背景啟動，不顯示終端機視窗。執行個體是否啟動仍由「自動啟動執行個體」控制。可手動開啟 TUI 管理；失敗記錄於 startup.log。"),
+    ("Cannot read Windows startup: {}", "Cannot read Windows startup: {}", "无法读取 Windows 自启动设置：{}", "無法讀取 Windows 自動啟動設定：{}"),
+    ("Cannot change Windows startup: {}", "Cannot change Windows startup: {}", "无法更改 Windows 自启动设置：{}", "無法變更 Windows 自動啟動設定：{}"),
+    ("Start stopped instances on the connected manager once when the main TUI opens. Additional windows do not trigger startup. Running instances are left as they are.", "Start stopped instances on the connected manager once when the main TUI opens. Additional windows do not trigger startup. Running instances are left as they are.", "主 TUI 打开时启动当前管理目标中已停止的实例，仅执行一次。附加窗口不会触发启动，运行中的实例保持原状。", "主 TUI 開啟時啟動目前管理目標中已停止的執行個體，僅執行一次。附加視窗不會觸發啟動，執行中的執行個體維持原狀。"),
+    ("Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too.", "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too.", "当前用户登录 Windows 后，使用当前目录和管理目标打开 TUI。同时开启“自动启动实例”即可一并启动实例。", "目前使用者登入 Windows 後，使用目前目錄和管理目標開啟 TUI。同時開啟「自動啟動執行個體」即可一併啟動執行個體。"),
     ("System", "System", "跟随系统", "跟隨系統"),
     ("Indigo", "Indigo", "靛蓝", "靛藍"),
     ("Teal", "Teal", "青绿", "青綠"),
@@ -1155,41 +1171,5 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
 ];
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn regional_locales_and_fallback() {
-        for locale in ["zh-Hant", "zh_TW.UTF-8", "zh-HK", "zh-MO"] {
-            assert_eq!(Language::resolve(locale), Language::Traditional);
-        }
-        for locale in ["zh-CN", "zh_Hans", "zh"] {
-            assert_eq!(Language::resolve(locale), Language::Simplified);
-        }
-        for locale in ["en-US", "C", "de_DE.UTF-8"] {
-            assert_eq!(Language::resolve(locale), Language::English);
-        }
-    }
-    #[test]
-    fn indexed_translations_match_every_catalog_entry_and_preserve_unknown_text() {
-        for &(source, english, simplified, traditional) in CATALOG {
-            assert_eq!(translate(source, Language::English), english);
-            assert_eq!(translate(source, Language::Simplified), simplified);
-            assert_eq!(translate(source, Language::Traditional), traditional);
-        }
-        assert_eq!(
-            translate("unknown translation key", Language::Simplified),
-            "unknown translation key"
-        );
-    }
-    #[test]
-    fn translations_keep_all_placeholders() {
-        let mut keys = std::collections::HashSet::new();
-        for (source, english, simplified, traditional) in CATALOG {
-            assert!(keys.insert(source), "Duplicate translation: {source}");
-            let count = source.matches("{}").count();
-            for translation in [english, simplified, traditional] {
-                assert_eq!(translation.matches("{}").count(), count, "{source}");
-            }
-        }
-    }
-}
+#[path = "test/i18n_test.rs"]
+mod tests;

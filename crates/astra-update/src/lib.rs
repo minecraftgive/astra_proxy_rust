@@ -250,4 +250,5 @@ impl ReleaseManifest {
 }
 
 #[cfg(test)]
+#[path = "test/update_test.rs"]
 mod tests;

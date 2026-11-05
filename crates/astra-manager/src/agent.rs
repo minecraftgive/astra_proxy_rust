@@ -12,6 +12,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 #[cfg(test)]
+#[path = "test/agent_test.rs"]
 mod tests;
 
 fn program_info() -> ProgramInfo {
@@ -783,6 +784,7 @@ impl AgentService {
         match &mut command {
             Command::Remove { instance }
             | Command::Start { instance }
+            | Command::StartSilent { instance }
             | Command::ForceStart { instance }
             | Command::Stop { instance }
             | Command::Restart { instance }
@@ -805,6 +807,7 @@ impl AgentService {
         let target = match &command {
             Command::Remove { instance }
             | Command::Start { instance }
+            | Command::StartSilent { instance }
             | Command::ForceStart { instance }
             | Command::Stop { instance }
             | Command::Restart { instance }
@@ -887,6 +890,7 @@ impl AgentService {
             }
             Command::Remove { instance } => old::Action::Remove(instance),
             Command::Start { instance } => old::Action::Start(instance),
+            Command::StartSilent { instance } => old::Action::StartSilent(instance),
             Command::ForceStart { instance } => old::Action::ForceStart(instance),
             Command::Stop { instance } => old::Action::Stop(instance),
             Command::Restart { instance } => old::Action::Restart(instance),
@@ -1134,7 +1138,9 @@ impl AgentService {
             astra_platform::platform::recover_stale_endpoint(&endpoint)?;
         }
         match command {
-            Command::Start { .. } => self.start_server(name, path).await?,
+            Command::Start { .. } | Command::StartSilent { .. } => {
+                self.start_server(name, path).await?
+            }
             Command::Stop { .. } => {
                 self.stop_server(name).await?;
             }

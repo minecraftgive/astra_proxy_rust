@@ -7,6 +7,7 @@ use astra_update::{ImportOptions, ReleaseStore};
 use serde_json::json;
 
 #[cfg(test)]
+#[path = "../test/manager_updates_test.rs"]
 mod tests;
 mod transactions;
 
@@ -840,13 +841,5 @@ fn ensure_unprivileged_updates() -> Result<()> {
 }
 
 #[cfg(test)]
-mod unit_tests {
-    use super::*;
-    #[test]
-    fn online_activation_requires_an_ordinary_user_manager() {
-        assert!(require_unprivileged_update(false).is_ok());
-        let error = require_unprivileged_update(true).unwrap_err().to_string();
-        assert!(error.contains("elevated manager"));
-        assert!(error.contains("existing connections are unchanged"));
-    }
-}
+#[path = "../test/manager_updates_unit_test.rs"]
+mod unit_tests;

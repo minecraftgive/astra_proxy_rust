@@ -118,8 +118,8 @@ def argument_parser():
 
 
 def build_command(roles, target, profile, *, timings=False):
-    crates = [item for name in role_packages(roles) for item in ('-p', name)]
-    binaries = [item for name in role_binaries(roles) for item in ('--bin', name)]
+    crates = [item for name in role_packages(roles, target=target) for item in ('-p', name)]
+    binaries = [item for name in role_binaries(roles, target=target) for item in ('--bin', name)]
     return ['cargo', 'build', '--locked', *crates, *binaries, '--target', target,
             '--profile', cargo_profile(profile), *(['--timings'] if timings else [])]
 
@@ -146,7 +146,7 @@ def main():
     if os.name == 'nt' and platform.machine().lower() in ('amd64', 'x86_64') and not shutil.which('nasm', path=env['PATH']):
         parser.error('NASM is required by BoringSSL on Windows x64; see docs/INSTALL.md')
     roles = tuple(ROLES) if args.role == 'all' else (args.role,)
-    packages = role_packages(roles)
+    packages = role_packages(roles, target=layout.target)
     versions = {p['name']: p['version'] for p in metadata['packages']}
     missing = set(packages) - versions.keys()
     if missing:

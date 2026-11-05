@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 
-from astra_tools.artifacts import ArtifactIndex, ROLES, sha256
+from astra_tools.artifacts import ArtifactIndex, ROLES, role_binaries, sha256
 from astra_tools.fixtures.protocols import tls_material
 from astra_tools.management import ManagementHttp, eventually, expect_error
 from astra_tools.net import Echo, EchoServer, exact, free_port, socks_connect
@@ -57,7 +57,7 @@ def binaries(args, work):
             roots = [p for p in destination.iterdir() if p.is_dir()]
             assert len(roots) == 1 and len(list(destination.iterdir())) == 1
             manifest = verify_manifest(roots[0], role)
-            expected = {executable(name) for name in ROLES[role].binaries}
+            expected = {executable(name) for name in role_binaries((role,), target=index.target)}
             actual = {entry['path'] for entry in manifest['files']}
             assert expected <= actual, f'{role} is missing a role executable'
             result[role] = roots[0]

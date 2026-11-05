@@ -170,4 +170,5 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for BufferedStream<S> {
 }
 
 #[cfg(test)]
+#[path = "test/inbound_test.rs"]
 mod tests;

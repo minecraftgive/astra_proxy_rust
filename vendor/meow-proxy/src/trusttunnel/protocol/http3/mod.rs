@@ -10,6 +10,7 @@
 mod driver;
 mod stream;
 #[cfg(test)]
+#[path = "../../../test/trusttunnel_protocol_http3_test.rs"]
 mod tests;
 mod tls;
 

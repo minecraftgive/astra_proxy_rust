@@ -111,71 +111,71 @@ path = "src/lib.rs"
 
 [[test]]
 name = "anytls_integration"
-path = "tests/anytls_integration.rs"
+path = "src/test/anytls_integration_test.rs"
 
 [[test]]
 name = "anytls_leak"
-path = "tests/anytls_leak.rs"
+path = "src/test/anytls_leak_test.rs"
 
 [[test]]
 name = "gost_plugin_integration"
-path = "tests/gost_plugin_integration.rs"
+path = "src/test/gost_plugin_integration_test.rs"
 
 [[test]]
 name = "http_adapter_integration"
-path = "tests/http_adapter_integration.rs"
+path = "src/test/http_adapter_integration_test.rs"
 
 [[test]]
 name = "hysteria2_integration"
-path = "tests/hysteria2_integration.rs"
+path = "src/test/hysteria2_integration_test.rs"
 
 [[test]]
 name = "kcptun_e2e"
-path = "tests/kcptun_e2e.rs"
+path = "src/test/kcptun_e2e_test.rs"
 
 [[test]]
 name = "shadowsocks_integration"
-path = "tests/shadowsocks_integration.rs"
+path = "src/test/shadowsocks_integration_test.rs"
 
 [[test]]
 name = "snell_integration"
-path = "tests/snell_integration.rs"
+path = "src/test/snell_integration_test.rs"
 
 [[test]]
 name = "snell_server_docker_integration"
-path = "tests/snell_server_docker_integration.rs"
+path = "src/test/snell_server_docker_integration_test.rs"
 
 [[test]]
 name = "snell_smoke"
-path = "tests/snell_smoke.rs"
+path = "src/test/snell_smoke_test.rs"
 
 [[test]]
 name = "socks5_adapter_integration"
-path = "tests/socks5_adapter_integration.rs"
+path = "src/test/socks5_adapter_integration_test.rs"
 
 [[test]]
 name = "trojan_integration"
-path = "tests/trojan_integration.rs"
+path = "src/test/trojan_integration_test.rs"
 
 [[test]]
 name = "trusttunnel_e2e"
-path = "tests/trusttunnel_e2e.rs"
+path = "src/test/trusttunnel_e2e_test.rs"
 
 [[test]]
 name = "trusttunnel_integration"
-path = "tests/trusttunnel_integration.rs"
+path = "src/test/trusttunnel_integration_test.rs"
 
 [[test]]
 name = "v2ray_plugin_integration"
-path = "tests/v2ray_plugin_integration.rs"
+path = "src/test/v2ray_plugin_integration_test.rs"
 
 [[test]]
 name = "vless_integration"
-path = "tests/vless_integration.rs"
+path = "src/test/vless_integration_test.rs"
 
 [[test]]
 name = "xray_server_docker_integration"
-path = "tests/xray_server_docker_integration.rs"
+path = "src/test/xray_server_docker_integration_test.rs"
 
 [dependencies.aes]
 version = "0.8"

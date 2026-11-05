@@ -124,6 +124,16 @@ pub(super) struct Preferences {
     pub(super) vim_keys: bool,
     pub(super) mouse: bool,
     pub(super) start_page: StartPage,
+    pub(super) auto_start_instances: bool,
+    /// The Windows registration is authoritative, not the preferences file.
+    #[cfg(windows)]
+    #[serde(skip)]
+    pub(super) windows_startup: bool,
+    #[cfg(windows)]
+    pub(super) silent_startup: bool,
+    #[cfg(windows)]
+    #[serde(skip)]
+    pub(super) windows_service: bool,
     pub(super) marquee: MarqueePreferences,
 }
 
@@ -275,6 +285,13 @@ impl Default for Preferences {
             vim_keys: false,
             mouse: true,
             start_page: StartPage::Overview,
+            auto_start_instances: false,
+            #[cfg(windows)]
+            windows_startup: false,
+            #[cfg(windows)]
+            silent_startup: false,
+            #[cfg(windows)]
+            windows_service: false,
             marquee: MarqueePreferences::default(),
         }
     }
@@ -289,6 +306,13 @@ pub(super) enum Field {
     VimKeys,
     Mouse,
     StartPage,
+    AutoStartInstances,
+    #[cfg(windows)]
+    WindowsStartup,
+    #[cfg(windows)]
+    SilentStartup,
+    #[cfg(windows)]
+    WindowsService,
     MarqueeBorder,
     MarqueeText,
     MarqueeBackground,
@@ -299,7 +323,7 @@ pub(super) enum Field {
     MarqueeFps,
     MarqueeTrueColor,
 }
-const ALL_FIELDS: [Field; 16] = [
+const ALL_FIELDS: &[Field] = &[
     Field::Language,
     Field::Accent,
     Field::Colors,
@@ -307,6 +331,13 @@ const ALL_FIELDS: [Field; 16] = [
     Field::VimKeys,
     Field::Mouse,
     Field::StartPage,
+    Field::AutoStartInstances,
+    #[cfg(windows)]
+    Field::WindowsStartup,
+    #[cfg(windows)]
+    Field::SilentStartup,
+    #[cfg(windows)]
+    Field::WindowsService,
     Field::MarqueeBorder,
     Field::MarqueeText,
     Field::MarqueeBackground,
@@ -318,19 +349,20 @@ const ALL_FIELDS: [Field; 16] = [
     Field::MarqueeTrueColor,
 ];
 /// Row of the first marquee field.
-const MARQUEE_ROW: usize = 7;
+const MARQUEE_ROW: usize = 8 + 3 * cfg!(windows) as usize;
 /// Rows shown now; the marquee section stays hidden until it is unlocked.
 fn fields(p: &Preferences) -> &'static [Field] {
     if p.marquee.unlocked {
-        &ALL_FIELDS
+        ALL_FIELDS
     } else {
         &ALL_FIELDS[..MARQUEE_ROW]
     }
 }
-const SECTIONS: [(&str, std::ops::Range<usize>); 3] = [
+const SECTIONS: [(&str, std::ops::Range<usize>); 4] = [
     ("Appearance", 0..4),
     ("Interaction", 4..7),
-    ("Marquee", 7..16),
+    ("Startup", 7..MARQUEE_ROW),
+    ("Marquee", MARQUEE_ROW..ALL_FIELDS.len()),
 ];
 
 impl Field {
@@ -343,6 +375,13 @@ impl Field {
             Self::VimKeys => "Vim navigation",
             Self::Mouse => "Mouse",
             Self::StartPage => "Start page",
+            Self::AutoStartInstances => "Auto-start instances",
+            #[cfg(windows)]
+            Self::WindowsStartup => "Start TUI with Windows",
+            #[cfg(windows)]
+            Self::SilentStartup => "Silent startup",
+            #[cfg(windows)]
+            Self::WindowsService => "Windows privilege service",
             Self::MarqueeBorder => "Focused border",
             Self::MarqueeText => "Focused item text",
             Self::MarqueeBackground => "Focused item background",
@@ -363,6 +402,13 @@ impl Field {
             Self::VimKeys => "h j k l g G move in lists and logs, in addition to the arrow keys.",
             Self::Mouse => "Off returns the mouse to the terminal so you can select and copy text.",
             Self::StartPage => "Page shown when a window opens without --view.",
+            Self::AutoStartInstances => "Start stopped instances on the connected manager once when the main TUI opens. Additional windows do not trigger startup. Running instances are left as they are.",
+            #[cfg(windows)]
+            Self::WindowsStartup => "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too.",
+            #[cfg(windows)]
+            Self::SilentStartup => "At Windows sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.",
+            #[cfg(windows)]
+            Self::WindowsService => "Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.",
             Self::MarqueeBorder => "A rainbow runs around the border of the focused panel.",
             Self::MarqueeText => "A rainbow runs across the text of the selected row.",
             Self::MarqueeBackground => "A rainbow runs across the background of the selected row.",
@@ -387,8 +433,11 @@ impl Field {
                 "Monochrome",
             ],
             Self::Motion => &["Normal", "Reduced", "Off"],
+            #[cfg(windows)]
+            Self::WindowsStartup | Self::SilentStartup | Self::WindowsService => &["On", "Off"],
             Self::VimKeys
             | Self::Mouse
+            | Self::AutoStartInstances
             | Self::MarqueeBorder
             | Self::MarqueeText
             | Self::MarqueeBackground
@@ -413,6 +462,13 @@ impl Field {
             Self::VimKeys => usize::from(!p.vim_keys),
             Self::Mouse => usize::from(!p.mouse),
             Self::StartPage => p.start_page.page(),
+            Self::AutoStartInstances => usize::from(!p.auto_start_instances),
+            #[cfg(windows)]
+            Self::WindowsStartup => usize::from(!p.windows_startup),
+            #[cfg(windows)]
+            Self::SilentStartup => usize::from(!p.silent_startup),
+            #[cfg(windows)]
+            Self::WindowsService => usize::from(!p.windows_service),
             Self::MarqueeBorder => usize::from(!p.marquee.border),
             Self::MarqueeText => usize::from(!p.marquee.text),
             Self::MarqueeBackground => usize::from(!p.marquee.background),
@@ -455,6 +511,13 @@ impl Field {
             Self::VimKeys => p.vim_keys = index == 0,
             Self::Mouse => p.mouse = index == 0,
             Self::StartPage => p.start_page = StartPage::ALL[index],
+            Self::AutoStartInstances => p.auto_start_instances = index == 0,
+            #[cfg(windows)]
+            Self::WindowsStartup => p.windows_startup = index == 0,
+            #[cfg(windows)]
+            Self::SilentStartup => p.silent_startup = index == 0,
+            #[cfg(windows)]
+            Self::WindowsService => p.windows_service = index == 0,
             Self::MarqueeBorder => p.marquee.border = index == 0,
             Self::MarqueeText => p.marquee.text = index == 0,
             Self::MarqueeBackground => p.marquee.background = index == 0,
@@ -535,26 +598,106 @@ impl Ui {
             self.message = error;
         }
     }
-    /// Change preferences, apply what differs and save them.
-    pub(super) fn change_preferences(&mut self, change: impl FnOnce(&mut Preferences)) {
+    #[cfg(windows)]
+    pub(super) fn load_startup_context(&mut self, context: &crate::windows::Context) {
+        self.startup_context = Some(context.clone());
+        match crate::startup::enabled(context) {
+            Ok(enabled) => self.preferences.windows_startup = enabled,
+            Err(error) => {
+                self.message = tr!("Cannot read Windows startup: {}", format!("{error:#}"));
+            }
+        }
+        match astra_platform::windows_service::installed() {
+            Ok(installed) => self.preferences.windows_service = installed,
+            Err(error) => self.message = tr!("Cannot read Windows service: {}", error.to_string()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn change_windows_service(&mut self, enabled: bool) {
+        if self.service_change.is_some() {
+            self.message = t("Windows service registration is in progress").into();
+            return;
+        }
+        if self.preferences.windows_service == enabled {
+            return;
+        }
+        let Some(context) = &self.startup_context else {
+            self.message = tr!(
+                "Cannot change Windows service: {}",
+                "Windows startup context is unavailable"
+            );
+            return;
+        };
+        if crate::protocol::target().is_some() {
+            self.message = t("Open the local TUI to register the Windows privilege service").into();
+            return;
+        }
+        let bin = context.bin.clone();
+        self.service_change = Some(tokio::task::spawn_blocking(move || {
+            astra_platform::windows_service::set_installed(&bin, enabled)
+                .and_then(|_| astra_platform::windows_service::installed())
+                .map_err(|error| error.to_string())
+        }));
+        self.message = t("Approve the Windows UAC prompt to change the privilege service").into();
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn poll_service_change(&mut self) -> bool {
+        if !self
+            .service_change
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            return false;
+        }
+        let result = self
+            .service_change
+            .take()
+            .unwrap()
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        match result {
+            Ok(installed) => {
+                self.preferences.windows_service = installed;
+                self.message = format!(
+                    "{}: {}",
+                    t(Field::WindowsService.label()),
+                    Field::WindowsService.value_label(&self.preferences)
+                );
+            }
+            Err(error) => {
+                if let Ok(installed) = astra_platform::windows_service::installed() {
+                    self.preferences.windows_service = installed;
+                }
+                self.message = tr!("Cannot change Windows service: {}", error);
+            }
+        }
+        true
+    }
+    /// Save first so a failed write never presents an unsaved choice as enabled.
+    pub(super) fn change_preferences(&mut self, change: impl FnOnce(&mut Preferences)) -> bool {
         let previous = self.preferences.clone();
         change(&mut self.preferences);
         if self.preferences == previous {
-            return;
+            return true;
+        }
+        if let Err(error) = self.save_preferences() {
+            self.preferences = previous;
+            self.message = tr!("Cannot save preferences: {}", format!("{error:#}"));
+            return false;
         }
         self.apply_preferences(Some(&previous));
-        self.save_preferences();
+        true
     }
-    fn save_preferences(&mut self) {
+    fn save_preferences(&self) -> Result<()> {
         let Some(path) = &self.preferences_path else {
-            return;
+            return Ok(());
         };
-        let result = serde_json::to_vec_pretty(&self.preferences)
-            .map_err(anyhow::Error::from)
-            .and_then(|data| Ok(astra_platform::storage::atomic_write_default(path, &data)?));
-        if let Err(error) = result {
-            self.message = tr!("Cannot save preferences: {}", format!("{error:#}"));
-        }
+        let data = serde_json::to_vec_pretty(&self.preferences)?;
+        astra_platform::storage::atomic_write_default(path, &data)?;
+        Ok(())
     }
     /// `previous` is `None` at startup, when everything is applied.
     fn apply_preferences(&mut self, previous: Option<&Preferences>) {
@@ -629,7 +772,7 @@ impl Ui {
         self.marquee_hold = Some((start, now, done || finished));
         if finished {
             let unlock = !self.preferences.marquee.unlocked;
-            self.change_preferences(|p| {
+            if !self.change_preferences(|p| {
                 p.marquee = if unlock {
                     MarqueePreferences {
                         unlocked: true,
@@ -639,7 +782,9 @@ impl Ui {
                 } else {
                     MarqueePreferences::default()
                 }
-            });
+            }) {
+                return;
+            }
             if unlock {
                 self.settings_cursor = MARQUEE_ROW;
                 self.settings_view.follow_selection.set(true);
@@ -674,7 +819,65 @@ impl Ui {
         }
     }
     fn choose_setting(&mut self, field: Field, index: usize) {
-        self.change_preferences(|p| field.set(p, index));
+        #[cfg(windows)]
+        if field == Field::WindowsService {
+            self.change_windows_service(index == 0);
+            return;
+        }
+        #[cfg(windows)]
+        if field == Field::WindowsStartup {
+            let result = self
+                .startup_context
+                .as_ref()
+                .context("Windows startup context is unavailable")
+                .and_then(|context| {
+                    crate::startup::set_enabled(
+                        context,
+                        index == 0,
+                        self.preferences.silent_startup,
+                    )
+                });
+            match result {
+                Ok(()) => self.preferences.windows_startup = index == 0,
+                Err(error) => {
+                    self.message = tr!("Cannot change Windows startup: {}", format!("{error:#}"));
+                    return;
+                }
+            }
+            self.message = format!(
+                "{}: {}",
+                t(field.label()),
+                field.value_label(&self.preferences)
+            );
+            return;
+        }
+        #[cfg(windows)]
+        if field == Field::SilentStartup && self.preferences.windows_startup {
+            let previous = self.preferences.silent_startup;
+            let result = self
+                .startup_context
+                .as_ref()
+                .context("Windows startup context is unavailable")
+                .and_then(|context| crate::startup::set_enabled(context, true, index == 0));
+            if let Err(error) = result {
+                self.message = tr!("Cannot change Windows startup: {}", format!("{error:#}"));
+                return;
+            }
+            if !self.change_preferences(|p| p.silent_startup = index == 0) {
+                if let Some(context) = &self.startup_context {
+                    if let Err(error) = crate::startup::set_enabled(context, true, previous) {
+                        self.message.push_str(&format!(
+                            "\n{}",
+                            tr!("Cannot change Windows startup: {}", format!("{error:#}"))
+                        ));
+                    }
+                }
+                return;
+            }
+        }
+        if !self.change_preferences(|p| field.set(p, index)) {
+            return;
+        }
         self.message = format!(
             "{}: {}",
             t(field.label()),
@@ -1058,257 +1261,5 @@ impl Ui {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
-
-    fn settings_ui() -> (Ui, tempdir::Dir) {
-        let dir = tempdir::Dir::new();
-        let mut ui = Ui::new(Session::default());
-        ui.load_preferences(dir.path().join(FILE));
-        ui.navigate(shell::SETTINGS);
-        (ui, dir)
-    }
-    mod tempdir {
-        pub(super) struct Dir(std::path::PathBuf);
-        impl Dir {
-            pub(super) fn new() -> Self {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static NEXT: AtomicU64 = AtomicU64::new(0);
-                let path = std::env::temp_dir().join(format!(
-                    "astra-settings-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::create_dir_all(&path).unwrap();
-                Self(path)
-            }
-            pub(super) fn path(&self) -> &std::path::Path {
-                &self.0
-            }
-        }
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-    }
-    fn press(ui: &mut Ui, code: KeyCode) {
-        ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
-    }
-
-    #[test]
-    fn every_field_round_trips_each_choice() {
-        for field in ALL_FIELDS {
-            for index in 0..field.choices().len() {
-                let mut p = Preferences::default();
-                field.set(&mut p, index);
-                assert_eq!(field.get(&p), index, "{field:?}");
-            }
-        }
-    }
-    #[test]
-    fn numeric_marquee_settings_step_clamp_and_read_old_presets() {
-        let (mut ui, _dir) = settings_ui();
-        ui.change_preferences(|p| p.marquee.unlocked = true);
-        let speed = ALL_FIELDS
-            .iter()
-            .position(|f| *f == Field::MarqueeSpeed)
-            .unwrap();
-        ui.settings_cursor = speed;
-        press(&mut ui, KeyCode::Right);
-        assert_eq!(ui.preferences.marquee.speed, 170);
-        ui.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-        assert_eq!(ui.preferences.marquee.speed, 70);
-        for _ in 0..3 {
-            ui.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-        }
-        assert_eq!(ui.preferences.marquee.speed, 0, "clamped at the minimum");
-        assert_eq!(ui.animations.marquee().speed, 0.0);
-        press(&mut ui, KeyCode::Delete);
-        assert_eq!(ui.preferences.marquee.speed, SPEED.default);
-        // Width: clicks on the arrows.
-        ui.click_setting(speed + 1, Some(1));
-        assert_eq!(ui.preferences.marquee.width, 31);
-        ui.click_setting(speed + 1, Some(0));
-        ui.click_setting(speed + 1, Some(0));
-        assert_eq!(ui.preferences.marquee.width, 29);
-        // Frame rate reaches the animation clock.
-        ui.settings_cursor = speed + 2;
-        assert_eq!(ui.settings_field(), Field::MarqueeFps);
-        ui.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
-        assert_eq!(ui.preferences.marquee.fps, 30);
-        assert_eq!(ui.animations.marquee().fps, 30);
-        let mut p = Preferences::default();
-        Field::MarqueeWidth.set(&mut p, 10_000);
-        assert_eq!(p.marquee.width, WIDTH.max);
-        Field::MarqueeFps.set(&mut p, 0);
-        assert_eq!(p.marquee.fps, FPS.min);
-        // Earlier builds saved preset names; numbers out of range are clamped.
-        let old: MarqueePreferences =
-            serde_json::from_str(r#"{"speed":"fast","width":"extra_wide"}"#).unwrap();
-        assert_eq!((old.speed, old.width, old.fps), (320, 120, FPS.default));
-        let big: MarqueePreferences = serde_json::from_str(r#"{"speed":99999,"width":1}"#).unwrap();
-        assert_eq!((big.speed, big.width), (SPEED.max, WIDTH.min));
-        // The row renders the value with its unit.
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        ui.settings_cursor = speed;
-        terminal.draw(|f| ui.render(f)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(text.contains("160"), "speed value is shown");
-    }
-    #[test]
-    fn keys_change_apply_and_persist_preferences() {
-        let (mut ui, dir) = settings_ui();
-        // Motion is the fourth row.
-        for _ in 0..3 {
-            press(&mut ui, KeyCode::Down);
-        }
-        press(&mut ui, KeyCode::Right);
-        assert_eq!(ui.preferences.motion, animation::MotionMode::Reduced);
-        assert_eq!(ui.animations.mode(), animation::MotionMode::Reduced);
-        assert_eq!(ui.session.motion, animation::MotionMode::Reduced);
-        press(&mut ui, KeyCode::Down);
-        press(&mut ui, KeyCode::Enter);
-        assert!(ui.vim_keys);
-        press(&mut ui, KeyCode::Down);
-        press(&mut ui, KeyCode::Enter);
-        assert_eq!(ui.mouse_request, Some(false));
-        let saved = Preferences {
-            motion: animation::MotionMode::Reduced,
-            vim_keys: true,
-            mouse: false,
-            ..Default::default()
-        };
-        let (loaded, error) = load(&dir.path().join(FILE), &Session::default());
-        assert!(error.is_none());
-        assert_eq!(loaded, saved);
-        // Delete restores the default of the selected row.
-        press(&mut ui, KeyCode::Delete);
-        assert!(ui.preferences.mouse);
-        assert_eq!(ui.page, shell::SETTINGS, "keys stay on the page");
-    }
-    #[test]
-    fn missing_file_keeps_session_choices_and_damaged_file_reports() {
-        let dir = tempdir::Dir::new();
-        let session = Session {
-            motion: animation::MotionMode::Off,
-            vim_keys: true,
-            ..Default::default()
-        };
-        let (p, error) = load(&dir.path().join(FILE), &session);
-        assert!(error.is_none());
-        assert_eq!(p.motion, animation::MotionMode::Off);
-        assert!(p.vim_keys);
-        std::fs::write(dir.path().join(FILE), b"{ not json").unwrap();
-        let (p, error) = load(&dir.path().join(FILE), &session);
-        assert_eq!(p, Preferences::default());
-        assert!(error.is_some());
-    }
-    #[test]
-    fn page_renders_at_any_size_and_choices_are_clickable() {
-        let (ui, _dir) = settings_ui();
-        for (width, height) in [(30, 8), (80, 24), (140, 40)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| ui.render(f)).unwrap();
-            let text: String = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|c| c.symbol())
-                .collect();
-            assert!(
-                text.contains("Settings") || text.contains("设置"),
-                "{width}x{height}"
-            );
-        }
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|f| ui.render(f)).unwrap();
-        assert!(ui
-            .hits
-            .borrow()
-            .iter()
-            .any(|(_, hit)| matches!(hit, Target::Setting(1, Some(5)))));
-    }
-    #[test]
-    fn accent_and_language_choices_apply() {
-        let (mut ui, _dir) = settings_ui();
-        ui.click_setting(1, Some(2));
-        assert_eq!(ui.preferences.accent, Accent::Green);
-        crate::i18n::with_language(crate::i18n::Language::English, || {
-            assert_eq!(Field::Language.choice_label(2), "简体中文");
-        });
-    }
-    #[test]
-    fn indicator_marquee_only_marks_healthy_states() {
-        let (mut ui, _dir) = settings_ui();
-        ui.change_preferences(|p| p.marquee.indicator = true);
-        assert_eq!(
-            ui.indicator_color(Color::Green),
-            Color::Green,
-            "locked: no effect"
-        );
-        ui.change_preferences(|p| p.marquee.unlocked = true);
-        assert_eq!(ui.indicator_color(Color::Green), animation::STATUS_MARK);
-        assert_eq!(ui.indicator_color(Color::Red), Color::Red);
-        assert_eq!(ui.indicator_color(MUTED), MUTED);
-    }
-    #[test]
-    fn holding_ctrl_home_on_accent_unlocks_and_hides_the_marquee() {
-        let (mut ui, dir) = settings_ui();
-        let ctrl_home = event::KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
-        // Not on the accent row: the chord does nothing here.
-        assert!(ui.marquee_hold_key(ctrl_home).is_none());
-        press(&mut ui, KeyCode::Down);
-        assert_eq!(ui.settings_field(), Field::Accent);
-        assert_eq!(
-            fields(&ui.preferences).len(),
-            MARQUEE_ROW,
-            "hidden by default"
-        );
-        let start = Instant::now();
-        let hold = |ui: &mut Ui, until: u64| {
-            for ms in (0..=until).step_by(50) {
-                ui.marquee_hold_at(start + Duration::from_millis(ms));
-            }
-        };
-        // A pause longer than the repeat gap starts over.
-        hold(&mut ui, 2500);
-        ui.marquee_hold_at(start + Duration::from_millis(3600));
-        assert!(!ui.preferences.marquee.unlocked);
-        // Another key in between starts over too.
-        ui.marquee_hold = None;
-        hold(&mut ui, 2900);
-        assert!(ui
-            .marquee_hold_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-            .is_none());
-        assert!(ui.marquee_hold.is_none());
-        ui.settings_cursor = 1;
-        hold(&mut ui, 3000);
-        assert!(ui.preferences.marquee.unlocked);
-        assert!(ui.animations.marquee().border);
-        assert_eq!(ui.settings_field(), Field::MarqueeBorder);
-        assert_eq!(fields(&ui.preferences).len(), ALL_FIELDS.len());
-        let (loaded, _) = load(&dir.path().join(FILE), &Session::default());
-        assert!(loaded.marquee.unlocked && loaded.marquee.border);
-        // Still holding after unlocking does not toggle it straight back.
-        ui.marquee_hold_at(start + Duration::from_millis(6500));
-        assert!(ui.preferences.marquee.unlocked);
-        // A new hold on the accent row hides and turns everything off.
-        ui.settings_cursor = 1;
-        ui.marquee_hold = None;
-        let start = start + Duration::from_secs(10);
-        for ms in (0..=3000).step_by(50) {
-            ui.marquee_hold_at(start + Duration::from_millis(ms));
-        }
-        assert_eq!(ui.preferences.marquee, MarqueePreferences::default());
-        assert!(!ui.animations.marquee().border);
-    }
-}
+#[path = "../test/ui_settings_test.rs"]
+mod tests;

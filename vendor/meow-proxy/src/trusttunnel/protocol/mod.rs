@@ -692,4 +692,5 @@ where
 }
 
 #[cfg(test)]
+#[path = "../../test/trusttunnel_protocol_test.rs"]
 mod tests;

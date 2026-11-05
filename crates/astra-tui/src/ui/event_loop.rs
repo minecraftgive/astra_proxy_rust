@@ -20,6 +20,9 @@ pub(super) async fn run_local(
     };
     // Preferences are per user, shared by every window and remote target.
     ui.load_preferences(context.home.join(settings::FILE));
+    #[cfg(windows)]
+    ui.load_startup_context(&context);
+    let mut startup = startup::Instances::new(ui.preferences.auto_start_instances, &launch);
     ui.page = ui.preferences.start_page.page();
     if let Some(view) = launch.view {
         if let Some(page) = view.page() {
@@ -81,6 +84,18 @@ pub(super) async fn run_local(
                 }
             }
             let quit = jobs.poll(&mut ui).await;
+            #[cfg(windows)]
+            {
+                redraw |= ui.poll_service_change().await;
+            }
+            if !quit {
+                let recovering = ui.recovery.is_some();
+                if let Some(action) = startup.poll(&mut ui, &socket, feeds.ready).await {
+                    jobs.start(&mut ui, action, None);
+                    redraw = true;
+                }
+                redraw |= recovering != ui.recovery.is_some();
+            }
             let changed = jobs.take_changed();
             redraw |= changed;
             if changed || quit {
@@ -353,45 +368,5 @@ impl MotionState {
 }
 
 #[cfg(test)]
-mod exit_tests {
-    use super::*;
-    #[test]
-    fn error_exit_attempts_both_cleanup_steps_and_preserves_original_failure() {
-        let calls = std::cell::RefCell::new(Vec::new());
-        let result = finish_session(
-            Err(anyhow::anyhow!("draw failed")),
-            || {
-                calls.borrow_mut().push("checkpoint");
-                anyhow::bail!("disk full")
-            },
-            || {
-                calls.borrow_mut().push("restore");
-                anyhow::bail!("terminal closed")
-            },
-        );
-        assert_eq!(*calls.borrow(), ["checkpoint", "restore"]);
-        let text = result.unwrap_err().to_string();
-        assert!(
-            text.contains("draw failed")
-                && text.contains("disk full")
-                && text.contains("terminal closed")
-        );
-    }
-    #[test]
-    fn clean_exit_checkpoints_before_restoring_terminal() {
-        let calls = std::cell::RefCell::new(Vec::new());
-        finish_session(
-            Ok(()),
-            || {
-                calls.borrow_mut().push("checkpoint");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("restore");
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(*calls.borrow(), ["checkpoint", "restore"]);
-    }
-}
+#[path = "../test/ui_event_loop_exit_test.rs"]
+mod exit_tests;

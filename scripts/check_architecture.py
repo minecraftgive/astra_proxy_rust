@@ -82,7 +82,7 @@ os_pattern = re.compile(r"std::os::|windows_sys::|#\[cfg\([^\n]*(?:windows|unix|
 for package in ("astra-protocols", "astra-proxy", "astra-server-core"):
     source = ROOT / "crates" / package / "src"
     for path in source.rglob("*.rs"):
-        if "platform" in path.relative_to(source).parts or path.name == 'tests.rs' or path.stem.endswith('_tests'):
+        if any(part in ('platform', 'test') for part in path.relative_to(source).parts):
             continue
         text = path.read_text(encoding="utf-8")
         # Unit-test modules may exercise OS-specific behavior. Production code

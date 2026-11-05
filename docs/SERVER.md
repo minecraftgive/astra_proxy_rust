@@ -75,4 +75,4 @@ python scripts/build.py --role server --package
 python scripts/test.py server package      # 回归 + 解压 dist/ 中的服务端包并验证
 ```
 
-互通脚本只启动 Astra 原生客户端和服务端，使用本地 TCP/UDP 回声目标与临时证书；不会启用 TUN 或系统代理。独立压缩包根目录为 `server/`，包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host`、版本清单和一份完整 `server.example.toml`。Windows 程序带 `.exe` 后缀。说明、源码、许可材料与验证记录留在仓库，不放入运行包；验证记录见 `docs/SERVER_VERIFICATION.md`。
+互通脚本只启动 Astra 原生客户端和服务端，使用本地 TCP/UDP 回声目标与临时证书；不会启用 TUN 或系统代理。独立压缩包根目录为 `server/`，包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host`、版本清单和一份完整 `server.example.toml`。Windows 程序带 `.exe` 后缀，并附带静默自启动辅助程序 `astra-tui-startup.exe`，开关位于 TUI 设置页且默认关闭。说明、源码、许可材料与验证记录留在仓库，不放入运行包；验证记录见 `docs/SERVER_VERIFICATION.md`。

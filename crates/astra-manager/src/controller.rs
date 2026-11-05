@@ -15,6 +15,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Message};
 #[cfg(test)]
+#[path = "test/controller_test.rs"]
 mod tests;
 
 #[derive(Serialize, Deserialize)]

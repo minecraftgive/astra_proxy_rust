@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "astra-server-tui"
 path = "src/server_main.rs"
 
+[[bin]]
+name = "astra-tui-startup"
+path = "src/startup_main.rs"
+
 [dependencies]
 astra-platform = { path = "../astra-platform" }
 astra-app = { path = "../astra-app" }
@@ -38,7 +42,8 @@ sha2 = "0.10"
 astra-manager = { path = "../astra-manager" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_System_Com"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -28,7 +28,7 @@
 //! The record framing, nonce schedule, BLAKE3 key-derivation contexts, and
 //! padding logic mirror the upstream Go implementation byte-for-byte so a
 //! meow-rs client interoperates with an unmodified Xray-core / mihomo server.
-//! A loopback integration test (`tests/vless_encryption_test.rs`) exercises the
+//! A loopback integration test (`src/test/vless_encryption_loopback_test.rs`) exercises the
 //! client against a reference server port of `server.go`.
 
 mod aead;
@@ -44,4 +44,5 @@ pub use factory::parse_client_encryption;
 pub mod server;
 
 #[cfg(test)]
+#[path = "../../test/vless_encryption_loopback_test.rs"]
 mod loopback_tests;

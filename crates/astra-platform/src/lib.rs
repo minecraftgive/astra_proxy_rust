@@ -8,6 +8,8 @@ pub mod program_info;
 pub mod storage;
 #[cfg(unix)]
 pub mod unix_handoff;
+#[cfg(windows)]
+pub mod windows_service;
 
 pub mod command;
 pub mod monitor;

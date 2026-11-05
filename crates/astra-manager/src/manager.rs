@@ -179,60 +179,8 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod runtime_directory_tests {
-    use super::*;
-    #[test]
-    fn configured_runtime_directories_isolate_state_and_child_environment() {
-        let directory = tempfile::tempdir().unwrap();
-        let profile = directory.path().join("profile.toml");
-        fs::write(&profile, "standalone=true").unwrap();
-        let mut managers = Vec::new();
-        for name in ["one", "two"] {
-            let home = directory.path().join(format!("state-{name}"));
-            private_dir(&home).unwrap();
-            managers.push(
-                Manager::load_with_runtime(
-                    home,
-                    directory.path().join(format!("config-{name}")),
-                    directory.path().into(),
-                    Some(directory.path().join(format!("runtime-{name}"))),
-                )
-                .unwrap(),
-            );
-        }
-        let state = astra_model::runtime::Overrides {
-            tun: Some(true),
-            ..Default::default()
-        };
-        let first = astra_platform::storage::runtime_path_in(
-            &managers[0].runtime_dir,
-            &profile,
-            "overrides",
-        )
-        .unwrap();
-        astra_platform::storage::write_json(&first, &state).unwrap();
-        assert_eq!(
-            astra_platform::runtime::load_overrides_in(&managers[0].runtime_dir, &profile)
-                .unwrap()
-                .tun,
-            Some(true)
-        );
-        assert_eq!(
-            astra_platform::runtime::load_overrides_in(&managers[1].runtime_dir, &profile)
-                .unwrap()
-                .tun,
-            Some(false)
-        );
-        for manager in managers {
-            let process = core_process(manager.bin.join("astra-proxy"), &manager.runtime_dir);
-            assert!(process
-                .as_std()
-                .get_envs()
-                .any(|(key, value)| key == "ASTRA_RUNTIME_DIR"
-                    && value == Some(manager.runtime_dir.as_os_str())));
-        }
-    }
-}
+#[path = "test/manager_runtime_directory_test.rs"]
+mod runtime_directory_tests;
 
 /// Core logs are appended across restarts; once one passes this size it is
 /// moved to `<name>.log.1` (replacing the previous one) when the core starts.
@@ -938,6 +886,14 @@ impl Manager {
         self.start_with_recovery(name, false).await
     }
     async fn start_with_recovery(&mut self, name: &str, force: bool) -> Result<()> {
+        self.start_with_policy(name, force, true).await
+    }
+    async fn start_with_policy(
+        &mut self,
+        name: &str,
+        force: bool,
+        allow_elevation: bool,
+    ) -> Result<()> {
         self.reap()?;
         let plan = self.start_plan_with(name, force)?;
         // Validate the group before starting its first new process. Checks run
@@ -959,6 +915,12 @@ impl Manager {
                 } else {
                     self.instance(item)?
                 };
+                // Check the whole dependency plan before starting any process.
+                // Recheck at spawn as well so silent starts can never reach UAC.
+                anyhow::ensure!(
+                    allow_elevation || !self.needs_elevation(&instance)? || Self::elevation_service_installed()?,
+                    "Silent startup requires manual action: {item} needs administrator permission for TUN; register the Windows privilege service or start it in the TUI"
+                );
                 if instance.kind != Kind::Rule {
                     checks.push((instance.kind, instance.config));
                 }
@@ -980,11 +942,9 @@ impl Manager {
             if self.running.contains_key(&item) {
                 continue;
             }
-            let result = if force {
-                self.start_with_options(&item, None, true).await
-            } else {
-                self.start_one(&item).await
-            };
+            let result = self
+                .start_with_options(&item, None, force, allow_elevation)
+                .await;
             if let Err(error) = result {
                 // Only processes created by this attempt are rolled back.
                 let mut rollback_errors = Vec::new();
@@ -1013,10 +973,38 @@ impl Manager {
         }
         Ok(())
     }
-    /// Launch a Windows TUN proxy through UAC. `replaces` is a running core
-    /// the new one waits for, so the prompt is answered before that core stops.
+    fn needs_elevation(&self, instance: &Instance) -> Result<bool> {
+        #[cfg(windows)]
+        return Ok(instance.kind == Kind::Proxy
+            && astra_platform::runtime::load_overrides_in(&self.runtime_dir, &instance.config)?
+                .tun
+                == Some(true)
+            && !astra_platform::elevation::is_elevated()?);
+        #[cfg(not(windows))]
+        {
+            let _ = instance;
+            Ok(false)
+        }
+    }
+    fn elevation_service_installed() -> Result<bool> {
+        #[cfg(windows)]
+        return Ok(astra_platform::windows_service::installed()?);
+        #[cfg(not(windows))]
+        Ok(false)
+    }
+    /// Launch a Windows TUN proxy through the registered service or UAC.
+    /// `replaces` is a core the replacement waits for before binding endpoints.
     #[cfg(windows)]
     async fn spawn_elevated(&self, name: &str, replaces: Option<u32>) -> Result<ManagedChild> {
+        self.spawn_elevated_with_policy(name, replaces, true).await
+    }
+    #[cfg(windows)]
+    async fn spawn_elevated_with_policy(
+        &self,
+        name: &str,
+        replaces: Option<u32>,
+        allow_uac: bool,
+    ) -> Result<ManagedChild> {
         let instance = self.instance(name)?;
         let exe = self.bin.join(instance.kind.binary());
         let mut args = astra_platform::elevation::core_arguments_in(
@@ -1030,13 +1018,28 @@ impl Manager {
         args.push(
             serde_json::to_string(&astra_platform::lifecycle::capture(std::process::id())?)?.into(),
         );
-        astra_ipc::progress::report(
-            "Waiting for administrator approval",
-            format!("{name} · approve the Windows UAC prompt to run TUN"),
+        let service = Self::elevation_service_installed()?;
+        anyhow::ensure!(
+            service || allow_uac,
+            "Windows privilege service is not registered; silent startup cannot request UAC"
         );
+        if service {
+            astra_ipc::progress::report("Starting with Windows service", name.to_owned());
+        } else {
+            astra_ipc::progress::report(
+                "Waiting for administrator approval",
+                format!("{name} · approve the Windows UAC prompt to run TUN"),
+            );
+        }
         Ok(ManagedChild::Elevated(
-            tokio::task::spawn_blocking(move || astra_platform::elevation::spawn(&exe, &args))
-                .await??,
+            tokio::task::spawn_blocking(move || {
+                if service {
+                    astra_platform::windows_service::spawn(&exe, &args)
+                } else {
+                    astra_platform::elevation::spawn(&exe, &args)
+                }
+            })
+            .await??,
         ))
     }
     async fn start_one(&mut self, name: &str) -> Result<()> {
@@ -1045,13 +1048,14 @@ impl Manager {
     /// Start a core, or adopt `prepared`: an elevated replacement already
     /// approved through UAC that binds the endpoint once its predecessor exits.
     async fn start_with(&mut self, name: &str, prepared: Option<ManagedChild>) -> Result<()> {
-        self.start_with_options(name, prepared, false).await
+        self.start_with_options(name, prepared, false, true).await
     }
     async fn start_with_options(
         &mut self,
         name: &str,
         prepared: Option<ManagedChild>,
         force: bool,
+        allow_elevation: bool,
     ) -> Result<()> {
         self.reap()?;
         anyhow::ensure!(
@@ -1082,18 +1086,20 @@ impl Manager {
             .mode(0o600)
             .open(self.log(name))?;
         #[cfg(windows)]
-        let elevate = adopted
-            || instance.kind == Kind::Proxy
-                && astra_platform::runtime::load_overrides_in(&self.runtime_dir, &instance.config)?
-                    .tun
-                    == Some(true)
-                && !astra_platform::elevation::is_elevated()?;
+        let elevate = adopted || self.needs_elevation(&instance)?;
         #[cfg(not(windows))]
         let elevate = false;
+        anyhow::ensure!(
+            !elevate || allow_elevation || Self::elevation_service_installed()?,
+            "Silent startup requires manual action: {name} needs administrator permission for TUN; register the Windows privilege service or start it in the TUI"
+        );
         #[cfg(windows)]
         let elevated = match prepared {
             Some(child) => Some(child),
-            None if elevate => Some(self.spawn_elevated(name, None).await?),
+            None if elevate => Some(
+                self.spawn_elevated_with_policy(name, None, allow_elevation)
+                    .await?,
+            ),
             None => None,
         };
         #[cfg(not(windows))]
@@ -1637,6 +1643,10 @@ impl Manager {
             Action::BindStart { name, targets } => self.action_bind_start(name, targets).await,
             Action::Remove(name) => self.action_remove(name).await,
             Action::Start(name) => self.action_start(name).await,
+            Action::StartSilent(name) => {
+                self.start_with_policy(&name, false, false).await?;
+                Ok(Reply::text("Started"))
+            }
             Action::ForceStart(name) => self.action_force_start(name).await,
             Action::Stop(name) => self.action_stop(name).await,
             Action::UpdateSubscriptions(name) => self.action_update_subscriptions(name).await,
@@ -2184,4 +2194,5 @@ pub(crate) async fn start_native(
 }
 
 #[cfg(test)]
+#[path = "test/manager_test.rs"]
 mod tests;

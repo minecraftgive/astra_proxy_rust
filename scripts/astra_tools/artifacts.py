@@ -16,26 +16,33 @@ from .workspace import ROOT, cargo_profile as resolve_cargo_profile
 class Role:
     binaries: tuple[str, ...]
     example: str | None = None
+    windows_binaries: tuple[str, ...] = ()
 
 
 ROLES = {
-    'client': Role(('astra-rule', 'astra-proxy', 'astra-tui', 'astra-host', 'astra-manager', 'astra-convert'), 'client.example.toml'),
-    'server': Role(('astra-server-core', 'astra-server-tui', 'astra-manager', 'astra-host'), 'server.example.toml'),
+    'client': Role(('astra-rule', 'astra-proxy', 'astra-tui', 'astra-host', 'astra-manager', 'astra-convert'),
+                   'client.example.toml', ('astra-tui-startup', 'astra-service')),
+    'server': Role(('astra-server-core', 'astra-server-tui', 'astra-manager', 'astra-host'),
+                   'server.example.toml', ('astra-tui-startup',)),
     'controller': Role(('astra-manager',)),
     'web': Role(('astra-web',)),
 }
 COMPONENT_PACKAGES = {
     'astra-host': 'astra-manager',
     'astra-server-tui': 'astra-tui',
+    'astra-tui-startup': 'astra-tui',
+    'astra-service': 'astra-manager',
 }
 
 
-def role_binaries(roles):
-    return sorted({binary for role in roles for binary in ROLES[role].binaries})
+def role_binaries(roles, *, target=None):
+    windows = os.name == 'nt' if target is None else 'windows' in target
+    return sorted({binary for role in roles
+                   for binary in ROLES[role].binaries + (ROLES[role].windows_binaries if windows else ())})
 
 
-def role_packages(roles):
-    return sorted({COMPONENT_PACKAGES.get(binary, binary) for binary in role_binaries(roles)})
+def role_packages(roles, *, target=None):
+    return sorted({COMPONENT_PACKAGES.get(binary, binary) for binary in role_binaries(roles, target=target)})
 
 
 def _build_metadata(profile, cargo_profile=None):
@@ -70,7 +77,8 @@ def write_release_manifest(directory, label, target, versions, *, role='client',
         if not path.is_file() or path.is_symlink():
             raise ValueError(f'Unexpected release entry: {path}')
         files.append({'path': path.name, 'size': path.stat().st_size, 'sha256': sha256(path)})
-    components = {name: versions[COMPONENT_PACKAGES.get(name, name)] for name in ROLES[role].binaries}
+    components = {name: versions[COMPONENT_PACKAGES.get(name, name)]
+                  for name in role_binaries((role,), target=target)}
     identity = json.dumps({'target': target, 'role': role, 'components': components, 'files': files, **build},
                           sort_keys=True, separators=(',', ':')).encode()
     digest = hashlib.sha256(identity).hexdigest()[:16]
@@ -85,7 +93,7 @@ def stage(role, bin_dir, destination, *, target, versions, label, profile=None):
     _build_metadata(profile)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
-    for binary in ROLES[role].binaries:
+    for binary in role_binaries((role,), target=target):
         shutil.copy2(Path(bin_dir) / executable(binary), destination / executable(binary))
     if ROLES[role].example:
         shutil.copy2(ROOT / 'configs' / ROLES[role].example, destination / ROLES[role].example)
@@ -122,7 +130,7 @@ class ArtifactIndex:
                              'staged': Path(staged).resolve().relative_to(self.directory.resolve()).as_posix(),
                              'archive': Path(archive).resolve().relative_to(self.directory.resolve()).as_posix() if archive else None,
                              'archive_sha256': sha256(archive) if archive else None,
-                             'binaries': list(ROLES[role].binaries), **build})
+                             'binaries': role_binaries((role,), target=self.target), **build})
 
     def save(self):
         self.directory.mkdir(parents=True, exist_ok=True)

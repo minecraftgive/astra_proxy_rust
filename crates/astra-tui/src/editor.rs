@@ -3180,4 +3180,5 @@ impl Editor {
 }
 
 #[cfg(test)]
+#[path = "test/editor_test.rs"]
 mod tests;

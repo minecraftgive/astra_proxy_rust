@@ -124,6 +124,10 @@ pub enum Command {
     Start {
         instance: String,
     },
+    /// Start without interactive elevation; fails if any dependency needs it.
+    StartSilent {
+        instance: String,
+    },
     /// Discard old session metadata after explicit user confirmation.
     ForceStart {
         instance: String,
