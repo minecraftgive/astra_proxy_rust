@@ -51,8 +51,8 @@ fn every_field_round_trips_each_choice() {
 fn startup_defaults_are_off_and_instance_choice_persists() {
     let old: Preferences = serde_json::from_str(r#"{"mouse":false}"#).unwrap();
     assert!(!old.auto_start_instances);
-    #[cfg(windows)]
-    assert!(!old.windows_startup);
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    assert!(!old.startup_enabled);
     let (mut ui, dir) = settings_ui();
     let row = ALL_FIELDS
         .iter()
@@ -80,27 +80,25 @@ fn failed_startup_preference_save_keeps_previous_choice_and_error() {
         .contains(t("Cannot save preferences: {}").split("{}").next().unwrap()));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[test]
-fn windows_startup_is_read_from_os_and_registration_failure_is_visible() {
-    let old: Preferences = serde_json::from_str(r#"{"windows_startup":true}"#).unwrap();
+fn startup_enabled_is_read_from_os_and_registration_failure_is_visible() {
+    let old: Preferences = serde_json::from_str(r#"{"startup_enabled":true}"#).unwrap();
     assert!(
-        !old.windows_startup,
-        "JSON cannot silently register Windows startup"
+        !old.startup_enabled,
+        "JSON cannot silently register OS startup"
     );
     assert!(serde_json::to_value(old)
         .unwrap()
-        .get("windows_startup")
+        .get("startup_enabled")
         .is_none());
     let (mut ui, _) = settings_ui();
-    ui.choose_setting(Field::WindowsStartup, 0);
-    assert!(!ui.preferences.windows_startup);
-    assert!(ui
-        .message
-        .contains("Windows startup context is unavailable"));
+    ui.choose_setting(Field::StartupRegistration, 0);
+    assert!(!ui.preferences.startup_enabled);
+    assert!(ui.message.contains("Startup context is unavailable"));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn silent_startup_is_opt_in_and_persists_without_registering_startup() {
     let old: Preferences = serde_json::from_str("{}").unwrap();
@@ -108,7 +106,7 @@ fn silent_startup_is_opt_in_and_persists_without_registering_startup() {
     let (mut ui, dir) = settings_ui();
     ui.choose_setting(Field::SilentStartup, 0);
     assert!(ui.preferences.silent_startup);
-    assert!(!ui.preferences.windows_startup);
+    assert!(!ui.preferences.startup_enabled);
     let (loaded, error) = load(&dir.path().join(FILE), &Session::default());
     assert!(error.is_none());
     assert!(loaded.silent_startup);
@@ -120,18 +118,16 @@ fn silent_startup_is_opt_in_and_persists_without_registering_startup() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn silent_shortcut_update_failure_keeps_previous_preference() {
     let (mut ui, dir) = settings_ui();
     // No context means no real OS registration is read or changed.
-    ui.preferences.windows_startup = true;
+    ui.preferences.startup_enabled = true;
     ui.choose_setting(Field::SilentStartup, 0);
     assert!(!ui.preferences.silent_startup);
-    assert!(ui.preferences.windows_startup);
-    assert!(ui
-        .message
-        .contains("Windows startup context is unavailable"));
+    assert!(ui.preferences.startup_enabled);
+    assert!(ui.message.contains("Startup context is unavailable"));
     assert!(!dir.path().join(FILE).exists());
 }
 
@@ -148,9 +144,7 @@ fn privilege_service_is_os_state_and_missing_context_cannot_install_it() {
     ui.choose_setting(Field::WindowsService, 0);
     assert!(!ui.preferences.windows_service);
     assert!(ui.service_change.is_none());
-    assert!(ui
-        .message
-        .contains("Windows startup context is unavailable"));
+    assert!(ui.message.contains("Startup context is unavailable"));
     assert!(!dir.path().join(FILE).exists());
 }
 

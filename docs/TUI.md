@@ -27,16 +27,48 @@
 
 例如：`astra-tui --config-dir D:/Astra/config --state-dir D:/Astra/state`。
 
-在 **7 设置 → 启动** 中可独立控制以下选项，默认均关闭：
+在 **7 设置 → 启动** 中可独立控制以下选项，默认均关闭或未创建：
 
 - **Windows 登录后启动 TUI**（仅 Windows）：为当前用户创建启动快捷方式，登录后打开 TUI；保存当前程序、状态目录、配置目录、核心目录和管理端点，无需管理员权限。关闭选项会删除对应快捷方式。移动或删除安装目录前应先关闭此选项，再从新位置启用。
-- **静默启动**（仅 Windows）：配合 Windows 自启动使用，登录后不打开终端窗口，由随包附带的 `astra-tui-startup.exe` 在后台启动本地管理器，并按“自动启动实例”偏好启动实例。之后可手动打开普通 `astra-tui.exe` 或 `astra-server-tui.exe` 管理运行中的实例。连接独立管理端点时仍要求服务已运行；静默启动错误写入状态目录的 `startup.log`。静默启动不会弹出 UAC；需要提权的 TUN 实例可使用下述权限服务，未注册时记录错误，等待手动启动。
+- **macOS 登录后启动 TUI**（仅 macOS）：在当前用户的 `~/Library/LaunchAgents/` 创建 [LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)，下次登录时通过 Terminal 打开 TUI，无需管理员权限。启用时不会立即打开新窗口；关闭选项会删除对应启动文件，已运行的管理器和实例继续运行。
+- **静默启动**（Windows / macOS）：配合登录自启动使用，登录后不打开终端窗口，在后台启动本地管理器，并按“自动启动实例”偏好启动实例。Windows 使用随包附带的 `astra-tui-startup.exe`，macOS 直接运行 TUI 的 `--silent` 模式。之后可手动打开普通 TUI 管理运行中的实例。连接独立管理端点时仍要求服务已运行；静默启动错误写入状态目录的 `startup.log`。静默启动不会请求交互式提权；Windows TUN 可使用下述权限服务，其他缺少权限的实例记录错误，等待手动处理。
+- **systemd 用户服务文件**（仅 Linux）：创建当前用户的 `.service` 文件，显示“已创建 / 未创建”及文件路径；不会调用 `systemctl`，也不会自动启用或启动服务。生成的单元始终使用 `--silent`，是否启动实例由“自动启动实例”决定。手动启用方法见下文。
 - **Windows 权限服务**（仅 Windows 本地客户端）：首次开启时请求一次 UAC，将 `astra-service.exe`、`astra-proxy.exe` 和 `wintun.dll` 的受保护副本安装并注册为自动启动服务。之后当前账户的 TUN 启动、重启及静默自启动均优先使用服务，不逐次请求 UAC。需要当前账户本身是启用 UAC 的管理员账户；不保存密码，不支持输入另一个管理员账户来授权。关闭此选项需再次 UAC，以停止并卸载服务；已经运行的实例仍由管理器控制。
 - **自动启动实例**：下次打开主 TUI 并取得实例列表后，自动启动当前管理目标中已停止的已注册实例，复用正常启动检查和后台任务提示；不会重启正在运行的实例，也不会替换待恢复会话。F8、Alt+数字键及 `--view` / `--window-id` 打开的附加窗口不会触发自动启动。
 
-启用 Windows 自启动和自动启动实例后，登录 Windows 即可启动实例；再启用静默启动则不显示终端窗口。实例自动启动与静默启动偏好保存在状态目录的 `ui-preferences.json`，与该目录的其他窗口共享；开关变化不会立即启动或停止实例。仅启用 Windows 自启动时，仍可手动连接实例。
+Windows / macOS 启用登录自启动和自动启动实例后，登录即可启动实例；再启用静默启动则不显示终端窗口。实例自动启动与静默启动偏好保存在状态目录的 `ui-preferences.json`，与该目录的其他窗口共享；开关变化不会立即启动或停止实例。仅启用登录自启动时，仍可手动启动实例。
 
-启动快捷方式保留启用时的程序及核心目录。升级后需要在新版本中重新关闭、开启 Windows 自启动，以更新快捷方式的版本路径。
+各平台的启动文件保留生成时的程序、状态目录、配置目录、核心目录和管理目标。升级或移动安装目录后，应在新版本中重新生成启动文件以更新程序路径。macOS 使用 `com.astra.tui.<标识>.plist`，普通启动还会在 `~/Library/Application Support/Astra/startup/` 保存对应的 `.command` 文件；变更在下次登录时生效。
+
+Linux 文件保存到绝对路径的 `$XDG_CONFIG_HOME/systemd/user/`（未设置或使用相对路径时为 `~/.config/systemd/user/`），名称为 `astra-tui-<标识>.service`。已有的主目录或配置根目录别名会解析到实际目录；生成文件的目录仍需属于当前用户。生成文件要求 **systemd 242 或更新版本**：`Type=exec` 在 [systemd 240](https://github.com/systemd/systemd/blob/v240/NEWS) 引入，用于保留参数中美元符号的 `:` 命令前缀在 [systemd 242](https://github.com/systemd/systemd/blob/v242/NEWS) 引入。
+
+先在设置页生成文件，再将下方 `unit`、`file` 替换为界面显示的单元名和完整绝对路径。请在已登录、能够连接 systemd 用户管理器的会话中执行：
+
+```sh
+systemctl --user daemon-reload
+unit='astra-tui-<标识>.service'
+file='/请替换为完整路径/astra-tui-<标识>.service'
+if [ "$file" -ef "$(systemctl --user show --property=FragmentPath --value "$unit")" ]; then
+    systemctl --user enable "$unit"
+else
+    systemctl --user enable "$file"
+fi
+```
+
+需要立即运行或查看状态时，再执行：
+
+```sh
+systemctl --user start "$unit"
+systemctl --user status "$unit"
+```
+
+上述命令先检查用户管理器已找到的单元文件是否就是生成文件，目录别名指向同一文件时按名称启用，避免创建指向自身的链接；否则按完整路径启用，让 systemd 在需要时将其链接到管理器的单元搜索目录。这也适用于终端单独设置 `XDG_CONFIG_HOME`、与用户管理器环境不同的情况。之后的 `start`、`status`、`restart` 和 `disable` 使用单元名。界面只显示这些命令，不会自动执行查询或启用操作。[systemctl 启用语义](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)
+
+该单元在用户登录时发起一次后台启动，使用 `Type=exec`、`RemainAfterExit=yes` 和 `KillMode=process`。systemd 成功执行启动包装程序 `/bin/sh` 后便继续后续登录流程，不等待整个实例启动过程；`TimeoutStartSec=30s` 只限制这一步的进程启动，不是所有实例的就绪时限。`active (running)` 可表示后台启动流程仍在进行，成功退出后显示 `active (exited)`；这两种状态都不代表实例的当前健康状态，具体结果请查看 TUI 和状态目录的 `startup.log`。[systemd 服务语义](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)
+
+停止该单元不会停止已经独立运行的管理器或实例，实例启停仍在 TUI 中操作。重复执行 `start` 不会重跑已激活的单元，需要再次发起启动时使用 `restart`。生成文件不会开启开机前运行或用户 linger。[进程终止语义](https://github.com/systemd/systemd/blob/main/man/systemd.kill.xml)
+
+取消 Linux 登录启动时，先执行 `systemctl --user disable 'astra-tui-<标识>.service'`（同样替换实际标识），再关闭设置页的“systemd 用户服务文件”，最后执行 `systemctl --user daemon-reload`。仅删除生成文件不会替你清理已有的启用状态。Linux / macOS 登录启动均使用当前用户权限，不安装提权服务，也不授予 root 或 capabilities；TUN 和特权路由仍需满足既有系统权限要求。
 
 权限服务只负责启动固定的受保护 TUN 核心，普通管理器、TUI 和配置编辑保持原权限。它仅接受安装账户的本地请求，使用该账户的提权令牌，网络工作进程使用普通权限；不会将管理接口作为 LocalSystem 服务运行。服务不可用或受保护核心与当前版本不符时会报告错误，不隐式退回 UAC。更新服务副本前先停止 TUN 实例，再关闭、开启权限服务重新授权；普通程序更新不会覆盖服务副本。服务注册状态来自 Windows，不由 `ui-preferences.json` 授权。
 

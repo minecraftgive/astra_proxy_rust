@@ -5,6 +5,10 @@
 //! opens with. Every change applies immediately and is saved at once.
 use super::dashboard::{Target, BLUE, MUTED};
 use super::*;
+#[cfg(windows)]
+use crate::startup as startup_registration;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::startup_unix as startup_registration;
 use ratatui::{layout::Rect, style::Modifier};
 
 mod program_info;
@@ -125,11 +129,11 @@ pub(super) struct Preferences {
     pub(super) mouse: bool,
     pub(super) start_page: StartPage,
     pub(super) auto_start_instances: bool,
-    /// The Windows registration is authoritative, not the preferences file.
-    #[cfg(windows)]
+    /// The generated OS startup file is authoritative, not these preferences.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[serde(skip)]
-    pub(super) windows_startup: bool,
-    #[cfg(windows)]
+    pub(super) startup_enabled: bool,
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(super) silent_startup: bool,
     #[cfg(windows)]
     #[serde(skip)]
@@ -286,9 +290,9 @@ impl Default for Preferences {
             mouse: true,
             start_page: StartPage::Overview,
             auto_start_instances: false,
-            #[cfg(windows)]
-            windows_startup: false,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            startup_enabled: false,
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             silent_startup: false,
             #[cfg(windows)]
             windows_service: false,
@@ -307,9 +311,9 @@ pub(super) enum Field {
     Mouse,
     StartPage,
     AutoStartInstances,
-    #[cfg(windows)]
-    WindowsStartup,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    StartupRegistration,
+    #[cfg(any(windows, target_os = "macos"))]
     SilentStartup,
     #[cfg(windows)]
     WindowsService,
@@ -332,9 +336,9 @@ const ALL_FIELDS: &[Field] = &[
     Field::Mouse,
     Field::StartPage,
     Field::AutoStartInstances,
-    #[cfg(windows)]
-    Field::WindowsStartup,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    Field::StartupRegistration,
+    #[cfg(any(windows, target_os = "macos"))]
     Field::SilentStartup,
     #[cfg(windows)]
     Field::WindowsService,
@@ -349,7 +353,10 @@ const ALL_FIELDS: &[Field] = &[
     Field::MarqueeTrueColor,
 ];
 /// Row of the first marquee field.
-const MARQUEE_ROW: usize = 8 + 3 * cfg!(windows) as usize;
+const MARQUEE_ROW: usize = 8
+    + 3 * cfg!(windows) as usize
+    + 2 * cfg!(target_os = "macos") as usize
+    + cfg!(target_os = "linux") as usize;
 /// Rows shown now; the marquee section stays hidden until it is unlocked.
 fn fields(p: &Preferences) -> &'static [Field] {
     if p.marquee.unlocked {
@@ -376,9 +383,17 @@ impl Field {
             Self::Mouse => "Mouse",
             Self::StartPage => "Start page",
             Self::AutoStartInstances => "Auto-start instances",
-            #[cfg(windows)]
-            Self::WindowsStartup => "Start TUI with Windows",
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupRegistration => {
+                if cfg!(target_os = "macos") {
+                    "Start TUI at macOS login"
+                } else if cfg!(target_os = "linux") {
+                    "systemd user service file"
+                } else {
+                    "Start TUI with Windows"
+                }
+            }
+            #[cfg(any(windows, target_os = "macos"))]
             Self::SilentStartup => "Silent startup",
             #[cfg(windows)]
             Self::WindowsService => "Windows privilege service",
@@ -403,10 +418,18 @@ impl Field {
             Self::Mouse => "Off returns the mouse to the terminal so you can select and copy text.",
             Self::StartPage => "Page shown when a window opens without --view.",
             Self::AutoStartInstances => "Start stopped instances on the connected manager once when the main TUI opens. Additional windows do not trigger startup. Running instances are left as they are.",
-            #[cfg(windows)]
-            Self::WindowsStartup => "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too.",
-            #[cfg(windows)]
-            Self::SilentStartup => "At Windows sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.",
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupRegistration => {
+                if cfg!(target_os = "macos") {
+                    "Open this TUI in Terminal at the next macOS login. Silent startup runs it in the background instead. Auto-start instances controls instance startup. No administrator permission is required."
+                } else if cfg!(target_os = "linux") {
+                    "Create or remove a user systemd service file for silent startup. Enable it manually with systemctl; Auto-start instances controls instance startup. Removing the file does not stop running instances."
+                } else {
+                    "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too."
+                }
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::SilentStartup => "At sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.",
             #[cfg(windows)]
             Self::WindowsService => "Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.",
             Self::MarqueeBorder => "A rainbow runs around the border of the focused panel.",
@@ -433,8 +456,18 @@ impl Field {
                 "Monochrome",
             ],
             Self::Motion => &["Normal", "Reduced", "Off"],
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupRegistration => {
+                if cfg!(target_os = "linux") {
+                    &["Created", "Not created"]
+                } else {
+                    &["On", "Off"]
+                }
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::SilentStartup => &["On", "Off"],
             #[cfg(windows)]
-            Self::WindowsStartup | Self::SilentStartup | Self::WindowsService => &["On", "Off"],
+            Self::WindowsService => &["On", "Off"],
             Self::VimKeys
             | Self::Mouse
             | Self::AutoStartInstances
@@ -463,9 +496,9 @@ impl Field {
             Self::Mouse => usize::from(!p.mouse),
             Self::StartPage => p.start_page.page(),
             Self::AutoStartInstances => usize::from(!p.auto_start_instances),
-            #[cfg(windows)]
-            Self::WindowsStartup => usize::from(!p.windows_startup),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupRegistration => usize::from(!p.startup_enabled),
+            #[cfg(any(windows, target_os = "macos"))]
             Self::SilentStartup => usize::from(!p.silent_startup),
             #[cfg(windows)]
             Self::WindowsService => usize::from(!p.windows_service),
@@ -512,9 +545,9 @@ impl Field {
             Self::Mouse => p.mouse = index == 0,
             Self::StartPage => p.start_page = StartPage::ALL[index],
             Self::AutoStartInstances => p.auto_start_instances = index == 0,
-            #[cfg(windows)]
-            Self::WindowsStartup => p.windows_startup = index == 0,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupRegistration => p.startup_enabled = index == 0,
+            #[cfg(any(windows, target_os = "macos"))]
             Self::SilentStartup => p.silent_startup = index == 0,
             #[cfg(windows)]
             Self::WindowsService => p.windows_service = index == 0,
@@ -598,15 +631,16 @@ impl Ui {
             self.message = error;
         }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(super) fn load_startup_context(&mut self, context: &crate::windows::Context) {
         self.startup_context = Some(context.clone());
-        match crate::startup::enabled(context) {
-            Ok(enabled) => self.preferences.windows_startup = enabled,
+        match startup_registration::enabled(context) {
+            Ok(enabled) => self.preferences.startup_enabled = enabled,
             Err(error) => {
-                self.message = tr!("Cannot read Windows startup: {}", format!("{error:#}"));
+                self.message = tr!("Cannot read startup registration: {}", format!("{error:#}"));
             }
         }
+        #[cfg(windows)]
         match astra_platform::windows_service::installed() {
             Ok(installed) => self.preferences.windows_service = installed,
             Err(error) => self.message = tr!("Cannot read Windows service: {}", error.to_string()),
@@ -625,7 +659,7 @@ impl Ui {
         let Some(context) = &self.startup_context else {
             self.message = tr!(
                 "Cannot change Windows service: {}",
-                "Windows startup context is unavailable"
+                "Startup context is unavailable"
             );
             return;
         };
@@ -824,23 +858,31 @@ impl Ui {
             self.change_windows_service(index == 0);
             return;
         }
-        #[cfg(windows)]
-        if field == Field::WindowsStartup {
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        if field == Field::StartupRegistration {
             let result = self
                 .startup_context
                 .as_ref()
-                .context("Windows startup context is unavailable")
+                .context("Startup context is unavailable")
                 .and_then(|context| {
-                    crate::startup::set_enabled(
+                    startup_registration::set_enabled(
                         context,
                         index == 0,
                         self.preferences.silent_startup,
                     )
                 });
             match result {
-                Ok(()) => self.preferences.windows_startup = index == 0,
+                Ok(()) => self.preferences.startup_enabled = index == 0,
                 Err(error) => {
-                    self.message = tr!("Cannot change Windows startup: {}", format!("{error:#}"));
+                    if let Some(context) = &self.startup_context {
+                        if let Ok(enabled) = startup_registration::enabled(context) {
+                            self.preferences.startup_enabled = enabled;
+                        }
+                    }
+                    self.message = tr!(
+                        "Cannot change startup registration: {}",
+                        format!("{error:#}")
+                    );
                     return;
                 }
             }
@@ -849,26 +891,38 @@ impl Ui {
                 t(field.label()),
                 field.value_label(&self.preferences)
             );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(context) = &self.startup_context {
+                if let Ok(path) = startup_registration::managed_path(context) {
+                    self.message.push_str(&format!(" · {}", path.display()));
+                }
+            }
             return;
         }
-        #[cfg(windows)]
-        if field == Field::SilentStartup && self.preferences.windows_startup {
+        #[cfg(any(windows, target_os = "macos"))]
+        if field == Field::SilentStartup && self.preferences.startup_enabled {
             let previous = self.preferences.silent_startup;
             let result = self
                 .startup_context
                 .as_ref()
-                .context("Windows startup context is unavailable")
-                .and_then(|context| crate::startup::set_enabled(context, true, index == 0));
+                .context("Startup context is unavailable")
+                .and_then(|context| startup_registration::set_enabled(context, true, index == 0));
             if let Err(error) = result {
-                self.message = tr!("Cannot change Windows startup: {}", format!("{error:#}"));
+                self.message = tr!(
+                    "Cannot change startup registration: {}",
+                    format!("{error:#}")
+                );
                 return;
             }
             if !self.change_preferences(|p| p.silent_startup = index == 0) {
                 if let Some(context) = &self.startup_context {
-                    if let Err(error) = crate::startup::set_enabled(context, true, previous) {
+                    if let Err(error) = startup_registration::set_enabled(context, true, previous) {
                         self.message.push_str(&format!(
                             "\n{}",
-                            tr!("Cannot change Windows startup: {}", format!("{error:#}"))
+                            tr!(
+                                "Cannot change startup registration: {}",
+                                format!("{error:#}")
+                            )
                         ));
                     }
                 }
@@ -1048,9 +1102,39 @@ impl Ui {
             ));
             for row in range.clone() {
                 lines.push((Line::raw(""), Some(row)));
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if row == selected && fields[row] == Field::StartupRegistration {
+                    if let Some(context) = &self.startup_context {
+                        // Activation instructions may be longer than the
+                        // fixed footer. Keep every line in the scrollable
+                        // viewport so narrow terminals can inspect them all.
+                        let mut details = Vec::new();
+                        if let Ok(path) = startup_registration::managed_path(context) {
+                            let path: String = path
+                                .display()
+                                .to_string()
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .collect();
+                            details.push(Line::raw(path));
+                        }
+                        if self.preferences.startup_enabled {
+                            if let Ok(instructions) = startup_registration::instructions(context) {
+                                details.extend(
+                                    instructions.lines().map(|line| Line::raw(line.to_owned())),
+                                );
+                            }
+                        }
+                        lines.extend(
+                            program_info::wrap(details, inner.width.saturating_sub(1))
+                                .into_iter()
+                                .map(|line| (line, None)),
+                        );
+                    }
+                }
             }
         }
-        let description = Paragraph::new(vec![
+        let description_lines = vec![
             Line::styled(
                 t(fields[selected].description()).to_owned(),
                 Style::default().fg(MUTED),
@@ -1067,8 +1151,18 @@ impl Ui {
                     .unwrap_or_default(),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])
-        .wrap(Wrap { trim: true });
+        ];
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let description_lines = {
+            let mut description_lines = description_lines;
+            if fields[selected] == Field::StartupRegistration {
+                // This field is backed by the generated OS file rather than
+                // ui-preferences.json, whose path is shown for other fields.
+                description_lines.truncate(1);
+            }
+            description_lines
+        };
+        let description = Paragraph::new(description_lines).wrap(Wrap { trim: true });
         let description_height = (description.line_count(inner.width.saturating_sub(2).max(1))
             as u16)
             .min(inner.height / 3);

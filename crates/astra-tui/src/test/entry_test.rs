@@ -6,7 +6,7 @@ fn silent_launch_cannot_accidentally_open_a_window_or_run_maintenance() {
     assert!(validate_silent_launch(false, false, false, false, false, &launch).is_ok());
     assert_eq!(
         validate_silent_launch(true, false, false, false, false, &launch).is_ok(),
-        cfg!(windows)
+        cfg!(any(windows, target_os = "macos", target_os = "linux"))
     );
     for (daemon, shutdown, operation, console) in [
         (true, false, false, false),
@@ -20,6 +20,28 @@ fn silent_launch_cannot_accidentally_open_a_window_or_run_maintenance() {
     }
     let detached = windows::Launch::detached(windows::View::Profiles, None, protocol::Kind::Proxy);
     assert!(validate_silent_launch(true, false, false, false, false, &detached).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn silent_manager_gets_an_independent_session_without_process_group_conflicts() {
+    let mut command = Command::new("/bin/sleep");
+    command
+        .arg("5")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_manager_background(&mut command, true);
+    let mut child = command.spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let (session, group, parent_session) =
+        unsafe { (libc::getsid(pid), libc::getpgid(pid), libc::getsid(0)) };
+    // Always reap the fixture before assertions; no test daemon is left behind.
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert_eq!(session, pid);
+    assert_eq!(group, pid);
+    assert_ne!(session, parent_session);
 }
 use astra_update::{
     ImportOptions, ProtocolRange, ReleaseFile, ReleaseManifest, ReleaseStore,

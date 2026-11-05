@@ -138,11 +138,40 @@ fn validate_silent_launch(
     launch: &windows::Launch,
 ) -> Result<()> {
     if silent {
-        anyhow::ensure!(cfg!(windows), "Silent startup is supported only on Windows");
+        anyhow::ensure!(
+            cfg!(any(windows, target_os = "macos", target_os = "linux")),
+            "Silent startup is supported only on Windows, macOS and Linux"
+        );
         anyhow::ensure!(!daemon && !shutdown && !operation && !native_console && launch.view.is_none() && launch.window_id.is_none() && launch.instance.is_none(),
             "--silent cannot be combined with manager, shutdown, update, native-console or window selection options");
     }
     Ok(())
+}
+
+/// A headless launcher may exit as soon as the manager is ready. On Unix the
+/// manager needs its own session, without the launcher's controlling terminal;
+/// its standard handles are already null/log files and std::process::Child
+/// deliberately does not kill it when this frontend drops the handle.
+fn configure_manager_background(command: &mut Command, silent: bool) {
+    #[cfg(unix)]
+    if silent {
+        use std::os::unix::process::CommandExt;
+        // Do not also call background_command/process_group(0): making the
+        // child a group leader before setsid would make setsid fail with EPERM.
+        // SAFETY: setsid is async-signal-safe and this callback does no allocation.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        return;
+    }
+    #[cfg(not(unix))]
+    let _ = silent;
+    astra_platform::platform::background_command(command, true);
 }
 
 async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> Result<()> {
@@ -242,7 +271,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
                 println!("{program} [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
                 println!("update PATH: apply a local update package\nupdate-status: show release and drain status\nrollback: return new sessions to the previous release\nastra-host runs the background manager by default; host updates take effect after an intentional restart");
                 println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 println!("--silent: start the manager and configured auto-start instances without opening the TUI; errors are saved to STATE_DIR/startup.log");
                 println!("--view overview|proxies|connections|rules|logs|profiles|settings|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–7: page in a new window");
                 return Ok(());
@@ -450,7 +479,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        astra_platform::platform::background_command(&mut command, true);
+        configure_manager_background(&mut command, silent);
         let mut child = command.spawn()?;
         let mut ready = false;
         // Poll quickly at first: the manager normally binds within a few ms.

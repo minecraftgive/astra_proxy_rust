@@ -276,7 +276,7 @@ async fn refresh_failure_cancels_remaining_startup_requests() {
 
 fn silent_context(home: &std::path::Path) -> crate::windows::Context {
     crate::windows::Context {
-        executable: home.join("astra-tui.exe"),
+        executable: home.join(astra_platform::platform::executable("astra-tui")),
         home: home.into(),
         config: home.join("config"),
         bin: home.join("bin"),

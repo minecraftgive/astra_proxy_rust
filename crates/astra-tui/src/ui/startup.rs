@@ -68,6 +68,8 @@ pub(crate) fn log_startup(home: &std::path::Path, message: &str) -> Result<()> {
 
 /// Headless launch: never restore a UI session, enter raw mode or create a
 /// missing configuration. The manager retains validation and rollback policy.
+/// The same path is used by Windows sign-in, macOS launchd and Linux systemd;
+/// failures are logged instead of opening a terminal or requesting elevation.
 pub(crate) async fn run_silent(socket: PathBuf, context: crate::windows::Context) -> Result<()> {
     log_startup(&context.home, "Silent startup started")?;
     let result: Result<()> = async {

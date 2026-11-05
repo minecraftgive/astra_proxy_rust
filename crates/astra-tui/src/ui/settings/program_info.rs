@@ -94,7 +94,7 @@ fn features(lines: &mut Vec<Line<'static>>, title: &str, features: &[FeatureSupp
 
 /// Wrap at grapheme boundaries using terminal cell widths. Keeping the physical
 /// lines lets the same viewport scroll information and clickable preferences.
-fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut output = Vec::new();
     for line in lines {

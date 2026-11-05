@@ -20,7 +20,7 @@ pub(super) async fn run_local(
     };
     // Preferences are per user, shared by every window and remote target.
     ui.load_preferences(context.home.join(settings::FILE));
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     ui.load_startup_context(&context);
     let mut startup = startup::Instances::new(ui.preferences.auto_start_instances, &launch);
     ui.page = ui.preferences.start_page.page();

@@ -476,7 +476,7 @@ struct Ui {
     search_on_open: bool,
     preferences: settings::Preferences,
     preferences_path: Option<PathBuf>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     startup_context: Option<crate::windows::Context>,
     #[cfg(windows)]
     service_change: Option<tokio::task::JoinHandle<std::result::Result<bool, String>>>,
@@ -640,7 +640,7 @@ impl Ui {
             search_on_open: false,
             preferences: Default::default(),
             preferences_path: None,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_context: None,
             #[cfg(windows)]
             service_change: None,

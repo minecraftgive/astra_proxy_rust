@@ -10,6 +10,8 @@
 
 Windows 客户端包另含 `astra-tui-startup.exe` 和 `astra-service.exe`。设置页中默认关闭的“静默启动”会在 Windows 登录时后台启动管理器，并按“自动启动实例”偏好启动实例，不打开终端；之后可手动打开 `astra-tui.exe` 管理。错误记录在状态目录的 `startup.log`。
 
+macOS 可在 **7 设置 → 启动** 开启当前用户的登录自启动，下次登录时打开 Terminal 中的 TUI；开启“静默启动”后改为后台运行。Linux 提供“systemd 用户服务文件”生成选项，要求 systemd 242 或更新版本。生成后需手动执行界面显示的启用命令：先刷新用户管理器，再比较其已找到的文件；同一文件按名称启用，否则使用生成文件的完整绝对路径，兼容目录别名和自定义 `XDG_CONFIG_HOME`。需要立即运行时再执行 `systemctl --user start '<生成的单元名>'`，查看状态也使用单元名。生成文件不会自动启用、启动服务或请求管理员权限；启动单元不会等待全部实例就绪而阻塞后续登录流程。两者均复用“自动启动实例”偏好，完整命令、状态含义及停止行为见 [TUI 启动设置](TUI.md)。
+
 需要 TUN 无提示启动时，在本地 TUI 的 **7 设置 → 启动 → Windows 权限服务** 完成一次 UAC 注册。安装器将服务、代理核心及 Wintun DLL 复制到受管理员保护的目录；需要完整客户端包中的 `wintun.dll` 和当前账户的管理员身份。后续启动不再逐次弹出 UAC。卸载或更新服务仍需 UAC；更新前先停止 TUN 实例，再关闭、开启此开关。服务只接受安装账户的本地 TUN 启动请求，普通管理器保持原权限；没有注册服务时，静默启动会跳过需要提权的实例并记录错误。详情见 [TUI 启动设置](TUI.md)。这些 Windows 辅助程序应与客户端包一同保留，其他平台不分发。
 
 完整示例默认独立模式，按注释填写节点后运行 `astra-proxy --check client.example.toml` 校验，然后运行 `astra-proxy client.example.toml`。需要规则核心时，按文件末尾说明把注释中的完整规则模板另存为 `rule.toml`，修改独立模式设置后分别启动两个核心；也可由 TUI 管理。示例列出全部协议变体，部署时删除不用的节点。客户端默认本机入站没有认证，保持回环监听。
@@ -19,6 +21,8 @@ Windows 客户端包另含 `astra-tui-startup.exe` 和 `astra-service.exe`。设
 解压 `astra-server-版本-平台-架构.tar.gz` 后进入 `server/`。包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host` 与 `server.example.toml`。按注释替换凭据和证书，运行 `astra-server-core --config server.example.toml --check`。终端入口 `astra-server-tui` 默认打开 Server 配置档，在界面中注册并绑定配置；也可通过 Agent/Web 管理。旧专用 TUI 的 `--config`/`--control` 用法不适用于统一 TUI。
 
 Windows 服务端包同样包含 `astra-tui-startup.exe`，支持设置页的 Windows 静默自启动；手动管理仍使用 `astra-server-tui.exe`。用法与客户端一致，详见 [TUI 启动设置](TUI.md)。
+
+macOS / Linux 的 `astra-server-tui` 同样支持相应平台的登录启动或用户服务文件生成，使用当前服务端程序及所选目录，不需要额外启动辅助程序。
 
 示例覆盖全部八类入站协议、传输与扩展；服务端私钥与客户端公钥分别配置。部署和管理方法见 [服务端说明](SERVER.md)，扩展字段见 [服务端扩展](SERVER_EXTENSIONS.md)。
 

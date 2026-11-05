@@ -21,6 +21,8 @@ mod protocol;
 mod shell;
 #[cfg(windows)]
 mod startup;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod startup_unix;
 use astra_management::subscription_view;
 mod theme;
 use astra_platform::tui_log;
