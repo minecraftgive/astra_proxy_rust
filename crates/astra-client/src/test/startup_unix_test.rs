@@ -324,17 +324,15 @@ fn systemd_unit_disables_environment_expansion_and_preserves_specifier_literals(
 fn command_keeps_storage_and_remote_target_without_window_overrides() {
     let temp = Temporary::new();
     let context = context(&temp.0);
-    let target = Some((
-        temp.0.join("controller.sock"),
-        Some("node with spaces".into()),
-    ));
+    let endpoint = temp.0.join("controller.sock");
+    let target = Some((endpoint.clone(), Some("node with spaces".into())));
     let command = Command::from_context(&context, &target).unwrap();
     let arguments = command.argv(true);
     for (flag, value) in [
         ("--state-dir", context.home),
         ("--config-dir", context.config),
         ("--bin-dir", context.bin),
-        ("--endpoint", target.unwrap().0),
+        ("--endpoint", endpoint),
     ] {
         assert!(arguments
             .windows(2)

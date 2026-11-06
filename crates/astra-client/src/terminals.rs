@@ -8,14 +8,14 @@ use std::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Candidate {
+pub struct Candidate {
     pub id: String,
     pub label: String,
     pub executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LaunchOutcome {
+pub enum LaunchOutcome {
     Launched {
         terminal: String,
     },
@@ -281,7 +281,7 @@ fn discover_in(
 }
 
 /// Filesystem-only discovery: never launches terminals or queries their shells.
-pub(crate) fn discover() -> Vec<Candidate> {
+pub fn discover() -> Vec<Candidate> {
     let platform = Platform::current();
     discover_in(platform, &Locations::environment(platform), executable_file)
 }
@@ -499,7 +499,7 @@ fn script_body(executable: &Path, args: &[OsString], parent: &Path) -> Result<St
 
 /// Missing selections and failed terminal spawns try the same ordered Auto
 /// choices, then leave native/current-terminal fallback to the caller.
-pub(crate) fn launch(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOutcome> {
+pub fn launch(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOutcome> {
     let platform = Platform::current();
     if id == "native" && platform == Platform::Windows {
         return Ok(LaunchOutcome::Native);

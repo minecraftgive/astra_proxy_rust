@@ -1,5 +1,10 @@
 use std::path::PathBuf;
 pub struct Fixture(pub PathBuf);
+impl Default for Fixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Fixture {
     pub fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

@@ -169,10 +169,10 @@ fn resolve_config_root(path: &Path) -> Result<PathBuf> {
     }
 }
 
-pub(crate) fn managed_path(context: &Context) -> Result<PathBuf> {
+pub fn managed_path(context: &Context) -> Result<PathBuf> {
     Ok(paths(context, &crate::protocol::target())?.file)
 }
-pub(crate) fn instructions(context: &Context) -> Result<String> {
+pub fn instructions(context: &Context) -> Result<String> {
     let paths = paths(context, &crate::protocol::target())?;
     activation_instructions(&paths)
 }
@@ -186,11 +186,11 @@ fn activation_instructions(paths: &Paths) -> Result<String> {
         ),
     })
 }
-pub(crate) fn enabled(context: &Context) -> Result<bool> {
+pub fn enabled(context: &Context) -> Result<bool> {
     let paths = paths(context, &crate::protocol::target())?;
     managed_file(&paths.file, &paths.prefix())
 }
-pub(crate) fn set_enabled(context: &Context, enabled: bool, silent: bool) -> Result<()> {
+pub fn set_enabled(context: &Context, enabled: bool, silent: bool) -> Result<()> {
     let target = crate::protocol::target();
     let paths = paths(context, &target)?;
     let command = Command::from_context(context, &target)?;

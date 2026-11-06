@@ -12,7 +12,7 @@ use std::{
 const READY_CONTENT: &[u8] = b"astra-tui-ready-v1\n";
 
 /// Publish readiness only after the replacement interface draws its first frame.
-pub(crate) fn signal_ready(path: &Path) -> Result<()> {
+pub fn signal_ready(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Inspect interface readiness marker"),
@@ -93,7 +93,7 @@ fn wait_for_ready(child: &mut Child, path: &Path, timeout: Duration) -> Result<(
 }
 
 /// Importing or partially applying a release must never restart the interface.
-pub(crate) fn completed_release(status: &updates::UpdateStatus) -> Option<&str> {
+pub fn completed_release(status: &updates::UpdateStatus) -> Option<&str> {
     let operation = status.operation.as_ref()?;
     if operation.phase != updates::UpdatePhase::Complete
         || !operation.runtime_committed
@@ -115,10 +115,7 @@ pub(crate) fn completed_release(status: &updates::UpdateStatus) -> Option<&str> 
 
 /// Resolve from the local store, never from a path supplied by a status reply.
 /// resolve_current rechecks the manifest, target, protocol and every file hash.
-pub(crate) fn resolve(
-    context: &windows::Context,
-    release_id: &str,
-) -> Result<Option<windows::Context>> {
+pub fn resolve(context: &windows::Context, release_id: &str) -> Result<Option<windows::Context>> {
     let Some(release) = astra_update::ReleaseStore::new(&context.home).resolve_current()? else {
         anyhow::bail!("The completed update has no selected local release");
     };
@@ -168,7 +165,7 @@ fn restart_command(context: &windows::Context, launch: &windows::Launch) -> Comm
 
 /// Called only after checkpointing drafts and restoring the terminal. No host
 /// command is sent: the replacement frontend reconnects to the existing host.
-pub(crate) fn restart(context: &windows::Context, launch: &windows::Launch) -> Result<()> {
+pub fn restart(context: &windows::Context, launch: &windows::Launch) -> Result<()> {
     let mut command = restart_command(context, launch);
     #[cfg(unix)]
     {

@@ -1,0 +1,39 @@
+[package]
+name = "astra-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+unicode-segmentation = "1"
+unicode-width = "=0.2.0"
+astra-platform = { path = "../astra-platform" }
+astra-app = { path = "../astra-app" }
+astra-model = { path = "../astra-model" }
+anyhow.workspace = true
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio.workspace = true
+serde.workspace = true
+toml.workspace = true
+astra-ipc = { path = "../astra-ipc" }
+astra-management = { path = "../astra-management" }
+astra-update = { path = "../astra-update" }
+astra-convert = { path = "../astra-convert" }
+serde_json = "1"
+toml_edit = "0.23"
+sha2 = "0.10"
+
+[dev-dependencies]
+astra-manager = { path = "../astra-manager" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

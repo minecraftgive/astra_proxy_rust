@@ -12,12 +12,12 @@ use std::{
 type Target = Option<(PathBuf, Option<String>)>;
 
 /// Cheap enough for opening Settings: never creates a COM object or files.
-pub(crate) fn enabled(context: &Context) -> Result<bool> {
+pub fn enabled(context: &Context) -> Result<bool> {
     let path = startup_directory()?.join(shortcut_name(context, &crate::protocol::target()));
     shortcut_exists(&path)
 }
 
-pub(crate) fn set_enabled(context: &Context, enabled: bool, silent: bool) -> Result<()> {
+pub fn set_enabled(context: &Context, enabled: bool, silent: bool) -> Result<()> {
     let target = crate::protocol::target();
     let path = startup_directory()?.join(shortcut_name(context, &target));
     if !enabled {
@@ -151,7 +151,7 @@ fn arguments(context: &Context, target: &Target, silent: bool) -> Result<OsStrin
 
 /// Windows argv quoting; there is no cmd.exe, PowerShell or percent expansion
 /// when the shortcut launches the executable. Double trailing backslashes too.
-pub(crate) fn quote_arguments(args: &[OsString]) -> Result<OsString> {
+pub fn quote_arguments(args: &[OsString]) -> Result<OsString> {
     let mut output = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if index != 0 {

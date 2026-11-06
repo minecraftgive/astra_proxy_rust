@@ -17,7 +17,7 @@ pub enum Language {
 static LANGUAGE: AtomicU8 = AtomicU8::new(1);
 /// `--lang` on the command line outranks the saved preference for this run.
 static COMMAND_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) }; }
 impl Language {
     pub fn resolve(locale: &str) -> Self {
@@ -37,7 +37,7 @@ impl Language {
     }
 }
 pub fn language() -> Language {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(language) = TEST_LANGUAGE.get() {
         return language;
     }
@@ -47,7 +47,7 @@ pub fn language() -> Language {
         _ => Language::Simplified,
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn with_language<T>(language: Language, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<Language>);
     impl Drop for Restore {
@@ -86,11 +86,11 @@ pub fn command_line_language() -> bool {
 pub fn set_language(language: Option<Language>) {
     let language = language.unwrap_or_else(|| Language::resolve(&environment_locale()));
     // Tests run in parallel; keep a change on the calling test's thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         TEST_LANGUAGE.set(Some(language));
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     LANGUAGE.store(language as u8, Ordering::Relaxed);
 }
 fn environment_locale() -> String {
@@ -1228,6 +1228,77 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Hue degrees per second, 0–1800; at 360 one whole rainbow passes each cell per second. ←→ ±10, Shift ±100. Reduced or Off motion holds the colors still.", "Hue degrees per second, 0–1800; at 360 one whole rainbow passes each cell per second. ←→ ±10, Shift ±100. Reduced or Off motion holds the colors still.", "每秒色相变化的度数，0–1800；360 表示每秒有一整段彩虹流过每个字符格。←→ ±10，Shift ±100。动效为“减弱”或“关闭”时颜色静止。", "每秒色相變化的度數，0–1800；360 表示每秒有一整段彩虹流過每個字元格。←→ ±10，Shift ±100。動效為「減弱」或「關閉」時顏色靜止。"),
     ("Cells one whole rainbow spans, 2–400; wider is a gentler gradient. ←→ ±1, Shift ±10.", "Cells one whole rainbow spans, 2–400; wider is a gentler gradient. ←→ ±1, Shift ±10.", "一整段彩虹跨越的字符格数，2–400；越宽渐变越柔和。←→ ±1，Shift ±10。", "一整段彩虹跨越的字元格數，2–400；越寬漸層越柔和。←→ ±1，Shift ±10。"),
     ("Marquee colors ignore the Colors setting and are always sent as 24-bit color. Needs a terminal with true color.", "Marquee colors ignore the Colors setting and are always sent as 24-bit color. Needs a terminal with true color.", "跑马灯颜色忽略“色彩”设置，始终以 24 位真彩色输出。需要终端支持真彩色。", "跑馬燈顏色忽略「色彩」設定，始終以 24 位元全彩輸出。需要終端機支援全彩。"),
+    // Native GUI shell and the explicitly staged parity views.
+    ("Search commands", "Search commands", "搜索命令", "搜尋命令"),
+    ("No profile selected", "No profile selected", "尚未选择配置", "尚未選擇設定"),
+    ("Framework preview · planned features", "Framework preview · planned features", "界面框架预览 · 待实现功能", "介面框架預覽 · 待實作功能"),
+    ("Planned", "Planned", "待实现", "待實作"),
+    ("Tasks", "Tasks", "任务", "工作"),
+    ("Diagnostics", "Diagnostics", "诊断", "診斷"),
+    ("Recovery", "Recovery", "恢复", "復原"),
+    ("Monitor", "Monitor", "监控", "監控"),
+    ("GUI log", "GUI log", "GUI 日志", "GUI 日誌"),
+    ("Runtime and traffic", "Runtime and traffic", "运行状态与流量", "執行狀態與流量"),
+    ("Groups and outbound selection", "Groups and outbound selection", "代理组与出站选择", "代理群組與出站選擇"),
+    ("Active network sessions", "Active network sessions", "活动网络连接", "作用中的網路連線"),
+    ("Routing and explanation", "Routing and explanation", "路由规则与解析", "路由規則與解析"),
+    ("Live events and diagnostics", "Live events and diagnostics", "实时事件与诊断", "即時事件與診斷"),
+    ("Proxy, rule and server configurations", "Proxy, rule and server configurations", "代理、规则与服务端配置", "代理、規則與伺服器設定"),
+    ("Appearance, startup and installation", "Appearance, startup and installation", "外观、启动与安装", "外觀、啟動與安裝"),
+    ("Header card, alerts and connection toggle", "Header card, alerts and connection toggle", "概览卡片、提醒与连接开关", "概覽卡片、提醒與連線開關"),
+    ("Mode, system proxy, TUN and LAN controls", "Mode, system proxy, TUN and LAN controls", "模式、系统代理、TUN 与局域网控制", "模式、系統代理、TUN 與區域網路控制"),
+    ("Connection sparkline, proxy groups and expandable traffic panel", "Connection sparkline, proxy groups and expandable traffic panel", "连接趋势图、代理组与可展开的流量面板", "連線趨勢圖、代理群組與可展開的流量面板"),
+    ("Pause live display", "Pause live display", "暂停实时显示", "暫停即時顯示"),
+    ("Group list and member grid with delay chips", "Group list and member grid with delay chips", "代理组列表、成员网格与延迟标记", "代理群組清單、成員網格與延遲標記"),
+    ("Test group and find members", "Test group and find members", "测试代理组与查找成员", "測試代理群組與尋找成員"),
+    ("Virtualized table grouped by destination", "Virtualized table grouped by destination", "按目标分组的虚拟化连接表", "依目標分組的虛擬化連線表"),
+    ("Filter and connection details", "Filter and connection details", "筛选与连接详情", "篩選與連線詳細資訊"),
+    ("Close selected connection and confirm close all", "Close selected connection and confirm close all", "关闭所选连接与确认关闭全部", "關閉所選連線與確認關閉全部"),
+    ("Rule core status", "Rule core status", "规则核心状态", "規則核心狀態"),
+    ("Route test dialog and explanation view", "Route test dialog and explanation view", "路由测试对话框与解析视图", "路由測試對話框與解析檢視"),
+    ("Edit and search rules", "Edit and search rules", "编辑与搜索规则", "編輯與搜尋規則"),
+    ("Virtualized log viewer and source switch", "Virtualized log viewer and source switch", "虚拟化日志查看器与来源切换", "虛擬化日誌檢視器與來源切換"),
+    ("Search n/N, filter, display and capture levels", "Search n/N, filter, display and capture levels", "n/N 搜索、筛选、显示与采集级别", "n/N 搜尋、篩選、顯示與擷取層級"),
+    ("Memory limit, wrap, follow, reconnect and horizontal scroll", "Memory limit, wrap, follow, reconnect and horizontal scroll", "内存限制、换行、跟随、重连与横向滚动", "記憶體限制、換行、跟隨、重新連線與橫向捲動"),
+    ("Proxy / Rule / Server tabs and profile details", "Proxy / Rule / Server tabs and profile details", "代理 / 规则 / 服务端标签页与配置详情", "代理 / 規則 / 伺服器分頁與設定詳細資訊"),
+    ("Create, clone, start, stop, restart and force start", "Create, clone, start, stop, restart and force start", "新建、复制、启动、停止、重启与强制启动", "新增、複製、啟動、停止、重新啟動與強制啟動"),
+    ("Reload, edit, logs, test, bindings, remove, import, export and validate", "Reload, edit, logs, test, bindings, remove, import, export and validate", "重载、编辑、日志、测试、绑定、移除、导入、导出与校验", "重新載入、編輯、日誌、測試、繫結、移除、匯入、匯出與驗證"),
+    ("Operations context menu and confirmation dialogs", "Operations context menu and confirmation dialogs", "操作右键菜单与确认对话框", "操作快顯選單與確認對話框"),
+    ("Language, accent, colour intensity, motion, Vim keys, mouse and start page", "Language, accent, colour intensity, motion, Vim keys, mouse and start page", "语言、强调色、色彩强度、动效、Vim 按键、鼠标与启动页", "語言、強調色、色彩強度、動效、Vim 按鍵、滑鼠與啟動頁"),
+    ("Terminal picker and GUI / TUI login startup", "Terminal picker and GUI / TUI login startup", "终端选择器与 GUI / TUI 登录启动", "終端機選擇器與 GUI / TUI 登入啟動"),
+    ("Silent startup and Windows privilege service", "Silent startup and Windows privilege service", "静默启动与 Windows 权限服务", "靜默啟動與 Windows 權限服務"),
+    ("Installation, secure askpass / UAC and update self-restart", "Installation, secure askpass / UAC and update self-restart", "安装、安全提权提示与更新后自动重启", "安裝、安全提權提示與更新後自動重新啟動"),
+    ("Hidden Ctrl+Home marquee banner", "Hidden Ctrl+Home marquee banner", "Ctrl+Home 隐藏跑马灯横幅", "Ctrl+Home 隱藏跑馬燈橫幅"),
+    ("Task event details and abort", "Task event details and abort", "任务事件详情与中止", "工作事件詳細資訊與中止"),
+    ("CPU, memory and network charts", "CPU, memory and network charts", "CPU、内存与网络图表", "CPU、記憶體與網路圖表"),
+    ("Pause and clear history", "Pause and clear history", "暂停与清空历史", "暫停與清除歷程"),
+    ("Checklist runner, streaming results and abort", "Checklist runner, streaming results and abort", "检查清单、实时结果与中止", "檢查清單、即時結果與中止"),
+    ("Egress, kind, target, record, server and count form", "Egress, kind, target, record, server and count form", "出口、类型、目标、记录、服务器与次数表单", "出口、類型、目標、記錄、伺服器與次數表單"),
+    ("Import package, status, activate confirmation, rollback and recover", "Import package, status, activate confirmation, rollback and recover", "导入程序包、状态、激活确认、回滚与恢复", "匯入程式套件、狀態、啟用確認、回復與復原"),
+    ("Restart GUI after update", "Restart GUI after update", "更新后重启 GUI", "更新後重新啟動 GUI"),
+    ("Schema tree: fold, mark, reorder, rename, duplicate and delete with undo", "Schema tree: fold, mark, reorder, rename, duplicate and delete with undo", "结构树：折叠、标记、排序、重命名、复制与可撤销删除", "結構樹：摺疊、標記、排序、重新命名、複製與可復原刪除"),
+    ("Schema form, member picker and new outbound wizard", "Schema form, member picker and new outbound wizard", "配置表单、成员选择器与新建出站向导", "設定表單、成員選擇器與新增出站精靈"),
+    ("Raw TOML code editor and semantic highlighting", "Raw TOML code editor and semantic highlighting", "原始 TOML 代码编辑器与语义高亮", "原始 TOML 程式碼編輯器與語意醒目提示"),
+    ("Drafts, conflict banner, disk comparison and Ctrl-S save", "Drafts, conflict banner, disk comparison and Ctrl-S save", "草稿、冲突提醒、磁盘对比与 Ctrl-S 保存", "草稿、衝突提醒、磁碟比較與 Ctrl-S 儲存"),
+    ("Import drafts, nodes and rules; export TOML and share links", "Import drafts, nodes and rules; export TOML and share links", "导入草稿、节点与规则；导出 TOML 与分享链接", "匯入草稿、節點與規則；匯出 TOML 與分享連結"),
+    ("External editor and shared Vim bindings zM / zR / v / K / J", "External editor and shared Vim bindings zM / zR / v / K / J", "外部编辑器与共享 Vim 按键 zM / zR / v / K / J", "外部編輯器與共用 Vim 按鍵 zM / zR / v / K / J"),
+    ("Full-window recovery view with back and continue", "Full-window recovery view with back and continue", "全窗口恢复视图，支持返回与继续", "全視窗復原檢視，支援返回與繼續"),
+    ("TUI / GUI log source, filter, follow and search", "TUI / GUI log source, filter, follow and search", "TUI / GUI 日志来源、筛选、跟随与搜索", "TUI / GUI 日誌來源、篩選、跟隨與搜尋"),
+    ("This action is planned for the next implementation phase", "This action is planned for the next implementation phase", "此操作将在下一阶段实现", "此操作將在下一階段實作"),
+    ("Diagnostics is planned for the next implementation phase", "Diagnostics is planned for the next implementation phase", "诊断功能将在下一阶段实现", "診斷功能將在下一階段實作"),
+    ("Unable to connect to the manager", "Unable to connect to the manager", "无法连接管理器", "無法連線至管理員程式"),
+    ("Check the manager path or start astra-host, then relaunch the GUI.", "Check the manager path or start astra-host, then relaunch the GUI.", "请检查管理器路径或启动 astra-host，然后重新打开 GUI。", "請檢查管理員程式路徑或啟動 astra-host，然後重新開啟 GUI。"),
+    ("Prompt dialogs and native file pickers", "Prompt dialogs and native file pickers", "输入对话框与原生文件选择器", "輸入對話框與原生檔案選擇器"),
+    ("No background tasks", "No background tasks", "暂无后台任务", "目前沒有背景工作"),
+    ("Server status and statistics", "Server status and statistics", "服务端状态与统计", "伺服器狀態與統計"),
+    ("No profiles", "No profiles", "暂无配置", "目前沒有設定"),
+    ("Connecting…", "Connecting…", "连接中…", "連線中…"),
+    ("Done", "Done", "已完成", "已完成"),
+    ("Working", "Working", "处理中", "處理中"),
+    ("Manager", "Manager", "管理器", "管理員程式"),
+    ("Runtime", "Runtime", "运行状态", "執行狀態"),
+    ("Program info", "Program info", "程序信息", "程式資訊"),
+
 ];
 
 #[cfg(test)]

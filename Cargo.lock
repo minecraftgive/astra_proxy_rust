@@ -228,6 +228,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "astra-app",
+ "astra-convert",
+ "astra-ipc",
+ "astra-management",
+ "astra-manager",
+ "astra-model",
+ "astra-platform",
+ "astra-update",
+ "chrono",
+ "futures-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "astra-convert"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +580,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astra-app",
+ "astra-client",
  "astra-convert",
  "astra-ipc",
  "astra-management",

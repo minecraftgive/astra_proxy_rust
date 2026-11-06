@@ -14,6 +14,7 @@ name = "astra-server-tui"
 path = "src/server_main.rs"
 
 [dependencies]
+astra-client = { path = "../astra-client" }
 astra-platform = { path = "../astra-platform" }
 astra-app = { path = "../astra-app" }
 astra-model = { path = "../astra-model" }
@@ -35,6 +36,7 @@ toml_edit = "0.23"
 sha2 = "0.10"
 
 [dev-dependencies]
+astra-client = { path = "../astra-client", features = ["test-support"] }
 astra-manager = { path = "../astra-manager" }
 
 [target.'cfg(windows)'.dependencies]

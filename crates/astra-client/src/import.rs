@@ -1,5 +1,5 @@
 pub use astra_app::import::*;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "test/import_test.rs"]
-pub(crate) mod tests;
+pub mod tests;

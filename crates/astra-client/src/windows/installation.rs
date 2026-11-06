@@ -41,7 +41,7 @@ fn shell_program(program: &Path) -> Result<Vec<u16>> {
     Ok(value)
 }
 
-pub(crate) fn elevate(program: &Path, arguments: &[String]) -> Result<()> {
+pub fn elevate(program: &Path, arguments: &[String]) -> Result<()> {
     let program = std::fs::canonicalize(program)?;
     anyhow::ensure!(
         program.is_file(),

@@ -69,7 +69,7 @@ pub async fn request(socket: &Path, body: v::RequestBody) -> Result<v::ResponseB
 async fn query(p: &Path, q: v::Query) -> Result<v::ResponseBody> {
     request(p, v::RequestBody::Query(q)).await
 }
-pub(crate) async fn execute(p: &Path, c: v::Command) -> Result<v::ResponseBody> {
+pub async fn execute(p: &Path, c: v::Command) -> Result<v::ResponseBody> {
     execute_id(p, id(), c).await
 }
 async fn execute_id(p: &Path, operation_id: String, c: v::Command) -> Result<v::ResponseBody> {

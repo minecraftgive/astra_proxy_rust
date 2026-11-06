@@ -1,31 +1,31 @@
-mod availability;
-mod clipboard;
+use astra_client::availability;
+use astra_client::clipboard;
+pub use astra_client::tr;
 mod diagnostics;
 mod editor;
 mod entry;
 mod explanation;
-mod export;
-mod external_editor;
+use astra_client::export;
+use astra_client::external_editor;
 mod help;
 mod highlight;
-mod i18n;
-mod import;
-mod log_stream;
+use astra_client::i18n;
+use astra_client::import;
+use astra_client::log_stream;
 mod logs;
 #[cfg(test)]
 #[path = "test/lib_manager_test.rs"]
 mod manager;
 mod nettools;
-mod network_interfaces;
-mod protocol;
-mod self_update;
-mod shell;
+use astra_client::network_interfaces;
+use astra_client::protocol;
+use astra_client::self_update;
 #[cfg(windows)]
-mod startup;
+use astra_client::startup;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-mod startup_unix;
+use astra_client::startup_unix;
+use astra_client::terminals;
 use astra_management::subscription_view;
-mod terminals;
 mod theme;
 use astra_platform::tui_log;
 mod ui;
