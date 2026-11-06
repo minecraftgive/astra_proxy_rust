@@ -33,8 +33,15 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        let preferences = model.read(cx).client.preferences.clone();
+        crate::theme::apply_for_window(&preferences, window, cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search commands")));
+        let appearance_model = model.clone();
         let observations = vec![
+            window.observe_window_appearance(move |window, cx| {
+                let preferences = appearance_model.read(cx).client.preferences.clone();
+                crate::theme::apply_for_window(&preferences, window, cx);
+            }),
             cx.observe(&model, |this, model, cx| {
                 if this.page.is_none() && model.read(cx).ready {
                     this.page = Some(model.read(cx).client.page);
