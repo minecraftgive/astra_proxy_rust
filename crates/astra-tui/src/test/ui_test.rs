@@ -315,17 +315,29 @@ async fn live_rule_editor_completes_a_bound_proxy_node_and_saves_valid_action() 
     assert!(ui.recovery.is_none());
     let editor = ui.editor.as_mut().unwrap();
     editor
-        .key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor.paste("eas");
     editor
-        .key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     let text = editor.text();
     assert!(!text.contains("do-not-show"));
@@ -994,11 +1006,17 @@ default_action = "direct"
         .into(),
     );
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor.paste("/tmp/new.sock");
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     let draft = editor.text();
     let snapshot = serde_json::to_value(&editor).unwrap();
@@ -1029,11 +1047,17 @@ fn invalid_entry_uses_c_to_resume_and_b_to_cancel_the_field_only() {
     // Select IPC connections after standalone settings, socket, listeners and authentication.
     for _ in 0..7 {
         editor
-            .key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .key(crate::input::key(event::KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
             .unwrap();
     }
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor.paste("0");
     let snapshot = serde_json::to_value(&editor).unwrap();
@@ -1160,7 +1184,10 @@ fn session_roundtrip_retains_draft_recovery_and_selection() {
         .editor
         .as_mut()
         .unwrap()
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     session.editor.as_mut().unwrap().paste("/tmp/pending.sock");
     let form = serde_json::to_value(session.editor.as_ref().unwrap()).unwrap();
@@ -1214,14 +1241,23 @@ async fn live_recovery_and_defaults() {
     // An invalid route action is rejected by the core; all form state survives c.
     let editor = ui.editor.as_mut().unwrap();
     editor
-        .key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     editor.paste("invalid-route");
     editor
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     let snapshot = serde_json::to_value(ui.editor.as_ref().unwrap()).unwrap();
     let Input::Run(save, _) = ui.key(event::KeyEvent::new(
@@ -1310,7 +1346,10 @@ async fn live_recovery_and_defaults() {
     ui.editor
         .as_mut()
         .unwrap()
-        .key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .key(crate::input::key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
         .unwrap();
     ui.editor
         .as_mut()

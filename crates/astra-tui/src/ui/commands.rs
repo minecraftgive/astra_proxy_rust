@@ -1,280 +1,12 @@
 //! Shared global command descriptions, dispatch, palette and help bindings.
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Id {
-    Palette,
-    Help,
-    Profiles,
-    CopyTerminal,
-    Settings,
-    Search,
-    NextMatch,
-    PreviousMatch,
-    Save,
-    Tasks,
-    Logs,
-    Monitor,
-    Window,
-    Quit,
-    Shutdown,
-    Import,
-    ExternalEditor,
-    ReadExternal,
-    Discard,
-    CompareDraft,
-    Undo,
-    Redo,
-    Pause,
-    VimKeys,
-    MotionFull,
-    MotionReduced,
-    MotionOff,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Scope {
-    Global,
-    Editor,
-    Live,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Repeat {
-    Once,
-    Navigation,
-}
-pub(super) struct Spec {
-    pub id: Id,
-    pub label: &'static str,
-    pub key: &'static str,
-    pub scope: Scope,
-    pub repeat: Repeat,
-}
-pub(super) const SPECS: &[Spec] = &[
-    Spec {
-        id: Id::Palette,
-        label: "Command palette",
-        key: "Ctrl-K / F2",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Help,
-        label: "Keyboard help",
-        key: "F1",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Profiles,
-        label: "Switch current profile",
-        key: "Ctrl-P / p",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::CopyTerminal,
-        label: "Copy terminal proxy commands to clipboard",
-        key: "F4",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Search,
-        label: "Find in current view",
-        key: "Ctrl-F / /",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::NextMatch,
-        label: "Next match",
-        key: "F3",
-        scope: Scope::Global,
-        repeat: Repeat::Navigation,
-    },
-    Spec {
-        id: Id::PreviousMatch,
-        label: "Previous match",
-        key: "Shift-F3",
-        scope: Scope::Global,
-        repeat: Repeat::Navigation,
-    },
-    Spec {
-        id: Id::Save,
-        label: "Save and apply draft",
-        key: "Ctrl-S",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Tasks,
-        label: "Task details",
-        key: "F6",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Logs,
-        label: "TUI log",
-        key: "F7",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Window,
-        label: "Open page in new window",
-        key: "F8",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Monitor,
-        label: "Performance / memory / network monitor",
-        key: "F9",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Quit,
-        label: "Leave interface (cores keep running)",
-        key: "Ctrl-C / q",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Shutdown,
-        label: "Stop all instances and manager",
-        key: "",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Import,
-        label: "Import into draft",
-        key: "",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::ExternalEditor,
-        label: "Open external editor",
-        key: "",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::ReadExternal,
-        label: "Read external draft",
-        key: "",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Discard,
-        label: "Discard current draft",
-        key: "",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::CompareDraft,
-        label: "Compare draft with observed disk",
-        key: "",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Undo,
-        label: "Undo draft edit",
-        key: "Ctrl-Z",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Redo,
-        label: "Redo draft edit",
-        key: "Ctrl-Y",
-        scope: Scope::Editor,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Pause,
-        label: "Pause / resume live display",
-        key: "Space",
-        scope: Scope::Live,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::Settings,
-        label: "Open settings",
-        key: "7",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::VimKeys,
-        label: "Toggle optional Vim navigation aliases",
-        key: "",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::MotionFull,
-        label: "Motion: normal",
-        key: "",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::MotionReduced,
-        label: "Motion: reduced",
-        key: "",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-    Spec {
-        id: Id::MotionOff,
-        label: "Motion: off",
-        key: "",
-        scope: Scope::Global,
-        repeat: Repeat::Once,
-    },
-];
+pub use astra_client::commands::*;
 fn shortcut(key: event::KeyEvent) -> Option<Id> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::F(1) => Some(Id::Help),
-        KeyCode::F(2) => Some(Id::Palette),
-        KeyCode::F(4) if key.modifiers.is_empty() => Some(Id::CopyTerminal),
-        KeyCode::F(6) => Some(Id::Tasks),
-        KeyCode::F(7) => Some(Id::Logs),
-        KeyCode::F(9) => Some(Id::Monitor),
-        KeyCode::Char('k') if ctrl => Some(Id::Palette),
-        KeyCode::Char('p') if ctrl => Some(Id::Profiles),
-        KeyCode::Char('f') if ctrl => Some(Id::Search),
-        KeyCode::Char('s') if ctrl => Some(Id::Save),
-        KeyCode::F(3) => Some(if key.modifiers.contains(KeyModifiers::SHIFT) {
-            Id::PreviousMatch
-        } else {
-            Id::NextMatch
-        }),
-        _ => None,
-    }
+    astra_client::commands::shortcut(crate::input::key(key))
 }
 pub(super) fn repeatable(key: event::KeyEvent) -> bool {
-    shortcut(key).is_some_and(|id| {
-        SPECS
-            .iter()
-            .any(|spec| spec.id == id && spec.repeat == Repeat::Navigation)
-    })
-}
-pub(super) fn help() -> String {
-    let mut text = String::from(t("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–7  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n"));
-    for spec in SPECS.iter().filter(|s| !s.key.is_empty()) {
-        text.push_str(&format!("{}  {}\n", spec.key, t(spec.label)));
-    }
-    text.push_str(t("\nAll other actions are in the command palette. Q, R and 0 no longer execute destructive actions.\n"));
-    text
+    astra_client::commands::repeatable(crate::input::key(key))
 }
 impl Ui {
     pub(super) fn text_input_active(&self) -> bool {
@@ -290,7 +22,10 @@ impl Ui {
         if self.monitor.is_some() {
             return false;
         }
-        if self.tasks.showing_details() || self.help_scroll.is_some() || self.recovery.is_some() {
+        if self.client.tasks.showing_details()
+            || self.help_scroll.is_some()
+            || self.recovery.is_some()
+        {
             return false;
         }
         if let Some(viewer) = &self.tui_viewer {
@@ -312,50 +47,6 @@ impl Ui {
                 .as_ref()
                 .is_some_and(logs::Viewer::accepts_text_input)
     }
-    pub(super) fn command_available(&self, id: Id) -> Option<&'static str> {
-        let scope = SPECS
-            .iter()
-            .find(|spec| spec.id == id)
-            .map_or(Scope::Global, |spec| spec.scope);
-        if scope == Scope::Editor && self.editor.is_none() {
-            return Some("Open a configuration first");
-        }
-        if scope == Scope::Live
-            && !matches!(
-                self.page,
-                shell::OVERVIEW | shell::CONNECTIONS | shell::LOGS
-            )
-        {
-            return Some("Open connections or logs first");
-        }
-        match id {
-            Id::CopyTerminal if self.prompt.is_some() => {
-                Some("Finish or cancel the current prompt first")
-            }
-            Id::CopyTerminal if self.terminal_export_profile().is_none() => Some("No profile yet"),
-            Id::ReadExternal | Id::Import
-                if self
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| !editor.browsing()) =>
-            {
-                Some("Confirm or cancel the field before importing changes")
-            }
-            Id::Save
-                if self
-                    .update_status
-                    .as_ref()
-                    .and_then(|status| status.operation.as_ref())
-                    .is_some_and(|operation| !operation.phase.terminal()) =>
-            {
-                Some("Update running or requires recovery; draft retained, retry save afterward")
-            }
-            Id::Profiles if self.prompt.is_some() => {
-                Some("Finish or cancel the current prompt first")
-            }
-            _ => None,
-        }
-    }
     pub(super) fn run_command(&mut self, id: Id) -> Input {
         if let Some(reason) = self.command_available(id) {
             self.message = t(reason).into();
@@ -363,6 +54,24 @@ impl Ui {
         }
         let plain = |code| event::KeyEvent::new(code, KeyModifiers::NONE);
         match id {
+            Id::Save
+            | Id::Undo
+            | Id::Redo
+            | Id::Quit
+            | Id::Shutdown
+            | Id::Import
+            | Id::Discard
+            | Id::CompareDraft
+            | Id::ExternalEditor
+            | Id::ReadExternal => match self.client.run_command(id) {
+                astra_client::state::Input::Idle => Input::Idle,
+                astra_client::state::Input::Quit => Input::Quit,
+                astra_client::state::Input::Run(action, origin) => Input::Run(action, origin),
+                astra_client::state::Input::ExternalEditor => Input::ExternalEditor,
+                astra_client::state::Input::Frontend(_) => {
+                    unreachable!("model command returned a view effect")
+                }
+            },
             Id::CopyTerminal => self.copy_terminal_commands(),
             Id::Palette => {
                 let was_open = self.palette.is_some();
@@ -390,19 +99,20 @@ impl Ui {
                     } else {
                         event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
                     };
-                    let _ = editor.key(code);
+                    let _ = editor.key(crate::input::key(code));
                 } else if let Some(viewer) = &mut self.viewer {
-                    viewer.key(event::KeyEvent::new(
+                    viewer.key(crate::input::key(event::KeyEvent::new(
                         KeyCode::Char('f'),
                         KeyModifiers::CONTROL,
-                    ));
+                    )));
                 } else if matches!(self.page, shell::OVERVIEW | shell::CONNECTIONS) {
                     self.page = shell::CONNECTIONS;
                     self.connection_filtering = true;
                 } else if self.page == shell::RULES {
                     return self.rule_search();
                 } else {
-                    self.prompt(Prompt::Find(self.page));
+                    let page = self.page;
+                    self.prompt(Prompt::Find(page));
                 }
                 Input::Idle
             }
@@ -413,14 +123,14 @@ impl Ui {
                         let _ = editor.find_again(backwards);
                     }
                 } else if let Some(viewer) = &mut self.viewer {
-                    viewer.key(event::KeyEvent::new(
+                    viewer.key(crate::input::key(event::KeyEvent::new(
                         KeyCode::F(3),
                         if backwards {
                             KeyModifiers::SHIFT
                         } else {
                             KeyModifiers::NONE
                         },
-                    ));
+                    )));
                 } else if self.page == shell::CONNECTIONS && !self.connection_filter.is_empty() {
                     let count = self.connection_rows().len();
                     if count > 0 {
@@ -439,25 +149,8 @@ impl Ui {
                 }
                 Input::Idle
             }
-            Id::Save => {
-                let editor = self.editor.as_mut().unwrap();
-                match editor.prepare_save() {
-                    Ok(text) => Input::Run(
-                        Action::Save {
-                            name: editor.name.clone(),
-                            original: editor.original.clone(),
-                            text,
-                        },
-                        None,
-                    ),
-                    Err(error) => {
-                        self.fail(format!("{error:#}"), Resume::Editor);
-                        Input::Idle
-                    }
-                }
-            }
             Id::Tasks => {
-                let was_open = self.tasks.showing_details();
+                let was_open = self.client.tasks.showing_details();
                 self.close_replaceable_overlays();
                 if was_open {
                     Input::Idle
@@ -495,48 +188,9 @@ impl Ui {
                 }
                 Input::Idle
             }
-            Id::Quit => {
-                self.remember_draft();
-                Input::Quit
-            }
-            Id::Shutdown => {
-                self.prompt(Prompt::Shutdown);
-                Input::Idle
-            }
-            Id::Import => {
-                self.prompt(Prompt::Import);
-                Input::Idle
-            }
-            Id::ExternalEditor => Input::ExternalEditor,
-            Id::ReadExternal => {
-                if let Err(error) = self.read_external() {
-                    self.fail(format!("{error:#}"), Resume::Editor);
-                }
-                Input::Idle
-            }
-            Id::Discard => {
-                self.prompt(Prompt::Discard);
-                Input::Idle
-            }
-            Id::CompareDraft => {
-                self.compare_draft();
-                Input::Idle
-            }
-            Id::Undo | Id::Redo => {
-                let key = event::KeyEvent::new(
-                    KeyCode::Char(if id == Id::Undo { 'z' } else { 'y' }),
-                    KeyModifiers::CONTROL,
-                );
-                if let Some(editor) = &mut self.editor {
-                    if let Err(error) = editor.key(key) {
-                        self.fail(format!("{error:#}"), Resume::Editor);
-                    }
-                }
-                Input::Idle
-            }
             Id::Pause => {
                 if let Some(viewer) = &mut self.viewer {
-                    viewer.key(plain(KeyCode::Char(' ')));
+                    viewer.key(crate::input::key(plain(KeyCode::Char(' '))));
                     Input::Idle
                 } else {
                     self.toggle_live_pause()
@@ -575,7 +229,7 @@ impl Ui {
         self.palette = None;
         self.help_scroll = None;
         self.help_override = None;
-        if self.tasks.showing_details() {
+        if self.client.tasks.showing_details() {
             self.background_key(event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         }
         self.tui_viewer = None;
@@ -596,7 +250,7 @@ impl Ui {
         // the visible editor, never a draft underneath a palette or task drawer.
         if self.palette.is_some()
             || self.help_scroll.is_some()
-            || self.tasks.showing_details()
+            || self.client.tasks.showing_details()
             || self.tui_viewer.is_some()
             || self.monitor.is_some()
         {

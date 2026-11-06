@@ -15,24 +15,25 @@ impl Ui {
         let view = if let Some(view) = explicit {
             view
         } else if key.code == KeyCode::F(8) {
-            if self.tui_viewer.is_some() {
+            if self.client.tui_viewer.is_some() {
                 View::TuiLog
-            } else if self.viewer.is_some() {
+            } else if self.client.viewer.is_some() {
                 View::Logs
-            } else if self.diagnostics.is_some() {
+            } else if self.client.diagnostics.is_some() {
                 View::Diagnostics
             } else if self.editor.is_some()
                 || self.prompt.is_some()
                 || self.recovery.is_some()
-                || self.tasks.showing_details()
-                || self.explanation.is_some()
-                || self.help_scroll.is_some()
+                || self.client.tasks.showing_details()
+                || self.client.explanation.is_some()
+                || self.client.help_scroll.is_some()
             {
-                self.message = t("Use Alt+1–7 to open a page; the current draft stays here").into();
-                self.tasks.notice_message(&self.message);
+                self.client.message =
+                    t("Use Alt+1–7 to open a page; the current draft stays here").into();
+                self.client.tasks.notice_message(&self.client.message);
                 return Some(Input::Idle);
             } else {
-                View::from_page(self.page)
+                View::from_page(self.client.page)
             }
         } else {
             return None;
@@ -45,10 +46,10 @@ impl Ui {
         };
         let instance = if view == View::TuiLog {
             None
-        } else if view == View::Logs && self.viewer.is_some() {
-            self.viewer.as_ref().map(|v| v.name.clone())
+        } else if view == View::Logs && self.client.viewer.is_some() {
+            self.client.viewer.as_ref().map(|v| v.name.clone())
         } else if view == View::Diagnostics {
-            self.diagnostics.as_ref().map(|v| v.name.clone())
+            self.client.diagnostics.as_ref().map(|v| v.name.clone())
         } else if view == View::Profiles {
             self.selected().map(|r| r.instance.name.clone())
         } else {
@@ -62,16 +63,26 @@ impl Ui {
         }
         if let Some(view) = launch.view {
             if let Some(page) = view.page() {
-                self.page = page;
+                self.client.page = page;
             }
         }
         if let Some(name) = &launch.instance {
-            let Some(row) = self.rows.iter().find(|row| &row.instance.name == name) else {
-                self.message = tr!("Instance unavailable: {}", name);
+            let Some(row) = self
+                .client
+                .rows
+                .iter()
+                .find(|row| &row.instance.name == name)
+            else {
+                self.client.message = tr!("Instance unavailable: {}", name);
                 return None;
             };
             self.kind = row.instance.kind;
-            if let Some(index) = self.rows().iter().position(|r| &r.instance.name == name) {
+            if let Some(index) = self
+                .client
+                .rows()
+                .iter()
+                .position(|r| &r.instance.name == name)
+            {
                 let kind = self.index();
                 self.selections[kind] = index;
             }

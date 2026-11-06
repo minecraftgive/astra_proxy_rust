@@ -1,4 +1,3 @@
-use astra_client::availability;
 use astra_client::clipboard;
 pub use astra_client::tr;
 mod diagnostics;
@@ -11,13 +10,11 @@ mod help;
 mod highlight;
 use astra_client::i18n;
 use astra_client::import;
-use astra_client::log_stream;
 mod logs;
 #[cfg(test)]
 #[path = "test/lib_manager_test.rs"]
 mod manager;
 mod nettools;
-use astra_client::network_interfaces;
 use astra_client::protocol;
 use astra_client::self_update;
 #[cfg(windows)]
@@ -25,7 +22,6 @@ use astra_client::startup;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use astra_client::startup_unix;
 use astra_client::terminals;
-use astra_management::subscription_view;
 mod theme;
 use astra_platform::tui_log;
 mod ui;
@@ -39,3 +35,4 @@ pub async fn run() -> anyhow::Result<()> {
 pub async fn run_server() -> anyhow::Result<()> {
     entry::run(Some(protocol::Kind::Server)).await
 }
+mod input;

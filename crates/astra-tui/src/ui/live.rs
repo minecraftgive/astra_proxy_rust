@@ -173,14 +173,14 @@ impl Ui {
         if let Some(index) = self.selected_connection_row_index() {
             self.connection_selection = index;
         }
-        if self.page == OVERVIEW {
+        if self.client.page == OVERVIEW {
             self.overview_cursor = group.map_or(self.connection_selection, |group| {
                 self.connection_rows().len().saturating_add(group)
             });
         }
     }
     fn track_new_connections(&mut self, snapshot: &Snapshot) {
-        let Some(previous) = &self.runtime_snapshot else {
+        let Some(previous) = &self.client.runtime_snapshot else {
             return;
         };
         let known: HashSet<_> = previous.connections.iter().map(|c| c.id).collect();
@@ -220,21 +220,22 @@ impl Ui {
     }
     pub(super) fn live_input(&self) -> bool {
         self.editor.is_none()
-            && self.viewer.is_none()
+            && self.client.viewer.is_none()
             && self.prompt.is_none()
             && self.recovery.is_none()
             && self.menu.is_none()
             && self.binding_picker.is_none()
-            && self.diagnostics.is_none()
-            && self.explanation.is_none()
-            && self.help_scroll.is_none()
+            && self.client.diagnostics.is_none()
+            && self.client.explanation.is_none()
+            && self.client.help_scroll.is_none()
     }
     /// Runtime data of the active profile; stale data from an older process is hidden.
     pub(super) fn live(&self) -> Option<&Snapshot> {
         let row = self.active_proxy()?;
-        self.runtime_snapshot
+        self.client
+            .runtime_snapshot
             .as_ref()
-            .filter(|s| self.runtime_instance == row.instance.name && Some(s.pid) == row.pid)
+            .filter(|s| self.client.runtime_instance == row.instance.name && Some(s.pid) == row.pid)
     }
     pub(super) fn accept_runtime(&mut self, name: String, snapshot: Snapshot) {
         self.accept_runtime_view(
@@ -248,13 +249,13 @@ impl Ui {
     /// A transport reconnect preserves the view; a different profile or host PID does not.
     pub(super) fn reset_live_identity(&mut self) {
         self.live_state = LiveState::default();
-        self.runtime_instance.clear();
-        self.runtime_snapshot = None;
-        self.runtime_sample = Instant::now();
-        self.runtime_error.clear();
-        self.history = Default::default();
-        self.rates = [0, 0];
-        self.direct_rates = [0, 0];
+        self.client.runtime_instance.clear();
+        self.client.runtime_snapshot = None;
+        self.client.runtime_sample = Instant::now();
+        self.client.runtime_error.clear();
+        self.client.history = Default::default();
+        self.client.rates = [0, 0];
+        self.client.direct_rates = [0, 0];
         self.connection_selection = 0;
         self.overview_cursor = 0;
     }
@@ -263,8 +264,9 @@ impl Ui {
             snapshot,
             telemetry,
         } = view;
-        let identity_changed = self.runtime_instance != name
+        let identity_changed = self.client.runtime_instance != name
             || self
+                .client
                 .runtime_snapshot
                 .as_ref()
                 .is_some_and(|old| old.pid != snapshot.pid)
@@ -273,7 +275,7 @@ impl Ui {
                 .zip(self.live_state.telemetry.as_ref())
                 .is_some_and(|(new, old)| new.host_boot_id != old.host_boot_id);
         if identity_changed {
-            if self.runtime_snapshot.is_some() && self.runtime_instance == name {
+            if self.client.runtime_snapshot.is_some() && self.client.runtime_instance == name {
                 self.notice_host_restart();
             }
             self.reset_live_identity();
@@ -281,8 +283,8 @@ impl Ui {
         // Command replies without source metadata must not replace a hosted source clock.
         if telemetry.is_none() && self.live_state.telemetry.is_some() && !identity_changed {
             self.track_new_connections(&snapshot);
-            self.runtime_instance = name;
-            self.runtime_snapshot = Some(snapshot);
+            self.client.runtime_instance = name;
+            self.client.runtime_snapshot = Some(snapshot);
             self.sync_overview_cursor(None);
             return;
         }
@@ -336,11 +338,11 @@ impl Ui {
         }
         self.live_state.received = Some(Instant::now());
         self.live_state.disconnected = false;
-        self.runtime_sample = Instant::now();
+        self.client.runtime_sample = Instant::now();
         let overview_group = self.overview_group_cursor();
         self.track_new_connections(&snapshot);
-        self.runtime_instance = name;
-        self.runtime_snapshot = Some(snapshot);
+        self.client.runtime_instance = name;
+        self.client.runtime_snapshot = Some(snapshot);
         self.group_selection = self
             .group_selection
             .min(self.live().map_or(0, |s| s.groups.len().saturating_sub(1)));
@@ -348,93 +350,17 @@ impl Ui {
             self.select_connection(0);
         }
         self.sync_overview_cursor(overview_group);
-        self.runtime_error.clear();
-    }
-    fn set_runtime_rates(&mut self, old: &Snapshot, snapshot: &Snapshot, elapsed: f64) {
-        self.rates = [
-            (snapshot.proxy_upload.saturating_sub(old.proxy_upload) as f64 / elapsed) as u64,
-            (snapshot.proxy_download.saturating_sub(old.proxy_download) as f64 / elapsed) as u64,
-        ];
-        self.direct_rates = [
-            (snapshot
-                .upload
-                .saturating_sub(snapshot.proxy_upload)
-                .saturating_sub(old.upload.saturating_sub(old.proxy_upload)) as f64
-                / elapsed) as u64,
-            (snapshot
-                .download
-                .saturating_sub(snapshot.proxy_download)
-                .saturating_sub(old.download.saturating_sub(old.proxy_download))
-                as f64
-                / elapsed) as u64,
-        ];
-    }
-    fn record_runtime_rates(&mut self) {
-        for index in 0..2 {
-            self.history[index].push_back(self.rates[index]);
-            if self.history[index].len() > 64 {
-                self.history[index].pop_front();
-            }
-        }
+        self.client.runtime_error.clear();
     }
     fn accept_legacy_rates(&mut self, name: &str, snapshot: &Snapshot) {
-        let previous = self
-            .runtime_snapshot
-            .as_ref()
-            .filter(|old| name == self.runtime_instance && old.pid == snapshot.pid);
-        let elapsed = self.runtime_sample.elapsed().as_secs_f64();
-        self.direct_rates = if let Some(old) = previous {
-            if elapsed > 0.1 {
-                [
-                    (snapshot
-                        .upload
-                        .saturating_sub(snapshot.proxy_upload)
-                        .saturating_sub(old.upload.saturating_sub(old.proxy_upload))
-                        as f64
-                        / elapsed) as u64,
-                    (snapshot
-                        .download
-                        .saturating_sub(snapshot.proxy_download)
-                        .saturating_sub(old.download.saturating_sub(old.proxy_download))
-                        as f64
-                        / elapsed) as u64,
-                ]
-            } else {
-                self.direct_rates
-            }
-        } else {
-            self.history = Default::default();
-            [0, 0]
-        };
-        self.rates = if let Some(old) = previous {
-            if elapsed > 0.1 {
-                [
-                    (snapshot.proxy_upload.saturating_sub(old.proxy_upload) as f64 / elapsed)
-                        as u64,
-                    (snapshot.proxy_download.saturating_sub(old.proxy_download) as f64 / elapsed)
-                        as u64,
-                ]
-            } else {
-                self.rates
-            }
-        } else {
-            self.history = Default::default();
-            [0, 0]
-        };
-        for index in 0..2 {
-            self.history[index].push_back(self.rates[index]);
-            if self.history[index].len() > 64 {
-                self.history[index].pop_front();
-            }
-        }
-        self.runtime_sample = Instant::now();
-        self.live_state.rates_valid = previous.is_some();
+        self.client.accept_legacy_rates(name, snapshot);
+        self.live_state.rates_valid = self.client.runtime_rates_valid;
     }
     pub(super) fn runtime_disconnected(&mut self, error: String) {
         self.live_state.disconnected = true;
         self.live_state.rates_valid = false;
         self.live_state.baseline = None;
-        self.runtime_error = error;
+        self.client.runtime_error = error;
     }
     pub(super) fn runtime_rates_available(&self) -> bool {
         self.live().is_some()
@@ -706,6 +632,7 @@ impl Ui {
                 let name = row.instance.name.clone();
                 let pid = row.pid;
                 let supported = self
+                    .client
                     .details
                     .get(&name)
                     .is_some_and(|details| details.elevation_supported);
@@ -758,7 +685,7 @@ impl Ui {
             member: member.name.clone(),
         });
         if !select {
-            self.message = t("Automatic groups choose members by latency").into();
+            self.client.message = t("Automatic groups choose members by latency").into();
             if let Some((_, cursor)) = self.runtime_picker.as_mut() {
                 *cursor = index.min(count.saturating_sub(1));
             }
@@ -773,7 +700,7 @@ impl Ui {
         Input::Idle
     }
     pub(super) fn visible_connections(&self) -> Vec<&astra_model::runtime::Connection> {
-        let filter = if self.page == CONNECTIONS {
+        let filter = if self.client.page == CONNECTIONS {
             self.connection_filter.to_lowercase()
         } else {
             String::new()
@@ -805,7 +732,7 @@ impl Ui {
         if self.disabled_live_alias(key) {
             return Some(Input::Idle);
         }
-        if self.page == OVERVIEW {
+        if self.client.page == OVERVIEW {
             let count = self.live()?.groups.len();
             let page = self.live_page_size(Viewport::OverviewGroups);
             match key.code {
@@ -828,7 +755,7 @@ impl Ui {
                 }
                 _ => return None,
             }
-        } else if self.page == CONNECTIONS {
+        } else if self.client.page == CONNECTIONS {
             let page = self
                 .live_page_size(Viewport::Details)
                 .min(u16::MAX as usize) as u16;
@@ -863,7 +790,7 @@ impl Ui {
         if !self.connection_filtering && self.disabled_live_alias(key) {
             return Some(Input::Idle);
         }
-        if self.live_state.detail_open && self.page == CONNECTIONS {
+        if self.live_state.detail_open && self.client.page == CONNECTIONS {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.live_state.detail_open = false;
@@ -949,7 +876,7 @@ impl Ui {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            if matches!(self.page, PROXIES | CONNECTIONS)
+            if matches!(self.client.page, PROXIES | CONNECTIONS)
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 match key.code {
@@ -967,7 +894,7 @@ impl Ui {
             return None;
         }
         // List keys on runtime pages never fall through to other handlers.
-        if self.live().is_none() && matches!(self.page, PROXIES | CONNECTIONS) {
+        if self.live().is_none() && matches!(self.client.page, PROXIES | CONNECTIONS) {
             return match key.code {
                 KeyCode::Up
                 | KeyCode::Down
@@ -982,7 +909,7 @@ impl Ui {
             };
         }
         let snapshot = self.live()?.clone();
-        if matches!(self.page, OVERVIEW | CONNECTIONS) {
+        if matches!(self.client.page, OVERVIEW | CONNECTIONS) {
             let group = self.overview_group_cursor();
             self.sync_overview_cursor(group);
             match key.code {
@@ -998,7 +925,7 @@ impl Ui {
                 _ => {}
             }
         }
-        if self.page == OVERVIEW {
+        if self.client.page == OVERVIEW {
             let connection_count = self.connection_rows().len();
             let page = self.live_page_size(Viewport::Overview);
             let count = self.overview_item_count.get().max(connection_count);
@@ -1054,7 +981,7 @@ impl Ui {
             KeyCode::Char('T') => return Some(self.runtime_action(Command::Tun(!snapshot.tun))),
             _ => {}
         }
-        if self.page == PROXIES {
+        if self.client.page == PROXIES {
             let count = snapshot.groups.len();
             let page = self.live_page_size(Viewport::Groups);
             match key.code {
@@ -1081,7 +1008,7 @@ impl Ui {
             }
             return Some(Input::Idle);
         }
-        if self.page == CONNECTIONS {
+        if self.client.page == CONNECTIONS {
             let page = self.live_page_size(Viewport::Connections);
             let count = self.connection_rows().len();
             match key.code {
@@ -1111,7 +1038,7 @@ impl Ui {
                 }
                 KeyCode::Char('x') | KeyCode::Delete => {
                     let Some(id) = self.selected_connection().map(|c| c.id) else {
-                        self.message = if matches!(
+                        self.client.message = if matches!(
                             self.selected_connection_row_key(),
                             Some(ConnectionRowKey::Target(_))
                         ) {
@@ -1126,7 +1053,8 @@ impl Ui {
                             .live()
                             .is_some_and(|s| s.connections.iter().any(|c| c.id == id))
                     {
-                        self.message = "Connection cannot be verified in the latest sample".into();
+                        self.client.message =
+                            "Connection cannot be verified in the latest sample".into();
                         return Some(Input::Idle);
                     }
                     return Some(self.runtime_action(Command::Disconnect(Some(id))));
@@ -1315,7 +1243,11 @@ impl Ui {
             Some(row) if row.pid.is_none() => {
                 tr!("{} is not connected · c connect", row.instance.name)
             }
-            Some(_) => format!("{}\n{}", t("Waiting for runtime data…"), self.runtime_error),
+            Some(_) => format!(
+                "{}\n{}",
+                t("Waiting for runtime data…"),
+                self.client.runtime_error
+            ),
         };
         f.render_widget(
             Paragraph::new(text)

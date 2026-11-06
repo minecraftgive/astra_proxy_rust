@@ -1,6 +1,10 @@
 use super::*;
+use astra_client::input::{KeyCode, KeyEvent};
 use astra_model::diagnostics::Probe;
+use astra_model::diagnostics::{Event, Report};
 use ratatui::{backend::TestBackend, Terminal};
+use std::path::Path;
+use tokio::sync::mpsc;
 #[tokio::test]
 async fn updates_latency_and_results_without_waiting_for_done_and_cancel_retains_results() {
     let mut view = View::start(Path::new("unused-stream.sock"), "proxy".into());

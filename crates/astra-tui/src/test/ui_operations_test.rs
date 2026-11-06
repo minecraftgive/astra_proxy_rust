@@ -130,7 +130,10 @@ async fn server_logs_read_chunks_without_requesting_capture_control() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert!(matches!(
-            viewer.key(event::KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)),
+            viewer.key(crate::input::key(event::KeyEvent::new(
+                KeyCode::Char('L'),
+                KeyModifiers::NONE
+            ))),
             logs::Command::None
         ));
         assert!(viewer.browsing());

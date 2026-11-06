@@ -26,51 +26,13 @@ pub(super) struct View {
     selected_visible: std::cell::Cell<bool>,
 }
 
-pub(super) const FILE: &str = "ui-preferences.json";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum LanguageChoice {
-    #[default]
-    System,
-    English,
-    Simplified,
-    Traditional,
+pub use astra_client::preferences::*;
+pub(super) trait AccentColor {
+    fn color(self) -> Color;
 }
-impl LanguageChoice {
-    fn language(self) -> Option<crate::i18n::Language> {
-        use crate::i18n::Language;
-        match self {
-            Self::System => None,
-            Self::English => Some(Language::English),
-            Self::Simplified => Some(Language::Simplified),
-            Self::Traditional => Some(Language::Traditional),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum Accent {
-    #[default]
-    Indigo,
-    Teal,
-    Green,
-    Violet,
-    Rose,
-    Amber,
-}
-impl Accent {
-    const ALL: [Self; 6] = [
-        Self::Indigo,
-        Self::Teal,
-        Self::Green,
-        Self::Violet,
-        Self::Rose,
-        Self::Amber,
-    ];
+impl AccentColor for Accent {
     /// Every accent keeps white text readable on top of it.
-    pub(super) fn color(self) -> Color {
+    fn color(self) -> Color {
         match self {
             Self::Indigo => BLUE,
             Self::Teal => Color::Rgb(15, 118, 110),
@@ -81,229 +43,10 @@ impl Accent {
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ColorDepth {
-    #[default]
-    Auto,
-    TrueColor,
-    Ansi256,
-    Ansi16,
-    Monochrome,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum StartPage {
-    #[default]
-    Overview,
-    Proxies,
-    Connections,
-    Rules,
-    Logs,
-    Profiles,
-    Settings,
-}
-impl StartPage {
-    const ALL: [Self; 7] = [
-        Self::Overview,
-        Self::Proxies,
-        Self::Connections,
-        Self::Rules,
-        Self::Logs,
-        Self::Profiles,
-        Self::Settings,
-    ];
-    pub(super) fn page(self) -> usize {
-        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub(super) struct Preferences {
-    pub(super) language: LanguageChoice,
-    pub(super) accent: Accent,
-    pub(super) colors: ColorDepth,
-    pub(super) motion: animation::MotionMode,
-    pub(super) vim_keys: bool,
-    pub(super) mouse: bool,
-    pub(super) start_page: StartPage,
-    pub(super) terminal: String,
-    pub(super) installation_notices: std::collections::BTreeSet<String>,
-    /// The generated OS startup file is authoritative, not these preferences.
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    #[serde(skip)]
-    pub(super) startup_enabled: bool,
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    pub(super) silent_startup: bool,
-    #[cfg(windows)]
-    #[serde(skip)]
-    pub(super) windows_service: bool,
-    pub(super) marquee: MarqueePreferences,
-}
-
-/// Hidden until Ctrl+Home is held for three seconds on the accent color row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub(super) struct MarqueePreferences {
-    pub(super) unlocked: bool,
-    pub(super) border: bool,
-    pub(super) text: bool,
-    pub(super) background: bool,
-    pub(super) status: bool,
-    pub(super) indicator: bool,
-    /// Hue degrees per second.
-    #[serde(deserialize_with = "speed_or_preset")]
-    pub(super) speed: u16,
-    /// Cells one whole rainbow spans.
-    #[serde(deserialize_with = "width_or_preset")]
-    pub(super) width: u16,
-    /// Frames per second while only the marquee is moving.
-    pub(super) fps: u16,
-    pub(super) true_color: bool,
-}
-impl Default for MarqueePreferences {
-    fn default() -> Self {
-        Self {
-            unlocked: false,
-            border: false,
-            text: false,
-            background: false,
-            status: false,
-            indicator: false,
-            speed: SPEED.default,
-            width: WIDTH.default,
-            fps: FPS.default,
-            true_color: false,
-        }
-    }
-}
-impl MarqueePreferences {
-    /// What actually runs: nothing while the section is hidden.
-    pub(super) fn effect(self) -> animation::Marquee {
-        animation::Marquee {
-            border: self.unlocked && self.border,
-            text: self.unlocked && self.text,
-            background: self.unlocked && self.background,
-            status: self.unlocked && self.status,
-            indicator: self.unlocked && self.indicator,
-            true_color: self.true_color,
-            speed: f32::from(SPEED.clamp(self.speed)),
-            width: f32::from(WIDTH.clamp(self.width)),
-            fps: FPS.clamp(self.fps),
-        }
-    }
-}
-/// A preference adjusted in steps rather than picked from named choices.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Range {
-    min: u16,
-    max: u16,
-    step: u16,
-    /// Step with Shift held.
-    big: u16,
-    default: u16,
-    unit: &'static str,
-}
-impl Range {
-    fn clamp(self, value: u16) -> u16 {
-        value.clamp(self.min, self.max)
-    }
-    fn nudge(self, value: u16, up: bool, big: bool) -> u16 {
-        let step = if big { self.big } else { self.step };
-        self.clamp(if up {
-            value.saturating_add(step)
-        } else {
-            value.saturating_sub(step)
-        })
-    }
-}
-const SPEED: Range = Range {
-    min: 0,
-    max: 1800,
-    step: 10,
-    big: 100,
-    default: 160,
-    unit: "\u{b0}/s",
-};
-const WIDTH: Range = Range {
-    min: 2,
-    max: 400,
-    step: 1,
-    big: 10,
-    default: 30,
-    unit: "cells",
-};
-const FPS: Range = Range {
-    min: 1,
-    max: 120,
-    step: 1,
-    big: 10,
-    default: 20,
-    unit: "fps",
-};
-/// A number, or a preset name saved by an earlier build.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum NumberOrPreset {
-    Number(u64),
-    Preset(String),
-}
-fn number_or_preset<'de, D: serde::Deserializer<'de>>(
-    d: D,
-    range: Range,
-    preset: fn(&str) -> Option<u16>,
-) -> Result<u16, D::Error> {
-    Ok(match NumberOrPreset::deserialize(d)? {
-        NumberOrPreset::Number(n) => range.clamp(n.min(u64::from(u16::MAX)) as u16),
-        NumberOrPreset::Preset(name) => preset(&name).unwrap_or(range.default),
-    })
-}
-fn speed_or_preset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
-    number_or_preset(d, SPEED, |name| match name {
-        "slow" => Some(60),
-        "fast" => Some(320),
-        "very_fast" => Some(640),
-        _ => None,
-    })
-}
-fn width_or_preset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
-    number_or_preset(d, WIDTH, |name| match name {
-        "narrow" => Some(12),
-        "wide" => Some(60),
-        "extra_wide" => Some(120),
-        _ => None,
-    })
-}
 /// How long Ctrl+Home must be held, and the longest gap between key repeats
 /// that still counts as holding (the first repeat waits for the OS delay).
 const HOLD: Duration = Duration::from_secs(3);
 const HOLD_GAP: Duration = Duration::from_millis(800);
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            language: LanguageChoice::System,
-            accent: Accent::Indigo,
-            colors: ColorDepth::Auto,
-            motion: animation::MotionMode::Normal,
-            vim_keys: false,
-            mouse: true,
-            start_page: StartPage::Overview,
-            terminal: "auto".into(),
-            installation_notices: Default::default(),
-            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-            startup_enabled: false,
-            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-            silent_startup: false,
-            #[cfg(windows)]
-            windows_service: false,
-            marquee: MarqueePreferences::default(),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Field {
@@ -600,83 +343,55 @@ impl Field {
     }
 }
 
-/// Read saved preferences. A missing file starts from what the session already
-/// remembered (motion, Vim aliases); a damaged file falls back to defaults.
-pub(super) fn load(path: &std::path::Path, session: &Session) -> (Preferences, Option<String>) {
-    match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(preferences) => (preferences, None),
-            Err(error) => (
-                Preferences::default(),
-                Some(tr!(
-                    "Cannot read preferences, using defaults: {}",
-                    error.to_string()
-                )),
-            ),
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (
-            Preferences {
-                motion: session.motion,
-                vim_keys: session.vim_keys,
-                ..Default::default()
-            },
-            None,
-        ),
-        Err(error) => (
-            Preferences::default(),
-            Some(tr!(
-                "Cannot read preferences, using defaults: {}",
-                error.to_string()
-            )),
-        ),
-    }
-}
-
 impl Ui {
     /// Load preferences at startup and apply all of them.
     pub(super) fn load_preferences(&mut self, path: PathBuf) {
-        let (preferences, error) = load(&path, &self.session);
-        self.preferences_path = Some(path);
-        self.preferences = preferences;
+        let (preferences, error) = load(&path, &self.client.session);
+        self.client.preferences_path = Some(path);
+        self.client.preferences = preferences;
         self.apply_preferences(None);
         if let Some(error) = error {
-            self.message = error;
+            self.client.message = error;
         }
     }
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(super) fn load_startup_context(&mut self, context: &crate::windows::Context) {
         self.startup_context = Some(context.clone());
         match startup_registration::enabled(context) {
-            Ok(enabled) => self.preferences.startup_enabled = enabled,
+            Ok(enabled) => self.client.preferences.startup_enabled = enabled,
             Err(error) => {
-                self.message = tr!("Cannot read startup registration: {}", format!("{error:#}"));
+                self.client.message =
+                    tr!("Cannot read startup registration: {}", format!("{error:#}"));
             }
         }
         #[cfg(windows)]
         match astra_platform::windows_service::installed() {
-            Ok(installed) => self.preferences.windows_service = installed,
-            Err(error) => self.message = tr!("Cannot read Windows service: {}", error.to_string()),
+            Ok(installed) => self.client.preferences.windows_service = installed,
+            Err(error) => {
+                self.client.message = tr!("Cannot read Windows service: {}", error.to_string())
+            }
         }
     }
 
     #[cfg(windows)]
     fn change_windows_service(&mut self, enabled: bool) {
         if self.service_change.is_some() {
-            self.message = t("Windows service registration is in progress").into();
+            self.client.message = t("Windows service registration is in progress").into();
             return;
         }
-        if self.preferences.windows_service == enabled {
+        if self.client.preferences.windows_service == enabled {
             return;
         }
         let Some(context) = &self.startup_context else {
-            self.message = tr!(
+            self.client.message = tr!(
                 "Cannot change Windows service: {}",
                 "Startup context is unavailable"
             );
             return;
         };
         if crate::protocol::target().is_some() {
-            self.message = t("Open the local TUI to register the Windows privilege service").into();
+            self.client.message =
+                t("Open the local TUI to register the Windows privilege service").into();
             return;
         }
         let bin = context.bin.clone();
@@ -685,7 +400,8 @@ impl Ui {
                 .and_then(|_| astra_platform::windows_service::installed())
                 .map_err(|error| error.to_string())
         }));
-        self.message = t("Approve the Windows UAC prompt to change the privilege service").into();
+        self.client.message =
+            t("Approve the Windows UAC prompt to change the privilege service").into();
     }
 
     #[cfg(windows)]
@@ -706,48 +422,48 @@ impl Ui {
             .and_then(|result| result);
         match result {
             Ok(installed) => {
-                self.preferences.windows_service = installed;
-                self.message = format!(
+                self.client.preferences.windows_service = installed;
+                self.client.message = format!(
                     "{}: {}",
                     t(Field::WindowsService.label()),
-                    Field::WindowsService.value_label(&self.preferences)
+                    Field::WindowsService.value_label(&self.client.preferences)
                 );
             }
             Err(error) => {
                 if let Ok(installed) = astra_platform::windows_service::installed() {
-                    self.preferences.windows_service = installed;
+                    self.client.preferences.windows_service = installed;
                 }
-                self.message = tr!("Cannot change Windows service: {}", error);
+                self.client.message = tr!("Cannot change Windows service: {}", error);
             }
         }
         true
     }
     /// Save first so a failed write never presents an unsaved choice as enabled.
     pub(super) fn change_preferences(&mut self, change: impl FnOnce(&mut Preferences)) -> bool {
-        let previous = self.preferences.clone();
-        change(&mut self.preferences);
-        if self.preferences == previous {
+        let previous = self.client.preferences.clone();
+        change(&mut self.client.preferences);
+        if self.client.preferences == previous {
             return true;
         }
         if let Err(error) = self.save_preferences() {
-            self.preferences = previous;
-            self.message = tr!("Cannot save preferences: {}", format!("{error:#}"));
+            self.client.preferences = previous;
+            self.client.message = tr!("Cannot save preferences: {}", format!("{error:#}"));
             return false;
         }
         self.apply_preferences(Some(&previous));
         true
     }
     fn save_preferences(&self) -> Result<()> {
-        let Some(path) = &self.preferences_path else {
+        let Some(path) = &self.client.preferences_path else {
             return Ok(());
         };
-        let data = serde_json::to_vec_pretty(&self.preferences)?;
+        let data = serde_json::to_vec_pretty(&self.client.preferences)?;
         astra_platform::storage::atomic_write_default(path, &data)?;
         Ok(())
     }
     /// `previous` is `None` at startup, when everything is applied.
     fn apply_preferences(&mut self, previous: Option<&Preferences>) {
-        let p = self.preferences.clone();
+        let p = self.client.preferences.clone();
         let changed = |field: Field| previous.is_none_or(|old| field.get(old) != field.get(&p));
         if changed(Field::Language) && !(previous.is_none() && crate::i18n::command_line_language())
         {
@@ -757,12 +473,12 @@ impl Ui {
             self.animations.set_palette(p.accent.color(), p.colors);
         }
         if changed(Field::Motion) {
-            self.session.motion = p.motion;
+            self.client.session.motion = p.motion;
             self.animations.set_mode(p.motion);
         }
         if changed(Field::VimKeys) {
-            self.session.vim_keys = p.vim_keys;
-            for viewer in [&mut self.viewer, &mut self.tui_viewer]
+            self.client.session.vim_keys = p.vim_keys;
+            for viewer in [&mut self.client.viewer, &mut self.client.tui_viewer]
                 .into_iter()
                 .flatten()
             {
@@ -779,7 +495,7 @@ impl Ui {
     }
 
     fn settings_field(&self) -> Field {
-        let fields = fields(&self.preferences);
+        let fields = fields(&self.client.preferences);
         fields[self.settings_cursor.min(fields.len() - 1)]
     }
 
@@ -792,13 +508,13 @@ impl Ui {
             && !key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
-        let here = self.page == shell::SETTINGS
+        let here = self.client.page == shell::SETTINGS
             && self.settings_field() == Field::Accent
             && self.focus.region == focus::Region::Main
             && self.palette.is_none()
             && self.prompt.is_none()
             && self.menu.is_none()
-            && self.help_scroll.is_none();
+            && self.client.help_scroll.is_none();
         if !(chord && here) {
             self.marquee_hold = None;
             return None;
@@ -817,7 +533,7 @@ impl Ui {
         let finished = !done && held >= HOLD;
         self.marquee_hold = Some((start, now, done || finished));
         if finished {
-            let unlock = !self.preferences.marquee.unlocked;
+            let unlock = !self.client.preferences.marquee.unlocked;
             if !self.change_preferences(|p| {
                 p.marquee = if unlock {
                     MarqueePreferences {
@@ -835,7 +551,7 @@ impl Ui {
                 self.settings_cursor = MARQUEE_ROW;
                 self.settings_view.follow_selection.set(true);
             }
-            self.message = t(if unlock {
+            self.client.message = t(if unlock {
                 "Marquee unlocked"
             } else {
                 "Marquee hidden"
@@ -843,7 +559,7 @@ impl Ui {
             .into();
         } else if !done && held >= Duration::from_millis(500) {
             let steps = ((held.as_millis() * 10 / HOLD.as_millis()) as usize).min(10);
-            self.message = tr!(
+            self.client.message = tr!(
                 "Keep holding\u{2026} {}",
                 format!(
                     "{}{}",
@@ -888,47 +604,49 @@ impl Ui {
                     startup_registration::set_enabled(
                         context,
                         index == 0,
-                        self.preferences.silent_startup,
+                        self.client.preferences.silent_startup,
                     )
                 });
             match result {
-                Ok(()) => self.preferences.startup_enabled = index == 0,
+                Ok(()) => self.client.preferences.startup_enabled = index == 0,
                 Err(error) => {
                     if let Some(context) = &self.startup_context {
                         if let Ok(enabled) = startup_registration::enabled(context) {
-                            self.preferences.startup_enabled = enabled;
+                            self.client.preferences.startup_enabled = enabled;
                         }
                     }
-                    self.message = tr!(
+                    self.client.message = tr!(
                         "Cannot change startup registration: {}",
                         format!("{error:#}")
                     );
                     return;
                 }
             }
-            self.message = format!(
+            self.client.message = format!(
                 "{}: {}",
                 t(field.label()),
-                field.value_label(&self.preferences)
+                field.value_label(&self.client.preferences)
             );
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(context) = &self.startup_context {
                 if let Ok(path) = startup_registration::managed_path(context) {
-                    self.message.push_str(&format!(" · {}", path.display()));
+                    self.client
+                        .message
+                        .push_str(&format!(" · {}", path.display()));
                 }
             }
             return;
         }
         #[cfg(any(windows, target_os = "macos"))]
-        if field == Field::SilentStartup && self.preferences.startup_enabled {
-            let previous = self.preferences.silent_startup;
+        if field == Field::SilentStartup && self.client.preferences.startup_enabled {
+            let previous = self.client.preferences.silent_startup;
             let result = self
                 .startup_context
                 .as_ref()
                 .context("Startup context is unavailable")
                 .and_then(|context| startup_registration::set_enabled(context, true, index == 0));
             if let Err(error) = result {
-                self.message = tr!(
+                self.client.message = tr!(
                     "Cannot change startup registration: {}",
                     format!("{error:#}")
                 );
@@ -937,7 +655,7 @@ impl Ui {
             if !self.change_preferences(|p| p.silent_startup = index == 0) {
                 if let Some(context) = &self.startup_context {
                     if let Err(error) = startup_registration::set_enabled(context, true, previous) {
-                        self.message.push_str(&format!(
+                        self.client.message.push_str(&format!(
                             "\n{}",
                             tr!(
                                 "Cannot change startup registration: {}",
@@ -952,16 +670,16 @@ impl Ui {
         if !self.change_preferences(|p| field.set(p, index)) {
             return;
         }
-        self.message = format!(
+        self.client.message = format!(
             "{}: {}",
             t(field.label()),
-            field.value_label(&self.preferences)
+            field.value_label(&self.client.preferences)
         );
     }
     pub(super) fn click_setting(&mut self, row: usize, choice: Option<usize>) -> Input {
         self.focus = Default::default();
         self.settings_view.follow_selection.set(true);
-        self.settings_cursor = row.min(fields(&self.preferences).len() - 1);
+        self.settings_cursor = row.min(fields(&self.client.preferences).len() - 1);
         let field = self.settings_field();
         let current = self.setting_index(field);
         if field == Field::Terminal && choice.is_none() {
@@ -1044,7 +762,7 @@ impl Ui {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_cursor =
-                    (self.settings_cursor + 1).min(fields(&self.preferences).len() - 1)
+                    (self.settings_cursor + 1).min(fields(&self.client.preferences).len() - 1)
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.settings_cursor = 0;
@@ -1053,7 +771,7 @@ impl Ui {
                 return Some(Input::Idle);
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.settings_cursor = fields(&self.preferences).len() - 1
+                self.settings_cursor = fields(&self.client.preferences).len() - 1
             }
             KeyCode::Left | KeyCode::Char('h') if current > 0 => {
                 self.choose_setting(field, current - 1)
@@ -1110,7 +828,7 @@ impl Ui {
             self.settings_view.selected_visible.set(false);
             return;
         }
-        let fields = fields(&self.preferences);
+        let fields = fields(&self.client.preferences);
         let selected = self.settings_cursor.min(fields.len() - 1);
         let label_width = fields
             .iter()
@@ -1157,7 +875,7 @@ impl Ui {
                                 .collect();
                             details.push(Line::raw(path));
                         }
-                        if self.preferences.startup_enabled {
+                        if self.client.preferences.startup_enabled {
                             if let Ok(instructions) = startup_registration::instructions(context) {
                                 details.extend(
                                     instructions.lines().map(|line| Line::raw(line.to_owned())),
@@ -1179,7 +897,8 @@ impl Ui {
                 Style::default().fg(MUTED),
             ),
             Line::styled(
-                self.preferences_path
+                self.client
+                    .preferences_path
                     .as_ref()
                     .map(|path| {
                         let path = path.display().to_string();
@@ -1301,7 +1020,7 @@ impl Ui {
                     Color::DarkGray
                 })
             };
-            let value = format!(" {} ", field.value_label(&self.preferences));
+            let value = format!(" {} ", field.value_label(&self.client.preferences));
             let value_width = Line::from(value.as_str()).width() as u16;
             let x = rect.x + prefix as u16;
             self.hit(

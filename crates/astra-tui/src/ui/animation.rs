@@ -14,7 +14,6 @@
 //!   motion; such transitions are not animated at all.
 use astra_tui_kit::theme::BLUE;
 use ratatui::{buffer::Buffer, layout::Rect, style::Color, Frame};
-use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
     sync::OnceLock,
@@ -29,15 +28,7 @@ pub(crate) fn wake() {
     notify().notify_one();
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum MotionMode {
-    #[default]
-    Normal,
-    Reduced,
-    Off,
-}
-
+pub use astra_client::motion::{Marquee, MotionMode};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Palette,
@@ -129,44 +120,6 @@ pub(super) struct Motion {
 /// Hidden running-light effect, unlocked from Settings. Each part is optional.
 /// It deliberately breaks the "never restyle persistent content" rule above, so
 /// it is off unless the user turns it on, and it stands still without Normal motion.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Marquee {
-    pub(super) border: bool,
-    pub(super) text: bool,
-    pub(super) background: bool,
-    /// The bottom status line text.
-    pub(super) status: bool,
-    /// The connection dot and state word, only while connected.
-    pub(super) indicator: bool,
-    /// Paint marquee cells in 24-bit color whatever the Colors setting says.
-    pub(super) true_color: bool,
-    /// Hue degrees per second.
-    pub(super) speed: f32,
-    /// Cells covered by one whole rainbow.
-    pub(super) width: f32,
-    /// Frames per second while only the marquee moves.
-    pub(super) fps: u16,
-}
-impl Default for Marquee {
-    fn default() -> Self {
-        Self {
-            border: false,
-            text: false,
-            background: false,
-            status: false,
-            indicator: false,
-            true_color: false,
-            speed: 160.0,
-            width: 30.0,
-            fps: 30,
-        }
-    }
-}
-impl Marquee {
-    fn any(self) -> bool {
-        self.border || self.text || self.background || self.status || self.indicator
-    }
-}
 /// Focused border color while the border marquee is on; one step off Cyan so an
 /// unprocessed frame looks the same.
 pub(super) const FOCUS_MARK: Color = Color::Rgb(0, 215, 214);

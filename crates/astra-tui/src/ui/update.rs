@@ -223,25 +223,12 @@ pub(super) fn package_action(input: &str, directory: &Path) -> Result<Action> {
     })
 }
 
-pub(super) struct View {
-    pub(super) status: UpdateStatus,
+pub use astra_client::update::View;
+pub trait ViewRender {
+    fn lines(&self) -> Vec<Line<'static>>;
 }
-impl View {
-    pub(super) fn new(status: UpdateStatus) -> Self {
-        Self { status }
-    }
-    pub(super) fn decode(text: &str) -> Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(text)?;
-        anyhow::ensure!(
-            value
-                .get("schema_version")
-                .and_then(|version| version.as_u64())
-                == Some(1),
-            "This manager does not support the update transaction view"
-        );
-        Ok(Self::new(serde_json::from_value(value)?))
-    }
-    pub(super) fn lines(&self) -> Vec<Line<'static>> {
+impl ViewRender for View {
+    fn lines(&self) -> Vec<Line<'static>> {
         use crate::i18n::t;
         let status = &self.status;
         let clean = |value: String| {

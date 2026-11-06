@@ -1160,7 +1160,7 @@ impl Ui {
     }
 
     pub(super) fn mouse(&mut self, mouse: MouseEvent) -> Input {
-        if self.installation.visible() {
+        if self.client.installation.visible() {
             return self.installation_mouse(mouse);
         }
         if self.monitor.is_some() {
@@ -1172,7 +1172,7 @@ impl Ui {
         ) {
             if self.page == shell::SETTINGS
                 && self.overview_input()
-                && !self.tasks.showing_details()
+                && !self.client.tasks.showing_details()
                 && self.tui_viewer.is_none()
             {
                 self.scroll_settings(mouse.kind == MouseEventKind::ScrollDown);

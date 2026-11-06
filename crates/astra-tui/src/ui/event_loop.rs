@@ -19,10 +19,10 @@ pub(super) async fn run_local(
     } else {
         startup::Instances::new(&launch)
     };
-    ui.page = ui.preferences.start_page.page();
+    ui.client.page = ui.client.preferences.start_page.page();
     if let Some(view) = launch.view {
         if let Some(page) = view.page() {
-            ui.page = page;
+            ui.client.page = page;
         }
     }
     if let Some(kind) = launch.kind {
@@ -36,7 +36,7 @@ pub(super) async fn run_local(
     let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     ui.mouse_request = None;
     let mut screen = TerminalSession::enter(TerminalOptions {
-        mouse: ui.preferences.mouse,
+        mouse: ui.client.preferences.mouse,
         bracketed_paste: true,
     })?;
     let mut terminal = astra_tui_kit::frame::screen()?;
@@ -51,7 +51,7 @@ pub(super) async fn run_local(
     let mut redraw = true;
     let mut refresh = true;
     let mut last_frame = Instant::now() - Duration::from_secs(1);
-    let mut last_notice = (ui.message.clone(), false);
+    let mut last_notice = (ui.client.message.clone(), false);
     let mut last_health = (ui.runtime_health(), ui.runtime_rates_available());
     let mut checkpoint_at: Option<Instant> = None;
     let shutdown = astra_platform::platform::shutdown_signal();
@@ -74,12 +74,12 @@ pub(super) async fn run_local(
             let mut index = 0;
             while index < opening.len() {
                 if opening[index].is_finished() {
-                    ui.message = match opening.remove(index).await {
+                    ui.client.message = match opening.remove(index).await {
                         Ok(Ok(())) => t("Opened in a new window").into(),
                         Ok(Err(error)) => format!("{}: {error:#}", t("Cannot open a new window")),
                         Err(error) => error.to_string(),
                     };
-                    ui.tasks.notice_message(&ui.message);
+                    ui.client.tasks.notice_message(&ui.client.message);
                     redraw = true;
                 } else {
                     index += 1;
@@ -106,7 +106,7 @@ pub(super) async fn run_local(
                     break Ok(());
                 }
             }
-            if let Some(view) = &mut ui.diagnostics {
+            if let Some(view) = &mut ui.client.diagnostics {
                 redraw |= view.poll();
             }
             if let Some(view) = &mut ui.monitor {
@@ -114,7 +114,7 @@ pub(super) async fn run_local(
             }
             let idle = !quit && initial.is_none() && opening.is_empty() && ui.restart_ready();
             match restart
-                .poll(ui.update_status.as_ref(), &context, idle)
+                .poll(ui.client.update_status.as_ref(), &context, idle)
                 .await
             {
                 Ok(Some(mut target)) => {
@@ -142,7 +142,7 @@ pub(super) async fn run_local(
                                 events = Some(event::EventStream::new());
                                 terminal.backend_mut().writer_mut().invalidate();
                                 ui.animations.resize();
-                                ui.message = tr!(
+                                ui.client.message = tr!(
                                     "Cannot restart updated interface: {}",
                                     format!("{error:#}")
                                 );
@@ -155,17 +155,21 @@ pub(super) async fn run_local(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    ui.message = tr!("Cannot restart updated interface: {}", format!("{error:#}"));
+                    ui.client.message =
+                        tr!("Cannot restart updated interface: {}", format!("{error:#}"));
                     redraw = true;
                 }
             }
-            for viewer in [&mut ui.viewer, &mut ui.tui_viewer].into_iter().flatten() {
+            for viewer in [&mut ui.client.viewer, &mut ui.client.tui_viewer]
+                .into_iter()
+                .flatten()
+            {
                 let revision = viewer.revision();
                 viewer.poll();
                 redraw |= revision != viewer.revision();
             }
             // One redraw when a successful notice recedes, never a permanent idle timer.
-            let notice = (ui.message.clone(), ui.tasks.notice_is_old());
+            let notice = (ui.client.message.clone(), ui.client.tasks.notice_is_old());
             if notice.1 && !last_notice.1 && notice.0 == last_notice.0 {
                 ui.animations.trigger(animation::Kind::Recede);
             }
@@ -190,7 +194,8 @@ pub(super) async fn run_local(
             redraw = false;
         }
         let animated = ui.animations.active();
-        let spinner = ui.tasks.running() && ui.animations.mode() == animation::MotionMode::Normal;
+        let spinner =
+            ui.client.tasks.running() && ui.animations.mode() == animation::MotionMode::Normal;
         let marquee = ui.animations.marquee_running();
         let scheduled = redraw || animated || spinner || marquee;
         let frame_time = match (redraw || animated, marquee) {
@@ -247,7 +252,7 @@ pub(super) async fn run_local(
             if ui.palette.is_some() {
                 ui.animations.finish(animation::Kind::Palette);
             }
-            if ui.tasks.showing_details() {
+            if ui.client.tasks.showing_details() {
                 ui.animations.finish(animation::Kind::Drawer);
             }
         }
@@ -322,7 +327,7 @@ pub(super) async fn run_local(
                     let mut context = context.clone();
                     // New windows open in the language chosen in Settings now.
                     context.language = crate::i18n::language();
-                    let terminal = ui.preferences.terminal.clone();
+                    let terminal = ui.client.preferences.terminal.clone();
                     opening.push(tokio::task::spawn_blocking(move || {
                         let result = context.open(&launch, &terminal);
                         super::wake();
@@ -365,7 +370,7 @@ pub(super) async fn run_local(
         previous.apply(&ui);
         if let Some(mouse) = ui.mouse_request.take() {
             if let Err(error) = screen.set_mouse(mouse) {
-                ui.message = format!("{error:#}");
+                ui.client.message = format!("{error:#}");
             }
         }
         refresh = true;
@@ -423,9 +428,9 @@ fn restore_session(path: &std::path::Path, handoff: bool) -> Result<Ui> {
 
 impl Ui {
     fn restart_ready(&self) -> bool {
-        let ready = !self.tasks.running()
-            && !self.installation.busy()
-            && !self.installation.visible()
+        let ready = !self.client.tasks.running()
+            && !self.client.installation.busy()
+            && !self.client.installation.visible()
             && !self.persistence_paused
             && self.recovery.is_none()
             // Confirmation overlays are intentionally not persisted.
@@ -436,15 +441,15 @@ impl Ui {
     }
 
     fn restart_launch(&self, window_id: Option<String>) -> crate::windows::Launch {
-        let (view, instance) = if self.tui_viewer.is_some() {
+        let (view, instance) = if self.client.tui_viewer.is_some() {
             (crate::windows::View::TuiLog, None)
-        } else if let Some(viewer) = &self.viewer {
+        } else if let Some(viewer) = &self.client.viewer {
             (crate::windows::View::Logs, Some(viewer.name.clone()))
-        } else if let Some(view) = &self.diagnostics {
+        } else if let Some(view) = &self.client.diagnostics {
             (crate::windows::View::Diagnostics, Some(view.name.clone()))
         } else {
             (
-                crate::windows::View::from_page(self.page),
+                crate::windows::View::from_page(self.client.page),
                 self.selected().map(|row| row.instance.name.clone()),
             )
         };
@@ -486,7 +491,7 @@ impl MotionState {
     fn of(ui: &Ui) -> Self {
         Self {
             palette: ui.palette.is_some(),
-            drawer: ui.tasks.showing_details(),
+            drawer: ui.client.tasks.showing_details(),
         }
     }
     fn apply(self, ui: &Ui) {
@@ -496,7 +501,7 @@ impl MotionState {
             (true, false) => ui.animations.close(Kind::Palette),
             _ => {}
         }
-        match (self.drawer, ui.tasks.showing_details()) {
+        match (self.drawer, ui.client.tasks.showing_details()) {
             (false, true) => ui.animations.open(Kind::Drawer),
             (true, false) => ui.animations.close(Kind::Drawer),
             _ => {}

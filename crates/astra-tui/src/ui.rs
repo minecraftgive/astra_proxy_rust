@@ -37,6 +37,9 @@ mod update;
 use crate::editor::Editor;
 use crate::logs;
 use crate::protocol::*;
+use crate::{
+    diagnostics::Render as _, editor::Render as _, explanation::Render as _, logs::Render as _,
+};
 use crate::{i18n::t, tr};
 use anyhow::{Context, Result};
 use astra_tui_kit::{TerminalOptions, TerminalSession};
@@ -50,170 +53,17 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde::Deserialize;
 use shell::{LOGS, PROFILES};
 use std::{
     collections::HashMap,
-    io,
     path::PathBuf,
     time::{Duration, Instant},
 };
+use update::ViewRender as _;
 
-#[derive(Clone, Serialize, Deserialize)]
-enum Prompt {
-    AddName,
-    AddPath(String),
-    Config(String),
-    Clone(String),
-    Remove(String),
-    ForceStart(String),
-    Shutdown,
-    Discard,
-    Import,
-    UpdatePackage,
-    UpdateConfirm(crate::protocol::updates::UpdateRequest),
-    ImportNode(crate::import::MergeMode),
-    ImportRule(crate::import::MergeMode),
-    ExportConfig {
-        text: String,
-    },
-    ExportNode {
-        text: String,
-        share: bool,
-    },
-    ExportNodeDestination {
-        text: String,
-        share: bool,
-        clipboard: bool,
-    },
-    ImportNodeSelection {
-        name: String,
-        path: PathBuf,
-        candidates: crate::import::NodeImport,
-        selected: Vec<usize>,
-        cursor: usize,
-        mode: crate::import::MergeMode,
-    },
-    ExportRule {
-        text: String,
-    },
-    ExportTerminal {
-        text: String,
-    },
-    ImportConfirm {
-        text: String,
-        notices: String,
-    },
-    Explain(String),
-    CloseAll {
-        name: String,
-        pid: Option<u32>,
-    },
-    /// Linux only: a sudo-launched core takes over the TUN listener.
-    ElevateTun {
-        name: String,
-        pid: Option<u32>,
-    },
-    /// Find on a list page; Enter jumps to the next match.
-    Find(usize),
-}
-impl Prompt {
-    fn picker(&self) -> bool {
-        matches!(
-            self,
-            Self::ExportNodeDestination { .. } | Self::ImportNodeSelection { .. }
-        )
-    }
-    fn confirmation(&self) -> bool {
-        matches!(
-            self,
-            Self::Remove(_)
-                | Self::ForceStart(_)
-                | Self::Shutdown
-                | Self::Discard
-                | Self::ImportConfirm { .. }
-                | Self::CloseAll { .. }
-                | Self::ElevateTun { .. }
-                | Self::UpdateConfirm(_)
-        )
-    }
-    fn title(&self) -> &str {
-        match self {
-            Self::AddName => t("Name (1–24: a-z, 0-9, -_)"),
-            Self::Find(_) => t("Find (Enter jumps to the next match)"),
-            Self::AddPath(_) => t("Configuration path"),
-            Self::Config(_) => t("Configuration path"),
-            Self::Clone(_) => t("Copy to path"),
-            Self::Remove(_) => t("Remove instance? Configuration is kept."),
-            Self::ForceStart(_) => t("Force start and replace previous sessions?"),
-            Self::Shutdown => t("Stop all instances?"),
-            Self::Discard => t("Discard changes?"),
-            Self::Import => t("Import config or proxy share links"),
-            Self::UpdatePackage => t("Local update package path (.zip, .tar.gz or directory)"),
-            Self::UpdateConfirm(_) => t("Apply this exact update target?"),
-            Self::ImportNode(_) => t("Import node files, TOML or share links"),
-            Self::ImportNodeSelection { .. } => t("Select nodes to import"),
-            Self::ImportRule(_) => t("Import rules TOML"),
-            Self::ExportConfig { .. } => t("Export configuration to path"),
-            Self::ExportNode { .. } => t("Export nodes to file or folder (missing folders are created)"),
-            Self::ExportNodeDestination { .. } => t("Export selected nodes"),
-            Self::ExportRule { .. } => t("Export selected rule to path"),
-            Self::ExportTerminal { .. } => t("Export terminal proxy commands to path"),
-            Self::ImportConfirm { .. } => t("Replace editor draft?"),
-            Self::Explain(_) => t("Enter host[:port] [tcp|udp] [process name or path]"),
-            Self::CloseAll { .. } => {
-                t("Close all connections? Applications reconnect on their own.")
-            }
-            Self::ElevateTun { .. } => {
-                t("Enable TUN? sudo asks for your password; the current core keeps running until the replacement is ready.")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Operation {
-    UpdateSubscriptions,
-    Start,
-    ForceStart,
-    Stop,
-    Restart,
-    Reload,
-    Edit,
-    Logs,
-    Bind,
-    Config,
-    Copy,
-    Remove,
-    Diagnostics,
-    NetTools,
-    Explain,
-    ExportConfig,
-    ExportTerminal,
-}
-impl Operation {
-    fn label(self) -> &'static str {
-        t(match self {
-            Self::Start => "Start",
-            Self::ForceStart => "Force start",
-            Self::Stop => "Stop",
-            Self::Restart => "Restart",
-            Self::Reload => "Reload",
-            Self::UpdateSubscriptions => "Update subscriptions",
-            Self::Edit => "Edit",
-            Self::Logs => "Logs",
-            Self::Bind => "Startup bindings",
-            Self::Config => "Configuration path",
-            Self::Copy => "Copy configuration",
-            Self::Remove => "Remove",
-            Self::Diagnostics => "Connectivity / Exit IP",
-            Self::NetTools => "Network tools",
-            Self::Explain => "Route explanation",
-            Self::ExportConfig => "Export config",
-            Self::ExportTerminal => "Copy terminal proxy commands to clipboard · F4",
-        })
-    }
-}
+use astra_client::state::*;
 struct BindingPicker {
     name: String,
     choices: Vec<(String, Kind)>,
@@ -221,222 +71,14 @@ struct BindingPicker {
     targets: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-enum Resume {
-    Prompt(Prompt, String),
-    Request(Action),
-    Session,
-    Editor,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Recovery {
-    message: String,
-    resume: Resume,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Session {
-    #[serde(default)]
-    session_version: u32,
-    #[serde(default)]
-    keymap_version: u32,
-    #[serde(default)]
-    keymap_notice_pending: bool,
-    #[serde(default)]
-    drafts: HashMap<String, drafts::Draft>,
-    #[serde(default)]
-    active_profile: Option<String>,
-    #[serde(default)]
-    searches: HashMap<usize, String>,
-    #[serde(default)]
-    input_cursor: usize,
-    #[serde(default)]
-    motion: animation::MotionMode,
-    #[serde(default)]
-    vim_keys: bool,
-    kind: Kind,
-    #[serde(deserialize_with = "read_selections")]
-    selections: [usize; 3],
-    editor: Option<Editor>,
-    prompt: Option<Prompt>,
-    input: String,
-    recovery: Option<Recovery>,
-    #[serde(default = "launch_directory")]
-    working_dir: PathBuf,
-    #[serde(default)]
-    log_settings: HashMap<String, logs::Settings>,
-    #[serde(default)]
-    active_log: Option<String>,
-    #[serde(default)]
-    external_draft: Option<crate::external_editor::Draft>,
-}
-fn launch_directory() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-}
-impl Default for Session {
-    fn default() -> Self {
-        Self {
-            session_version: 1,
-            keymap_version: drafts::KEYMAP_VERSION,
-            keymap_notice_pending: false,
-            drafts: HashMap::new(),
-            active_profile: None,
-            searches: HashMap::new(),
-            input_cursor: 0,
-            motion: Default::default(),
-            vim_keys: false,
-            kind: Kind::Proxy,
-            selections: [0; 3],
-            editor: None,
-            prompt: None,
-            input: String::new(),
-            recovery: None,
-            working_dir: launch_directory(),
-            log_settings: HashMap::new(),
-            active_log: None,
-            external_draft: None,
-        }
-    }
-}
-const SESSION_LIMIT: u64 = 4 * 1024 * 1024;
-fn read_selections<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<[usize; 3], D::Error> {
-    let old = Vec::<usize>::deserialize(deserializer)?;
-    if !(2..=3).contains(&old.len()) {
-        return Err(serde::de::Error::custom(
-            "Invalid saved instance selections; original session is retained",
-        ));
-    }
-    let mut result = [0; 3];
-    result[..old.len()].copy_from_slice(&old);
-    Ok(result)
-}
-fn kind_index(kind: Kind) -> usize {
-    match kind {
-        Kind::Proxy => 0,
-        Kind::Rule => 1,
-        Kind::Server => 2,
-    }
-}
-fn next_kind(kind: Kind) -> Kind {
-    match kind {
-        Kind::Proxy => Kind::Rule,
-        Kind::Rule => Kind::Server,
-        Kind::Server => Kind::Proxy,
-    }
-}
-impl Session {
-    fn load(path: &std::path::Path) -> Result<Self> {
-        use std::io::Read;
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.take(SESSION_LIMIT + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= SESSION_LIMIT,
-            "Saved session exceeds 4 MiB"
-        );
-        let mut session: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(
-            session.session_version <= 1,
-            "Saved session version is newer than this TUI; original file is retained: {}",
-            path.display()
-        );
-        anyhow::ensure!(
-            session.keymap_version <= drafts::KEYMAP_VERSION,
-            "Saved keymap version is newer than this TUI; original file is retained: {}",
-            path.display()
-        );
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let needs_migration = session.session_version == 0
-            || session.keymap_version < drafts::KEYMAP_VERSION
-            || value
-                .get("selections")
-                .and_then(|v| v.as_array())
-                .is_some_and(|v| v.len() == 2);
-        if needs_migration {
-            use astra_platform::platform::OpenOptionsExt;
-            use std::io::Write;
-            let backup = path.with_extension("pre-v2.json");
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&backup)
-            {
-                Ok(mut output) => {
-                    astra_platform::platform::set_private(&backup, 0o600)?;
-                    output.write_all(&bytes)?;
-                    output.sync_all()?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    anyhow::ensure!(
-                        std::fs::symlink_metadata(&backup)?.is_file(),
-                        "Session migration backup is not a regular file: {}",
-                        backup.display()
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        session.session_version = session.session_version.max(1);
-        if let Some(editor) = &mut session.editor {
-            editor.normalize();
-        }
-        for draft in session.drafts.values_mut() {
-            draft.editor.normalize();
-        }
-        if session.keymap_version < drafts::KEYMAP_VERSION {
-            if let Some(editor) = &session.editor {
-                session.drafts.insert(
-                    format!("{}\n", editor.name),
-                    drafts::Draft {
-                        path: PathBuf::new(),
-                        kind: session.kind,
-                        editor: editor.clone(),
-                        conflict: false,
-                        observed_disk: None,
-                    },
-                );
-            }
-            session.input_cursor = session.input.chars().count();
-            session.keymap_version = drafts::KEYMAP_VERSION;
-            session.keymap_notice_pending = true;
-        }
-        Ok(session)
-    }
-    fn save(&self, path: &std::path::Path) -> Result<()> {
-        let data = serde_json::to_vec(self)?;
-        anyhow::ensure!(data.len() as u64 <= SESSION_LIMIT, "Session exceeds 4 MiB");
-        Ok(astra_platform::storage::atomic_write_default(path, &data)?)
-    }
-}
-
 struct Ui {
-    session: Session,
+    client: Client,
     focus: focus::Focus,
     animations: animation::Motion,
     live_state: live::LiveState,
-    confirmation_accept: bool,
-    update_status: Option<crate::protocol::updates::UpdateStatus>,
-    update_view: Option<update::View>,
-    page: usize,
     navigation_stack: Vec<usize>,
     palette: Option<shell::Palette>,
     /// Reject late view-opening results after the user has switched overlays.
-    overlay_epoch: u64,
-    runtime_snapshot: Option<astra_model::runtime::Snapshot>,
-    runtime_instance: String,
-    runtime_error: String,
-    runtime_sample: Instant,
-    rates: [u64; 2],
-    direct_rates: [u64; 2],
-    history: [std::collections::VecDeque<u64>; 2],
     group_selection: usize,
     profile_viewport: std::cell::Cell<usize>,
     connection_selection: usize,
@@ -452,36 +94,17 @@ struct Ui {
     connection_filtering: bool,
     runtime_picker: Option<(String, usize)>,
     hits: std::cell::RefCell<astra_tui_kit::HitMap<dashboard::Target>>,
-    rows: Vec<Row>,
-    message: String,
-    viewer: Option<logs::Viewer>,
-    scroll: u16,
-    refresh_paused: bool,
     persistence_paused: bool,
-    details: HashMap<String, InstanceDetails>,
-    details_supported: bool,
     menu: Option<usize>,
     binding_picker: Option<BindingPicker>,
-    prefilled_input: bool,
-    diagnostics: Option<crate::diagnostics::View>,
     /// The pending Diagnostics action was requested as network tools.
-    open_nettools: bool,
-    explanation: Option<crate::explanation::View>,
     vim_g: bool,
-    help_scroll: Option<u16>,
-    help_override: Option<String>,
     operation_steps: Vec<String>,
     operation_result: Option<String>,
-    tasks: background::Tasks,
-    tui_viewer: Option<logs::Viewer>,
+    task_view: background::TaskView,
     monitor: Option<monitor::View>,
-    operation_failed: bool,
-    ready_editors: HashMap<String, Editor>,
     last_find: String,
     /// Open the editor's search as soon as a requested editor arrives.
-    search_on_open: bool,
-    preferences: settings::Preferences,
-    preferences_path: Option<PathBuf>,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     startup_context: Option<crate::windows::Context>,
     #[cfg(windows)]
@@ -491,20 +114,18 @@ struct Ui {
     terminals: settings::TerminalState,
     /// Ctrl+Home held on the accent setting: (first press, latest press, done).
     marquee_hold: Option<(Instant, Instant, bool)>,
-    program_info: background::ProgramInformation,
-    installation: installation::State,
     /// Mouse capture change for the event loop, which owns the terminal.
     mouse_request: Option<bool>,
 }
 impl std::ops::Deref for Ui {
-    type Target = Session;
-    fn deref(&self) -> &Session {
-        &self.session
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
     }
 }
 impl std::ops::DerefMut for Ui {
-    fn deref_mut(&mut self) -> &mut Session {
-        &mut self.session
+    fn deref_mut(&mut self) -> &mut Client {
+        &mut self.client
     }
 }
 
@@ -518,97 +139,15 @@ enum Input {
 }
 
 impl Ui {
-    fn prepare_external(
-        &mut self,
-        home: &std::path::Path,
-    ) -> Result<(crate::external_editor::Draft, PathBuf)> {
-        let editor = self
-            .editor
-            .as_mut()
-            .context(t("Open a configuration first"))?;
-        let text = editor.prepare_save()?;
-        let name = editor.name.clone();
-        if let Some(previous) = &self.external_draft {
-            if previous.name == name && previous.base != text && previous.path.is_file() {
-                anyhow::ensure!(
-                    previous.read()? == previous.base,
-                    "{}: {}",
-                    t("TUI draft changed; external file is kept for manual import"),
-                    previous.path.display()
-                );
-            }
-        }
-        let draft = match &self.external_draft {
-            Some(draft) if draft.name == name && draft.base == text && draft.path.is_file() => {
-                draft.clone()
-            }
-            _ => crate::external_editor::Draft::create(home, name.clone(), text)?,
-        };
-        self.external_draft = Some(draft.clone());
-        self.message = tr!(
-            "External draft: {} · F2 → Read external draft · Ctrl-S save",
-            draft.path.display()
-        );
-        let directory = self
-            .rows
-            .iter()
-            .find(|row| row.instance.name == name)
-            .and_then(|row| row.instance.config.parent())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| self.working_dir.clone());
-        Ok((draft, directory))
-    }
-    fn read_external(&mut self) -> Result<()> {
-        let draft = self
-            .external_draft
-            .clone()
-            .context(t("No external draft; use F2 → Open external editor"))?;
-        let text = draft.read()?;
-        let editor = self
-            .editor
-            .as_mut()
-            .context(t("Open a configuration first"))?;
-        anyhow::ensure!(
-            editor.name == draft.name,
-            t("External draft belongs to another instance")
-        );
-        anyhow::ensure!(
-            editor.text() == draft.base || editor.text() == text,
-            t("TUI draft changed; external file is kept for manual import")
-        );
-        let path = draft.path.clone();
-        if editor.text() != text {
-            editor.import(text.clone())?;
-        }
-        self.external_draft.as_mut().unwrap().base = text;
-        self.message = tr!(
-            "External draft: {} · F2 → Read external draft · Ctrl-S save",
-            path.display()
-        );
-        Ok(())
-    }
     fn new(session: Session) -> Self {
         let animations = animation::Motion::new(session.motion);
-        let migration = session.keymap_notice_pending;
         Self {
-            session,
+            client: Client::from_session(session).with_waker(astra_client::waker::Waker::new(wake)),
             focus: Default::default(),
             animations,
             live_state: Default::default(),
-            confirmation_accept: false,
-            update_status: None,
-            update_view: None,
-            page: 0,
             navigation_stack: Vec::new(),
             palette: None,
-            overlay_epoch: 0,
-            runtime_snapshot: None,
-            runtime_instance: String::new(),
-            runtime_error: String::new(),
-            runtime_sample: Instant::now(),
-            rates: [0, 0],
-            direct_rates: [0, 0],
-            history: Default::default(),
             group_selection: 0,
             profile_viewport: std::cell::Cell::new(1),
             connection_selection: 0,
@@ -621,34 +160,15 @@ impl Ui {
             connection_filtering: false,
             runtime_picker: None,
             hits: Default::default(),
-            rows: vec![],
-            message: String::new(),
-            viewer: None,
-            scroll: 0,
-            refresh_paused: false,
             persistence_paused: false,
-            details: HashMap::new(),
-            details_supported: false,
             menu: None,
             binding_picker: None,
-            prefilled_input: false,
-            diagnostics: None,
-            open_nettools: false,
-            explanation: None,
             vim_g: false,
-            help_scroll: migration.then_some(0),
-            help_override: migration.then(|| t("Keyboard layout updated\n\nTab / Shift-Tab now moves focus. Enter activates the focused item.\nSpace pauses connections and logs, or toggles a checkbox.\nF2 / Ctrl-K opens every command. Q, R and 0 no longer run destructive actions.\nEsc, page changes and quitting retain configuration drafts.\n\nF1 opens the complete key map. Enter / Esc dismisses this notice.").into()),
             operation_steps: Vec::new(),
             operation_result: None,
-            tasks: Default::default(),
-            tui_viewer: None,
+            task_view: Default::default(),
             monitor: None,
-            operation_failed: false,
-            ready_editors: HashMap::new(),
             last_find: String::new(),
-            search_on_open: false,
-            preferences: Default::default(),
-            preferences_path: None,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_context: None,
             #[cfg(windows)]
@@ -657,22 +177,8 @@ impl Ui {
             settings_view: Default::default(),
             terminals: Default::default(),
             marquee_hold: None,
-            program_info: Default::default(),
-            installation: Default::default(),
             mouse_request: None,
         }
-    }
-    fn index(&self) -> usize {
-        kind_index(self.kind)
-    }
-    fn rows(&self) -> Vec<&Row> {
-        self.rows
-            .iter()
-            .filter(|r| r.instance.kind == self.kind)
-            .collect()
-    }
-    fn selected(&self) -> Option<&Row> {
-        self.rows().get(self.selections[self.index()]).copied()
     }
     fn operations(&self) -> Vec<Operation> {
         let Some(row) = self.selected() else {
@@ -878,125 +384,6 @@ impl Ui {
             .map(|action| Input::Run(action, None))
             .unwrap_or(Input::Idle)
     }
-    fn update_rows(&mut self, reply: Reply) {
-        let details = serde_json::from_str(&reply.text);
-        self.details_supported = details.is_ok();
-        self.details = details.unwrap_or_default();
-        self.rows = reply.rows;
-        if self.active_profile.is_none() {
-            self.active_profile = self
-                .rows
-                .iter()
-                .filter(|r| r.instance.kind == Kind::Proxy)
-                .nth(self.selections[0])
-                .or_else(|| self.rows.iter().find(|r| r.instance.kind == Kind::Proxy))
-                .map(|r| r.instance.name.clone());
-        }
-        for (index, kind) in [Kind::Proxy, Kind::Rule, Kind::Server]
-            .into_iter()
-            .enumerate()
-        {
-            let count = self
-                .rows
-                .iter()
-                .filter(|row| row.instance.kind == kind)
-                .count();
-            self.selections[index] = self.selections[index].min(count.saturating_sub(1));
-        }
-    }
-    fn prompt(&mut self, prompt: Prompt) {
-        self.confirmation_accept = false;
-        if matches!(prompt, Prompt::ExportNode { .. }) {
-            match astra_platform::platform::documents_dir() {
-                Ok(directory) => self.working_dir = directory,
-                Err(error) => {
-                    self.fail(
-                        format!("Locate Documents directory: {error}"),
-                        Resume::Editor,
-                    );
-                    return;
-                }
-            }
-        } else if matches!(
-            prompt,
-            Prompt::AddName
-                | Prompt::Config(_)
-                | Prompt::Clone(_)
-                | Prompt::ImportNode(_)
-                | Prompt::ImportRule(_)
-                | Prompt::UpdatePackage
-                | Prompt::ExportConfig { .. }
-                | Prompt::ExportRule { .. }
-                | Prompt::ExportTerminal { .. }
-        ) {
-            self.working_dir = launch_directory();
-        }
-        self.input = match &prompt {
-            Prompt::Config(name) => self
-                .rows
-                .iter()
-                .find(|row| &row.instance.name == name)
-                .map(|row| row.instance.config.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            Prompt::Clone(name) => self
-                .rows
-                .iter()
-                .find(|row| &row.instance.name == name)
-                .map(|row| {
-                    let source = &row.instance.config;
-                    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
-                    let mut target = source.with_file_name(format!("{stem}-copy.toml"));
-                    for index in 2..=100 {
-                        if !target.exists() {
-                            break;
-                        }
-                        target = source.with_file_name(format!("{stem}-copy-{index}.toml"));
-                    }
-                    target.to_string_lossy().into_owned()
-                })
-                .unwrap_or_default(),
-            Prompt::ExportNode { share, .. } => self
-                .working_dir
-                .join(if *share { "nodes.txt" } else { "nodes.toml" })
-                .to_string_lossy()
-                .into_owned(),
-            Prompt::ExportConfig { .. }
-            | Prompt::ExportRule { .. }
-            | Prompt::ExportTerminal { .. } => String::new(),
-            Prompt::Find(page) => self.searches.get(page).cloned().unwrap_or_default(),
-            _ => String::new(),
-        };
-        self.prefilled_input = !self.input.is_empty();
-        self.input_cursor = self.input.chars().count();
-        self.prompt = Some(prompt);
-    }
-    fn paste_prompt(&mut self, text: &str) {
-        if self.prompt.as_ref().is_some_and(Prompt::picker) {
-            return;
-        }
-        if self.prefilled_input {
-            self.input.clear();
-            self.input_cursor = 0;
-            self.prefilled_input = false;
-        }
-        let multiline = matches!(self.prompt, Some(Prompt::ImportNode(_)))
-            || matches!(self.prompt, Some(Prompt::Import)) && astra_convert::share::is_share(text);
-        let inserted: String = text
-            .chars()
-            .filter(|character| {
-                !character.is_control() || (multiline && matches!(*character, '\n' | '\r' | '\t'))
-            })
-            .collect();
-        let byte = self.prompt_byte();
-        self.input.insert_str(byte, &inserted);
-        self.input_cursor += inserted.chars().count();
-    }
-    fn prompt_byte(&self) -> usize {
-        self.input
-            .char_indices()
-            .nth(self.input_cursor)
-            .map_or(self.input.len(), |(index, _)| index)
-    }
     fn paste(&mut self, text: &str) {
         if self.monitor.is_some() {
             return;
@@ -1034,14 +421,6 @@ impl Ui {
         } else if let Some(viewer) = &mut self.viewer {
             viewer.paste(text);
         }
-    }
-    fn fail(&mut self, error: impl std::fmt::Display, resume: Resume) {
-        self.operation_failed = true;
-        self.recovery = Some(Recovery {
-            message: error.to_string(),
-            resume,
-        });
-        self.scroll = 0;
     }
     fn checkpoint(&mut self, path: &std::path::Path) -> bool {
         self.remember_draft();
@@ -1319,7 +698,7 @@ impl Ui {
             }
             return Input::Idle;
         }
-        if self.tasks.showing_details() || self.tui_viewer.is_some() {
+        if self.client.tasks.showing_details() || self.tui_viewer.is_some() {
             if let Some(input) = self.background_key(key) {
                 return input;
             }
@@ -1441,7 +820,7 @@ impl Ui {
             if key.code == KeyCode::Esc && !view.handles_escape() {
                 self.diagnostics = None;
             } else {
-                view.key(key);
+                view.key(crate::input::key(key));
                 if view.closed() {
                     self.diagnostics = None;
                 }
@@ -1467,7 +846,8 @@ impl Ui {
             && self.kind == Kind::Rule
             && self.editor.as_ref().is_some_and(Editor::browsing)
         {
-            self.prompt(Prompt::Explain(self.editor.as_ref().unwrap().name.clone()));
+            let name = self.editor.as_ref().unwrap().name.clone();
+            self.prompt(Prompt::Explain(name));
         } else if self.editor.is_some() {
             return self.key_editor_focus(key);
         } else if self.viewer.is_some() {
@@ -1649,7 +1029,7 @@ impl Ui {
     fn key_editor_focus(&mut self, key: event::KeyEvent) -> Input {
         let editor_kind = self.kind;
         let editor = self.editor.as_mut().unwrap();
-        if editor.requests_subscription_update(key) {
+        if editor.requests_subscription_update(crate::input::key(key)) {
             if editor.text() != editor.original {
                 self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
             } else {
@@ -1705,14 +1085,15 @@ impl Ui {
             && editor.browsing()
         {
             // Ctrl-F matches the GUI; it opens the same search as `/`.
-            if let Err(error) =
-                editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-            {
+            if let Err(error) = editor.key(crate::input::key(event::KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            ))) {
                 self.fail(format!("{error:#}"), Resume::Editor);
             }
         } else if key.code == KeyCode::Esc && editor.can_close() {
             self.suspend_editor();
-        } else if let Err(error) = editor.key(key) {
+        } else if let Err(error) = editor.key(crate::input::key(key)) {
             self.fail(format!("{error:#}"), Resume::Editor);
         }
         Input::Idle
@@ -1721,7 +1102,7 @@ impl Ui {
     fn key_log_focus(&mut self, key: event::KeyEvent) -> Input {
         let viewer = self.viewer.as_mut().unwrap();
         let name = viewer.name.clone();
-        match viewer.key(key) {
+        match viewer.key(crate::input::key(key)) {
             logs::Command::Close => {
                 let settings = viewer.settings.clone();
                 self.log_settings.insert(name, settings);
@@ -2258,42 +1639,7 @@ impl Ui {
     }
 }
 
-pub(crate) fn action_description(action: &Action) -> String {
-    let (label, name) = match action {
-        Action::Logs(name) if name == "@tui" => ("TUI log", ""),
-        Action::Logs(name) => ("Logs", name.as_str()),
-        Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
-        Action::NetTool { name, .. } => ("Network tools", name.as_str()),
-        Action::Runtime { name, .. } => ("Applying runtime change", name.as_str()),
-        Action::PrepareElevation { name, .. } => {
-            ("Enable TUN with administrator permission", name.as_str())
-        }
-        Action::CancelElevation { name, .. } => ("Cancel TUN elevation", name.as_str()),
-        Action::WaitElevation { name, .. } => ("Wait for the elevated core", name.as_str()),
-        Action::ExplainRoute { name, .. } => ("Route explanation", name.as_str()),
-        Action::Create { name, .. } => ("Create", name.as_str()),
-        Action::Add(instance) => ("Add", instance.name.as_str()),
-        Action::Start(name) => ("Start", name.as_str()),
-        Action::ForceStart(name) => ("Force start", name.as_str()),
-        Action::Stop(name) => ("Stop", name.as_str()),
-        Action::Restart(name) => ("Restart", name.as_str()),
-        Action::Reload(name) => ("Reload", name.as_str()),
-        Action::Validate(name) => ("Validate", name.as_str()),
-        Action::Read(name) => ("Edit", name.as_str()),
-        Action::Save { name, .. } => ("Save", name.as_str()),
-        Action::UpdateSubscriptions(name) => ("Update subscriptions", name.as_str()),
-        Action::UpdatePackage(_) => ("Import local update package", ""),
-        Action::UpdateStatus => ("Update status", ""),
-        Action::Rollback => ("Roll back release", ""),
-        Action::BindStart { name, .. } => ("Startup bindings", name.as_str()),
-        Action::Remove(name) => ("Remove", name.as_str()),
-        Action::SetConfig(name, _) => ("Config path", name.as_str()),
-        Action::CloneConfig(name, _) => ("Copy config", name.as_str()),
-        Action::Shutdown => ("Stop all", ""),
-        _ => ("Processing request", ""),
-    };
-    format!("{} {}", t(label), name).trim().to_owned()
-}
+pub use astra_client::operations::action_description;
 
 fn uptime(seconds: u64) -> String {
     format!(

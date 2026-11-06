@@ -119,21 +119,6 @@ pub(super) fn duration(seconds: u64) -> String {
 }
 
 impl Ui {
-    pub(super) fn active_proxy(&self) -> Option<&Row> {
-        if self.kind == Kind::Server {
-            return None;
-        }
-        if let Some(name) = &self.active_profile {
-            self.rows
-                .iter()
-                .find(|r| r.instance.kind == Kind::Proxy && &r.instance.name == name)
-        } else {
-            self.rows
-                .iter()
-                .filter(|r| r.instance.kind == Kind::Proxy)
-                .nth(self.selections[0])
-        }
-    }
     /// The rule core a profile uses: its startup binding, or the only rule instance.
     pub(super) fn active_rule(&self) -> Option<&Row> {
         let proxy = self.active_proxy()?;
@@ -248,7 +233,8 @@ impl Ui {
         if find {
             match self.page {
                 PROXIES | PROFILES => {
-                    self.prompt(Prompt::Find(self.page));
+                    let page = self.page;
+                    self.prompt(Prompt::Find(page));
                     return Some(Input::Idle);
                 }
                 RULES => return Some(self.rule_search()),
@@ -316,17 +302,6 @@ impl Ui {
         let input = self.rule_operation(Operation::Edit);
         self.apply_pending_search();
         input
-    }
-    pub(super) fn apply_pending_search(&mut self) {
-        if !self.search_on_open {
-            return;
-        }
-        if self.editor.as_ref().is_some_and(Editor::browsing) {
-            self.search_on_open = false;
-            if let Some(editor) = self.editor.as_mut() {
-                let _ = editor.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-            }
-        }
     }
     /// Jumps to the next group/member (Proxies) or instance (Profiles) containing `query`.
     pub(super) fn find(&mut self, page: usize, query: &str) -> bool {
@@ -450,7 +425,10 @@ impl Ui {
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             let viewer = self.viewer.as_mut().filter(|v| v.browsing())?;
-            viewer.key(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+            viewer.key(crate::input::key(event::KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )));
             return Some(Input::Idle);
         }
         if self.page != LOGS

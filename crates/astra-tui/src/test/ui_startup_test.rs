@@ -16,8 +16,9 @@ fn row(name: &str, kind: Kind, pid: Option<u32>) -> Row {
 }
 
 fn enable_all(ui: &mut Ui) {
-    for row in &ui.rows {
-        ui.details
+    for row in &ui.client.rows {
+        ui.client
+            .details
             .entry(row.instance.name.clone())
             .or_default()
             .auto_start = true;

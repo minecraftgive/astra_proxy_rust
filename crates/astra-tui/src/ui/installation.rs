@@ -4,16 +4,9 @@ use super::*;
 use astra_management::v2 as v;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::watch;
 
-#[derive(Clone, Debug)]
-pub(super) struct Request {
-    pub package_id: String,
-    pub expected_release_id: String,
-    pub scope: v::InstallationScope,
-    pub elevate: bool,
-}
-
+pub use astra_client::installation::Request;
 #[derive(Clone)]
 pub(super) enum Click {
     Open,
@@ -23,44 +16,6 @@ pub(super) enum Click {
     Scope,
     Refresh,
     Install,
-}
-
-#[derive(Default)]
-pub(super) struct State {
-    open: bool,
-    notice: bool,
-    notice_accept: bool,
-    notice_key: Option<String>,
-    refresh: bool,
-    status: Option<v::InstallationStatus>,
-    query: Option<JoinHandle<Result<v::InstallationStatus, String>>>,
-    operation: Option<JoinHandle<Result<v::InstallationResult, String>>>,
-    progress: Option<watch::Receiver<Option<astra_ipc::progress::Progress>>>,
-    events: Vec<String>,
-    result: Option<v::InstallationResult>,
-    error: Option<String>,
-    query_error: Option<String>,
-    selected: usize,
-    scope: v::InstallationScope,
-    scroll: u16,
-}
-
-impl State {
-    pub(super) fn visible(&self) -> bool {
-        self.open || self.notice
-    }
-    pub(super) fn busy(&self) -> bool {
-        self.operation.is_some()
-    }
-    fn selected(&self) -> Option<&v::InstallationPackage> {
-        self.status.as_ref()?.packages.get(self.selected)
-    }
-    fn destination(&self) -> Option<&v::InstallationDestination> {
-        self.selected().map(|package| match self.scope {
-            v::InstallationScope::User => &package.user,
-            v::InstallationScope::System => &package.system,
-        })
-    }
 }
 
 fn notice_key(executable: &std::path::Path, socket: &std::path::Path) -> String {
@@ -108,9 +63,9 @@ async fn read_status(socket: PathBuf) -> Result<v::InstallationStatus, String> {
 
 impl Ui {
     pub(super) fn installation_failed(&mut self, error: String) {
-        self.installation.error = Some(error.clone());
-        self.message = error;
-        self.tasks.notice_result(&self.message, true);
+        self.client.installation.error = Some(error.clone());
+        self.client.message = error;
+        self.client.tasks.notice_result(&self.client.message, true);
     }
     pub(super) fn initialize_installation(
         &mut self,
@@ -123,48 +78,50 @@ impl Ui {
             return;
         }
         let key = notice_key(&context.executable, socket);
-        if !self.preferences.installation_notices.contains(&key) {
-            self.installation.notice_key = Some(key);
-            self.installation.refresh = true;
+        if !self.client.preferences.installation_notices.contains(&key) {
+            self.client.installation.notice_key = Some(key);
+            self.client.installation.refresh = true;
         }
     }
 
     pub(super) fn open_installation(&mut self) {
-        if let Some(key) = self.installation.notice_key.take() {
+        if let Some(key) = self.client.installation.notice_key.take() {
             self.change_preferences(|preferences| {
                 preferences.installation_notices.insert(key);
             });
         }
-        self.installation.notice = false;
-        self.installation.open = true;
-        self.installation.refresh = true;
-        self.installation.scroll = 0;
+        self.client.installation.notice = false;
+        self.client.installation.open = true;
+        self.client.installation.refresh = true;
+        self.client.installation.scroll = 0;
     }
 
     pub(super) async fn poll_installation(&mut self, socket: &std::path::Path) -> bool {
         let mut changed = false;
-        if let Some(progress) = &mut self.installation.progress {
+        if let Some(progress) = &mut self.client.installation.progress {
             if progress.has_changed().unwrap_or(false) {
                 if let Some(event) = progress.borrow_and_update().clone() {
-                    self.installation.events.push(format!(
+                    self.client.installation.events.push(format!(
                         "{} · {}",
                         t(&event.phase),
                         event.detail
                     ));
-                    if self.installation.events.len() > 64 {
-                        self.installation.events.remove(0);
+                    if self.client.installation.events.len() > 64 {
+                        self.client.installation.events.remove(0);
                     }
                     changed = true;
                 }
             }
         }
         if self
+            .client
             .installation
             .operation
             .as_ref()
             .is_some_and(|task| task.is_finished())
         {
             let result = self
+                .client
                 .installation
                 .operation
                 .take()
@@ -172,30 +129,32 @@ impl Ui {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            self.installation.progress = None;
+            self.client.installation.progress = None;
             match result {
                 Ok(result) => {
-                    self.message = result.message.clone();
-                    self.installation.result = Some(result);
-                    self.installation.error = None;
-                    self.tasks.notice_result(&self.message, false);
+                    self.client.message = result.message.clone();
+                    self.client.installation.result = Some(result);
+                    self.client.installation.error = None;
+                    self.client.tasks.notice_result(&self.client.message, false);
                 }
                 Err(error) => {
-                    self.message = error.clone();
-                    self.installation.error = Some(error);
-                    self.tasks.notice_result(&self.message, true);
+                    self.client.message = error.clone();
+                    self.client.installation.error = Some(error);
+                    self.client.tasks.notice_result(&self.client.message, true);
                 }
             }
-            self.installation.refresh = true;
+            self.client.installation.refresh = true;
             changed = true;
         }
         if self
+            .client
             .installation
             .query
             .as_ref()
             .is_some_and(|task| task.is_finished())
         {
             match self
+                .client
                 .installation
                 .query
                 .take()
@@ -205,59 +164,60 @@ impl Ui {
                 .and_then(|result| result)
             {
                 Ok(mut status) => {
-                    self.installation.query_error = None;
+                    self.client.installation.query_error = None;
                     status
                         .packages
                         .sort_by(|a, b| (&a.role, &a.source).cmp(&(&b.role, &b.source)));
-                    self.installation.selected = self
+                    self.client.installation.selected = self
+                        .client
                         .installation
                         .selected
                         .min(status.packages.len().saturating_sub(1));
-                    self.installation.status = Some(status);
+                    self.client.installation.status = Some(status);
                 }
-                Err(error) => self.installation.query_error = Some(error),
+                Err(error) => self.client.installation.query_error = Some(error),
             }
             changed = true;
         }
-        if self.installation.refresh
-            && self.installation.query.is_none()
-            && !self.installation.busy()
+        if self.client.installation.refresh
+            && self.client.installation.query.is_none()
+            && !self.client.installation.busy()
         {
-            self.installation.refresh = false;
+            self.client.installation.refresh = false;
             let socket = socket.to_owned();
-            self.installation.query = Some(tokio::spawn(async move {
+            self.client.installation.query = Some(tokio::spawn(async move {
                 let result = read_status(socket).await;
                 super::wake();
                 result
             }));
             changed = true;
         }
-        if self.installation.notice_key.is_some()
-            && self.installation.status.is_some()
-            && self.installation.query_error.is_none()
-            && !self.installation.visible()
+        if self.client.installation.notice_key.is_some()
+            && self.client.installation.status.is_some()
+            && self.client.installation.query_error.is_none()
+            && !self.client.installation.visible()
             && self.prompt.is_none()
             && self.recovery.is_none()
             && self.editor.is_none()
-            && self.help_scroll.is_none()
+            && self.client.help_scroll.is_none()
             && self.palette.is_none()
         {
-            self.installation.notice = true;
-            self.installation.notice_accept = true;
+            self.client.installation.notice = true;
+            self.client.installation.notice_accept = true;
             changed = true;
         }
         changed
     }
 
     fn dismiss_installation_notice(&mut self, open: bool) {
-        if let Some(key) = self.installation.notice_key.take() {
+        if let Some(key) = self.client.installation.notice_key.take() {
             self.change_preferences(|preferences| {
                 preferences.installation_notices.insert(key);
             });
         }
-        self.installation.notice = false;
+        self.client.installation.notice = false;
         if open {
-            self.page = shell::SETTINGS;
+            self.client.page = shell::SETTINGS;
             self.open_installation();
         }
     }
@@ -271,55 +231,59 @@ impl Ui {
         {
             return Input::Idle;
         }
-        if self.installation.notice {
+        if self.client.installation.notice {
             match key.code {
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
-                    self.installation.notice_accept = !self.installation.notice_accept
+                    self.client.installation.notice_accept = !self.client.installation.notice_accept
                 }
-                KeyCode::Enter => self.dismiss_installation_notice(self.installation.notice_accept),
+                KeyCode::Enter => {
+                    self.dismiss_installation_notice(self.client.installation.notice_accept)
+                }
                 KeyCode::Esc => self.dismiss_installation_notice(false),
                 _ => {}
             }
             return Input::Idle;
         }
         match key.code {
-            KeyCode::Esc => self.installation.open = false,
+            KeyCode::Esc => self.client.installation.open = false,
             KeyCode::Up => {
-                self.installation.selected = self.installation.selected.saturating_sub(1);
-                self.installation.scroll = 0;
+                self.client.installation.selected =
+                    self.client.installation.selected.saturating_sub(1);
+                self.client.installation.scroll = 0;
             }
             KeyCode::Down => {
                 let count = self
+                    .client
                     .installation
                     .status
                     .as_ref()
                     .map_or(0, |s| s.packages.len());
-                self.installation.selected =
-                    (self.installation.selected + 1).min(count.saturating_sub(1));
-                self.installation.scroll = 0;
+                self.client.installation.selected =
+                    (self.client.installation.selected + 1).min(count.saturating_sub(1));
+                self.client.installation.scroll = 0;
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab if !self.installation.busy() => {
-                self.installation.scope = match self.installation.scope {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab if !self.client.installation.busy() => {
+                self.client.installation.scope = match self.client.installation.scope {
                     v::InstallationScope::User => v::InstallationScope::System,
                     v::InstallationScope::System => v::InstallationScope::User,
                 };
-                self.installation.scroll = 0;
+                self.client.installation.scroll = 0;
             }
-            KeyCode::Char('r') if !self.installation.busy() => {
-                self.installation.query_error = None;
-                self.installation.refresh = true;
+            KeyCode::Char('r') if !self.client.installation.busy() => {
+                self.client.installation.query_error = None;
+                self.client.installation.refresh = true;
             }
             KeyCode::PageDown => {
-                self.installation.scroll = self.installation.scroll.saturating_add(5)
+                self.client.installation.scroll = self.client.installation.scroll.saturating_add(5)
             }
             KeyCode::PageUp => {
-                self.installation.scroll = self.installation.scroll.saturating_sub(5)
+                self.client.installation.scroll = self.client.installation.scroll.saturating_sub(5)
             }
             KeyCode::Enter
-                if !self.installation.busy()
-                    && !self.installation.refresh
-                    && self.installation.query.is_none()
-                    && self.installation.query_error.is_none() =>
+                if !self.client.installation.busy()
+                    && !self.client.installation.refresh
+                    && self.client.installation.query.is_none()
+                    && self.client.installation.query_error.is_none() =>
             {
                 return self.installation_request()
             }
@@ -329,39 +293,39 @@ impl Ui {
     }
 
     fn installation_request(&mut self) -> Input {
-        let Some(destination) = self.installation.destination() else {
+        let Some(destination) = self.client.installation.destination() else {
             return Input::Idle;
         };
         if let Some(reason) = &destination.unavailable_reason {
-            self.installation.error = Some(reason.clone());
+            self.client.installation.error = Some(reason.clone());
             return Input::Idle;
         }
         if destination.requires_elevation
             && crate::protocol::target().is_some_and(|(_, agent)| agent.is_some())
         {
-            self.installation.error = Some(t("Administrator permission is required. Run installation on the target machine; remote requests cannot open a permission prompt.").into());
+            self.client.installation.error = Some(t("Administrator permission is required. Run installation on the target machine; remote requests cannot open a permission prompt.").into());
             return Input::Idle;
         }
-        let package = self.installation.selected().unwrap();
+        let package = self.client.installation.selected().unwrap();
         Input::Install(Request {
             package_id: package.id.clone(),
             expected_release_id: package.release_id.clone(),
-            scope: self.installation.scope,
+            scope: self.client.installation.scope,
             elevate: destination.requires_elevation,
         })
     }
 
     pub(super) fn start_installation(&mut self, socket: &std::path::Path, request: Request) {
-        if self.installation.busy() {
+        if self.client.installation.busy() {
             return;
         }
-        self.installation.error = None;
-        self.installation.result = None;
-        self.installation.events.clear();
+        self.client.installation.error = None;
+        self.client.installation.result = None;
+        self.client.installation.events.clear();
         let socket = socket.to_owned();
         let (progress, receiver) = watch::channel(None);
-        self.installation.progress = Some(receiver);
-        self.installation.operation = Some(tokio::spawn(async move {
+        self.client.installation.progress = Some(receiver);
+        self.client.installation.operation = Some(tokio::spawn(async move {
             let result = astra_ipc::progress::scope(
                 progress,
                 crate::protocol::execute(
@@ -410,10 +374,12 @@ impl Ui {
             Some(dashboard::Target::Installation(Click::Later)) => {
                 self.dismiss_installation_notice(false)
             }
-            Some(dashboard::Target::Installation(Click::Close)) => self.installation.open = false,
+            Some(dashboard::Target::Installation(Click::Close)) => {
+                self.client.installation.open = false
+            }
             Some(dashboard::Target::Installation(Click::Row(index))) => {
-                self.installation.selected = index;
-                self.installation.scroll = 0;
+                self.client.installation.selected = index;
+                self.client.installation.scroll = 0;
             }
             Some(dashboard::Target::Installation(Click::Scope)) => {
                 return self
@@ -433,13 +399,13 @@ impl Ui {
     }
 
     pub(super) fn render_installation(&self, frame: &mut Frame<'_>) {
-        if !self.installation.visible() {
+        if !self.client.installation.visible() {
             return;
         }
         self.hits.borrow_mut().clear();
         let area = frame.area();
         frame.render_widget(Clear, area);
-        let block = dashboard::card(if self.installation.notice {
+        let block = dashboard::card(if self.client.installation.notice {
             "Install Astra"
         } else {
             "Installation"
@@ -449,8 +415,9 @@ impl Ui {
         if inner.width < 8 || inner.height < 4 {
             return;
         }
-        if self.installation.notice {
+        if self.client.installation.notice {
             let target = self
+                .client
                 .installation
                 .status
                 .as_ref()
@@ -472,7 +439,7 @@ impl Ui {
             {
                 let width = inner.width / 2;
                 let rect = Rect::new(inner.x + i as u16 * width, y, width, 1);
-                let chosen = self.installation.notice_accept == (i == 0);
+                let chosen = self.client.installation.notice_accept == (i == 0);
                 frame.render_widget(
                     Paragraph::new(format!("{} {}", if chosen { "›" } else { " " }, t(label)))
                         .style(Style::default().fg(if chosen {
@@ -494,11 +461,12 @@ impl Ui {
                 Constraint::Length(2),
             ])
             .split(inner);
-        let scope = match self.installation.scope {
+        let scope = match self.client.installation.scope {
             v::InstallationScope::User => "Current user",
             v::InstallationScope::System => "All users",
         };
         let target = self
+            .client
             .installation
             .status
             .as_ref()
@@ -519,13 +487,13 @@ impl Ui {
             dashboard::Target::Installation(Click::Scope),
         );
         let mut lines = Vec::<Line>::new();
-        if let Some(status) = &self.installation.status {
+        if let Some(status) = &self.client.installation.status {
             for (index, package) in status.packages.iter().enumerate() {
                 lines.push(Line::styled(
                     astra_tui_kit::text::truncate_cells(
                         &format!(
                             "{} {} · {}",
-                            if index == self.installation.selected {
+                            if index == self.client.installation.selected {
                                 "›"
                             } else {
                                 " "
@@ -536,7 +504,7 @@ impl Ui {
                         sections[1].width as usize,
                         "…",
                     ),
-                    Style::default().fg(if index == self.installation.selected {
+                    Style::default().fg(if index == self.client.installation.selected {
                         Color::Cyan
                     } else {
                         Color::White
@@ -558,8 +526,8 @@ impl Ui {
                     )));
                 }
             }
-            if let Some(package) = self.installation.selected() {
-                let destination = self.installation.destination().unwrap();
+            if let Some(package) = self.client.installation.selected() {
+                let destination = self.client.installation.destination().unwrap();
                 lines.extend([
                     Line::from(""),
                     Line::from(format!(
@@ -602,33 +570,34 @@ impl Ui {
                 lines.push(Line::from(warning.clone()));
             }
         }
-        if self.installation.query.is_some() {
+        if self.client.installation.query.is_some() {
             lines.push(Line::from(t("Checking the current package…")));
         }
-        if self.installation.busy() {
+        if self.client.installation.busy() {
             lines.push(Line::from(t(
                 "Installing… You may close this panel while the operation continues.",
             )));
         }
-        for event in &self.installation.events {
+        for event in &self.client.installation.events {
             lines.push(Line::from(event.clone()));
         }
-        if let Some(result) = &self.installation.result {
+        if let Some(result) = &self.client.installation.result {
             lines.extend([Line::from(""), Line::styled(result.message.clone(), Style::default().fg(Color::Green)), Line::from(format!("{}: {}", t("Launch command"), result.launch_command)), Line::from(t("Running programs keep their current version. Use the launch command after a maintenance restart."))]);
         }
-        if let Some(error) = &self.installation.error {
+        if let Some(error) = &self.client.installation.error {
             lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
         }
-        if let Some(error) = &self.installation.query_error {
+        if let Some(error) = &self.client.installation.query_error {
             lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
         }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((self.installation.scroll, 0)),
+                .scroll((self.client.installation.scroll, 0)),
             sections[1],
         );
         for (index, package) in self
+            .client
             .installation
             .status
             .iter()
@@ -636,7 +605,7 @@ impl Ui {
             .enumerate()
         {
             let _ = package;
-            if self.installation.scroll == 0 && index < sections[1].height as usize {
+            if self.client.installation.scroll == 0 && index < sections[1].height as usize {
                 self.hit(
                     Rect::new(
                         sections[1].x,

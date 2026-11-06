@@ -2,14 +2,6 @@
 use super::*;
 
 impl Ui {
-    pub(super) fn terminal_export_profile(&self) -> Option<&Row> {
-        if self.page == PROFILES && self.kind == Kind::Proxy {
-            self.selected()
-        } else {
-            self.active_proxy()
-        }
-    }
-
     pub(super) fn copy_terminal_commands(&mut self) -> Input {
         self.copy_terminal_commands_with(crate::clipboard::copy)
     }
@@ -25,8 +17,8 @@ impl Ui {
             })
             .and_then(|text| crate::export::current_shell_commands(&text))
             .and_then(|text| copy(&text));
-        self.operation_failed = result.is_err();
-        self.message = match result {
+        self.client.operation_failed = result.is_err();
+        self.client.message = match result {
             Ok(()) => t("Terminal proxy commands copied to clipboard").into(),
             Err(error) => tr!(
                 "Cannot copy terminal proxy commands: {}",
@@ -35,8 +27,9 @@ impl Ui {
         };
         self.operation_steps.clear();
         self.operation_result = None;
-        self.tasks
-            .notice_result(&self.message, self.operation_failed);
+        self.client
+            .tasks
+            .notice_result(&self.client.message, self.client.operation_failed);
         Input::Idle
     }
 }

@@ -971,7 +971,7 @@ fn selecting_nodes_and_closing_filtered_connections_use_runtime_commands_with_pi
 #[test]
 fn runtime_navigation_never_changes_hidden_instances_or_disconnects_on_ctrl_d() {
     let mut ui = sample();
-    ui.rows.push(ui.rows[0].clone());
+    ui.client.rows.push(ui.client.rows[0].clone());
     ui.rows[1].instance.name = "other".into();
     for page in [PROXIES, CONNECTIONS] {
         ui.navigate(page);

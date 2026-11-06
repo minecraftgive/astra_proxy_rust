@@ -15,10 +15,12 @@ fn ui() -> Ui {
         if editor.selected_node_tag().ok().as_deref() == Some("first") {
             break;
         }
-        editor.key(key(KeyCode::Down)).unwrap();
+        editor.key(crate::input::key(key(KeyCode::Down))).unwrap();
     }
     assert_eq!(editor.selected_node_tag().unwrap(), "first");
-    editor.key(key(KeyCode::Char('V'))).unwrap();
+    editor
+        .key(crate::input::key(key(KeyCode::Char('V'))))
+        .unwrap();
     ui.editor = Some(editor);
     ui
 }
@@ -148,10 +150,10 @@ fn node_transfer_multiline_import_reviews_selection_and_keeps_cancel_and_undo() 
     ui.editor
         .as_mut()
         .unwrap()
-        .key(event::KeyEvent::new(
+        .key(crate::input::key(event::KeyEvent::new(
             KeyCode::Char('z'),
             KeyModifiers::CONTROL,
-        ))
+        )))
         .unwrap();
     assert_eq!(ui.editor.as_ref().unwrap().text(), before);
 }

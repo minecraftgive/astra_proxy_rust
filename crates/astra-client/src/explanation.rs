@@ -1,0 +1,113 @@
+use crate::i18n::t;
+use anyhow::{ensure, Context, Result};
+use astra_ipc::API_VERSION;
+use astra_model::control::RouteExplanation;
+use astra_model::Inbound;
+use astra_model::Network;
+use astra_model::ProcessInfo;
+use astra_model::RouteAction;
+use astra_model::RouteRequest;
+use astra_model::Target;
+
+pub fn request(input: &str) -> Result<RouteRequest> {
+    let input = input.trim();
+    let (endpoint, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    let rest = rest.trim();
+    let (network, process) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    ensure!(
+        !endpoint.is_empty(),
+        t("Enter host[:port] [tcp|udp] [process name or path]")
+    );
+    let (host, port) = if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        (address.ip().to_string(), address.port())
+    } else if let Ok(address) = endpoint.parse::<std::net::IpAddr>() {
+        (address.to_string(), 443)
+    } else if let Some((host, port)) = endpoint.rsplit_once(':') {
+        ensure!(!host.contains(':'), t("Use [IPv6]:port for an IPv6 target"));
+        (
+            host.to_owned(),
+            port.parse::<u16>().context(t("Invalid target port"))?,
+        )
+    } else {
+        (endpoint.to_owned(), 443)
+    };
+    ensure!(
+        !host.is_empty() && host.len() <= 253 && port != 0 && !host.contains(['/', '\\', '[', ']']),
+        t("Invalid route query target")
+    );
+    let network = match network.to_ascii_lowercase().as_str() {
+        "" | "tcp" => Network::Tcp,
+        "udp" => Network::Udp,
+        _ => anyhow::bail!(t("Enter host[:port] [tcp|udp] [process name or path]")),
+    };
+    let process = process.trim();
+    let process = if process.is_empty() {
+        None
+    } else {
+        let quoted = process.starts_with(['\'', '"']);
+        let identity = if quoted {
+            ensure!(
+                process.len() >= 2 && process.ends_with(process.chars().next().unwrap()),
+                t("Invalid process name or absolute path")
+            );
+            &process[1..process.len() - 1]
+        } else {
+            process
+        };
+        let absolute = identity.starts_with('/')
+            || identity.starts_with("\\\\")
+            || (identity.as_bytes().get(1) == Some(&b':')
+                && matches!(identity.as_bytes().get(2), Some(b'/' | b'\\')));
+        ensure!(
+            !identity.trim().is_empty()
+                && identity.len() <= 4096
+                && !identity.contains('\0')
+                && (absolute
+                    || (!identity.contains(['/', '\\'])
+                        && (quoted || !identity.chars().any(char::is_whitespace)))),
+            t("Invalid process name or absolute path")
+        );
+        Some(ProcessInfo {
+            pid: 0,
+            name: identity.rsplit(['/', '\\']).next().unwrap().into(),
+            path: if absolute {
+                identity.into()
+            } else {
+                String::new()
+            },
+        })
+    };
+    Ok(RouteRequest {
+        destination_ip: None,
+        api_version: API_VERSION,
+        id: 0,
+        target: Target { host, port },
+        network,
+        inbound: Inbound::Socks5,
+        process,
+    })
+}
+/// A name without a dot (other than localhost) is a LAN/NetBIOS-style host,
+/// not the site the user most likely meant to query.
+pub fn single_label(host: &str) -> Option<&str> {
+    let host = host.trim_end_matches('.');
+    (!host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && !host.eq_ignore_ascii_case("localhost"))
+    .then_some(host)
+}
+pub fn action(value: &RouteAction) -> String {
+    match value {
+        RouteAction::Direct => "DIRECT".into(),
+        RouteAction::Block => "REJECT".into(),
+        RouteAction::Proxy(tag) => format!("proxy:{tag}"),
+    }
+}
+pub struct View {
+    pub report: RouteExplanation,
+    pub scroll: u16,
+}
+
+#[cfg(test)]
+#[path = "test/explanation_test.rs"]
+mod tests;
