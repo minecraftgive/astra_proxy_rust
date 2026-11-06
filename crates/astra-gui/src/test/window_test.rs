@@ -3,6 +3,48 @@ use astra_client::editor::{Editor, Mode};
 use gpui::{AppContext, Focusable, TestAppContext};
 
 #[gpui::test]
+fn dialog_focus_blocks_application_shortcuts_and_enter_submits(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, receiver) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        model.client.prompt(astra_client::state::Prompt::Shutdown)
+    });
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model.clone(), Some(0), window, cx));
+        Root::new(view, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "q 1 / space");
+    model.update(cx, |model, _| {
+        assert_eq!(model.client.page, 0);
+        assert!(matches!(
+            model.client.prompt,
+            Some(astra_client::state::Prompt::Shutdown)
+        ));
+    });
+    assert!(!receiver.is_closed());
+    cx.simulate_keystrokes(handle.into(), "escape");
+    model.update(cx, |model, cx| {
+        model.client.prompt(astra_client::state::Prompt::AddName);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "q 1 enter");
+    model.update(cx, |model, _| assert!(model.client.prompt.is_none()));
+    let crate::backend::BackendCmd::Start(request) = receiver.try_recv().unwrap() else {
+        panic!("submitting the dialog must dispatch the shared operation");
+    };
+    assert!(
+        matches!(request.action, astra_client::protocol::Action::Create { name, .. } if name == "q1")
+    );
+    assert!(!receiver.is_closed());
+}
+
+#[gpui::test]
 fn shortcuts_keep_working_after_palette_result_and_navigation(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

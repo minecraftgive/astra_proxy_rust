@@ -23,6 +23,7 @@ pub struct AppWindow {
     palette: bool,
     profile_chooser: bool,
     search: Entity<InputState>,
+    prompt: Entity<crate::widgets::PromptHost>,
     _observations: Vec<Subscription>,
 }
 impl AppWindow {
@@ -33,11 +34,24 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         let preferences = model.read(cx).client.preferences.clone();
         crate::theme::apply_for_window(&preferences, window, cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search commands")));
+        let prompt = cx.new(|cx| crate::widgets::PromptHost::new(model.clone(), window, cx));
         let appearance_model = model.clone();
         let observations = vec![
+            cx.subscribe_in(&prompt, window, |this, _, event, window, cx| {
+                match event {
+                    crate::widgets::PromptEvent::Input(input) => {
+                        this.handle_input(input.clone(), window, cx)
+                    }
+                    crate::widgets::PromptEvent::Cancelled => cx.notify(),
+                }
+                if this.model.read(cx).client.prompt.is_none() {
+                    window.focus(&this.focus, cx);
+                }
+            }),
             window.observe_window_appearance(move |window, cx| {
                 let preferences = appearance_model.read(cx).client.preferences.clone();
                 crate::theme::apply_for_window(&preferences, window, cx);
@@ -51,7 +65,6 @@ impl AppWindow {
             cx.observe(&search, |_, _, cx| cx.notify()),
         ];
         let page = page.or_else(|| model.read(cx).ready.then_some(model.read(cx).client.page));
-        window.focus(&focus, cx);
         Self {
             model,
             focus,
@@ -60,6 +73,7 @@ impl AppWindow {
             palette: false,
             profile_chooser: false,
             search,
+            prompt,
             _observations: observations,
         }
     }
@@ -107,7 +121,15 @@ impl AppWindow {
             input
         });
         self.page = Some(self.model.read(cx).client.page);
-        match input {
+        self.handle_input(input, window, cx);
+    }
+    fn handle_input(
+        &mut self,
+        input: astra_client::state::Input,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match input {
             astra_client::state::Input::Idle => {
                 cx.notify();
                 return;
@@ -143,8 +165,8 @@ impl AppWindow {
                 });
                 return;
             }
-            astra_client::state::Input::Frontend(_) => {}
-        }
+            astra_client::state::Input::Frontend(id) => id,
+        };
         match id {
             Id::Quit => {
                 self.model.update(cx, |model, cx| model.request_quit(cx));
@@ -191,14 +213,7 @@ impl AppWindow {
                     cx.notify();
                 })
             }
-            _ => {
-                self.panel = Some(Panel::Editor);
-                self.model.update(cx, |model, cx| {
-                    model.client.message =
-                        t("This action is planned for the next implementation phase").into();
-                    cx.notify();
-                });
-            }
+            _ => {}
         }
         cx.notify();
     }
@@ -236,22 +251,8 @@ impl AppWindow {
                 ))
                 .into_any_element();
         }
-        if let Some(prompt) = &model.client.prompt {
-            return body
-                .child(div().text_2xl().child(prompt.title().to_owned()))
-                .child(todo("Prompt dialogs and native file pickers", cx))
-                .child(
-                    Button::new("dismiss-prompt")
-                        .label(t("Cancel"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            window.focus(&this.focus, cx);
-                            this.model.update(cx, |model, cx| {
-                                model.client.prompt = None;
-                                cx.notify();
-                            });
-                        })),
-                )
-                .into_any_element();
+        if model.client.prompt.is_some() {
+            return body.child(self.prompt.clone()).into_any_element();
         }
         if self.palette || self.profile_chooser {
             let query = self.search.read(cx).value().to_string().to_lowercase();

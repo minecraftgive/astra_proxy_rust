@@ -22,10 +22,10 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     };
     // Native inputs own text and editing shortcuts. App navigation (for example
     // F1 and Ctrl-K) remains available. The shared editor also owns printable keys.
-    let shell = context("Astra && !Input");
-    let editor = context("AstraEditor && !Input");
-    let application = context("Astra || AstraEditor");
-    let non_input = context("(Astra || AstraEditor) && !Input");
+    let shell = context("Astra && !Input && !AstraDialog");
+    let editor = context("AstraEditor && !Input && !AstraDialog");
+    let application = context("(Astra || AstraEditor) && !AstraDialog");
+    let non_input = context("(Astra || AstraEditor) && !Input && !AstraDialog");
     let mut bindings = Vec::new();
     let mut command_chords = std::collections::HashSet::new();
     for spec in SPECS {
