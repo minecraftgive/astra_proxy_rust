@@ -10,6 +10,9 @@ use std::collections::VecDeque;
 
 pub struct AppModel {
     pub client: Client,
+    pub handle: tokio::runtime::Handle,
+    waker: astra_client::waker::Waker,
+    pub socket: std::path::PathBuf,
     pub commands: async_channel::Sender<BackendCmd>,
     pub online: bool,
     pub ready: bool,
@@ -19,13 +22,21 @@ pub struct AppModel {
     quit_prepared: bool,
 }
 impl AppModel {
-    pub fn new(kind: Kind, commands: async_channel::Sender<BackendCmd>) -> Self {
-        let mut client = Client::new(kind);
+    pub fn new(
+        kind: Kind,
+        commands: async_channel::Sender<BackendCmd>,
+        handle: tokio::runtime::Handle,
+        waker: astra_client::waker::Waker,
+    ) -> Self {
+        let mut client = Client::new(kind).with_waker(waker.clone());
         if kind == Kind::Server {
             client.page = 5;
         }
         Self {
             client,
+            handle,
+            waker,
+            socket: Default::default(),
             commands,
             online: false,
             ready: false,
@@ -34,6 +45,92 @@ impl AppModel {
             next_job: 0,
             quit_prepared: false,
         }
+    }
+    pub fn tokio<R>(&mut self, f: impl FnOnce(&mut Client) -> R) -> R {
+        let _guard = self.handle.enter();
+        f(&mut self.client)
+    }
+    #[cfg(test)]
+    pub fn new_test(kind: Kind, commands: async_channel::Sender<BackendCmd>) -> Self {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        Self::new(kind, commands, runtime.handle().clone(), Default::default())
+    }
+    pub fn observe_notifications(
+        model: &Entity<Self>,
+        notifications: async_channel::Receiver<()>,
+        cx: &mut App,
+    ) {
+        model.update(cx, |_, cx| {
+            cx.spawn(async move |model, cx| {
+                while notifications.recv().await.is_ok() {
+                    if model
+                        .update(cx, |model, cx| {
+                            model.poll_views();
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
+        model.update(cx, |_, cx| {
+            cx.spawn(async move |model, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                if model
+                    .update(cx, |model, cx| {
+                        if model.poll_views() {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            })
+            .detach();
+        });
+    }
+    fn poll_views(&mut self) -> bool {
+        let socket = self.socket.clone();
+        self.tokio(|client| {
+            let mut changed = false;
+            for viewer in [&mut client.viewer, &mut client.tui_viewer]
+                .into_iter()
+                .flatten()
+            {
+                let revision = viewer.revision();
+                if let Some(error) = viewer.poll() {
+                    client.message = error;
+                }
+                changed |= revision != viewer.revision();
+            }
+            if let Some(view) = &mut client.diagnostics {
+                changed |= view.poll();
+            }
+            if let Some(view) = &mut client.monitor {
+                changed |= view.poll_ready(&socket);
+            }
+            if !socket.as_os_str().is_empty() {
+                let overlay_clear = client.prompt.is_none() && client.editor.is_none();
+                changed |= client.poll_installation_ready(&socket, overlay_clear);
+            }
+            changed |= client.poll_terminal_scan_ready();
+            changed |= client.expire_connection_highlights();
+            changed |= client.expire_notices();
+            changed
+        })
     }
     pub fn bridge(
         model: &Entity<Self>,
@@ -165,12 +262,15 @@ impl AppModel {
         cx.notify();
     }
     pub fn apply(&mut self, event: BackendEvent, cx: &mut Context<Self>) {
+        let handle = self.handle.clone();
+        let _guard = handle.enter();
         match event {
             BackendEvent::Ready(prepared) => {
                 let (prepared, mut session) = *prepared;
+                self.socket = prepared.socket.clone();
                 self.ready = true;
                 session.kind = prepared.launch.kind.unwrap_or(session.kind);
-                self.client = Client::from_session(session);
+                self.client = Client::from_session(session).with_waker(self.waker.clone());
                 let preferences_path = prepared.context.home.join(astra_client::preferences::FILE);
                 let (preferences, notice) =
                     astra_client::preferences::load(&preferences_path, &self.client.session);

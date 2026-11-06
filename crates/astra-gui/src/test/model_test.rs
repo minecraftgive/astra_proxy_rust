@@ -3,9 +3,43 @@ use astra_client::operations::JobResult;
 use gpui::{AppContext, TestAppContext};
 
 #[gpui::test]
+fn shared_models_can_spawn_and_wake_from_the_gpui_thread(cx: &mut TestAppContext) {
+    let (commands, _) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    let (wake, notifications) = std::sync::mpsc::sync_channel(1);
+    let waker = astra_client::waker::Waker::new(move || {
+        let _ = wake.try_send(());
+    });
+    let missing_socket =
+        std::env::temp_dir().join(format!("astra-gui-missing-manager-{}", std::process::id()));
+    model.update(cx, |model, _| {
+        model.tokio(|client| {
+            client.viewer = Some(
+                astra_client::logs::Viewer::new("test".into(), Default::default())
+                    .with_waker(waker.clone()),
+            );
+            // Viewer::new is pure; Diagnostics also exercises the real spawn path.
+            client.diagnostics = Some(astra_client::diagnostics::View::start_with_waker(
+                &missing_socket,
+                "test".into(),
+                waker,
+            ));
+        });
+    });
+    notifications
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("spawned model must wake the frontend");
+    model.update(cx, |model, _| {
+        assert!(model.poll_views());
+        assert!(model.client.viewer.is_some());
+        assert!(model.client.diagnostics.as_ref().unwrap().error.is_some());
+    });
+}
+
+#[gpui::test]
 fn bridge_applies_current_results_and_drops_stale_runtime(cx: &mut TestAppContext) {
     let (commands, _) = async_channel::bounded(16);
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     model.update(cx, |model, cx| {
         let action = Action::Runtime {
             name: "test".into(),
@@ -66,7 +100,7 @@ fn cross_executor_messages_are_send() {
 fn async_bridge_delivers_disconnect_and_releases_closed_channel(cx: &mut TestAppContext) {
     let (commands, _) = async_channel::bounded(16);
     let (events, incoming) = async_channel::bounded(4);
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     cx.update(|cx| AppModel::bridge(&model, incoming, cx));
     events
         .try_send(BackendEvent::Disconnected {
@@ -85,7 +119,7 @@ fn async_bridge_delivers_disconnect_and_releases_closed_channel(cx: &mut TestApp
 fn quit_result_checkpoints_current_session_and_draft_before_closing(cx: &mut TestAppContext) {
     let (commands, incoming) = async_channel::unbounded();
     commands.try_send(BackendCmd::Cancel(7)).unwrap();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     cx.update(|cx| AppModel::observe_quit(&model, cx));
     let original = "standalone=true\n";
     let edited = "# unsaved edit\nstandalone=true\n";
@@ -133,7 +167,7 @@ fn quit_result_checkpoints_current_session_and_draft_before_closing(cx: &mut Tes
 #[gpui::test]
 fn native_quit_checkpoints_the_loaded_session(cx: &mut TestAppContext) {
     let (commands, incoming) = async_channel::unbounded();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     cx.update(|cx| AppModel::observe_quit(&model, cx));
     model.update(cx, |model, _| {
         model.ready = true;
@@ -156,7 +190,7 @@ fn native_quit_checkpoints_the_loaded_session(cx: &mut TestAppContext) {
 #[gpui::test]
 fn quitting_before_ready_does_not_overwrite_the_session_with_defaults(cx: &mut TestAppContext) {
     let (commands, incoming) = async_channel::unbounded();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     model.update(cx, |model, cx| model.request_quit(cx));
     assert!(matches!(
         incoming.try_recv(),
@@ -168,7 +202,7 @@ fn quitting_before_ready_does_not_overwrite_the_session_with_defaults(cx: &mut T
 fn quit_reports_checkpoint_failure_when_backend_is_closed(cx: &mut TestAppContext) {
     let (commands, incoming) = async_channel::unbounded();
     incoming.close();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     model.update(cx, |model, cx| {
         model.ready = true;
         model.request_quit(cx);

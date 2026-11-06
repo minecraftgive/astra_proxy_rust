@@ -360,6 +360,15 @@ impl Viewer {
             .map(|record| self.row_count(record))
             .sum()
     }
+    pub fn begin_search(&mut self) {
+        if self.browsing() {
+            self.settings.mode = Mode::Search(self.settings.search.clone());
+        }
+    }
+    pub fn find_again(&mut self, backwards: bool) {
+        self.jump(backwards);
+    }
+
     pub fn key(&mut self, mut key: KeyEvent) -> Command {
         if !self.capture_supported && matches!(self.settings.mode, Mode::CaptureLevel(_)) {
             self.cancel_input();

@@ -1,6 +1,6 @@
 //! Overview page and shared mouse hit testing. Never synthesize telemetry.
 use super::connections::{ConnectionRow, ConnectionRowKey};
-use super::shell::{duration, CONNECTIONS, LOGS, PAGES, PROXIES};
+use super::shell::{duration, CONNECTIONS, PAGES, PROXIES};
 use super::*;
 use astra_model::runtime::Mode;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -44,17 +44,12 @@ fn pad_cells(text: &str, width: usize) -> String {
 
 /// Current instance state as the uppercase colour code used by the layouts.
 fn indicator_state(row: &Row) -> (&'static str, Color) {
-    if row.state == "Starting" || row.state == "Stopping" {
-        ("●Y", Color::Yellow)
-    } else if row.state.starts_with("Unresponsive")
-        || row.state.starts_with("Exited")
-        || row.state.starts_with("Failed")
-    {
-        ("●R", Color::Red)
-    } else if row.pid.is_some() && row.state == "Running" {
-        ("●G", Color::Green)
-    } else {
-        ("○", MUTED)
+    use astra_client::overview::InstanceState;
+    match astra_client::overview::indicator_state(row) {
+        InstanceState::Starting => ("●Y", Color::Yellow),
+        InstanceState::Error => ("●R", Color::Red),
+        InstanceState::Running => ("●G", Color::Green),
+        InstanceState::Stopped => ("○", MUTED),
     }
 }
 
@@ -63,50 +58,38 @@ pub(super) fn card(title: &str) -> Block<'_> {
 }
 
 impl Ui {
-    pub(super) fn overview_input(&self) -> bool {
-        self.live_input() && self.runtime_picker.is_none() && self.palette.is_none()
-    }
-
-    pub(super) fn remember_page(&mut self, page: usize) {
-        if self.page != page {
-            self.navigation_stack.push(self.page);
-            self.page = page;
-        }
-    }
-
-    pub(super) fn navigate_back(&mut self) -> Input {
-        let Some(page) = self.navigation_stack.pop() else {
-            return Input::Idle;
-        };
-        // navigate performs normal page setup; returning must not push history.
-        let history_len = self.navigation_stack.len();
-        let input = self.navigate(page);
-        self.navigation_stack.truncate(history_len);
+    pub(super) fn navigate(&mut self, page: usize) -> Input {
+        self.focus = Default::default();
+        let input = self.client.navigate(page);
+        self.sync_overview_cursor(None);
         input
     }
-
-    pub(super) fn navigate(&mut self, page: usize) -> Input {
-        self.suspend_editor();
+    pub(super) fn navigate_back(&mut self) -> Input {
         self.focus = Default::default();
-        let page = page.min(PAGES.len() - 1);
-        if self.page == LOGS && page != LOGS {
-            self.close_viewer();
-        }
-        self.remember_page(page);
-        if page == shell::SETTINGS {
-            self.refresh_program_info();
-        }
-        if page == CONNECTIONS {
-            self.reveal_selected_connection();
-        }
-        self.connection_filtering = false;
-        self.runtime_picker = None;
-        if page == LOGS && self.viewer.is_none() {
-            if let Some(name) = self.log_source(true) {
-                return self.open_logs(name);
-            }
-        }
-        Input::Idle
+        let input = self.client.navigate_back();
+        self.sync_overview_cursor(None);
+        input
+    }
+    fn notices(&self) -> Vec<(Color, String)> {
+        use astra_client::overview::Severity;
+        self.client
+            .notices()
+            .into_iter()
+            .map(|(severity, text)| {
+                (
+                    match severity {
+                        Severity::Success => Color::Green,
+                        Severity::Warning => Color::Yellow,
+                        Severity::Error => Color::Red,
+                    },
+                    text,
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn overview_input(&self) -> bool {
+        self.live_input() && self.runtime_picker.is_none() && self.palette.is_none()
     }
 
     pub(super) fn hit(&self, rect: Rect, target: Target) {
@@ -122,128 +105,6 @@ impl Ui {
             area,
         );
         self.hit(area, target);
-    }
-
-    /// Recovery feedback and problems that need the user's attention.
-    fn notices(&self) -> Vec<(Color, String)> {
-        self.notice_expiry.set(None);
-        let mut notices = Vec::new();
-        let Some(row) = self.active_proxy() else {
-            return notices;
-        };
-        if let Some(notice) = self
-            .details
-            .get(&row.instance.name)
-            .and_then(|d| d.network_recovery.as_ref())
-        {
-            use astra_model::recovery::RecoveryState;
-            let (label, color) = match notice.state {
-                RecoveryState::Recovered => ("Network settings recovered", Color::Green),
-                RecoveryState::Pending => ("Network recovery pending", Color::Red),
-                RecoveryState::Conflict => ("Network recovery conflict", Color::Red),
-            };
-            let time = i64::try_from(notice.timestamp_ms)
-                .ok()
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|date| {
-                    date.with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M:%S %:z")
-                        .to_string()
-                })
-                .unwrap_or_else(|| "?".into());
-            notices.push((color, format!("{} · {time}", t(label))));
-            notices.push((color, notice.message.clone()));
-            notices.push((
-                color,
-                format!("{}: {}", t("Recovery record"), notice.journal.display()),
-            ));
-        }
-        if row.state.starts_with("Exited") || row.state == "Unresponsive" {
-            notices.push((
-                Color::Red,
-                tr!(
-                    "Core stopped unexpectedly ({}) · L logs · e edit · c retry",
-                    t(&row.state)
-                ),
-            ));
-        }
-        if row.changed {
-            notices.push((
-                Color::Yellow,
-                t("Configuration changed but not applied · r apply").into(),
-            ));
-        }
-        if let Some(rule) = self.active_rule() {
-            if rule.changed {
-                notices.push((
-                    Color::Yellow,
-                    tr!(
-                        "Rule core {} has unapplied changes · reload it in Profiles",
-                        rule.instance.name
-                    ),
-                ));
-            }
-            if row.pid.is_some() && rule.pid.is_none() {
-                notices.push((
-                    Color::Yellow,
-                    tr!(
-                        "Rule core {} is not running; routed connections will fail",
-                        rule.instance.name
-                    ),
-                ));
-            }
-        }
-        if row.pid.is_some() && !self.runtime_error.is_empty() {
-            notices.push((Color::Red, self.runtime_error.clone()));
-        }
-        if self
-            .details
-            .get(&row.instance.name)
-            .is_some_and(|d| d.config_unavailable)
-        {
-            notices.push((Color::Red, t("Configuration unavailable · e edit").into()));
-        }
-        // Successes and warnings recede after 15 seconds; errors stay until fixed.
-        let now = Instant::now();
-        let mut seen = self.notice_since.borrow_mut();
-        seen.retain(|message, _| notices.iter().any(|(_, text)| text == message));
-        notices.retain(|(color, message)| {
-            if !matches!(color, Color::Yellow | Color::Green) {
-                return true;
-            }
-            let deadline = *seen.entry(message.clone()).or_insert(now) + Duration::from_secs(15);
-            if deadline <= now {
-                return false;
-            }
-            self.notice_expiry.set(Some(
-                self.notice_expiry
-                    .get()
-                    .map_or(deadline, |next| next.min(deadline)),
-            ));
-            true
-        });
-        notices
-    }
-
-    pub(super) fn next_notice_expiry(&self) -> Option<Instant> {
-        if self.page == shell::OVERVIEW && self.kind != Kind::Server {
-            self.notice_expiry.get()
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn expire_notices(&self) -> bool {
-        if self
-            .next_notice_expiry()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
-            // Keep first-seen times so a later redraw cannot revive expired notices.
-            self.notice_expiry.set(None);
-            true
-        } else {
-            false
-        }
     }
 
     pub(super) fn overview_header_height(&self, _width: u16) -> u16 {

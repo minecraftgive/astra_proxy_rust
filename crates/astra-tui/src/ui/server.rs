@@ -3,28 +3,20 @@ use super::*;
 use ratatui::layout::Rect;
 impl Ui {
     pub(super) fn server_key(&mut self, key: event::KeyEvent) -> Option<Input> {
-        Some(match key.code {
-            KeyCode::Char('q') => Input::Quit,
-            KeyCode::Char('c') => {
-                self.operation(if self.selected().is_some_and(|r| r.pid.is_some()) {
-                    Operation::Stop
-                } else {
-                    Operation::Start
-                })
-            }
-            KeyCode::Char('r') => self.operation(Operation::Reload),
-            KeyCode::Char('e') => self.operation(Operation::Edit),
-            KeyCode::Char('L') | KeyCode::Enter if self.page == LOGS => {
-                self.operation(Operation::Logs)
-            }
-            KeyCode::Char('L') => self.operation(Operation::Logs),
-            KeyCode::Char('v') => match self.selected() {
-                Some(row) => Input::Run(Action::Validate(row.instance.name.clone()), None),
-                None => Input::Idle,
-            },
+        use astra_client::intents::ServerAction;
+        let action = match key.code {
+            KeyCode::Char('q') => ServerAction::Quit,
+            KeyCode::Char('c') => ServerAction::Toggle,
+            KeyCode::Char('r') => ServerAction::Reload,
+            KeyCode::Char('e') => ServerAction::Edit,
+            KeyCode::Char('L') => ServerAction::Logs,
+            KeyCode::Enter if self.page == LOGS => ServerAction::Logs,
+            KeyCode::Char('v') => ServerAction::Validate,
             _ => return None,
-        })
+        };
+        Some(self.client.server_action(action))
     }
+
     pub(super) fn render_server_header(&self, f: &mut Frame<'_>, area: Rect) {
         let selected = self.selected();
         let summary = selected

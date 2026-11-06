@@ -2,39 +2,16 @@
 use super::*;
 #[cfg(test)]
 use astra_client::monitor::rates;
+pub use astra_client::monitor::View;
 use astra_client::monitor::{bytes, mean_duration_ms, number, trend, LIMIT};
 #[cfg(test)]
 use astra_management::v2::MonitorSnapshot;
 use ratatui::layout::Rect;
-pub(super) struct View {
-    model: astra_client::monitor::View,
-    max_scroll: std::cell::Cell<u16>,
+pub(super) trait Render {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> u16;
 }
-impl std::ops::Deref for View {
-    type Target = astra_client::monitor::View;
-    fn deref(&self) -> &Self::Target {
-        &self.model
-    }
-}
-impl std::ops::DerefMut for View {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.model
-    }
-}
-impl View {
-    pub(super) fn new(name: String) -> Self {
-        let mut model = astra_client::monitor::View::new(name);
-        model.waker = astra_client::waker::Waker::new(super::wake);
-        Self {
-            model,
-            max_scroll: Default::default(),
-        }
-    }
-    pub(super) fn key(&mut self, key: event::KeyEvent) {
-        self.model.max_scroll = self.max_scroll.get();
-        self.model.key(crate::input::key(key));
-    }
-    pub(super) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+impl Render for View {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> u16 {
         let muted = Style::default().fg(dashboard::MUTED);
         let mut lines = vec![
             Line::styled(
@@ -199,7 +176,6 @@ impl View {
             .line_count(area.width.saturating_sub(2).max(1))
             .saturating_sub(area.height.saturating_sub(2) as usize)
             .min(u16::MAX as usize) as u16;
-        self.max_scroll.set(max_scroll);
         f.render_widget(Clear, area);
         f.render_widget(
             content.scroll((self.scroll.min(max_scroll), 0)).block(
@@ -216,6 +192,7 @@ impl View {
             ),
             area,
         );
+        max_scroll
     }
 }
 

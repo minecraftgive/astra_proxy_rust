@@ -546,7 +546,7 @@ fn feed_identity_change_clears_frozen_targets_before_legacy_snapshot_arrives() {
         // Feeds calls this exactly when its (profile, host PID) key changes.
         ui.reset_live_identity();
         assert!(ui.live_state.selected.is_none());
-        assert!(ui.live_state.telemetry.is_none());
+        assert!(ui.runtime_telemetry.is_none());
         assert!(!ui.connections_paused());
         assert!(ui.history.iter().all(|lane| lane.is_empty()));
         ui.rows[0].pid = Some(84);
@@ -575,7 +575,7 @@ fn same_host_reconnect_and_worker_generation_change_preserve_frozen_view() {
     assert_eq!(ui.selected_connection().unwrap().host, "example.test");
     assert_eq!(ui.live().unwrap().connections[0].host, "latest.test");
     assert_eq!(
-        ui.live_state.telemetry.as_ref().unwrap().active_generation,
+        ui.runtime_telemetry.as_ref().unwrap().active_generation,
         Some(2)
     );
 }
@@ -654,7 +654,7 @@ fn partial_samples_do_not_fabricate_rates_and_late_samples_do_not_rewind() {
     snapshot.proxy_download = 1;
     ui.accept_runtime_view("proxy".into(), telemetry(snapshot, "boot", 2, 2000));
     assert_eq!(ui.live().unwrap().proxy_download, 2000);
-    assert_eq!(ui.live_state.telemetry.as_ref().unwrap().sample_sequence, 3);
+    assert_eq!(ui.runtime_telemetry.as_ref().unwrap().sample_sequence, 3);
 }
 #[test]
 fn narrow_views_keep_pause_and_transport_health_visible() {

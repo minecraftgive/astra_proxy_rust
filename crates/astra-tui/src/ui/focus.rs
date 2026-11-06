@@ -173,9 +173,8 @@ impl Ui {
                     })
                 }
                 Region::Controls if self.page == PROFILES => {
-                    self.switch_core(
-                        [Kind::Proxy, Kind::Rule, Kind::Server][self.focus.cursor.min(2)],
-                    );
+                    let kind = [Kind::Proxy, Kind::Rule, Kind::Server][self.focus.cursor.min(2)];
+                    self.switch_core(kind);
                     Input::Idle
                 }
                 Region::Controls => {

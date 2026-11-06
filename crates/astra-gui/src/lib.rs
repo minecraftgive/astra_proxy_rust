@@ -37,11 +37,15 @@ pub fn run(kind: Kind) -> anyhow::Result<()> {
     let backend = backend::Backend::start(options)?;
     let commands = backend.commands.clone();
     let events = backend.events.clone();
+    let handle = backend.handle.clone();
+    let waker = backend.waker.clone();
+    let notifications = backend.notifications.clone();
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
         cx.bind_keys(keys::bindings(cx));
-        let model = cx.new(|_| model::AppModel::new(kind, commands));
+        let model = cx.new(|_| model::AppModel::new(kind, commands, handle, waker));
         model::AppModel::bridge(&model, events, cx);
+        model::AppModel::observe_notifications(&model, notifications, cx);
         model::AppModel::observe_quit(&model, cx);
         if let Err(error) = window::open(model.clone(), cx) {
             eprintln!("{error:#}");

@@ -63,6 +63,9 @@ pub enum BackendEvent {
 pub struct Backend {
     pub commands: Sender<BackendCmd>,
     pub events: Receiver<BackendEvent>,
+    pub handle: tokio::runtime::Handle,
+    pub waker: Waker,
+    pub notifications: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 impl Backend {
@@ -71,6 +74,12 @@ impl Backend {
         // also carries the final checkpoint, which must not be lost on a full queue.
         let (commands, incoming) = async_channel::unbounded();
         let (outgoing, events) = async_channel::bounded(256);
+        let (wake_sender, notifications) = async_channel::bounded(1);
+        let waker = Waker::new(move || {
+            let _ = wake_sender.try_send(());
+        });
+        let frontend_waker = waker.clone();
+        let (started, starting) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("astra-gui-backend".into())
             .spawn(move || {
@@ -78,16 +87,28 @@ impl Backend {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => tokio::task::LocalSet::new()
-                        .block_on(&runtime, run(options, incoming, outgoing)),
+                    Ok(runtime) => {
+                        if started.send(Ok(runtime.handle().clone())).is_ok() {
+                            tokio::task::LocalSet::new().block_on(
+                                &runtime,
+                                run(options, incoming, outgoing, frontend_waker),
+                            );
+                        }
+                    }
                     Err(error) => {
-                        let _ = outgoing.send_blocking(BackendEvent::Failed(error.to_string()));
+                        let _ = started.send(Err(error));
                     }
                 }
             })?;
+        let handle = starting
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Backend thread stopped before initialization"))??;
         Ok(Self {
             commands,
             events,
+            handle,
+            waker,
+            notifications,
             thread: Some(thread),
         })
     }
@@ -100,7 +121,12 @@ impl Backend {
     }
 }
 
-async fn run(options: Options, commands: Receiver<BackendCmd>, events: Sender<BackendEvent>) {
+async fn run(
+    options: Options,
+    commands: Receiver<BackendCmd>,
+    events: Sender<BackendEvent>,
+    frontend_waker: Waker,
+) {
     let prepared = match bootstrap::prepare(&options).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -138,7 +164,10 @@ async fn run(options: Options, commands: Receiver<BackendCmd>, events: Sender<Ba
     }
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let wake = notify.clone();
-    let waker = Waker::new(move || wake.notify_one());
+    let waker = Waker::new(move || {
+        wake.notify_one();
+        frontend_waker.wake();
+    });
     let mut jobs = Jobs::new(&socket, waker.clone());
     let mut list = Feed::start(socket.clone(), Action::WatchList, waker.clone());
     let mut updates = Feed::start(socket.clone(), Action::WatchUpdates, waker.clone());

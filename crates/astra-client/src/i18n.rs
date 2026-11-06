@@ -162,6 +162,10 @@ macro_rules! tr {
     ($source:literal $(, $arg:expr)* $(,)?) => { $crate::i18n::message($source, &[$(format!("{}", $arg)),*]) };
 }
 const CATALOG: &[(&str, &str, &str, &str)] = &[
+    ("Starting", "Starting", "启动中", "啟動中"),
+    ("Error", "Error", "错误", "錯誤"),
+    ("{} ms", "{} ms", "{} 毫秒", "{} 毫秒"),
+    ("No samples yet", "No samples yet", "暂无采样数据", "暫無取樣資料"),
     ("Installation", "Installation", "安装", "安裝"),
     ("Install Astra", "Install Astra", "安装 Astra", "安裝 Astra"),
     ("Install current package", "Install current package", "安装当前程序包", "安裝目前程式套件"),

@@ -90,13 +90,16 @@ impl AppWindow {
         self.profile_chooser = false;
         let page = self.page;
         let input = self.model.update(cx, |model, cx| {
-            if let Some(page) = page {
-                model.client.page = page;
-            }
-            let input = model.client.run_command(id);
+            let input = model.tokio(|client| {
+                if let Some(page) = page {
+                    client.page = page;
+                }
+                client.run_command(id)
+            });
             cx.notify();
             input
         });
+        self.page = Some(self.model.read(cx).client.page);
         match input {
             astra_client::state::Input::Idle => {
                 cx.notify();
@@ -115,6 +118,22 @@ impl AppWindow {
             astra_client::state::Input::ExternalEditor => {
                 self.panel = Some(Panel::Editor);
                 cx.notify();
+                return;
+            }
+            astra_client::state::Input::OpenWindow(launch) => {
+                let _ = open_at(
+                    self.model.clone(),
+                    launch.view.and_then(|view| view.page()).or(self.page),
+                    cx,
+                );
+                return;
+            }
+            astra_client::state::Input::Install(request) => {
+                self.model.update(cx, |model, cx| {
+                    let socket = model.socket.clone();
+                    model.tokio(|client| client.start_installation(&socket, request));
+                    cx.notify();
+                });
                 return;
             }
             astra_client::state::Input::Frontend(_) => {}

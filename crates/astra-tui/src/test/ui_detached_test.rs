@@ -67,14 +67,3 @@ fn shortcuts_open_pages_and_selected_logs_without_editing_or_navigation() {
         matches!(ui.key(event::KeyEvent::new(KeyCode::F(8),KeyModifiers::NONE)),Input::OpenWindow(launch)if launch.view==Some(View::TuiLog))
     );
 }
-#[test]
-fn startup_selects_instance_after_state_arrives_and_does_not_act_on_a_replacement() {
-    let mut ui = setup();
-    let launch = Launch::detached(View::Logs, Some("rule".into()), Kind::Proxy);
-    assert!(matches!(ui.apply_launch(&launch),Some(Action::Logs(name))if name=="rule"));
-    assert_eq!(ui.kind, Kind::Rule);
-    assert_eq!(ui.selected().unwrap().instance.name, "rule");
-    let missing = Launch::detached(View::Diagnostics, Some("removed".into()), Kind::Proxy);
-    assert!(ui.apply_launch(&missing).is_none());
-    assert!(ui.message.contains("removed"));
-}

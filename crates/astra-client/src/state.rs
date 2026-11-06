@@ -1,5 +1,4 @@
 use crate::commands::{Id, Scope, SPECS};
-use crate::input::{KeyCode, KeyModifiers};
 use crate::{drafts, editor::Editor, i18n::t, logs, protocol::*, tr, update};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -356,6 +355,26 @@ impl Session {
 }
 
 pub struct Client {
+    pub monitor: Option<crate::monitor::View>,
+    pub marquee_hold: Option<(Instant, Instant, bool)>,
+    pub terminals: crate::settings::TerminalState,
+    #[cfg(windows)]
+    pub service_change: Option<tokio::task::JoinHandle<std::result::Result<bool, String>>>,
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    pub startup_context: Option<crate::windows::Context>,
+    pub navigation_stack: Vec<usize>,
+    pub group_selection: usize,
+    pub connection_selection: usize,
+    pub traffic_expanded: bool,
+    pub connection_filter: String,
+    pub connection_filtering: bool,
+    pub runtime_picker: Option<(String, usize)>,
+    pub persistence_paused: bool,
+    pub binding_picker: Option<BindingPicker>,
+    pub last_find: String,
+    pub live_state: crate::live::State,
+    pub notice_since: std::cell::RefCell<HashMap<String, Instant>>,
+    pub notice_expiry: std::cell::Cell<Option<Instant>>,
     pub installation: crate::installation::State,
     pub tasks: crate::tasks::Tasks,
     pub confirmation_accept: bool,
@@ -410,7 +429,28 @@ impl Client {
     pub fn from_session(session: Session) -> Self {
         let migration = session.keymap_notice_pending;
         Self {
+            monitor: None,
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            startup_context: None,
+            #[cfg(windows)]
+            service_change: None,
+            terminals: Default::default(),
+            marquee_hold: None,
             installation: Default::default(),
+            navigation_stack: Vec::new(),
+            group_selection: 0,
+            connection_selection: 0,
+            traffic_expanded: false,
+            connection_filter: String::new(),
+            connection_filtering: false,
+            runtime_picker: None,
+            persistence_paused: false,
+            binding_picker: None,
+            last_find: String::new(),
+            live_state: Default::default(),
+            notice_since: Default::default(),
+            notice_expiry: Default::default(),
+
             confirmation_accept: false,
             prefilled_input: false,
             program_info: Default::default(),
@@ -628,10 +668,7 @@ impl Client {
         if self.editor.as_ref().is_some_and(Editor::browsing) {
             self.search_on_open = false;
             if let Some(editor) = self.editor.as_mut() {
-                let _ = editor.key(crate::input::Key::new(
-                    KeyCode::Char('/'),
-                    KeyModifiers::NONE,
-                ));
+                editor.begin_search();
             }
         }
     }
@@ -643,6 +680,8 @@ impl Client {
         self
     }
     pub fn reset_runtime_identity(&mut self) {
+        self.live_state = Default::default();
+        self.connection_selection = 0;
         self.runtime_instance.clear();
         self.runtime_snapshot = None;
         self.runtime_telemetry = None;
@@ -685,12 +724,20 @@ impl Client {
                 .zip(self.runtime_telemetry.as_ref())
                 .is_some_and(|(new, old)| new.host_boot_id != old.host_boot_id);
         if identity_changed {
+            if self.runtime_snapshot.is_some() && self.runtime_instance == name {
+                self.message =
+                    t("Host restarted; previous connection targets and paused data were cleared")
+                        .into();
+                self.tasks.notice_message(&self.message);
+            }
             self.reset_runtime_identity();
         }
         // An immediate command result is not a sample from the host clock.
         if telemetry.is_none() && self.runtime_telemetry.is_some() && !identity_changed {
+            self.track_new_connections(&snapshot);
             self.runtime_instance = name;
             self.runtime_snapshot = Some(snapshot);
+            self.sync_connection_selection();
             return;
         }
         if let Some(meta) = telemetry {
@@ -738,8 +785,16 @@ impl Client {
         }
         self.runtime_received = Some(Instant::now());
         self.runtime_sample = Instant::now();
+        self.track_new_connections(&snapshot);
         self.runtime_instance = name;
         self.runtime_snapshot = Some(snapshot);
+        self.group_selection = self
+            .group_selection
+            .min(self.live().map_or(0, |s| s.groups.len().saturating_sub(1)));
+        if self.live_state.selected.is_none() && self.live_state.selected_target.is_none() {
+            self.select_connection(0);
+        }
+        self.sync_connection_selection();
         self.runtime_error.clear();
     }
     pub fn runtime_rates_available(&self) -> bool {
@@ -1058,12 +1113,15 @@ impl Client {
 }
 
 /// Model decisions are shared; window/overlay presentation is returned to the frontend.
+#[derive(Clone)]
 pub enum Input {
     Idle,
     Quit,
     Run(Action, Option<Box<(Prompt, String)>>),
     ExternalEditor,
     Frontend(Id),
+    OpenWindow(crate::windows::Launch),
+    Install(crate::installation::Request),
 }
 impl Client {
     pub fn run_command(&mut self, id: Id) -> Input {
@@ -1090,12 +1148,8 @@ impl Client {
                 }
             }
             Id::Undo | Id::Redo => {
-                let key = crate::input::Key::new(
-                    KeyCode::Char(if id == Id::Undo { 'z' } else { 'y' }),
-                    KeyModifiers::CONTROL,
-                );
-                if let Some(editor) = &mut self.editor {
-                    if let Err(error) = editor.key(key) {
+                if let Some(editor) = self.editor.as_mut().filter(|editor| editor.browsing()) {
+                    if let Err(error) = editor.restore(id == Id::Redo) {
                         self.fail(format!("{error:#}"), Resume::Editor);
                     }
                 }
@@ -1128,7 +1182,42 @@ impl Client {
                 }
                 Input::Idle
             }
-            _ => Input::Frontend(id),
+            Id::CopyTerminal => self.copy_terminal_commands(),
+            Id::Search => self.search_current(),
+            Id::NextMatch | Id::PreviousMatch => self.find_next(id == Id::PreviousMatch),
+            Id::Window => self.detach_current(),
+            Id::Pause => {
+                if let Some(viewer) = &mut self.viewer {
+                    viewer.toggle_pause();
+                    Input::Idle
+                } else {
+                    self.toggle_live_pause()
+                }
+            }
+            Id::VimKeys => {
+                if self.change_preferences(|p| p.vim_keys = !p.vim_keys) {
+                    self.message = if self.vim_keys {
+                        "Vim aliases enabled"
+                    } else {
+                        "Vim aliases disabled"
+                    }
+                    .into();
+                }
+                Input::Idle
+            }
+            Id::MotionFull | Id::MotionReduced | Id::MotionOff => {
+                let mode = match id {
+                    Id::MotionFull => crate::motion::MotionMode::Normal,
+                    Id::MotionReduced => crate::motion::MotionMode::Reduced,
+                    _ => crate::motion::MotionMode::Off,
+                };
+                self.change_preferences(|p| p.motion = mode);
+                Input::Idle
+            }
+            Id::Settings => self.navigate(crate::navigation::SETTINGS),
+            Id::Palette | Id::Help | Id::Profiles | Id::Tasks | Id::Logs | Id::Monitor => {
+                Input::Frontend(id)
+            }
         }
     }
 }
@@ -1136,3 +1225,10 @@ impl Client {
 #[cfg(test)]
 #[path = "test/state_runtime_test.rs"]
 mod runtime_tests;
+
+pub struct BindingPicker {
+    pub name: String,
+    pub choices: Vec<(String, Kind)>,
+    pub selected: usize,
+    pub targets: Vec<String>,
+}

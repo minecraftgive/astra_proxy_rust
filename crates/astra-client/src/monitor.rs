@@ -2,6 +2,7 @@
 use crate::{i18n::t, input::KeyCode, protocol::Action};
 use anyhow::{Context, Result};
 use astra_management::v2::MonitorSnapshot;
+use futures_util::FutureExt;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -35,6 +36,10 @@ impl Drop for View {
 }
 
 impl View {
+    pub fn with_waker(mut self, waker: crate::waker::Waker) -> Self {
+        self.waker = waker;
+        self
+    }
     pub fn new(name: String) -> Self {
         Self {
             name,
@@ -58,20 +63,8 @@ impl View {
 
     pub fn key(&mut self, key: crate::input::Key) {
         match key.code {
-            KeyCode::Char(' ') => {
-                self.paused = !self.paused;
-                self.cancel();
-                self.baseline = None;
-                self.next = Instant::now();
-            }
-            KeyCode::Char('c') => {
-                self.cancel();
-                self.samples.clear();
-                self.baseline = None;
-                self.error = None;
-                self.scroll = 0;
-                self.next = Instant::now();
-            }
+            KeyCode::Char(' ') => self.set_paused(!self.paused),
+            KeyCode::Char('c') => self.clear(),
             KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(self.max_scroll),
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.max_scroll),
@@ -81,11 +74,33 @@ impl View {
             _ => {}
         }
     }
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.cancel();
+        self.baseline = None;
+        self.next = Instant::now();
+    }
+    pub fn clear(&mut self) {
+        self.cancel();
+        self.samples.clear();
+        self.baseline = None;
+        self.error = None;
+        self.scroll = 0;
+        self.next = Instant::now();
+    }
 
     pub async fn poll(&mut self, socket: &std::path::Path) -> bool {
+        self.poll_ready(socket)
+    }
+    pub fn poll_ready(&mut self, socket: &std::path::Path) -> bool {
         let mut changed = false;
         if self.pending.as_ref().is_some_and(|task| task.is_finished()) {
-            let result = self.pending.take().unwrap().await;
+            let result = self
+                .pending
+                .take()
+                .unwrap()
+                .now_or_never()
+                .expect("finished monitor task");
             match result {
                 Ok(Ok(snapshot)) => self.accept(snapshot),
                 result => {

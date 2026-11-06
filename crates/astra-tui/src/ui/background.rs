@@ -513,7 +513,7 @@ impl astra_client::feeds::Host for Ui {
         Ui::accept_runtime_view(self, name, view);
     }
     fn runtime_disconnected(&mut self, error: String) {
-        Ui::runtime_disconnected(self, error);
+        self.client.runtime_disconnected(error);
     }
 }
 

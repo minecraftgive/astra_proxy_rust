@@ -4,11 +4,11 @@ mod diagnostics;
 mod editor;
 mod entry;
 mod explanation;
-use astra_client::export;
 use astra_client::external_editor;
 mod help;
 mod highlight;
 use astra_client::i18n;
+#[cfg(test)]
 use astra_client::import;
 mod logs;
 #[cfg(test)]
@@ -19,8 +19,6 @@ use astra_client::protocol;
 use astra_client::self_update;
 #[cfg(windows)]
 use astra_client::startup;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-use astra_client::startup_unix;
 use astra_client::terminals;
 mod theme;
 use astra_platform::tui_log;

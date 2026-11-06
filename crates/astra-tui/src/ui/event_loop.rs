@@ -275,6 +275,7 @@ pub(super) async fn run_local(
             _ => Input::Idle,
         };
         let quit = match input {
+            Input::Frontend(_) => unreachable!("TUI commands consume their presentation effects"),
             Input::Install(request) => {
                 let result = if request.elevate {
                     drop(events.take());

@@ -2236,6 +2236,19 @@ impl Editor {
         }
         Ok(())
     }
+    /// Open the existing search interaction without depending on a keyboard binding.
+    pub fn begin_search(&mut self) {
+        match &mut self.form.mode {
+            Mode::Browse => {
+                let mut input = TextInput::new(self.form.last_search.clone());
+                input.replace = true;
+                self.form.mode = Mode::Search(input);
+            }
+            Mode::Members { find, .. } => *find = Some(String::new()),
+            _ => {}
+        }
+    }
+
     pub fn key_browse(&mut self, mut key: KeyEvent) -> Result<()> {
         if matches!(self.form.mode, Mode::Browse) {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

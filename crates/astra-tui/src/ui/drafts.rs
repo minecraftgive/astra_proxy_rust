@@ -19,16 +19,6 @@ impl Ui {
             },
         );
     }
-
-    pub(super) fn activate_profile(&mut self, name: String) {
-        self.suspend_editor();
-        self.active_profile = Some(name);
-        self.runtime_picker = None;
-        self.focus = Default::default();
-        if self.page == shell::LOGS {
-            self.close_viewer();
-        }
-    }
 }
 
 #[cfg(test)]

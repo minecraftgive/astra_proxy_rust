@@ -9,7 +9,7 @@ fn shortcuts_keep_working_after_palette_result_and_navigation(cx: &mut TestAppCo
         cx.bind_keys(keys::bindings(cx));
     });
     let (commands, _) = async_channel::unbounded();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     let mut app = None;
     let handle = cx.add_window(|window, cx| {
         let view = cx.new(|cx| AppWindow::new(model, Some(0), window, cx));
@@ -62,7 +62,7 @@ fn printable_shortcuts_are_text_in_search_fields(cx: &mut TestAppContext) {
         cx.bind_keys(keys::bindings(cx));
     });
     let (commands, receiver) = async_channel::unbounded();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     model.update(cx, |model, _| {
         let mut editor = Editor::new("test".into(), "standalone = true\n".into());
         editor.history.push("standalone = false\n".into());
@@ -123,7 +123,7 @@ fn only_the_visible_focused_editor_receives_keys_and_undo_runs_once(cx: &mut Tes
         cx.bind_keys(keys::bindings(cx));
     });
     let (commands, receiver) = async_channel::unbounded();
-    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
     let original = "# original\nstandalone = true\n";
     let previous = "# previous\nstandalone = true\n";
     let current = "# current\nstandalone = true\n";

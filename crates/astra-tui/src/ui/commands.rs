@@ -52,186 +52,62 @@ impl Ui {
             self.message = t(reason).into();
             return Input::Idle;
         }
-        let plain = |code| event::KeyEvent::new(code, KeyModifiers::NONE);
         match id {
-            Id::Save
-            | Id::Undo
-            | Id::Redo
-            | Id::Quit
-            | Id::Shutdown
-            | Id::Import
-            | Id::Discard
-            | Id::CompareDraft
-            | Id::ExternalEditor
-            | Id::ReadExternal => match self.client.run_command(id) {
-                astra_client::state::Input::Idle => Input::Idle,
-                astra_client::state::Input::Quit => Input::Quit,
-                astra_client::state::Input::Run(action, origin) => Input::Run(action, origin),
-                astra_client::state::Input::ExternalEditor => Input::ExternalEditor,
-                astra_client::state::Input::Frontend(_) => {
-                    unreachable!("model command returned a view effect")
-                }
-            },
-            Id::CopyTerminal => self.copy_terminal_commands(),
             Id::Palette => {
                 let was_open = self.palette.is_some();
                 self.close_replaceable_overlays();
                 if !was_open {
                     self.palette = Some(shell::Palette::default());
                 }
-                Input::Idle
             }
             Id::Help => {
                 let was_open = self.help_scroll.is_some();
                 self.close_replaceable_overlays();
                 self.help_scroll = (!was_open).then_some(0);
-                Input::Idle
             }
             Id::Profiles => {
                 self.close_replaceable_overlays();
                 self.palette = Some(shell::Palette::profiles(self.kind));
-                Input::Idle
-            }
-            Id::Search => {
-                if let Some(editor) = &mut self.editor {
-                    let code = if editor.browsing() {
-                        plain(KeyCode::Char('/'))
-                    } else {
-                        event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
-                    };
-                    let _ = editor.key(crate::input::key(code));
-                } else if let Some(viewer) = &mut self.viewer {
-                    viewer.key(crate::input::key(event::KeyEvent::new(
-                        KeyCode::Char('f'),
-                        KeyModifiers::CONTROL,
-                    )));
-                } else if matches!(self.page, shell::OVERVIEW | shell::CONNECTIONS) {
-                    self.page = shell::CONNECTIONS;
-                    self.connection_filtering = true;
-                } else if self.page == shell::RULES {
-                    return self.rule_search();
-                } else {
-                    let page = self.page;
-                    self.prompt(Prompt::Find(page));
-                }
-                Input::Idle
-            }
-            Id::NextMatch | Id::PreviousMatch => {
-                let backwards = id == Id::PreviousMatch;
-                if let Some(editor) = &mut self.editor {
-                    if editor.browsing() {
-                        let _ = editor.find_again(backwards);
-                    }
-                } else if let Some(viewer) = &mut self.viewer {
-                    viewer.key(crate::input::key(event::KeyEvent::new(
-                        KeyCode::F(3),
-                        if backwards {
-                            KeyModifiers::SHIFT
-                        } else {
-                            KeyModifiers::NONE
-                        },
-                    )));
-                } else if self.page == shell::CONNECTIONS && !self.connection_filter.is_empty() {
-                    let count = self.connection_rows().len();
-                    if count > 0 {
-                        let current = self.connection_selection.min(count - 1);
-                        self.select_connection(if backwards {
-                            (current + count - 1) % count
-                        } else {
-                            (current + 1) % count
-                        });
-                    }
-                } else {
-                    let query = self.searches.get(&self.page).cloned().unwrap_or_default();
-                    if !query.is_empty() {
-                        self.find_direction(self.page, &query, backwards);
-                    }
-                }
-                Input::Idle
             }
             Id::Tasks => {
                 let was_open = self.client.tasks.showing_details();
                 self.close_replaceable_overlays();
-                if was_open {
-                    Input::Idle
-                } else {
-                    self.background_key(plain(KeyCode::F(6)))
-                        .unwrap_or(Input::Idle)
-                }
+                self.client.tasks.details = (!was_open).then_some(0);
             }
             Id::Logs => {
                 let was_open = self.tui_viewer.is_some();
                 self.close_replaceable_overlays();
-                if was_open {
-                    Input::Idle
-                } else {
-                    self.background_key(plain(KeyCode::F(7)))
-                        .unwrap_or(Input::Idle)
+                if !was_open {
+                    return Input::Run(Action::Logs("@tui".into()), None);
                 }
             }
-            Id::Window => self.window_key(plain(KeyCode::F(8))).unwrap_or(Input::Idle),
             Id::Monitor => {
                 let was_open = self.monitor.is_some();
-                let name = if self.page == PROFILES || self.kind == Kind::Server {
-                    self.selected()
-                } else {
-                    self.active_proxy().or_else(|| self.selected())
-                }
-                .map(|row| row.instance.name.clone());
                 self.close_replaceable_overlays();
                 if !was_open {
-                    if let Some(name) = name {
-                        self.monitor = Some(monitor::View::new(name));
-                    } else {
-                        self.message = t("Select an instance to monitor").into();
-                    }
+                    self.client.open_monitor();
                 }
-                Input::Idle
-            }
-            Id::Pause => {
-                if let Some(viewer) = &mut self.viewer {
-                    viewer.key(crate::input::key(plain(KeyCode::Char(' '))));
-                    Input::Idle
-                } else {
-                    self.toggle_live_pause()
-                }
-            }
-            Id::VimKeys => {
-                if !self.change_preferences(|p| p.vim_keys = !p.vim_keys) {
-                    return Input::Idle;
-                }
-                self.message = if self.vim_keys {
-                    "Vim aliases enabled"
-                } else {
-                    "Vim aliases disabled"
-                }
-                .into();
-                Input::Idle
-            }
-            Id::MotionFull | Id::MotionReduced | Id::MotionOff => {
-                let mode = match id {
-                    Id::MotionFull => animation::MotionMode::Normal,
-                    Id::MotionReduced => animation::MotionMode::Reduced,
-                    _ => animation::MotionMode::Off,
-                };
-                self.change_preferences(|p| p.motion = mode);
-                Input::Idle
             }
             Id::Settings => {
                 self.close_replaceable_overlays();
-                self.suspend_editor();
-                self.navigate(shell::SETTINGS)
+                return self.navigate(shell::SETTINGS);
+            }
+            Id::CopyTerminal => return self.copy_terminal_commands(),
+            _ => {
+                let previous = self.client.preferences.clone();
+                let input = self.client.run_command(id);
+                self.apply_preferences(Some(&previous));
+                return input;
             }
         }
+        Input::Idle
     }
     fn close_replaceable_overlays(&mut self) {
         self.overlay_epoch = self.overlay_epoch.wrapping_add(1);
         self.palette = None;
         self.help_scroll = None;
         self.help_override = None;
-        if self.client.tasks.showing_details() {
-            self.background_key(event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
-        }
+        self.client.tasks.details = None;
         self.tui_viewer = None;
         self.monitor = None;
     }

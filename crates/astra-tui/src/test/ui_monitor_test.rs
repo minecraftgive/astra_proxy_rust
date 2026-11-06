@@ -43,17 +43,26 @@ fn history_is_bounded_pause_resets_baseline_and_restart_clears_history() {
         view.accept(snapshot(i * 1000, i * 100));
     }
     assert_eq!(view.samples.len(), LIMIT);
-    view.key(event::KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    view.key(crate::input::key(event::KeyEvent::new(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+    )));
     assert!(view.paused);
     assert!(view.baseline.is_none());
-    view.key(event::KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    view.key(crate::input::key(event::KeyEvent::new(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+    )));
     view.accept(snapshot(150_000, 15_000));
     assert_eq!(view.samples.back().unwrap().rates, [None; 2]);
     let mut restarted = snapshot(151_000, 0);
     restarted.pid = Some(43);
     view.accept(restarted);
     assert_eq!(view.samples.len(), 1);
-    view.key(event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    view.key(crate::input::key(event::KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::NONE,
+    )));
     assert!(view.samples.is_empty());
     assert!(view.baseline.is_none());
 }
@@ -106,7 +115,10 @@ async fn in_flight_requests_do_not_overlap_and_pause_or_drop_cancels_them() {
     view.pending = Some(pending);
     assert!(!view.poll(std::path::Path::new("unused")).await);
     assert_eq!(view.pending.as_ref().unwrap().id(), id);
-    view.key(event::KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    view.key(crate::input::key(event::KeyEvent::new(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+    )));
     tokio::task::yield_now().await;
     assert!(abort.is_finished());
     assert!(!view.poll(std::path::Path::new("unused")).await);
@@ -145,7 +157,11 @@ fn monitor_renders_in_all_languages_and_small_terminals() {
             for (width, height) in [(120, 24), (60, 20), (20, 8), (8, 4)] {
                 let mut terminal =
                     Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-                terminal.draw(|f| view.render(f, f.area())).unwrap();
+                terminal
+                    .draw(|f| {
+                        view.render(f, f.area());
+                    })
+                    .unwrap();
                 if width == 120 {
                     let content = terminal
                         .backend()
