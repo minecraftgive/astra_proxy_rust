@@ -679,7 +679,64 @@ fn wait_for_exit(pid: u32) -> io::Result<()> {
         _ => Err(io::Error::last_os_error()),
     }
 }
+/// Resolve the privilege boundary before reporting progress or launching a
+/// core. Registration, rather than current running state, selects the service:
+/// its launch path can start a stopped broker without interactive approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMethod {
+    Service,
+    Uac,
+}
+
+impl LaunchMethod {
+    /// Prefer the registered service even for an interactive request. A failed
+    /// registration query is an error, never permission to show a UAC prompt.
+    pub fn preferred(allow_uac: bool) -> io::Result<Self> {
+        Self::preferred_with(allow_uac, crate::windows_service::installed)
+    }
+
+    fn preferred_with(
+        allow_uac: bool,
+        installed: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Self> {
+        match installed()? {
+            true => Ok(Self::Service),
+            false if allow_uac => Ok(Self::Uac),
+            false => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Windows privilege service is not registered; silent startup cannot request UAC",
+            )),
+        }
+    }
+
+    /// Execute only the selected method. Service startup, authentication,
+    /// version and availability failures must never fall back to UAC.
+    pub fn spawn(self, exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
+        self.spawn_with(
+            || crate::windows_service::spawn(exe, args),
+            || spawn_uac(exe, args),
+        )
+    }
+
+    fn spawn_with<T>(
+        self,
+        service: impl FnOnce() -> io::Result<T>,
+        uac: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        match self {
+            Self::Service => service(),
+            Self::Uac => uac(),
+        }
+    }
+}
+
+/// Compatibility entry point for callers that permit interactive approval:
+/// installed privilege services still take precedence and never fall back.
 pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
+    LaunchMethod::preferred(true)?.spawn(exe, args)
+}
+
+fn spawn_uac(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
     let exe = ensure_admin_controlled(exe)?;
     let exe = wide(exe.as_os_str())?;
     let verb = wide(OsStr::new("runas"))?;

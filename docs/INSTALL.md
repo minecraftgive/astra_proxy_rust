@@ -16,7 +16,9 @@ macOS 可在 **7 设置 → 启动** 开启当前用户的登录自启动，下�
 
 在需要自动启动的 Proxy、Rule 或 Server 实例 TOML 顶层设置 `auto_start = true`，缺省为 `false`；也可在 TUI 的实例配置编辑器中修改并按 Ctrl-S 保存。主 TUI 打开及静默启动仅主动选择已开启的停止实例，正常绑定依赖仍随启动计划启动；已经运行的实例不会重启，附加窗口不会触发自动启动。旧版全局 `auto_start_instances` 偏好不再生效，也不会自动迁移到各份配置。
 
-需要 TUN 无提示启动时，在本地 TUI 的 **7 设置 → 启动 → Windows 权限服务** 完成一次 UAC 注册。安装器将服务、代理核心及 Wintun DLL 复制到受管理员保护的目录；需要完整客户端包中的 `wintun.dll` 和当前账户的管理员身份。后续启动不再逐次弹出 UAC。卸载或更新服务仍需 UAC；更新前先停止 TUN 实例，再关闭、开启此开关。服务只接受安装账户的本地 TUN 启动请求，普通管理器保持原权限；没有注册服务时，静默启动会跳过需要提权的实例并记录错误。详情见 [TUI 启动设置](TUI.md)。Windows 权限服务程序应与客户端包一同保留，其他平台不分发。
+需要 TUN 无提示启动时，在本地 TUI 的 **7 设置 → 启动 → Windows 权限服务** 完成一次 UAC 注册。安装器将服务、代理核心及 Wintun DLL 复制到受管理员保护的目录；需要完整客户端包中的 `wintun.dll` 和当前账户的管理员身份。之后本地手动启动、开启 TUN、重启和静默自启动统一优先使用服务；直接运行 `astra-proxy` 启动 TUN 也采用相同策略，无需先以管理员身份运行终端。只有未注册服务且允许交互提权时才请求 UAC；静默启动缺少服务时记录错误。服务查询或启动失败、受保护核心版本不符时直接报告错误，不退回 UAC。
+
+安装、卸载或更新服务仍需 UAC；更新前先停止 TUN 实例，再关闭、开启此开关。服务只接受安装账户的本地 TUN 启动请求，普通管理器保持原权限。通过 Controller / Agent 或其他管理客户端开启 TUN 时，可由目标管理器使用已注册服务，但不能触发交互式 UAC；缺少服务且需要提权时仍需本地操作。详情见 [TUI 启动设置](TUI.md)。Windows 权限服务程序应与客户端包一同保留，其他平台不分发。
 
 Windows 从旧版静默启动升级后，需用原状态目录和管理目标打开新版 TUI，将登录自启动关闭再开启，以更新仍指向旧辅助程序的快捷方式；保留“静默启动”开启即可。操作细节及脚本等待方式见 [TUI 启动设置](TUI.md)。
 
@@ -69,7 +71,7 @@ Ctrl-C、Ctrl-Break 和管理 IPC 都能请求正常停止；Python 启动器在
 
 此前的 Windows 本地回归覆盖双核心 IPC、SOCKS/HTTP CONNECT、64 KiB TCP 与 EOF、SOCKS UDP、独立模式启动器、正常退出及规则重载/失败回滚；工作区和 TUI live 测试另覆盖配置生命周期与日志轮转。该范围不等于全部加密协议已在 Windows 验收。2026-10-19 新增真实 WinINet HTTP/HTTPS、接管恢复，以及 Wintun 双栈 TCP/UDP、重载和设备/测试路由清理验证；已修复 TUN UDP 回包路径，范围见 [Windows 模式验证](WINDOWS_MODES_VERIFICATION.md)。TPROXY/REDIRECT 仍仅支持 Linux。
 
-Windows 系统接管示例见 `configs/windows.toml`，两种模式默认均关闭。`[system_proxy]` 使用回环 `http_listen`，管理当前用户 WinINet LAN 的 HTTP/HTTPS 代理，不修改 WinHTTP、VPN/RAS 连接或其他用户设置；HTTPS 使用 CONNECT。TUN 需要管理员身份及对应架构的官方签名 Wintun DLL：
+Windows 系统接管示例见 `configs/windows.toml`，两种模式默认均关闭。`[system_proxy]` 使用回环 `http_listen`，管理当前用户 WinINet LAN 的 HTTP/HTTPS 代理，不修改 WinHTTP、VPN/RAS 连接或其他用户设置；HTTPS 使用 CONNECT。TUN 需要管理员授权及对应架构的官方签名 Wintun DLL；注册权限服务后由服务完成提权，调用终端可保持普通权限：
 
 ```powershell
 # 仅下载并核对 SHA-256、复制 DLL 与许可；此命令不加载或安装驱动。
@@ -79,7 +81,7 @@ python scripts/install_wintun.py --bin-dir target/x86_64-pc-windows-msvc/debug
 ./scripts/build.ps1 --debug
 ```
 
-默认从 `astra-proxy.exe` 旁加载 `wintun.dll`；`ASTRA_WINTUN_DLL` 可指定另一可信 DLL 的完整路径。精简包只复制运行 DLL；许可和来源信息保留在准备脚本的本地输出中。没有 DLL 时普通 SOCKS/HTTP 模式仍可运行，只有启用 TUN 才报缺少驱动。Wintun 版本、下载地址及固定 SHA-256 保存在准备脚本及本地来源记录中，来源是 [Wintun 官方发布](https://www.wintun.net/)。具体路由、权限、恢复说明见 [系统模式](PROXY_MODES.md)。
+默认从 `astra-proxy.exe` 旁加载 `wintun.dll`；`ASTRA_WINTUN_DLL` 可指定另一可信 DLL 的完整路径。通过权限服务启动时固定使用安装时保存的受保护 DLL 副本，此环境变量不能替换服务使用的 DLL。精简包只复制运行 DLL；许可和来源信息保留在准备脚本的本地输出中。没有 DLL 时普通 SOCKS/HTTP 模式仍可运行，只有启用 TUN 才报缺少驱动。Wintun 版本、下载地址及固定 SHA-256 保存在准备脚本及本地来源记录中，来源是 [Wintun 官方发布](https://www.wintun.net/)。具体路由、权限、恢复说明见 [系统模式](PROXY_MODES.md)。
 
 ### Linux / macOS 构建
 

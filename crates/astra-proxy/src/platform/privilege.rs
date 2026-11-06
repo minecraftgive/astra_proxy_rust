@@ -37,6 +37,29 @@ fn has_tun_privilege() -> bool {
     (unsafe { libc::geteuid() } == 0) || (cfg!(target_os = "linux") && has_net_admin())
 }
 
+#[cfg(windows)]
+fn elevated_arguments(
+    path: &Path,
+    socket: &Path,
+    log: &Path,
+    level: &str,
+    runtime_root: &Path,
+) -> Result<Vec<std::ffi::OsString>> {
+    let mut arguments = astra_platform::elevation::core_arguments_in(
+        path,
+        Some(socket),
+        log,
+        level,
+        None,
+        runtime_root,
+    )?;
+    // The ordinary launcher remains alive while supervising the elevated core.
+    // Hosted workers can use this exact process identity to recover its token.
+    let owner = astra_platform::lifecycle::capture(std::process::id())?;
+    arguments.push(serde_json::to_string(&owner)?.into());
+    Ok(arguments)
+}
+
 pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
     #[cfg(unix)]
     if tun_enabled && !has_tun_privilege() {
@@ -52,12 +75,15 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
         if tun_enabled && !astra_platform::elevation::is_elevated()? {
             let path = std::fs::canonicalize(path)?;
             // A separate elevated core keeps the calling shell/launcher unprivileged.
-            let log = astra_platform::storage::runtime_path(&path, "elevated-logs")?;
+            let runtime_root = std::path::absolute(astra_platform::storage::runtime_root()?)?;
+            let log =
+                astra_platform::storage::runtime_path_in(&runtime_root, &path, "elevated-logs")?;
             astra_platform::storage::prepare_parent(&log)?;
             let socket = std::env::var_os("ASTRA_CONTROL_SOCKET")
                 .map(std::path::absolute)
                 .transpose()?
-                .unwrap_or(astra_platform::storage::runtime_path(
+                .unwrap_or(astra_platform::storage::runtime_path_in(
+                    &runtime_root,
                     &path,
                     "elevated-control",
                 )?);
@@ -65,16 +91,16 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
             let level = std::env::var("ASTRA_LOG_LEVEL")
                 .or_else(|_| std::env::var("RUST_LOG"))
                 .unwrap_or_else(|_| "info".into());
-            let arguments = astra_platform::elevation::core_arguments(
-                &path,
-                Some(&socket),
-                &log,
-                &level,
-                None,
-            )?;
-            tracing::info!(log=%log.display(), "Windows TUN requests administrator permission for a separate proxy core");
+            let arguments = elevated_arguments(&path, &socket, &log, &level, &runtime_root)?;
+            let launch_log = log.clone();
             let mut child = tokio::task::spawn_blocking(move || {
-                astra_platform::elevation::spawn(&std::env::current_exe()?, &arguments)
+                use astra_platform::elevation::LaunchMethod;
+                let method = LaunchMethod::preferred(true)?;
+                match method {
+                    LaunchMethod::Service => tracing::info!(log=%launch_log.display(), "Windows TUN starts a separate proxy core through the registered privilege service"),
+                    LaunchMethod::Uac => tracing::info!(log=%launch_log.display(), "Windows TUN requests administrator permission for a separate proxy core"),
+                }
+                method.spawn(&std::env::current_exe()?, &arguments)
             })
             .await??;
             let status = tokio::select! {
@@ -103,3 +129,7 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
     }
     Ok(false)
 }
+
+#[cfg(all(test, windows))]
+#[path = "../test/platform_privilege_test.rs"]
+mod tests;

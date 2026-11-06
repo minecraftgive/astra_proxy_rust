@@ -2,6 +2,78 @@ use super::*;
 use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
 
 #[test]
+fn registered_service_is_preferred_for_interactive_and_silent_requests() {
+    for allow_uac in [false, true] {
+        let method = LaunchMethod::preferred_with(allow_uac, || Ok(true)).unwrap();
+        assert_eq!(method, LaunchMethod::Service);
+        assert_eq!(
+            method
+                .spawn_with(|| Ok("service"), || panic!("UAC must not be called"))
+                .unwrap(),
+            "service"
+        );
+    }
+}
+
+#[test]
+fn only_unregistered_interactive_requests_may_use_uac() {
+    assert_eq!(
+        LaunchMethod::preferred_with(false, || Ok(false))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let method = LaunchMethod::preferred_with(true, || Ok(false)).unwrap();
+    assert_eq!(method, LaunchMethod::Uac);
+    assert_eq!(
+        method
+            .spawn_with(|| panic!("No service was registered"), || Ok("uac"))
+            .unwrap(),
+        "uac"
+    );
+}
+
+#[test]
+fn service_query_failure_never_grants_permission_to_launch_or_prompt() {
+    for allow_uac in [false, true] {
+        let result: io::Result<()> =
+            LaunchMethod::preferred_with(allow_uac, || Err(io::Error::from_raw_os_error(5)))
+                .and_then(|method| {
+                    method.spawn_with(
+                        || panic!("A failed service query must not launch a core"),
+                        || panic!("A failed service query must not trigger UAC"),
+                    )
+                });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+    }
+}
+
+#[test]
+fn registered_service_failures_do_not_retry_through_uac() {
+    for allow_uac in [false, true] {
+        for (kind, reason) in [
+            (io::ErrorKind::NotFound, "Service removed after selection"),
+            (
+                io::ErrorKind::PermissionDenied,
+                "Broker authentication failed",
+            ),
+            (io::ErrorKind::TimedOut, "Stopped service did not start"),
+            (io::ErrorKind::Other, "Installed proxy snapshot differs"),
+            (io::ErrorKind::InvalidInput, "Unsupported executable"),
+        ] {
+            let method = LaunchMethod::preferred_with(allow_uac, || Ok(true)).unwrap();
+            let result: io::Result<()> = method.spawn_with(
+                || Err(io::Error::new(kind, reason)),
+                || panic!("Service failure must never trigger interactive approval"),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), reason);
+        }
+    }
+}
+
+#[test]
 fn resident_mode_is_explicit_and_legacy_elevation_defaults_off() {
     assert!(!hosted_argument(None).unwrap());
     assert!(!hosted_argument(Some(&OsString::from("0"))).unwrap());

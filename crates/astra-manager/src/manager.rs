@@ -900,12 +900,7 @@ impl Manager {
     async fn start_with_recovery(&mut self, name: &str, force: bool) -> Result<()> {
         self.start_with_policy(name, force, true).await
     }
-    async fn start_with_policy(
-        &mut self,
-        name: &str,
-        force: bool,
-        allow_elevation: bool,
-    ) -> Result<()> {
+    async fn start_with_policy(&mut self, name: &str, force: bool, allow_uac: bool) -> Result<()> {
         self.reap()?;
         let plan = self.start_plan_with(name, force)?;
         // Validate the group before starting its first new process. Checks run
@@ -930,7 +925,7 @@ impl Manager {
                 // Check the whole dependency plan before starting any process.
                 // Recheck at spawn as well so silent starts can never reach UAC.
                 anyhow::ensure!(
-                    allow_elevation || !self.needs_elevation(&instance)? || Self::elevation_service_installed()?,
+                    allow_uac || !self.needs_elevation(&instance)? || Self::elevation_service_installed()?,
                     "Silent startup requires manual action: {item} needs administrator permission for TUN; register the Windows privilege service or start it in the TUI"
                 );
                 if instance.kind != Kind::Rule {
@@ -954,9 +949,7 @@ impl Manager {
             if self.running.contains_key(&item) {
                 continue;
             }
-            let result = self
-                .start_with_options(&item, None, force, allow_elevation)
-                .await;
+            let result = self.start_with_options(&item, None, force, allow_uac).await;
             if let Err(error) = result {
                 // Only processes created by this attempt are rolled back.
                 let mut rollback_errors = Vec::new();
@@ -1030,12 +1023,8 @@ impl Manager {
         args.push(
             serde_json::to_string(&astra_platform::lifecycle::capture(std::process::id())?)?.into(),
         );
-        let service = Self::elevation_service_installed()?;
-        anyhow::ensure!(
-            service || allow_uac,
-            "Windows privilege service is not registered; silent startup cannot request UAC"
-        );
-        if service {
+        let method = astra_platform::elevation::LaunchMethod::preferred(allow_uac)?;
+        if method == astra_platform::elevation::LaunchMethod::Service {
             astra_ipc::progress::report("Starting with Windows service", name.to_owned());
         } else {
             astra_ipc::progress::report(
@@ -1044,21 +1033,14 @@ impl Manager {
             );
         }
         Ok(ManagedChild::Elevated(
-            tokio::task::spawn_blocking(move || {
-                if service {
-                    astra_platform::windows_service::spawn(&exe, &args)
-                } else {
-                    astra_platform::elevation::spawn(&exe, &args)
-                }
-            })
-            .await??,
+            tokio::task::spawn_blocking(move || method.spawn(&exe, &args)).await??,
         ))
     }
     async fn start_one(&mut self, name: &str) -> Result<()> {
         self.start_with(name, None).await
     }
-    /// Start a core, or adopt `prepared`: an elevated replacement already
-    /// approved through UAC that binds the endpoint once its predecessor exits.
+    /// Start a core, or adopt `prepared`: a replacement authorized through the
+    /// service or UAC that binds the endpoint once its predecessor exits.
     async fn start_with(&mut self, name: &str, prepared: Option<ManagedChild>) -> Result<()> {
         self.start_with_options(name, prepared, false, true).await
     }
@@ -1067,7 +1049,7 @@ impl Manager {
         name: &str,
         prepared: Option<ManagedChild>,
         force: bool,
-        allow_elevation: bool,
+        allow_uac: bool,
     ) -> Result<()> {
         self.reap()?;
         anyhow::ensure!(
@@ -1102,14 +1084,14 @@ impl Manager {
         #[cfg(not(windows))]
         let elevate = false;
         anyhow::ensure!(
-            !elevate || allow_elevation || Self::elevation_service_installed()?,
+            !elevate || adopted || allow_uac || Self::elevation_service_installed()?,
             "Silent startup requires manual action: {name} needs administrator permission for TUN; register the Windows privilege service or start it in the TUI"
         );
         #[cfg(windows)]
         let elevated = match prepared {
             Some(child) => Some(child),
             None if elevate => Some(
-                self.spawn_elevated_with_policy(name, None, allow_elevation)
+                self.spawn_elevated_with_policy(name, None, allow_uac)
                     .await?,
             ),
             None => None,
@@ -1256,7 +1238,7 @@ impl Manager {
         Ok(())
     }
     #[cfg(windows)]
-    async fn elevate_runtime_tun(&mut self, name: &str) -> Result<Reply> {
+    async fn elevate_runtime_tun(&mut self, name: &str, allow_uac: bool) -> Result<Reply> {
         let previous_pid = self
             .running
             .get(name)
@@ -1277,22 +1259,23 @@ impl Manager {
             &instance.config,
             "overrides",
         )?;
-        // Ask for approval while the current core keeps serving; a cancelled
-        // or failed prompt leaves it running with its runtime state unchanged.
+        // Prepare through the service (or UAC if absent) while the current core
+        // keeps serving. Authorization failure leaves its runtime state unchanged.
         let replacement = self
-            .spawn_elevated(name, previous_pid)
+            .spawn_elevated_with_policy(name, previous_pid, allow_uac)
             .await
             .context("TUN was not enabled; the running core was left unchanged")?;
         astra_ipc::progress::report(
             "Restart with TUN",
-            "Approved; handing over to the administrator core (the profile is unchanged)",
+            "Handing over to the administrator core (the profile is unchanged)",
         );
         // The replacement reads the switches only after the old core exits.
         astra_platform::storage::write_json(&path, &next)?;
         let result: Result<Reply> = async {
             // An early return drops (and so terminates) the replacement.
             self.stop_core(name, false).await?;
-            self.start_with(name, Some(replacement)).await?;
+            self.start_with_options(name, Some(replacement), false, allow_uac)
+                .await?;
             let snapshot =
                 control::runtime(&self.socket(name), astra_model::runtime::Command::Snapshot)
                     .await?;
@@ -1306,7 +1289,7 @@ impl Manager {
         if let Err(error) = result {
             astra_platform::storage::write_json(&path, &previous)
                 .context("Restore previous runtime switches after rejected TUN restart")?;
-            self.recover_handover(name, previous_pid)
+            self.recover_handover(name, previous_pid, allow_uac)
                 .await
                 .context("Restore previous proxy core after rejected TUN restart")?;
             return Err(error);
@@ -1316,7 +1299,12 @@ impl Manager {
     /// After a failed handover, stop a replacement that came up and bring the
     /// instance back if nothing is serving it.
     #[cfg(windows)]
-    async fn recover_handover(&mut self, name: &str, previous_pid: Option<u32>) -> Result<()> {
+    async fn recover_handover(
+        &mut self,
+        name: &str,
+        previous_pid: Option<u32>,
+        allow_uac: bool,
+    ) -> Result<()> {
         let _ = self.reap();
         if self.running.contains_key(name)
             && self
@@ -1328,14 +1316,15 @@ impl Manager {
             self.stop(name).await.context("Stop the replacement core")?;
         }
         if !self.running.contains_key(name) {
-            self.start_one(name).await?;
+            self.start_with_options(name, None, false, allow_uac)
+                .await?;
         }
         self.notify();
         Ok(())
     }
-    /// Restart an elevated TUN proxy with the UAC prompt answered while the
+    /// Prepare an elevated TUN proxy through the service or UAC while the
     /// current core still serves, so its listeners close only for the drain
-    /// and handover rather than for as long as the prompt is open. Returns
+    /// and handover rather than during authorization. Returns
     /// false when the plain stop/start path applies.
     #[cfg(windows)]
     async fn restart_elevated(&mut self, name: &str) -> Result<bool> {
@@ -1358,11 +1347,8 @@ impl Manager {
         let replacement = self
             .spawn_elevated(name, Some(previous_pid))
             .await
-            .context("Restart was cancelled; the running core was left unchanged")?;
-        astra_ipc::progress::report(
-            "Restart with TUN",
-            "Approved; handing over to the administrator core",
-        );
+            .context("Restart could not be authorized; the running core was left unchanged")?;
+        astra_ipc::progress::report("Restart with TUN", "Handing over to the administrator core");
         let result: Result<()> = async {
             // An early return drops (and so terminates) the replacement.
             self.stop_core(name, false).await?;
@@ -1370,7 +1356,7 @@ impl Manager {
         }
         .await;
         if let Err(error) = result {
-            self.recover_handover(name, Some(previous_pid))
+            self.recover_handover(name, Some(previous_pid), true)
                 .await
                 .context("Restore proxy core after failed restart")?;
             return Err(error);
@@ -1696,6 +1682,19 @@ impl Manager {
         command: astra_model::runtime::Command,
         expected_pid: Option<u32>,
     ) -> Result<Reply> {
+        self.action_runtime_with_policy(name, command, expected_pid, true)
+            .await
+    }
+
+    async fn action_runtime_with_policy(
+        &mut self,
+        name: String,
+        command: astra_model::runtime::Command,
+        expected_pid: Option<u32>,
+        allow_uac: bool,
+    ) -> Result<Reply> {
+        #[cfg(not(windows))]
+        let _ = allow_uac;
         let instance = self.instance(&name)?;
         anyhow::ensure!(
             instance.kind == Kind::Proxy,
@@ -1714,7 +1713,7 @@ impl Manager {
                 .as_ref()
                 .is_err_and(|error| error.to_string().contains("administrator permission"))
         {
-            return self.elevate_runtime_tun(&name).await;
+            return self.elevate_runtime_tun(&name, allow_uac).await;
         }
         let snapshot = response?;
         anyhow::ensure!(

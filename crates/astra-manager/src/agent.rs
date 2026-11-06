@@ -911,26 +911,21 @@ impl AgentService {
                 expected_pid,
             } => {
                 let command = command.into_core()?;
-                // Interactive authorization belongs on the target host; remote callers never supply a password.
+                // Execute requests may use an already-authorized local service.
+                // The actor carries a no-UAC policy through the actual spawn,
+                // including a service disappearing during the request.
                 if matches!(command, astra_model::runtime::Command::Tun(true)) {
-                    let listing = self.call(old::Action::List).await?;
-                    let row = listing
-                        .rows
-                        .into_iter()
-                        .find(|r| r.instance.name == instance)
-                        .context("instance not found")?;
-                    anyhow::ensure!(
-                        row.instance.kind == old::Kind::Proxy && row.pid.is_some(),
-                        "Select a running proxy"
-                    );
-                    anyhow::ensure!(
-                        expected_pid.is_none() || expected_pid == row.pid,
-                        "Core PID changed; refresh before changing runtime state"
-                    );
-                    let snapshot=astra_ipc::control::runtime(&self.config.state_dir.join(format!("{instance}.sock")),command).await.map_err(|e|anyhow::anyhow!("RequiresLocalAction: target service could not enable TUN without interactive elevation: {e}"))?;
-                    anyhow::ensure!(Some(snapshot.pid) == row.pid, "Core PID changed");
+                    let reply = self
+                        .native
+                        .get()
+                        .context("Native actor not initialized")?
+                        .enable_tun_without_uac(instance, expected_pid)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("RequiresLocalAction: target service could not enable TUN without interactive elevation: {error:#}"))?;
+                    // A successful service handover returns a new PID. The
+                    // actor verified expected_pid before replacing the core.
                     return Ok(ResponseBody::Runtime(RuntimeSnapshot::Client(
-                        browser_numbers(serde_json::to_value(snapshot)?),
+                        browser_numbers(serde_json::from_str(&reply.text)?),
                     )));
                 }
                 old::Action::Runtime {

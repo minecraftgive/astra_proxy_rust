@@ -1,5 +1,112 @@
 use super::*;
 
+#[cfg(windows)]
+#[tokio::test]
+async fn execute_tun_carries_no_uac_policy_and_accepts_the_service_replacement_pid() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().join("bin"),
+        ..Default::default()
+    })
+    .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let (client, actor) = crate::manager::NativeClient::with_test_runtime_actor(
+        root.path().join("actor"),
+        move |action, allow_uac| {
+            let old::Action::Runtime {
+                name,
+                command: astra_model::runtime::Command::Tun(true),
+                expected_pid,
+            } = action
+            else {
+                anyhow::bail!("unexpected actor action");
+            };
+            recorded
+                .lock()
+                .unwrap()
+                .push((name.clone(), expected_pid, allow_uac));
+            if name == "missing-service" {
+                anyhow::bail!("Windows privilege service is not registered");
+            }
+            Ok(old::Reply::text(serde_json::to_string(
+                &astra_model::runtime::Snapshot {
+                    pid: 456,
+                    tun: true,
+                    ..Default::default()
+                },
+            )?))
+        },
+    )
+    .unwrap();
+    assert!(agent.native.set(client).is_ok());
+
+    for (id, instance) in [("enabled", "proxy"), ("missing", "missing-service")] {
+        let response = agent
+            .handle_remote(Request::new(
+                id,
+                RequestBody::Execute {
+                    operation_id: format!("tun-{id}"),
+                    command: Command::Runtime {
+                        instance: instance.into(),
+                        command: RuntimeCommand::Tun(true),
+                        expected_pid: Some(123),
+                    },
+                },
+            ))
+            .await;
+        if instance == "proxy" {
+            let ResponseBody::Runtime(RuntimeSnapshot::Client(snapshot)) = response.result.unwrap()
+            else {
+                panic!("expected runtime snapshot");
+            };
+            assert_eq!(snapshot["pid"], "456");
+            assert_eq!(snapshot["tun"], true);
+        } else {
+            assert!(matches!(
+                response.result,
+                Err(ApiError {
+                    code: ErrorCode::RequiresLocalAction,
+                    ..
+                })
+            ));
+        }
+    }
+
+    let local = || {
+        Request::new(
+            "local-tun",
+            RequestBody::Local(LocalCommand::EnableTun {
+                instance: "proxy".into(),
+                expected_pid: Some(123),
+            }),
+        )
+    };
+    assert!(agent.handle(local()).await.result.is_ok());
+    assert!(matches!(
+        agent.handle_remote(local()).await.result,
+        Err(ApiError {
+            code: ErrorCode::RequiresLocalAction,
+            ..
+        })
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            ("proxy".into(), Some(123), false),
+            ("missing-service".into(), Some(123), false),
+            ("proxy".into(), Some(123), true),
+        ]
+    );
+    drop(agent);
+    tokio::time::timeout(std::time::Duration::from_secs(1), actor)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn remote_instance_metadata_refreshes_per_config_auto_start_for_every_core_kind() {
     let root = tempfile::tempdir().unwrap();

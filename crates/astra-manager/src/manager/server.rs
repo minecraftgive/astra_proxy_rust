@@ -262,6 +262,9 @@ impl Hub {
 }
 struct Work {
     action: Action,
+    // Internal dispatch policy, never accepted from the wire. Execute clients
+    // can use a registered privilege service but cannot request UAC.
+    allow_runtime_uac: bool,
     reply: oneshot::Sender<Reply>,
     progress: progress::Sender,
     save: Option<oneshot::Sender<Result<astra_management::v2::SaveOutcome>>>,
@@ -337,6 +340,7 @@ impl NativeClient {
                 reply,
                 progress,
                 save: Some(sender),
+                allow_runtime_uac: true,
             })
             .await
             .context("Native actor stopped")?;
@@ -390,8 +394,36 @@ impl NativeClient {
         Ok(value)
     }
     pub(crate) async fn call(&self, action: Action) -> Result<Reply> {
+        self.call_with_runtime_policy(action, true).await
+    }
+    pub(crate) async fn enable_tun_without_uac(
+        &self,
+        name: String,
+        expected_pid: Option<u32>,
+    ) -> Result<Reply> {
+        self.call_with_runtime_policy(
+            Action::Runtime {
+                name,
+                command: astra_model::runtime::Command::Tun(true),
+                expected_pid,
+            },
+            false,
+        )
+        .await
+    }
+    async fn call_with_runtime_policy(
+        &self,
+        action: Action,
+        allow_runtime_uac: bool,
+    ) -> Result<Reply> {
         let shutdown = matches!(action, Action::Shutdown);
-        let result = if let Some(result) = fast(&self.hub, &action).await {
+        let immediate = if allow_runtime_uac {
+            fast(&self.hub, &action).await
+        } else {
+            // Keep the no-UAC decision on the serialized mutation actor.
+            None
+        };
+        let result = if let Some(result) = immediate {
             result
         } else if matches!(
             &action,
@@ -429,6 +461,7 @@ impl NativeClient {
                     reply: sender,
                     progress,
                     save: None,
+                    allow_runtime_uac,
                 })
                 .await
                 .context("Native actor stopped")?;
@@ -560,7 +593,17 @@ pub(super) async fn run(
                     let shutdown=matches!(work.action,Action::Shutdown);
                     actor_hub.log.write("manager",&format!("started {title}"));
                     work.progress.send_replace(Some(progress::Progress::new("Running",title.clone())));
-                    let result=progress::scope(work.progress,manager.action(work.action)).await;
+                    let result=progress::scope(work.progress,async {
+                        if !work.allow_runtime_uac {
+                            let Action::Runtime{name,command,expected_pid}=work.action else {
+                                anyhow::bail!("Non-interactive runtime policy requires a runtime command");
+                            };
+                            manager.reap()?;
+                            manager.action_runtime_with_policy(name,command,expected_pid,false).await
+                        } else {
+                            manager.action(work.action).await
+                        }
+                    }).await;
                     let reply=reply(result);
                     let shutdown_error=if shutdown {reply.error.clone()} else {None};
                     actor_hub.log.write("manager",&format!("{} {title}",if reply.error.is_some(){"failed"}else{"completed"}));
@@ -737,6 +780,7 @@ pub(super) async fn run(
                 reply,
                 progress,
                 save: None,
+                allow_runtime_uac: true,
             }),
         )
         .await;
@@ -1069,6 +1113,7 @@ async fn serve(
                             reply: response,
                             progress,
                             save: None,
+                            allow_runtime_uac: true,
                         })
                         .await?;
                     loop {
@@ -1290,3 +1335,7 @@ async fn fast_progress(
 #[cfg(test)]
 #[path = "../test/manager_server_update_status_test.rs"]
 mod update_status_tests;
+
+#[cfg(all(test, windows))]
+#[path = "../test/manager_server_runtime_policy_test.rs"]
+mod runtime_policy_tests;
