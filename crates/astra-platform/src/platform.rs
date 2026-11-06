@@ -105,15 +105,69 @@ pub fn executable(name: &str) -> String {
 
 pub fn home_dir() -> io::Result<PathBuf> {
     #[cfg(windows)]
-    let home = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("USERPROFILE"));
+    {
+        // Service-launched cores deliberately receive no profile environment.
+        // They still run with the original user's token, so resolve that user's
+        // Local AppData folder when neither environment override is available.
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .map_or_else(
+                || {
+                    known_folder_dir(
+                        &windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData,
+                        "local application data",
+                    )
+                },
+                Ok,
+            )
+    }
     #[cfg(not(windows))]
-    let home = std::env::var_os("HOME");
-    home.map(PathBuf::from).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "User home directory is unavailable",
+    {
+        std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "User home directory is unavailable",
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+fn known_folder_dir(folder: &windows_sys::core::GUID, name: &str) -> io::Result<PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY},
+    };
+    let mut path = std::ptr::null_mut();
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            folder,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut path,
         )
-    })
+    };
+    let result = if status < 0 || path.is_null() {
+        Err(io::Error::other(format!(
+            "Cannot locate {name} directory (HRESULT 0x{:08X})",
+            status as u32
+        )))
+    } else {
+        let mut length = 0;
+        unsafe {
+            while *path.add(length) != 0 {
+                length += 1;
+            }
+            Ok(PathBuf::from(OsString::from_wide(
+                std::slice::from_raw_parts(path, length),
+            )))
+        }
+    };
+    // Free the returned allocation even when folder lookup fails.
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
 }
 
 /// Locate the current user's Documents directory without creating it.
@@ -121,39 +175,10 @@ pub fn home_dir() -> io::Result<PathBuf> {
 pub fn documents_dir() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
-        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-        use windows_sys::Win32::{
-            System::Com::CoTaskMemFree,
-            UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY},
-        };
-        let mut path = std::ptr::null_mut();
-        let status = unsafe {
-            SHGetKnownFolderPath(
-                &FOLDERID_Documents,
-                KF_FLAG_DONT_VERIFY as u32,
-                std::ptr::null_mut(),
-                &mut path,
-            )
-        };
-        let result = if status < 0 || path.is_null() {
-            Err(io::Error::other(format!(
-                "Cannot locate Documents directory (HRESULT 0x{:08X})",
-                status as u32
-            )))
-        } else {
-            let mut length = 0;
-            unsafe {
-                while *path.add(length) != 0 {
-                    length += 1;
-                }
-                Ok(PathBuf::from(OsString::from_wide(
-                    std::slice::from_raw_parts(path, length),
-                )))
-            }
-        };
-        // Free the returned allocation even when folder lookup fails.
-        unsafe { CoTaskMemFree(path.cast()) };
-        result
+        known_folder_dir(
+            &windows_sys::Win32::UI::Shell::FOLDERID_Documents,
+            "Documents",
+        )
     }
     #[cfg(not(windows))]
     {

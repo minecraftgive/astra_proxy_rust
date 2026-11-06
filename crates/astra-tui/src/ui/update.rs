@@ -5,6 +5,93 @@ use anyhow::Result;
 use ratatui::text::Line;
 use std::path::Path;
 
+/// Observe only this local host's new transactions. Historical completions must
+/// not override an intentional launch with --bin-dir, nor cause restart loops.
+#[derive(Default)]
+pub(super) struct Restart {
+    observed: bool,
+    attempted: Option<(String, String)>,
+    checking: Option<tokio::task::JoinHandle<Result<Option<crate::windows::Context>>>>,
+    ready: Option<crate::windows::Context>,
+}
+impl Restart {
+    pub(super) fn new(resumed: bool) -> Self {
+        // A replacement may first observe a newer update completed while it
+        // was starting. Resolving its own release is harmless (returns None).
+        Self {
+            observed: resumed,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn defer(&mut self, target: crate::windows::Context) {
+        self.ready = Some(target);
+    }
+    fn candidate(&mut self, status: &UpdateStatus) -> Option<(String, String)> {
+        let key = crate::self_update::completed_release(status).map(|release| {
+            (
+                status
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .operation_id
+                    .clone(),
+                release.to_owned(),
+            )
+        });
+        if !self.observed {
+            self.observed = true;
+            self.attempted = key.clone();
+        }
+        key
+    }
+
+    pub(super) async fn poll(
+        &mut self,
+        status: Option<&UpdateStatus>,
+        context: &crate::windows::Context,
+        idle: bool,
+    ) -> Result<Option<crate::windows::Context>> {
+        // An Agent's release paths belong to the target machine. They cannot
+        // select code to execute in the controller's local frontend.
+        if crate::protocol::target().is_some() {
+            return Ok(None);
+        }
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        let key = self.candidate(status);
+        if self
+            .checking
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            self.ready = self.checking.take().unwrap().await??;
+        }
+        if key != self.attempted {
+            self.ready = None;
+            if self.checking.is_none() {
+                if let Some((_, release)) = &key {
+                    let context = context.clone();
+                    let release = release.clone();
+                    self.attempted = key.clone();
+                    self.checking = Some(tokio::task::spawn_blocking(move || {
+                        let result = crate::self_update::resolve(&context, &release);
+                        super::wake();
+                        result
+                    }));
+                }
+            }
+        }
+        Ok(if idle && key.is_some() && key == self.attempted {
+            self.ready.take()
+        } else {
+            None
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Command {
     Import,
@@ -321,6 +408,7 @@ impl View {
                 }
             }
         }
+        lines.push(t("After a successful local activation, this interface saves its session and restarts into the updated version.").to_owned().into());
         lines.push(t("Closing this interface does not update hosts. Maintenance restarts end existing sessions. Draining has no completion estimate.").to_owned().into());
         lines
     }

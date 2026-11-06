@@ -21,16 +21,15 @@ class Role:
 
 ROLES = {
     'client': Role(('astra-rule', 'astra-proxy', 'astra-tui', 'astra-host', 'astra-manager', 'astra-convert'),
-                   'client.example.toml', ('astra-tui-startup', 'astra-service')),
+                   'client.example.toml', ('astra-service',)),
     'server': Role(('astra-server-core', 'astra-server-tui', 'astra-manager', 'astra-host'),
-                   'server.example.toml', ('astra-tui-startup',)),
+                   'server.example.toml'),
     'controller': Role(('astra-manager',)),
     'web': Role(('astra-web',)),
 }
 COMPONENT_PACKAGES = {
     'astra-host': 'astra-manager',
     'astra-server-tui': 'astra-tui',
-    'astra-tui-startup': 'astra-tui',
     'astra-service': 'astra-manager',
 }
 

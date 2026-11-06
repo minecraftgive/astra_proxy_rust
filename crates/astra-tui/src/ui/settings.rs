@@ -12,6 +12,8 @@ use crate::startup_unix as startup_registration;
 use ratatui::{layout::Rect, style::Modifier};
 
 mod program_info;
+mod terminals;
+pub(super) use terminals::TerminalState;
 
 /// Information and preferences share one viewport. Explicit scrolling lets a
 /// short terminal inspect the header without changing a preference.
@@ -128,7 +130,7 @@ pub(super) struct Preferences {
     pub(super) vim_keys: bool,
     pub(super) mouse: bool,
     pub(super) start_page: StartPage,
-    pub(super) auto_start_instances: bool,
+    pub(super) terminal: String,
     /// The generated OS startup file is authoritative, not these preferences.
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[serde(skip)]
@@ -289,7 +291,7 @@ impl Default for Preferences {
             vim_keys: false,
             mouse: true,
             start_page: StartPage::Overview,
-            auto_start_instances: false,
+            terminal: "auto".into(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_enabled: false,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -310,7 +312,7 @@ pub(super) enum Field {
     VimKeys,
     Mouse,
     StartPage,
-    AutoStartInstances,
+    Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     StartupRegistration,
     #[cfg(any(windows, target_os = "macos"))]
@@ -335,7 +337,7 @@ const ALL_FIELDS: &[Field] = &[
     Field::VimKeys,
     Field::Mouse,
     Field::StartPage,
-    Field::AutoStartInstances,
+    Field::Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     Field::StartupRegistration,
     #[cfg(any(windows, target_os = "macos"))]
@@ -382,7 +384,7 @@ impl Field {
             Self::VimKeys => "Vim navigation",
             Self::Mouse => "Mouse",
             Self::StartPage => "Start page",
-            Self::AutoStartInstances => "Auto-start instances",
+            Self::Terminal => "Terminal",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => {
                 if cfg!(target_os = "macos") {
@@ -417,19 +419,19 @@ impl Field {
             Self::VimKeys => "h j k l g G move in lists and logs, in addition to the arrow keys.",
             Self::Mouse => "Off returns the mouse to the terminal so you can select and copy text.",
             Self::StartPage => "Page shown when a window opens without --view.",
-            Self::AutoStartInstances => "Start stopped instances on the connected manager once when the main TUI opens. Additional windows do not trigger startup. Running instances are left as they are.",
+            Self::Terminal => "Choose the terminal for the next TUI launch, new windows and non-silent startup. The current window stays here. Silent startup does not use a terminal. Press r to scan again.",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => {
                 if cfg!(target_os = "macos") {
-                    "Open this TUI in Terminal at the next macOS login. Silent startup runs it in the background instead. Auto-start instances controls instance startup. No administrator permission is required."
+                    "Open this TUI in the selected terminal at the next macOS login. Silent startup runs it in the background instead. Each instance config controls startup with auto_start. No administrator permission is required."
                 } else if cfg!(target_os = "linux") {
-                    "Create or remove a user systemd service file for silent startup. Enable it manually with systemctl; Auto-start instances controls instance startup. Removing the file does not stop running instances."
+                    "Create or remove a user systemd service file for silent startup. Enable it manually with systemctl. Each instance config controls startup with auto_start. Removing the file does not stop running instances."
                 } else {
-                    "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Turn on Auto-start instances to start instances too."
+                    "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Set auto_start = true in each instance config to start it too."
                 }
             }
             #[cfg(any(windows, target_os = "macos"))]
-            Self::SilentStartup => "At sign-in, start in the background without a terminal window. Auto-start instances still controls instance startup. Open the TUI manually to manage them; failures are recorded in startup.log.",
+            Self::SilentStartup => "At sign-in, start in the background without a terminal window. Each instance config controls startup with auto_start. Open the TUI manually to manage them; failures are recorded in startup.log.",
             #[cfg(windows)]
             Self::WindowsService => "Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.",
             Self::MarqueeBorder => "A rainbow runs around the border of the focused panel.",
@@ -446,6 +448,7 @@ impl Field {
     /// Choice names; language names are shown in their own language.
     fn choices(self) -> &'static [&'static str] {
         match self {
+            Self::Terminal => &["Auto"], // Dynamic choices are supplied by Ui.
             Self::Language => &["System", "English", "简体中文", "繁體中文"],
             Self::Accent => &["Indigo", "Teal", "Green", "Violet", "Rose", "Amber"],
             Self::Colors => &[
@@ -470,7 +473,6 @@ impl Field {
             Self::WindowsService => &["On", "Off"],
             Self::VimKeys
             | Self::Mouse
-            | Self::AutoStartInstances
             | Self::MarqueeBorder
             | Self::MarqueeText
             | Self::MarqueeBackground
@@ -495,7 +497,7 @@ impl Field {
             Self::VimKeys => usize::from(!p.vim_keys),
             Self::Mouse => usize::from(!p.mouse),
             Self::StartPage => p.start_page.page(),
-            Self::AutoStartInstances => usize::from(!p.auto_start_instances),
+            Self::Terminal => 0, // The cached terminal list resolves the saved ID.
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => usize::from(!p.startup_enabled),
             #[cfg(any(windows, target_os = "macos"))]
@@ -544,7 +546,7 @@ impl Field {
             Self::VimKeys => p.vim_keys = index == 0,
             Self::Mouse => p.mouse = index == 0,
             Self::StartPage => p.start_page = StartPage::ALL[index],
-            Self::AutoStartInstances => p.auto_start_instances = index == 0,
+            Self::Terminal => p.terminal = "auto".into(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => p.startup_enabled = index == 0,
             #[cfg(any(windows, target_os = "macos"))]
@@ -853,6 +855,10 @@ impl Ui {
         }
     }
     fn choose_setting(&mut self, field: Field, index: usize) {
+        if field == Field::Terminal {
+            self.choose_terminal(index);
+            return;
+        }
         #[cfg(windows)]
         if field == Field::WindowsService {
             self.change_windows_service(index == 0);
@@ -943,11 +949,15 @@ impl Ui {
         self.settings_view.follow_selection.set(true);
         self.settings_cursor = row.min(fields(&self.preferences).len() - 1);
         let field = self.settings_field();
-        let current = field.get(&self.preferences);
+        let current = self.setting_index(field);
+        if field == Field::Terminal && choice.is_none() {
+            self.open_terminal_picker();
+            return Input::Idle;
+        }
         let index = match field.range() {
             // The arrows either side of the value: 0 lowers it, anything else raises it.
             Some(range) => usize::from(range.nudge(current as u16, choice != Some(0), false)),
-            None => choice.unwrap_or((current + 1) % field.choices().len()),
+            None => choice.unwrap_or((current + 1) % self.setting_choice_count(field)),
         };
         self.choose_setting(field, index);
         Input::Idle
@@ -955,6 +965,9 @@ impl Ui {
 
     /// Settings keys; `None` lets page numbers, the palette and quit through.
     pub(super) fn settings_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        if self.terminals.picker.is_some() {
+            return self.terminal_picker_key(key);
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -979,7 +992,7 @@ impl Ui {
             return Some(Input::Idle);
         }
         let field = self.settings_field();
-        let current = field.get(&self.preferences);
+        let current = self.setting_index(field);
         if let Some(range) = field.range() {
             let big = key.modifiers.contains(KeyModifiers::SHIFT);
             let up = match key.code {
@@ -1000,10 +1013,11 @@ impl Ui {
                 return Some(Input::Idle);
             }
         }
-        let count = field.choices().len();
+        let count = self.setting_choice_count(field);
         match key.code {
             KeyCode::Char('r') => {
                 self.refresh_program_info();
+                self.request_terminal_scan();
                 return Some(Input::Idle);
             }
             KeyCode::PageUp | KeyCode::PageDown => {
@@ -1035,7 +1049,11 @@ impl Ui {
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {}
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.choose_setting(field, (current + 1) % count)
+                if field == Field::Terminal {
+                    self.open_terminal_picker();
+                } else {
+                    self.choose_setting(field, (current + 1) % count)
+                }
             }
             KeyCode::Delete | KeyCode::Backspace => {
                 let default = field.get(&Preferences::default());
@@ -1048,6 +1066,13 @@ impl Ui {
     }
 
     pub(super) fn scroll_settings(&mut self, down: bool) {
+        if self.terminals.picker.is_some() {
+            self.terminal_picker_key(event::KeyEvent::new(
+                if down { KeyCode::Down } else { KeyCode::Up },
+                KeyModifiers::NONE,
+            ));
+            return;
+        }
         self.move_settings_view(down, 3);
     }
 
@@ -1223,6 +1248,7 @@ impl Ui {
                 ),
             );
         }
+        self.render_terminal_picker(f, area);
     }
 
     fn render_setting_row(
@@ -1234,7 +1260,7 @@ impl Ui {
         label_width: usize,
     ) {
         let field = ALL_FIELDS[row];
-        let current = field.get(&self.preferences);
+        let current = self.setting_index(field);
         let marker = if selected { " › " } else { "   " };
         let label = astra_tui_kit::text::pad_cells(t(field.label()), label_width);
         let marquee = self.animations.marquee();
@@ -1290,6 +1316,10 @@ impl Ui {
                 Style::default().fg(Color::DarkGray),
             ));
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
+            return;
+        }
+        if field == Field::Terminal {
+            self.render_terminal_choice(f, rect, row, spans);
             return;
         }
         let swatch = |index: usize| (field == Field::Accent).then(|| Accent::ALL[index].color());

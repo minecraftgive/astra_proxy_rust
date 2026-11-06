@@ -38,7 +38,7 @@ def main():
             tar.extractall(directory, filter="data")
         root, = directory.iterdir()
         expected_files = {executable(n) for n in ('astra-rule','astra-proxy','astra-tui','astra-host','astra-manager','astra-convert')} | {'client.example.toml', 'manifest.json'}
-        if os.name == 'nt':expected_files.update(('astra-tui-startup.exe', 'astra-service.exe'))
+        if os.name == 'nt':expected_files.add('astra-service.exe')
         if os.name == 'nt' and (root/'wintun.dll').exists():expected_files.add('wintun.dll')
         actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
         assert root.name == 'client' and actual == expected_files and {p.name for p in root.iterdir()} == expected_files, actual
@@ -46,7 +46,7 @@ def main():
         assert manifest['schema_version'] == 1 and manifest['release_id']
         assert manifest['host_protocol']['min'] <= 1 <= manifest['host_protocol']['max']
         assert {'astra-rule', 'astra-proxy', 'astra-tui', 'astra-host', 'astra-manager'} <= manifest['components'].keys()
-        if os.name == 'nt':assert {'astra-tui-startup', 'astra-service'} <= manifest['components'].keys()
+        if os.name == 'nt':assert 'astra-service' in manifest['components']
         listed = {entry['path'] for entry in manifest['files']}
         assert len(listed) == len(manifest['files']) and listed == actual - {'manifest.json'}
         for entry in manifest['files']:

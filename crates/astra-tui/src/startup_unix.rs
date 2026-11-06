@@ -31,6 +31,8 @@ struct Paths {
     platform: Platform,
     id: String,
     file: PathBuf,
+    // Legacy macOS registrations used this Terminal helper. Preserve existing
+    // copies while replacing the plist, and clean them up on explicit disable.
     script: Option<PathBuf>,
 }
 impl Paths {
@@ -257,36 +259,15 @@ fn xml(value: &str) -> Result<String> {
         .replace('\'', "&apos;"))
 }
 fn mac_plist(paths: &Paths, command: &Command, silent: bool) -> Result<String> {
-    let args = if silent {
-        command.argv(true)
-    } else {
-        vec![
-            "/usr/bin/open".into(),
-            "-a".into(),
-            "Terminal".into(),
-            path_text(
-                paths
-                    .script
-                    .as_deref()
-                    .context("Missing Terminal startup script")?,
-            )?
-            .into(),
-        ]
-    };
-    let args = args
+    // The frontend selects the configured terminal when launchd supplies no
+    // TTY. Starting Terminal first would leave an extra window when the user's
+    // selected terminal is another application. Silent launches bypass routing.
+    let args = command
+        .argv(silent)
         .iter()
         .map(|arg| Ok(format!("    <string>{}</string>\n", xml(arg)?)))
         .collect::<Result<String>>()?;
     Ok(format!("{}<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>com.astra.tui.{}</string>\n  <key>ProgramArguments</key>\n  <array>\n{}  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>LimitLoadToSessionType</key>\n  <string>Aqua</string>\n</dict>\n</plist>\n", paths.prefix(), paths.id, args))
-}
-fn mac_script(paths: &Paths, command: &Command) -> Result<String> {
-    let args = command
-        .argv(false)
-        .iter()
-        .map(|arg| Ok(shell_quote(valid_text(arg)?)))
-        .collect::<Result<Vec<_>>>()?
-        .join(" ");
-    Ok(format!("{}exec {args}\n", paths.script_prefix()))
 }
 /// ':' disables systemd's environment expansion for the entire command. This
 /// also preserves '$' in the executable path (which is not an environment word).
@@ -351,29 +332,9 @@ fn apply_with_writer(
     match paths.platform {
         Platform::Mac => {
             let plist = mac_plist(paths, command, silent)?;
-            if silent {
-                // Keep any old helper until disable. Its cleanup cannot be
-                // allowed to fail after committing the new startup mode.
-                write(&paths.file, plist.as_bytes(), 0o600)?;
-                return Ok(());
-            }
-            let script = paths.script.as_ref().unwrap();
-            let previous = had_script
-                .then(|| astra_platform::storage::read_bounded(script, MAX_FILE))
-                .transpose()?;
-            write(script, mac_script(paths, command)?.as_bytes(), 0o700)?;
-            if let Err(error) = write(&paths.file, plist.as_bytes(), 0o600) {
-                let rollback = match previous {
-                    Some(bytes) => write(script, &bytes, 0o700),
-                    None => std::fs::remove_file(script).map_err(Into::into),
-                };
-                return match rollback {
-                    Ok(()) => Err(error),
-                    Err(rollback) => Err(error.context(format!(
-                        "Could not restore the previous startup script: {rollback}"
-                    ))),
-                };
-            }
+            // Keep legacy helpers until disable. Both modes publish only the
+            // plist, with no fallible helper mutation after that commit.
+            write(&paths.file, plist.as_bytes(), 0o600)?;
         }
         Platform::Linux => write(&paths.file, linux_unit(paths, command)?.as_bytes(), 0o600)?,
     }

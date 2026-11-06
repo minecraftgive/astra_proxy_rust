@@ -85,7 +85,14 @@ fn set_operation(operation: &mut Option<protocol::Action>, next: protocol::Actio
     Ok(())
 }
 
-fn finish_launch(launch: &mut windows::Launch, default_kind: Option<protocol::Kind>) {
+fn finish_launch(
+    launch: &mut windows::Launch,
+    default_kind: Option<protocol::Kind>,
+    prepared: bool,
+) {
+    if prepared {
+        return;
+    }
     if let (Some(view), None) = (launch.view, &launch.window_id) {
         launch.window_id = windows::Launch::detached(view, None, protocol::Kind::Proxy).window_id;
     }
@@ -97,18 +104,26 @@ fn finish_launch(launch: &mut windows::Launch, default_kind: Option<protocol::Ki
 }
 
 pub(crate) async fn run(default_kind: Option<protocol::Kind>) -> Result<()> {
-    run_mode(default_kind, false).await
-}
-
-#[cfg(windows)]
-pub(crate) async fn run_silent() -> Result<()> {
-    run_mode(None, true).await
-}
-
-async fn run_mode(default_kind: Option<protocol::Kind>, silent_default: bool) -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let mut silent = silent_default;
-    let result = run_inner(default_kind, &mut silent).await;
+    // Decide before localization/argument validation can fail. Silent launches
+    // must never allocate a console and must log early failures as well.
+    let (mut silent, _daemon) = headless_options(&args);
+    #[cfg(windows)]
+    let daemon = _daemon || is_host_binary(&std::env::current_exe()?);
+    #[cfg(windows)]
+    let console = if !silent && !daemon {
+        // CLI help/errors can use the invoking shell, preserving redirected
+        // output. An interactive UI gets its own console after validation.
+        windows::prepare_console(windows::ConsoleMode::CommandLine)
+    } else {
+        Ok(())
+    };
+    #[cfg(not(windows))]
+    let console: Result<()> = Ok(());
+    let result = match console {
+        Ok(()) => run_inner(default_kind, &mut silent).await,
+        Err(error) => Err(error),
+    };
     if silent {
         if let Err(error) = &result {
             let home = args
@@ -126,7 +141,124 @@ async fn run_mode(default_kind: Option<protocol::Kind>, silent_default: bool) ->
             }
         }
     }
+    #[cfg(windows)]
+    if !silent && !daemon {
+        if let Err(error) = &result {
+            // A double-clicked GUI frontend may fail before it opens the TUI.
+            // Keep such errors visible without changing redirected CLI errors.
+            windows::report_startup_error(&format!("{error:#}"));
+        }
+    }
     result
+}
+
+fn headless_options(args: &[std::ffi::OsString]) -> (bool, bool) {
+    let mut silent = false;
+    let mut daemon = false;
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--silent") => silent = true,
+            Some("--manager") => daemon = true,
+            // Values that happen to look like flags are still values, matching
+            // the real parser. In particular a directory can be "--silent".
+            Some(
+                "--endpoint" | "--agent" | "--lang" | "--state-dir" | "--config-dir" | "--bin-dir"
+                | "--view" | "--instance" | "--core" | "--window-id" | "--restart-ready" | "update",
+            ) => {
+                args.next();
+            }
+            _ => {}
+        }
+    }
+    (silent, daemon)
+}
+
+#[cfg(windows)]
+fn prepare_interactive_console(
+    native_console: bool,
+    terminal_child: bool,
+    launch: &windows::Launch,
+) -> Result<()> {
+    windows::prepare_console(if terminal_child {
+        windows::ConsoleMode::Hosted
+    } else if native_console {
+        windows::ConsoleMode::NewWindow
+    } else {
+        windows::ConsoleMode::Interactive
+    })?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle(format!(
+            "Astra · {}",
+            launch.view.unwrap_or(windows::View::Dashboard).name()
+        ))
+    )?;
+    Ok(())
+}
+
+fn should_launch_terminal(
+    hosted: bool,
+    native: bool,
+    resume: bool,
+    preference: &str,
+    tty: bool,
+) -> bool {
+    !hosted && !native && !resume && (cfg!(windows) || preference != "auto" || !tty)
+}
+
+fn terminal_arguments(
+    context: &windows::Context,
+    launch: &windows::Launch,
+    explicit_language: bool,
+) -> Result<Vec<std::ffi::OsString>> {
+    let mut context = context.clone();
+    // Terminal profiles can change the working directory of the new process.
+    context.config = std::path::absolute(&context.config)?;
+    context.bin = std::path::absolute(&context.bin)?;
+    let mut args = context.arguments(launch);
+    if !explicit_language {
+        // The main window has not applied its saved language yet. Let the
+        // hosted UI load it, instead of turning the system locale into a CLI
+        // override. New windows already know the active UI language.
+        if let Some(index) = args.iter().position(|arg| arg == "--lang") {
+            args.drain(index..index + 2);
+        }
+    }
+    Ok(args)
+}
+
+async fn launch_terminal(
+    context: &windows::Context,
+    launch: &windows::Launch,
+    terminal_child: bool,
+    terminal_native: bool,
+    resume_ui: bool,
+) -> Result<bool> {
+    use std::io::IsTerminal;
+    if terminal_child || terminal_native || resume_ui {
+        return Ok(false);
+    }
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let args = terminal_arguments(context, launch, i18n::command_line_language())?;
+    let context = context.clone();
+    tokio::task::spawn_blocking(move || {
+        let preference = ui::preferred_terminal(&context.home);
+        if !should_launch_terminal(terminal_child, terminal_native, resume_ui, &preference, tty) {
+            return Ok(false);
+        }
+        match crate::terminals::launch(&preference, &context.executable, &args)? {
+            crate::terminals::LaunchOutcome::Native => Ok(false),
+            crate::terminals::LaunchOutcome::Launched { terminal } => {
+                if let Ok(log) = astra_platform::tui_log::Log::open(&context.home.join("tui.log")) {
+                    log.write("terminal", &format!("opened {terminal}"));
+                }
+                Ok(true)
+            }
+        }
+    })
+    .await
+    .context("Choose terminal")?
 }
 
 fn validate_silent_launch(
@@ -194,6 +326,10 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         ..Default::default()
     };
     let mut native_console = false;
+    let mut terminal_child = false;
+    let mut terminal_native = false;
+    let mut resume_ui = false;
+    let mut restart_ready = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -248,6 +384,14 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
                 launch.window_id = Some(args.next().context("--window-id requires an ID")?)
             }
             "--native-console" => native_console = true,
+            "--terminal-child" => terminal_child = true,
+            "--terminal-native" => terminal_native = true,
+            "--resume-ui" => resume_ui = true,
+            "--restart-ready" => {
+                restart_ready = Some(PathBuf::from(
+                    args.next().context("--restart-ready requires a path")?,
+                ));
+            }
             "--silent" => *silent = true,
             "--manager" => daemon = true,
             "--shutdown" => shutdown = true,
@@ -280,6 +424,20 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         }
     }
     let silent = *silent;
+    anyhow::ensure!(
+        !(terminal_child && terminal_native)
+            && (!(terminal_child || terminal_native)
+                || (!silent && !daemon && !shutdown && operation.is_none())),
+        "Terminal host flags require an interactive frontend and cannot be combined"
+    );
+    anyhow::ensure!(
+        restart_ready.is_none() || resume_ui,
+        "--restart-ready requires --resume-ui"
+    );
+    anyhow::ensure!(
+        !resume_ui || (!silent && !daemon && !shutdown && operation.is_none()),
+        "--resume-ui requires an interactive frontend"
+    );
     validate_silent_launch(
         silent,
         daemon,
@@ -296,22 +454,21 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         *path = std::fs::canonicalize(&*path)
             .with_context(|| format!("Cannot open update package {}", path.display()))?;
     }
-    finish_launch(&mut launch, default_kind);
-    #[cfg(windows)]
-    if native_console {
-        windows::attach_console_io()?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::SetTitle(format!(
-                "Astra · {}",
-                launch.view.unwrap_or(windows::View::Dashboard).name()
-            ))
-        )?;
-    }
+    // Terminal handoffs already carry the parsed view and window identity.
+    // In particular the server's default Profiles view remains a primary
+    // window so it still runs configured instance startup exactly once.
+    finish_launch(
+        &mut launch,
+        default_kind,
+        resume_ui || terminal_child || terminal_native,
+    );
     #[cfg(not(windows))]
     let _ = native_console;
     astra_platform::storage::private_dir(&home)?;
     home = std::fs::canonicalize(home)?;
+    if let Some(path) = &restart_ready {
+        validate_restart_ready(&home, path)?;
+    }
     anyhow::ensure!(
         agent_id.is_none() || endpoint.is_some(),
         "--agent requires --endpoint"
@@ -349,14 +506,27 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         let context = windows::Context {
             executable,
             home,
-            config: config_home,
-            bin,
+            config: std::path::absolute(config_home)?,
+            bin: std::path::absolute(bin)?,
             language: i18n::language(),
         };
         return if silent {
             ui::run_silent(endpoint, context).await
         } else {
-            ui::run(endpoint, context, launch).await
+            if launch_terminal(
+                &context,
+                &launch,
+                terminal_child,
+                terminal_native,
+                resume_ui,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            #[cfg(windows)]
+            prepare_interactive_console(native_console, terminal_child, &launch)?;
+            ui::run(endpoint, context, launch, resume_ui, restart_ready).await
         };
     }
     astra_platform::storage::private_dir(&config_home)?;
@@ -385,8 +555,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         if let Some(frontend) =
             selected_frontend(&executable, &bin, has_selected_release, explicit_bin)?
         {
-            // This is a new user launch, never an in-place UI restart. Unlike a
-            // host handoff, a frontend can reconnect to an existing manager.
+            // A frontend can reconnect to an existing manager without replacing it.
             let status = tokio::process::Command::new(frontend)
                 .args(std::env::args_os().skip(1))
                 .arg("--bin-dir")
@@ -521,8 +690,38 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
     if silent {
         ui::run_silent(socket, context).await
     } else {
-        ui::run(socket, context, launch).await
+        if launch_terminal(
+            &context,
+            &launch,
+            terminal_child,
+            terminal_native,
+            resume_ui,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        // Allocate only in the frontend that actually displays the UI. A
+        // versioned frontend handoff above must not leave an extra empty window.
+        #[cfg(windows)]
+        prepare_interactive_console(native_console, terminal_child, &launch)?;
+        ui::run(socket, context, launch, resume_ui, restart_ready).await
     }
+}
+
+fn validate_restart_ready(home: &Path, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute() && !path.try_exists()?,
+        "Invalid restart readiness path"
+    );
+    let parent = path
+        .parent()
+        .context("Missing restart readiness directory")?;
+    anyhow::ensure!(
+        std::fs::canonicalize(parent)? == std::fs::canonicalize(home.join("restart-ready"))?,
+        "Restart readiness path must be inside the state restart-ready directory"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

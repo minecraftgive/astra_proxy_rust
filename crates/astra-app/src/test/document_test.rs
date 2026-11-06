@@ -1,4 +1,103 @@
 use super::*;
+
+fn roundtrip_auto_start(kind: CoreKind, text: &str) -> (bool, String) {
+    macro_rules! roundtrip {
+        ($config:ty) => {{
+            let config: $config = toml::from_str(text).unwrap();
+            let serialized = toml::to_string(&config).unwrap();
+            let restored: $config = toml::from_str(&serialized).unwrap();
+            assert_eq!(config.auto_start, restored.auto_start);
+            (restored.auto_start, serialized)
+        }};
+    }
+    match kind {
+        CoreKind::Proxy => roundtrip!(astra_model::config::proxy::ProxyConfig),
+        CoreKind::Rule => roundtrip!(astra_model::config::rule::RuleConfig),
+        CoreKind::Server => roundtrip!(astra_model::config::server::Config),
+    }
+}
+
+#[test]
+fn instance_auto_start_is_opt_in_and_roundtrips_for_every_core_kind() {
+    for kind in [CoreKind::Proxy, CoreKind::Rule, CoreKind::Server] {
+        let template = Document::template(kind);
+        assert_eq!(
+            toml::from_str::<toml::Value>(&template).unwrap()["auto_start"].as_bool(),
+            Some(false)
+        );
+        let legacy = template.replace("auto_start = false\n", "");
+        assert!(!roundtrip_auto_start(kind, &legacy).0);
+        for enabled in [false, true] {
+            let text = format!("auto_start = {enabled}\n{legacy}");
+            Document::parse(kind, &text)
+                .unwrap()
+                .validate_structure()
+                .unwrap();
+            let (restored, serialized) = roundtrip_auto_start(kind, &text);
+            assert_eq!(restored, enabled);
+            assert_eq!(
+                toml::from_str::<toml::Value>(&serialized).unwrap()["auto_start"].as_bool(),
+                Some(enabled)
+            );
+        }
+        for invalid in ["'true'", "1", "[]"] {
+            assert!(
+                Document::parse(kind, &format!("auto_start = {invalid}\n{legacy}"))
+                    .unwrap()
+                    .validate_structure()
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn instance_auto_start_schema_edits_save_and_reset_on_all_platforms() {
+    for kind in [CoreKind::Proxy, CoreKind::Rule, CoreKind::Server] {
+        let legacy = Document::template(kind).replace("auto_start = false\n", "");
+        let mut document = Document::parse(kind, &legacy).unwrap();
+        for platform in [
+            Platform::Windows,
+            Platform::Macos,
+            Platform::Linux,
+            Platform::Other,
+        ] {
+            let schema = document.schema(&[], platform).unwrap();
+            let field = schema
+                .rows
+                .iter()
+                .find_map(|row| match row {
+                    SchemaRow::Field { field } if field.key == "auto_start" => Some(field),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(field.field_type, FieldType::Boolean);
+            assert_eq!(field.default, "false");
+            assert!(field.value.is_none());
+            assert!(!field.required);
+        }
+        for enabled in [true, false] {
+            document
+                .apply(EditCommand::SetField {
+                    path: vec![],
+                    key: "auto_start".into(),
+                    input: enabled.to_string(),
+                })
+                .unwrap();
+            document.validate_structure().unwrap();
+            assert_eq!(roundtrip_auto_start(kind, document.text()).0, enabled);
+            document = Document::parse(kind, document.text()).unwrap();
+        }
+        document
+            .apply(EditCommand::RemoveField {
+                path: vec![],
+                key: "auto_start".into(),
+            })
+            .unwrap();
+        assert!(!roundtrip_auto_start(kind, document.text()).0);
+    }
+}
+
 #[test]
 fn edits_keep_comments_unknown_fields_and_exact_undo() {
     let source = "# owned comment\ndefault_action = 'DIRECT' # inline\nunknown = 'preserved'\n";

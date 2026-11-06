@@ -88,7 +88,11 @@ fn startup_preserves_storage_and_target_without_detached_window_overrides() {
         silent,
         arguments
             .into_iter()
-            .filter(|argument| argument != "--native-console")
+            .map(|argument| if argument == "--native-console" {
+                OsString::from("--silent")
+            } else {
+                argument
+            })
             .collect::<Vec<_>>()
     );
 }
@@ -160,19 +164,8 @@ fn shortcut_com_round_trip_in_temporary_directory_only() {
         executable: temporary.0.join("astra-tui.exe"),
         ..context()
     };
-    let helper = context.executable.with_file_name("astra-tui-startup.exe");
-    assert_eq!(
-        shortcut_executable(&context, false).unwrap(),
-        context.executable
-    );
-    assert!(shortcut_executable(&context, true)
-        .unwrap_err()
-        .to_string()
-        .contains("astra-tui-startup.exe"));
     // Only target-path metadata is needed: these files are never executed.
     std::fs::write(&context.executable, b"shortcut target placeholder").unwrap();
-    std::fs::write(&helper, b"silent helper placeholder").unwrap();
-    assert_eq!(shortcut_executable(&context, true).unwrap(), helper);
     let target = Some((
         r"C:\remote space\management.sock".into(),
         Some("node & one".into()),
@@ -205,15 +198,11 @@ fn shortcut_com_round_trip_in_temporary_directory_only() {
             decoded(&arg_buffer),
             arguments(&context, &target, silent).unwrap()
         );
-        assert_eq!(
-            decoded(&exe_buffer),
-            shell_path(&shortcut_executable(&context, silent).unwrap())
-        );
+        assert_eq!(decoded(&exe_buffer), shell_path(&context.executable));
         assert_eq!(
             decoded(&dir_buffer),
             shell_path(context.executable.parent().unwrap())
         );
     }
-    std::fs::remove_file(helper).unwrap();
     std::fs::remove_file(context.executable).unwrap();
 }

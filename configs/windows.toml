@@ -1,4 +1,5 @@
 # Windows template. Replace the upstream before use. Both system modes start disabled.
+auto_start = false
 standalone = true
 watch_config = true
 socks5_listen = "127.0.0.1:1080"

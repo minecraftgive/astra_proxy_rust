@@ -1,6 +1,102 @@
 use super::*;
 
 #[test]
+fn terminal_handoffs_do_not_relaunch_hosted_native_or_update_children() {
+    for preference in ["auto", "native", "wezterm", "missing-terminal"] {
+        for tty in [false, true] {
+            assert!(!should_launch_terminal(true, false, false, preference, tty));
+            assert!(!should_launch_terminal(false, true, false, preference, tty));
+            assert!(!should_launch_terminal(false, false, true, preference, tty));
+        }
+    }
+    assert!(should_launch_terminal(false, false, false, "wezterm", true));
+    assert!(should_launch_terminal(false, false, false, "auto", false));
+    assert_eq!(
+        should_launch_terminal(false, false, false, "auto", true),
+        cfg!(windows)
+    );
+}
+
+#[test]
+fn terminal_handoff_resolves_paths_and_preserves_language_override_intent() {
+    let context = windows::Context {
+        executable: std::env::current_exe().unwrap(),
+        home: std::env::temp_dir(),
+        config: "relative config".into(),
+        bin: "relative bin".into(),
+        language: i18n::Language::Traditional,
+    };
+    let launch = windows::Launch::detached(
+        windows::View::Logs,
+        Some("selected-instance".into()),
+        protocol::Kind::Rule,
+    );
+    let args = terminal_arguments(&context, &launch, false).unwrap();
+    assert!(!args.iter().any(|arg| arg == "--lang"));
+    for (option, relative) in [
+        ("--config-dir", &context.config),
+        ("--bin-dir", &context.bin),
+    ] {
+        let value = args.windows(2).find(|pair| pair[0] == option).unwrap();
+        assert_eq!(value[1], std::path::absolute(relative).unwrap());
+    }
+    for (option, value) in [
+        ("--view", "logs"),
+        ("--instance", "selected-instance"),
+        ("--window-id", launch.window_id.as_deref().unwrap()),
+    ] {
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == option && pair[1] == value));
+    }
+    let explicit = terminal_arguments(&context, &launch, true).unwrap();
+    assert!(explicit
+        .windows(2)
+        .any(|pair| pair[0] == "--lang" && pair[1] == "zh-TW"));
+}
+
+#[test]
+fn headless_flags_are_known_before_errors_but_option_values_are_not_flags() {
+    let flags = |args: &[&str]| {
+        headless_options(
+            &args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(flags(&[]), (false, false));
+    assert_eq!(flags(&["--unknown", "--silent"]), (true, false));
+    assert_eq!(
+        flags(&["--silent", "--lang", "bad-language"]),
+        (true, false)
+    );
+    assert_eq!(flags(&["--manager"]), (false, true));
+    assert_eq!(flags(&["--silent", "--manager"]), (true, true));
+    for option in [
+        "--endpoint",
+        "--agent",
+        "--lang",
+        "--state-dir",
+        "--config-dir",
+        "--bin-dir",
+        "--view",
+        "--instance",
+        "--core",
+        "--window-id",
+        "--restart-ready",
+        "update",
+    ] {
+        assert_eq!(flags(&[option, "--silent"]), (false, false), "{option}");
+        assert_eq!(
+            flags(&[option, "--manager", "--silent"]),
+            (true, false),
+            "{option}"
+        );
+    }
+}
+
+#[test]
 fn silent_launch_cannot_accidentally_open_a_window_or_run_maintenance() {
     let launch = windows::Launch::default();
     assert!(validate_silent_launch(false, false, false, false, false, &launch).is_ok());
@@ -55,7 +151,12 @@ fn server_default_view_is_primary_but_explicit_view_is_detached() {
         kind: Some(protocol::Kind::Server),
         ..Default::default()
     };
-    finish_launch(&mut primary, Some(protocol::Kind::Server));
+    finish_launch(&mut primary, Some(protocol::Kind::Server), false);
+    assert_eq!(primary.view, Some(windows::View::Profiles));
+    assert!(primary.window_id.is_none());
+    // The terminal receives this prepared default as an explicit --view;
+    // it must retain the main window identity rather than allocate a new one.
+    finish_launch(&mut primary, Some(protocol::Kind::Server), true);
     assert_eq!(primary.view, Some(windows::View::Profiles));
     assert!(primary.window_id.is_none());
     let mut detached = windows::Launch {
@@ -63,11 +164,39 @@ fn server_default_view_is_primary_but_explicit_view_is_detached() {
         kind: Some(protocol::Kind::Server),
         ..Default::default()
     };
-    finish_launch(&mut detached, Some(protocol::Kind::Server));
+    finish_launch(&mut detached, Some(protocol::Kind::Server), false);
     assert!(detached.window_id.is_some());
     let existing = detached.window_id.clone();
-    finish_launch(&mut detached, Some(protocol::Kind::Server));
+    finish_launch(&mut detached, Some(protocol::Kind::Server), false);
     assert_eq!(detached.window_id, existing);
+}
+
+#[test]
+fn resumed_primary_and_detached_windows_keep_the_same_session() {
+    for id in [None, Some("existing-window".into())] {
+        let mut launch = windows::Launch {
+            view: Some(windows::View::Connections),
+            kind: Some(protocol::Kind::Server),
+            window_id: id.clone(),
+            ..Default::default()
+        };
+        finish_launch(&mut launch, Some(protocol::Kind::Server), true);
+        assert_eq!(launch.window_id, id);
+        assert_eq!(launch.view, Some(windows::View::Connections));
+    }
+}
+
+#[test]
+fn restart_readiness_is_restricted_to_a_new_file_in_the_private_state_directory() {
+    let fixture = Directory::new();
+    let directory = fixture.path.join("restart-ready");
+    std::fs::create_dir(&directory).unwrap();
+    let marker = directory.join("ready");
+    validate_restart_ready(&fixture.path, &marker).unwrap();
+    assert!(validate_restart_ready(&fixture.path, &fixture.path.join("outside")).is_err());
+    assert!(validate_restart_ready(&fixture.path, Path::new("relative")).is_err());
+    std::fs::write(&marker, "existing").unwrap();
+    assert!(validate_restart_ready(&fixture.path, &marker).is_err());
 }
 
 struct Directory {

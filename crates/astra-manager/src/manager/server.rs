@@ -1097,6 +1097,18 @@ async fn serve(
         }
     }
 }
+fn refresh_startup_details(mut reply: Reply) -> Result<Reply> {
+    let mut details: HashMap<String, InstanceDetails> = serde_json::from_str(&reply.text)?;
+    for row in &reply.rows {
+        let entry = details.entry(row.instance.name.clone()).or_default();
+        let auto_start = read_config_auto_start(&row.instance.config);
+        entry.config_unavailable = auto_start.is_err();
+        entry.auto_start = auto_start.unwrap_or(false);
+    }
+    reply.text = serde_json::to_string(&details)?;
+    Ok(reply)
+}
+
 async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
     Some(match action {
         Action::Monitor { name } => {
@@ -1113,7 +1125,16 @@ async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
             }
             .await
         }
-        Action::List => Ok(hub.list.borrow().clone()),
+        Action::List => {
+            // Runtime observations can use the pushed snapshot, but startup
+            // opt-in must reflect the saved file at this explicit refresh.
+            // Keep filesystem reads independent of the mutation actor and
+            // off the async worker, including while a long action is running.
+            let reply = hub.list.borrow().clone();
+            tokio::task::spawn_blocking(move || refresh_startup_details(reply))
+                .await
+                .unwrap_or_else(|error| Err(error.into()))
+        }
         Action::UpdateStatus => serde_json::to_string(&*hub.updates.borrow())
             .map(Reply::text)
             .map_err(Into::into),

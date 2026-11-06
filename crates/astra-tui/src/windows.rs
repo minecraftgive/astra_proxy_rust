@@ -1,13 +1,12 @@
 //! Independent terminal windows sharing the existing manager, never the UI checkpoint.
 use crate::{i18n::Language, protocol::Kind};
-use anyhow::{Context as _, Result};
-#[cfg(not(windows))]
-use std::process::Stdio;
+use anyhow::Result;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Command,
 };
+#[cfg(windows)]
+use {anyhow::Context as _, std::process::Command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -125,7 +124,7 @@ pub struct Context {
     pub language: Language,
 }
 impl Context {
-    fn arguments(&self, launch: &Launch) -> Vec<OsString> {
+    pub(crate) fn arguments(&self, launch: &Launch) -> Vec<OsString> {
         let mut args = vec![
             "--state-dir".into(),
             self.home.clone().into_os_string(),
@@ -169,106 +168,47 @@ impl Context {
         }
         args
     }
-    pub fn open(&self, launch: &Launch) -> Result<()> {
+    pub fn open(&self, launch: &Launch, terminal: &str) -> Result<()> {
         let args = self.arguments(launch);
         let title = format!("Astra · {}", launch.view.unwrap_or(View::Dashboard).name());
-        #[cfg(windows)]
-        let child = {
-            use std::os::windows::process::CommandExt;
-            // An explicit user request for a separate interactive console.
-            Command::new(&self.executable)
-                .args(&args)
-                .arg("--native-console")
-                .creation_flags(0x00000010)
-                .spawn()
-                .context("Cannot open a new terminal window")?
-        };
-        #[cfg(target_os = "macos")]
-        let child = {
-            let command = std::iter::once(self.executable.as_os_str())
-                .chain(args.iter().map(|a| a.as_os_str()))
-                .map(|s| shell_quote(&s.to_string_lossy()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let script = format!(
-                "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-                apple_quote(&format!("exec {command}"))
-            );
-            Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("Cannot open Terminal")?
-        };
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let child = {
-            let candidates: [(&str, &[&str]); 4] = [
-                ("x-terminal-emulator", &["-e"]),
-                ("gnome-terminal", &["--window", "--"]),
-                ("konsole", &["--separate", "-e"]),
-                ("xterm", &["-e"]),
-            ];
-            let mut launched = None;
-            for (program, prefix) in candidates {
-                match Command::new(program)
-                    .args(prefix)
-                    .arg(&self.executable)
+        if matches!(
+            crate::terminals::launch(terminal, &self.executable, &args)?,
+            crate::terminals::LaunchOutcome::Native
+        ) {
+            #[cfg(windows)]
+            {
+                // A missing/disabled external host still has the native console.
+                // This internal flag prevents the fallback from scanning again.
+                let mut child = Command::new(&self.executable)
                     .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .arg("--native-console")
+                    .arg("--terminal-native")
                     .spawn()
-                {
-                    Ok(child) => {
-                        launched = Some(child);
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e).context("Cannot open terminal"),
-                }
+                    .context("Cannot open a new terminal window")?;
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
             }
-            launched.context("Install x-terminal-emulator, gnome-terminal, konsole or xterm to open a new window")?
-        };
-        // Reap launcher/terminal processes without holding up the TUI.
-        std::thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-        });
+            #[cfg(not(windows))]
+            anyhow::bail!(
+                "No supported terminal is installed; install a terminal and rescan in Settings"
+            );
+        }
         if let Ok(log) = crate::tui_log::Log::open(&self.home.join("tui.log")) {
             log.write("window", &format!("opened {title}"));
         }
         Ok(())
     }
 }
-// A new Windows console must use its own input/output, even if the parent had
-// inherited handles to another terminal or redirected output.
 #[cfg(windows)]
-pub fn attach_console_io() -> Result<()> {
-    use std::{fs::OpenOptions, os::windows::io::AsRawHandle};
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn SetStdHandle(which: u32, handle: *mut std::ffi::c_void) -> i32;
-    }
-    for (which, path) in [(-10i32, "CONIN$"), (-11, "CONOUT$"), (-12, "CONOUT$")] {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .context("Open new console input/output")?;
-        // The OS standard-handle table owns these handles until process exit.
-        if unsafe { SetStdHandle(which as u32, file.as_raw_handle()) } == 0 {
-            return Err(std::io::Error::last_os_error()).context("Attach new console input/output");
-        }
-        std::mem::forget(file);
-    }
-    Ok(())
-}
-#[cfg(any(target_os = "macos", test))]
+mod console;
+#[cfg(test)]
 use crate::shell::shell_quote;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(windows, test))]
+use console::attach_console_io;
+#[cfg(windows)]
+pub use console::{prepare_console, report_startup_error, ConsoleMode};
+#[cfg(test)]
 fn apple_quote(value: &str) -> String {
     format!(
         "\"{}\"",

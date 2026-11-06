@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-from astra_tools.artifacts import ArtifactIndex, ROLES, role_binaries, role_packages, stage, write_release_manifest
+from astra_tools.artifacts import ArtifactIndex, COMPONENT_PACKAGES, ROLES, role_binaries, role_packages, stage, write_release_manifest
 from astra_tools.package_checks import verify_manifest
 from astra_tools.platform import executable
 from astra_tools.workspace import BuildLayout, cargo_profile, resolve_binary_dir
@@ -104,20 +104,23 @@ class ProfileResolutionTests(unittest.TestCase):
 
 
 class BuildCommandTests(unittest.TestCase):
-    def test_silent_startup_helper_is_built_only_for_windows_tui_roles(self):
+    def test_tui_roles_build_the_main_binary_without_a_silent_startup_helper(self):
         helper = 'astra-tui-startup'
+        self.assertNotIn(helper, COMPONENT_PACKAGES)
         for target in ('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc',
                        'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'):
             for role in ROLES:
                 with self.subTest(target=target, role=role):
                     command = build.build_command((role,), target, 'release')
                     binaries = [command[i + 1] for i, item in enumerate(command) if item == '--bin']
-                    self.assertEqual(helper in binaries, 'windows' in target and role in ('client', 'server'))
+                    self.assertNotIn(helper, binaries)
+                    self.assertEqual('astra-tui' in binaries, role == 'client')
+                    self.assertEqual('astra-server-tui' in binaries, role == 'server')
                     self.assertEqual('astra-service' in binaries, 'windows' in target and role == 'client')
                     packages = [command[i + 1] for i, item in enumerate(command) if item == '-p']
-                    self.assertNotIn(helper, packages, 'the helper belongs to the astra-tui crate')
+                    self.assertNotIn(helper, packages)
 
-    def test_silent_helper_is_staged_manifested_and_indexed_for_windows(self):
+    def test_tui_artifacts_exclude_stale_helper_and_keep_platform_specific_components(self):
         helper = 'astra-tui-startup'
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -125,8 +128,10 @@ class BuildCommandTests(unittest.TestCase):
             bins.mkdir()
             for binary in role_binaries(('client', 'server'), target='x86_64-pc-windows-msvc'):
                 (bins / executable(binary)).write_bytes(b'executable fixture')
+            # An old build output must not leak into new packages or manifests.
+            (bins / executable(helper)).write_bytes(b'obsolete helper fixture')
             versions = {name: '0.1.0' for name in role_packages(('client', 'server'))}
-            for target in ('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'):
+            for target in ('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'):
                 index = ArtifactIndex(root / target, target)
                 for role in ('client', 'server'):
                     with self.subTest(target=target, role=role):
@@ -134,13 +139,15 @@ class BuildCommandTests(unittest.TestCase):
                                        versions=versions, label='0.1.0', profile='release')
                         manifest = verify_manifest(staged, role)
                         index.add(role=role, profile='release', binary_dir=bins, staged=staged)
-                        included = 'windows' in target
-                        self.assertEqual((staged / executable(helper)).is_file(), included)
-                        self.assertEqual(helper in manifest['components'], included)
-                        self.assertEqual(helper in index.entries[-1]['binaries'], included)
-                        if included:
-                            self.assertEqual(manifest['components'][helper], versions['astra-tui'])
-                        service = included and role == 'client'
+                        self.assertFalse((staged / executable(helper)).exists())
+                        self.assertNotIn(helper, manifest['components'])
+                        self.assertNotIn(executable(helper), {entry['path'] for entry in manifest['files']})
+                        self.assertNotIn(helper, index.entries[-1]['binaries'])
+                        tui = 'astra-tui' if role == 'client' else 'astra-server-tui'
+                        self.assertTrue((staged / executable(tui)).is_file())
+                        self.assertEqual(manifest['components'][tui], versions['astra-tui'])
+                        self.assertIn(tui, index.entries[-1]['binaries'])
+                        service = 'windows' in target and role == 'client'
                         self.assertEqual((staged / executable('astra-service')).is_file(), service)
                         self.assertEqual('astra-service' in manifest['components'], service)
                         self.assertEqual('astra-service' in index.entries[-1]['binaries'], service)

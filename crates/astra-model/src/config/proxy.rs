@@ -119,6 +119,8 @@ impl Tun {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     #[serde(default)]
+    pub auto_start: bool,
+    #[serde(default)]
     pub rule_socket: String,
     #[serde(default)]
     pub standalone: bool,

@@ -98,6 +98,7 @@ fn yes() -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub auto_start: bool,
     pub max_connections: usize,
     pub max_udp_flows: usize,
     pub handshake_timeout_secs: u64,
@@ -111,6 +112,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            auto_start: false,
             max_connections: 1024,
             max_udp_flows: 512,
             handshake_timeout_secs: 10,

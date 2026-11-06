@@ -5,24 +5,20 @@ pub(super) async fn run_local(
     socket: PathBuf,
     context: crate::windows::Context,
     launch: crate::windows::Launch,
+    resume_ui: bool,
+    mut restart_ready: Option<PathBuf>,
 ) -> Result<()> {
     let session_path = launch.session_path(&crate::protocol::session_home(&context.home)?)?;
-    let mut ui = match Session::load(&session_path) {
-        Ok(session) => Ui::new(session),
-        Err(error) => {
-            let mut ui = Ui::new(Session::default());
-            ui.fail(
-                tr!("Cannot restore session: {}", format!("{error:#}")),
-                Resume::Session,
-            );
-            ui
-        }
-    };
+    let mut ui = restore_session(&session_path, restart_ready.is_some())?;
     // Preferences are per user, shared by every window and remote target.
     ui.load_preferences(context.home.join(settings::FILE));
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     ui.load_startup_context(&context);
-    let mut startup = startup::Instances::new(ui.preferences.auto_start_instances, &launch);
+    let mut startup = if resume_ui {
+        startup::Instances::resumed()
+    } else {
+        startup::Instances::new(&launch)
+    };
     ui.page = ui.preferences.start_page.page();
     if let Some(view) = launch.view {
         if let Some(page) = view.page() {
@@ -32,7 +28,10 @@ pub(super) async fn run_local(
     if let Some(kind) = launch.kind {
         ui.kind = kind;
     }
+    let window_id = launch.window_id.clone();
     let mut initial = Some(launch);
+    let mut restart = update::Restart::new(resume_ui);
+    let mut restarted = false;
     let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     ui.mouse_request = None;
     let mut screen = TerminalSession::enter(TerminalOptions {
@@ -61,6 +60,7 @@ pub(super) async fn run_local(
     let outcome = 'ui: loop {
         if refresh {
             let previous = MotionState::of(&ui);
+            redraw |= ui.poll_terminal_scan().await;
             redraw |= feeds.poll(&mut ui).await;
             if feeds.ready {
                 if let Some(launch) = initial.take() {
@@ -110,6 +110,53 @@ pub(super) async fn run_local(
             if let Some(view) = &mut ui.monitor {
                 redraw |= view.poll(&socket).await;
             }
+            let idle = !quit && initial.is_none() && opening.is_empty() && ui.restart_ready();
+            match restart
+                .poll(ui.update_status.as_ref(), &context, idle)
+                .await
+            {
+                Ok(Some(mut target)) => {
+                    // Do not relinquish the old UI until its complete draft is
+                    // durable. The new process opens this exact window session.
+                    if ui.checkpoint(&session_path) {
+                        let launch = ui.restart_launch(window_id.clone());
+                        target.language = crate::i18n::language();
+                        drop(events.take());
+                        let result = screen
+                            .suspend()
+                            .map_err(anyhow::Error::from)
+                            .and_then(|()| crate::self_update::restart(&target, &launch));
+                        match result {
+                            Ok(()) => {
+                                restarted = true;
+                                break Ok(());
+                            }
+                            Err(error) => {
+                                if let Err(restore) = screen.resume() {
+                                    break Err(
+                                        error.context(format!("Restore terminal: {restore}"))
+                                    );
+                                }
+                                events = Some(event::EventStream::new());
+                                terminal.backend_mut().writer_mut().invalidate();
+                                ui.animations.resize();
+                                ui.message = tr!(
+                                    "Cannot restart updated interface: {}",
+                                    format!("{error:#}")
+                                );
+                            }
+                        }
+                    } else {
+                        restart.defer(target);
+                    }
+                    redraw = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    ui.message = tr!("Cannot restart updated interface: {}", format!("{error:#}"));
+                    redraw = true;
+                }
+            }
             for viewer in [&mut ui.viewer, &mut ui.tui_viewer].into_iter().flatten() {
                 let revision = viewer.revision();
                 viewer.poll();
@@ -131,6 +178,11 @@ pub(super) async fn run_local(
         if redraw && last_frame.elapsed() >= ui.animations.draw_interval() {
             if let Err(error) = ui.draw(&mut terminal) {
                 break Err(error);
+            }
+            if let Some(path) = restart_ready.take() {
+                if let Err(error) = crate::self_update::signal_ready(&path) {
+                    break Err(error);
+                }
             }
             last_frame = Instant::now();
             redraw = false;
@@ -248,8 +300,9 @@ pub(super) async fn run_local(
                     let mut context = context.clone();
                     // New windows open in the language chosen in Settings now.
                     context.language = crate::i18n::language();
+                    let terminal = ui.preferences.terminal.clone();
                     opening.push(tokio::task::spawn_blocking(move || {
-                        let result = context.open(&launch);
+                        let result = context.open(&launch, &terminal);
                         super::wake();
                         result
                     }));
@@ -309,6 +362,11 @@ pub(super) async fn run_local(
     finish_session(
         outcome,
         || {
+            // The replacement may already be saving its own session. Never
+            // overwrite it with a late checkpoint from the outgoing process.
+            if restarted {
+                return Ok(());
+            }
             anyhow::ensure!(
                 ui.checkpoint(&session_path),
                 "Cannot save final UI session: {}",
@@ -318,6 +376,61 @@ pub(super) async fn run_local(
         },
         || screen.suspend().map_err(Into::into),
     )
+}
+
+fn restore_session(path: &std::path::Path, handoff: bool) -> Result<Ui> {
+    // A replacement must prove it can read the checkpoint before acknowledging
+    // readiness. The outgoing process still owns the recoverable draft.
+    anyhow::ensure!(
+        !handoff || path.is_file(),
+        "Missing saved interface session for restart"
+    );
+    match Session::load(path) {
+        Ok(session) => Ok(Ui::new(session)),
+        Err(error) if handoff => Err(error).context("Restore updated interface session"),
+        Err(error) => {
+            let mut ui = Ui::new(Session::default());
+            ui.fail(
+                tr!("Cannot restore session: {}", format!("{error:#}")),
+                Resume::Session,
+            );
+            Ok(ui)
+        }
+    }
+}
+
+impl Ui {
+    fn restart_ready(&self) -> bool {
+        let ready = !self.tasks.running()
+            && !self.persistence_paused
+            && self.recovery.is_none()
+            // Confirmation overlays are intentionally not persisted.
+            && !self.prompt.as_ref().is_some_and(Prompt::confirmation);
+        #[cfg(windows)]
+        let ready = ready && self.service_change.is_none();
+        ready
+    }
+
+    fn restart_launch(&self, window_id: Option<String>) -> crate::windows::Launch {
+        let (view, instance) = if self.tui_viewer.is_some() {
+            (crate::windows::View::TuiLog, None)
+        } else if let Some(viewer) = &self.viewer {
+            (crate::windows::View::Logs, Some(viewer.name.clone()))
+        } else if let Some(view) = &self.diagnostics {
+            (crate::windows::View::Diagnostics, Some(view.name.clone()))
+        } else {
+            (
+                crate::windows::View::from_page(self.page),
+                self.selected().map(|row| row.instance.name.clone()),
+            )
+        };
+        crate::windows::Launch {
+            view: Some(view),
+            instance,
+            kind: Some(self.kind),
+            window_id,
+        }
+    }
 }
 
 fn finish_session(

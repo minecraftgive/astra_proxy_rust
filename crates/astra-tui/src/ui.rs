@@ -17,6 +17,11 @@ mod node_transfer;
 mod operations;
 mod pages;
 mod settings;
+pub(crate) fn preferred_terminal(home: &std::path::Path) -> String {
+    settings::load(&home.join(settings::FILE), &Session::default())
+        .0
+        .terminal
+}
 mod shell;
 mod startup;
 pub(crate) use startup::{log_startup, run_silent};
@@ -482,6 +487,7 @@ struct Ui {
     service_change: Option<tokio::task::JoinHandle<std::result::Result<bool, String>>>,
     settings_cursor: usize,
     settings_view: settings::View,
+    terminals: settings::TerminalState,
     /// Ctrl+Home held on the accent setting: (first press, latest press, done).
     marquee_hold: Option<(Instant, Instant, bool)>,
     program_info: background::ProgramInformation,
@@ -646,6 +652,7 @@ impl Ui {
             service_change: None,
             settings_cursor: 0,
             settings_view: Default::default(),
+            terminals: Default::default(),
             marquee_hold: None,
             program_info: Default::default(),
             mouse_request: None,
@@ -1314,6 +1321,11 @@ impl Ui {
         if self.palette.is_some() {
             return self.palette_key(key);
         }
+        if self.page == shell::SETTINGS && self.terminals.picker.is_some() && self.live_input() {
+            if let Some(input) = self.settings_key(key) {
+                return input;
+            }
+        }
         if let Some(input) = self.focus_key(key) {
             return input;
         }
@@ -1341,6 +1353,7 @@ impl Ui {
             && self.can_switch_page()
             && !self.connection_filtering
             && self.runtime_picker.is_none()
+            && self.terminals.picker.is_none()
             && !self.live_detail_open()
             && self.editor.is_none()
             && !(self.page == shell::CONNECTIONS && !self.connection_filter.is_empty())
@@ -2297,9 +2310,17 @@ pub async fn run(
     socket: PathBuf,
     context: crate::windows::Context,
     launch: crate::windows::Launch,
+    resume_ui: bool,
+    restart_ready: Option<PathBuf>,
 ) -> Result<()> {
     tokio::task::LocalSet::new()
-        .run_until(event_loop::run_local(socket, context, launch))
+        .run_until(event_loop::run_local(
+            socket,
+            context,
+            launch,
+            resume_ui,
+            restart_ready,
+        ))
         .await
 }
 /// Ctrl-C is normally a raw-mode key event, but sudo needs a real terminal.

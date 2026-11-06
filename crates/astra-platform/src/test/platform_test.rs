@@ -2,6 +2,67 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
+#[test]
+fn home_directory_resolves_with_service_environment_and_preserves_overrides() {
+    const CASE: &str = "ASTRA_TEST_HOME_DIRECTORY_CASE";
+    const EXPECTED: &str = "ASTRA_TEST_HOME_DIRECTORY_EXPECTED";
+    if let Some(case) = std::env::var_os(CASE) {
+        let expected = PathBuf::from(std::env::var_os(EXPECTED).unwrap());
+        assert_eq!(home_dir().unwrap(), expected, "case: {case:?}");
+        return;
+    }
+
+    let root = std::env::temp_dir().join("astra home 中文");
+    let local = root.join("local");
+    let profile = root.join("profile");
+    let known = known_folder_dir(
+        &windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData,
+        "local application data",
+    )
+    .unwrap();
+    assert!(known.is_absolute());
+    for (case, expected) in [
+        ("local-preferred", &local),
+        ("profile-only", &profile),
+        ("service-environment", &known),
+    ] {
+        // Isolate environment changes and match the privilege service's
+        // restricted environment, without inheriting a cached folder lookup.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        background_command(&mut command, false);
+        command.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .args([
+                "--exact",
+                "platform::tests::home_directory_resolves_with_service_environment_and_preserves_overrides",
+                "--nocapture",
+            ])
+            .env(CASE, case)
+            .env(EXPECTED, expected)
+            // Per-user paths such as the system proxy lock must not depend
+            // on which runtime directory a particular manager selected.
+            .env("ASTRA_RUNTIME_DIR", root.join("runtime"));
+        if case == "local-preferred" {
+            command.env("LOCALAPPDATA", &local);
+        }
+        if matches!(case, "local-preferred" | "profile-only") {
+            command.env("USERPROFILE", &profile);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{case}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[tokio::test]
 async fn forced_recovery_preserves_live_pipes_links_and_nonmarkers() {
     let directory = std::env::temp_dir().join(format!(

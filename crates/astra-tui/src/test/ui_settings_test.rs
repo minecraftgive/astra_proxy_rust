@@ -36,6 +36,167 @@ fn press(ui: &mut Ui, code: KeyCode) {
     ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+fn terminal_candidate(id: &str, label: &str) -> crate::terminals::Candidate {
+    crate::terminals::Candidate {
+        id: id.into(),
+        label: label.into(),
+        executable: Some(std::path::PathBuf::from("installed-terminal")),
+    }
+}
+
+#[test]
+fn terminal_preference_defaults_to_auto_and_preserves_missing_selections() {
+    let old: Preferences = serde_json::from_str(r#"{"mouse":false}"#).unwrap();
+    assert_eq!(old.terminal, "auto");
+    let (mut ui, dir) = settings_ui();
+    assert!(ui.change_preferences(|p| p.terminal = "uninstalled-terminal".into()));
+    let choices = ui.terminal_choices();
+    assert_eq!(choices[0].id, "auto");
+    assert_eq!(
+        choices.iter().any(|choice| choice.id == "native"),
+        cfg!(windows)
+    );
+    let selected = &choices[ui.setting_index(Field::Terminal)];
+    assert_eq!(selected.id, "uninstalled-terminal");
+    assert!(!selected.available);
+    assert!(selected.label.contains(t("Unavailable")));
+    assert_eq!(
+        super::super::preferred_terminal(dir.path()),
+        "uninstalled-terminal"
+    );
+    let before = ui.preferences.clone();
+    ui.choose_setting(Field::Terminal, ui.setting_index(Field::Terminal));
+    assert_eq!(ui.preferences, before);
+    assert!(ui.message.contains(t(
+        "This terminal is unavailable. Scan again or choose another terminal."
+    )));
+}
+
+#[test]
+fn terminal_picker_saves_ids_handles_escape_and_keeps_choice_on_save_failure() {
+    let (mut ui, dir) = settings_ui();
+    ui.terminals.candidates = vec![terminal_candidate("wezterm", "WezTerm")];
+    let index = ui
+        .terminal_choices()
+        .iter()
+        .position(|choice| choice.id == "wezterm")
+        .unwrap();
+    ui.settings_cursor = ALL_FIELDS
+        .iter()
+        .position(|field| *field == Field::Terminal)
+        .unwrap();
+    let page = ui.page;
+    press(&mut ui, KeyCode::Enter);
+    assert!(ui.terminals.picker.is_some());
+    press(&mut ui, KeyCode::Tab);
+    assert_eq!(
+        ui.focus.region,
+        focus::Region::Main,
+        "dropdown owns local focus keys"
+    );
+    let selected = ui.terminals.picker.clone();
+    press(&mut ui, KeyCode::Char('j'));
+    assert_eq!(ui.terminals.picker, selected, "Vim aliases remain opt-in");
+    press(&mut ui, KeyCode::Esc);
+    assert!(ui.terminals.picker.is_none());
+    assert_eq!(
+        ui.page, page,
+        "Escape closes the dropdown before page history"
+    );
+    press(&mut ui, KeyCode::Enter);
+    press(&mut ui, KeyCode::End);
+    press(&mut ui, KeyCode::Enter);
+    assert_eq!(ui.preferences.terminal, "wezterm");
+    assert!(ui.terminals.picker.is_none());
+    assert_eq!(
+        load(&dir.path().join(FILE), &Session::default()).0.terminal,
+        "wezterm"
+    );
+    // Save failures must keep both the displayed and persisted choice intact.
+    ui.preferences_path = Some(dir.path().to_owned());
+    ui.choose_setting(Field::Terminal, 0);
+    assert_eq!(ui.preferences.terminal, "wezterm");
+    assert_eq!(ui.setting_index(Field::Terminal), index);
+    assert!(ui
+        .message
+        .contains(t("Cannot save preferences: {}").split("{}").next().unwrap()));
+    press(&mut ui, KeyCode::Char('r'));
+    assert!(ui.terminals.pending);
+    assert_eq!(ui.preferences.terminal, "wezterm");
+}
+
+#[tokio::test]
+async fn terminal_scanning_runs_on_entry_and_refresh_preserves_saved_id() {
+    let (mut ui, _dir) = settings_ui();
+    assert!(ui.poll_terminal_scan().await);
+    assert!(ui.terminals.inside_settings);
+    assert!(!ui.terminals.pending);
+    // Complete the bounded PATH scan before substituting a deterministic result.
+    ui.terminals.scan.take().unwrap().await.unwrap();
+    assert!(
+        !ui.poll_terminal_scan().await,
+        "polling does not scan every frame"
+    );
+    ui.preferences.terminal = "wezterm".into();
+    ui.terminals.scan = Some(tokio::spawn(async {
+        vec![terminal_candidate("alacritty", "Alacritty")]
+    }));
+    while !ui.terminals.scan.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert!(ui.poll_terminal_scan().await);
+    assert_eq!(ui.preferences.terminal, "wezterm");
+    assert!(!ui.terminal_choices()[ui.setting_index(Field::Terminal)].available);
+    assert!(!ui.poll_terminal_scan().await);
+    ui.page = shell::OVERVIEW;
+    assert!(!ui.poll_terminal_scan().await);
+    ui.page = shell::SETTINGS;
+    assert!(
+        ui.poll_terminal_scan().await,
+        "returning to settings scans again"
+    );
+    ui.terminals.scan.take().unwrap().await.unwrap();
+}
+
+#[test]
+fn terminal_dropdown_renders_and_mouse_selects_only_visible_choices() {
+    let (mut ui, _dir) = settings_ui();
+    ui.terminals.candidates = vec![terminal_candidate("wezterm", "WezTerm")];
+    ui.open_terminal_picker();
+    let index = ui
+        .terminal_choices()
+        .iter()
+        .position(|choice| choice.id == "wezterm")
+        .unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("WezTerm"));
+    let rect = ui
+        .hits
+        .borrow()
+        .iter()
+        .find_map(|(rect, target)| match target {
+            Target::Setting(_, Some(choice)) if *choice == index => Some(*rect),
+            _ => None,
+        })
+        .unwrap();
+    ui.mouse(event::MouseEvent {
+        kind: event::MouseEventKind::Down(event::MouseButton::Left),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(ui.preferences.terminal, "wezterm");
+    assert!(ui.terminals.picker.is_none());
+}
+
 #[test]
 fn every_field_round_trips_each_choice() {
     for field in ALL_FIELDS {
@@ -48,33 +209,26 @@ fn every_field_round_trips_each_choice() {
 }
 
 #[test]
-fn startup_defaults_are_off_and_instance_choice_persists() {
-    let old: Preferences = serde_json::from_str(r#"{"mouse":false}"#).unwrap();
-    assert!(!old.auto_start_instances);
+fn legacy_instance_startup_preference_is_ignored_and_not_saved() {
+    let old: Preferences =
+        serde_json::from_str(r#"{"auto_start_instances":true,"mouse":false}"#).unwrap();
+    assert!(!old.mouse);
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     assert!(!old.startup_enabled);
-    let (mut ui, dir) = settings_ui();
-    let row = ALL_FIELDS
-        .iter()
-        .position(|f| *f == Field::AutoStartInstances)
-        .unwrap();
-    ui.click_setting(row, Some(0));
-    let (loaded, error) = load(&dir.path().join(FILE), &Session::default());
-    assert!(error.is_none());
-    assert!(loaded.auto_start_instances);
-    ui.settings_cursor = row;
-    press(&mut ui, KeyCode::Delete);
-    let (loaded, _) = load(&dir.path().join(FILE), &Session::default());
-    assert!(!loaded.auto_start_instances);
+    assert!(serde_json::to_value(old)
+        .unwrap()
+        .get("auto_start_instances")
+        .is_none());
 }
 
 #[test]
-fn failed_startup_preference_save_keeps_previous_choice_and_error() {
+fn failed_preference_save_keeps_previous_choice_and_error() {
     let (mut ui, dir) = settings_ui();
     // A directory cannot be replaced with the preferences file.
     std::fs::create_dir(dir.path().join(FILE)).unwrap();
-    ui.choose_setting(Field::AutoStartInstances, 0);
-    assert!(!ui.preferences.auto_start_instances);
+    let previous = ui.preferences.mouse;
+    ui.choose_setting(Field::Mouse, usize::from(previous));
+    assert_eq!(ui.preferences.mouse, previous);
     assert!(ui
         .message
         .contains(t("Cannot save preferences: {}").split("{}").next().unwrap()));

@@ -2,6 +2,81 @@ use super::*;
 use astra_model::nettool::Egress;
 use astra_model::nettool::Probe;
 
+#[test]
+fn instance_auto_start_is_opt_in_and_defaults_off_for_older_json_peers() {
+    for json in ["{}", r#"{"modes":["Standalone"]}"#] {
+        let details: InstanceDetails = serde_json::from_str(json).unwrap();
+        assert!(!details.auto_start);
+    }
+    let details: InstanceDetails = serde_json::from_str(r#"{"auto_start":true}"#).unwrap();
+    assert!(details.auto_start);
+    let encoded = serde_json::to_value(details).unwrap();
+    assert_eq!(encoded["auto_start"], true);
+}
+
+#[tokio::test]
+async fn auto_start_metadata_preserves_the_existing_bincode_reply_and_row_layout() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyRow {
+        instance: Instance,
+        pid: Option<u32>,
+        state: String,
+        uptime: u64,
+        changed: bool,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyReply {
+        version: u16,
+        error: Option<String>,
+        rows: Vec<LegacyRow>,
+        text: String,
+    }
+    let reply = Reply {
+        version: astra_ipc::API_VERSION,
+        error: None,
+        rows: vec![Row {
+            instance: Instance {
+                name: "proxy".into(),
+                kind: Kind::Proxy,
+                config: PathBuf::from("proxy.toml"),
+            },
+            pid: Some(123),
+            state: "Running".into(),
+            uptime: 456,
+            changed: true,
+        }],
+        text: serde_json::to_string(&std::collections::HashMap::from([(
+            "proxy",
+            InstanceDetails {
+                auto_start: true,
+                ..Default::default()
+            },
+        )]))
+        .unwrap(),
+    };
+    let (mut client, mut server) = astra_platform::platform::stream_pair().await.unwrap();
+    astra_ipc::send_management(&mut client, &reply)
+        .await
+        .unwrap();
+    let legacy: LegacyReply = astra_ipc::receive_management(&mut server).await.unwrap();
+    assert_eq!(legacy.version, reply.version);
+    assert!(legacy.error.is_none());
+    assert_eq!(legacy.rows.len(), 1);
+    assert_eq!(legacy.rows[0].instance.name, "proxy");
+    assert_eq!(legacy.rows[0].instance.config, PathBuf::from("proxy.toml"));
+    assert_eq!(legacy.rows[0].pid, Some(123));
+    assert_eq!(legacy.rows[0].state, "Running");
+    assert_eq!(legacy.rows[0].uptime, 456);
+    assert!(legacy.rows[0].changed);
+    astra_ipc::send_management(&mut client, &legacy)
+        .await
+        .unwrap();
+    let received: Reply = astra_ipc::receive_management(&mut server).await.unwrap();
+    let details: std::collections::HashMap<String, InstanceDetails> =
+        serde_json::from_str(&received.text).unwrap();
+    assert!(details["proxy"].auto_start);
+}
+
 #[tokio::test]
 async fn force_start_is_explicit_and_preserves_existing_wire_actions() {
     use tokio::io::AsyncReadExt;

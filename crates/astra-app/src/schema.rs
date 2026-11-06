@@ -100,6 +100,14 @@ pub const PROTOCOLS: &[&str] = &[
     "tuic",
 ];
 
+fn auto_start(t: fn(&str) -> &str) -> Spec {
+    Spec {
+        kind: Type::Boolean,
+        help: t("Start this instance when TUI or silent startup runs.").into(),
+        ..Spec::text("auto_start", t("Auto-start this instance"), "false", false)
+    }
+}
+
 pub fn rows_for(
     doc: &DocumentMut,
     path: &[Part],
@@ -172,6 +180,7 @@ pub fn server_rows(doc: &DocumentMut, path: &[Part], t: fn(&str) -> &str) -> Vec
                 ),
                 boolean("allow_private_targets", false),
                 list("deny_cidrs", false),
+                auto_start(t),
             ],
             vec!["listeners"],
         )
@@ -433,6 +442,7 @@ pub fn rows(
                         false,
                     )
                 },
+                auto_start(t),
             ]
         } else {
             vec![
@@ -469,6 +479,7 @@ pub fn rows(
                         false,
                     )
                 },
+                auto_start(t),
             ]
         }
     } else if last_key(path) == Some("subscription")
@@ -941,6 +952,9 @@ pub fn rows(
             field.required = true;
         }
         field.help = match field.key.as_str() {
+            "auto_start" if path.is_empty() => {
+                t("Start this instance when TUI or silent startup runs.").into()
+            }
             "action" | "default_action" => {
                 t("Select direct / block / a proxy node; manual proxy:tag is supported").into()
             }

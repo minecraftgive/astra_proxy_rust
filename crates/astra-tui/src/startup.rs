@@ -130,9 +130,11 @@ fn arguments(context: &Context, target: &Target, silent: bool) -> Result<OsStrin
         OsString::from("--bin-dir"),
         shell_path(&std::path::absolute(&context.bin)?),
     ];
-    if !silent {
-        args.push(OsString::from("--native-console"));
-    }
+    args.push(OsString::from(if silent {
+        "--silent"
+    } else {
+        "--native-console"
+    }));
     if let Some((endpoint, agent)) = target {
         args.extend([
             OsString::from("--endpoint"),
@@ -181,20 +183,6 @@ fn quote_arguments(args: &[OsString]) -> Result<OsString> {
     Ok(OsString::from_wide(&output))
 }
 
-fn shortcut_executable(context: &Context, silent: bool) -> Result<PathBuf> {
-    let executable = std::path::absolute(&context.executable)?;
-    if !silent {
-        return Ok(executable);
-    }
-    let helper = executable.with_file_name("astra-tui-startup.exe");
-    anyhow::ensure!(
-        helper.is_file(),
-        "Silent startup requires astra-tui-startup.exe beside the TUI; install a complete package ({})",
-        helper.display()
-    );
-    Ok(helper)
-}
-
 fn create_shortcut(path: &Path, context: &Context, target: &Target, silent: bool) -> Result<()> {
     // A dedicated apartment avoids changing the UI executor thread's COM mode.
     // Use IShellLinkW directly: WScript.Shell corrupts non-ANSI arguments even
@@ -224,7 +212,7 @@ fn create_shortcut_in_apartment(
         },
     };
     let _apartment = ComApartment::new()?;
-    let executable = shortcut_executable(context, silent)?;
+    let executable = std::path::absolute(&context.executable)?;
     let directory = wide(&shell_path(
         executable
             .parent()
@@ -241,7 +229,7 @@ fn create_shortcut_in_apartment(
         shortcut.SetWorkingDirectory(PCWSTR(directory.as_ptr()))?;
         shortcut.SetDescription(w!("Astra TUI - start at Windows sign-in"))?;
         // SetShowCmd only supports normal/maximized/minimized, not SW_HIDE.
-        // The silent helper uses the GUI subsystem and never creates a window.
+        // The frontend uses the GUI subsystem; --silent never creates a window.
         shortcut.SetShowCmd(SW_SHOWNORMAL)?;
         let file: IPersistFile = shortcut.cast()?;
         file.Save(PCWSTR(destination.as_ptr()), true)

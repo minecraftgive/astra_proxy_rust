@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
+    #[serde(default)]
+    pub auto_start: bool,
     pub socket: String,
     #[serde(default)]
     pub watch_config: bool,

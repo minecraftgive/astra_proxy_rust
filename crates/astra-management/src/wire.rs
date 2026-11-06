@@ -45,6 +45,8 @@ pub struct Row {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstanceDetails {
+    /// Explicit opt-in from this instance's top-level TOML configuration.
+    pub auto_start: bool,
     pub network_recovery: Option<astra_model::recovery::Notice>,
     pub server_status: Option<crate::v2::ServerSnapshot>,
     pub modes: Vec<String>,

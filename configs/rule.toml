@@ -1,3 +1,4 @@
+auto_start = false
 socket = "/tmp/astra-rule.sock"
 default_action = "direct"
 direct_local = true

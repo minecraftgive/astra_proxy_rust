@@ -1,5 +1,6 @@
 # Standalone DNS service; no Rule Core or proxy inbound required.
 # Point a test DNS client at 127.0.0.1:1053 (UDP or TCP).
+auto_start = false
 [dns]
 enable = true
 listen = ["127.0.0.1:1053"]

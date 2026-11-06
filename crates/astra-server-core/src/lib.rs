@@ -97,7 +97,7 @@ pub async fn run() -> Result<()> {
                     .open(&path)?;
                 astra_platform::platform::set_private(&path, 0o600)?;
                 use std::io::Write;
-                write!(file,"# Bind to loopback until TLS and firewall settings are ready.\n[[listeners]]\ntag = \"vless\"\nprotocol = \"vless\"\nlisten = \"127.0.0.1:24443\"\nallow_plaintext = true\n[[listeners.users]]\nname = \"default\"\nuuid = \"{id}\"\n")?;
+                write!(file,"# Bind to loopback until TLS and firewall settings are ready.\nauto_start = false\n[[listeners]]\ntag = \"vless\"\nprotocol = \"vless\"\nlisten = \"127.0.0.1:24443\"\nallow_plaintext = true\n[[listeners.users]]\nname = \"default\"\nuuid = \"{id}\"\n")?;
                 println!("Created {}", path.display());
                 return Ok(());
             }

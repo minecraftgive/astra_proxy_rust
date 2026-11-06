@@ -30,9 +30,12 @@ pub fn runtime_path_in(root: &Path, source: &Path, category: &str) -> io::Result
 /// The directory writable runtime state belongs in, also for elevated cores
 /// that must keep using the invoking user's documents after dropping root.
 pub fn runtime_root() -> io::Result<PathBuf> {
-    Ok(std::env::var_os("ASTRA_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(crate::platform::home_dir()?.join(".astra/runtime")))
+    // Elevated/service cores may have no home environment; resolve it only
+    // when the launcher has not supplied an explicit runtime directory.
+    std::env::var_os("ASTRA_RUNTIME_DIR").map_or_else(
+        || crate::platform::home_dir().map(|home| home.join(".astra/runtime")),
+        |runtime| Ok(PathBuf::from(runtime)),
+    )
 }
 
 pub fn prepare_parent(path: &Path) -> io::Result<()> {

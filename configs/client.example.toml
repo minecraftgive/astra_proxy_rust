@@ -12,6 +12,7 @@
 # Direct/Block 是规则 action，不是 [[outbounds]] 的 kind。
 
 # ---------- 全部顶层设置（标出的运行数值为默认值；监听与 socket 需按实例配置） ----------
+auto_start = false
 watch_config = false              # true：每秒监测当前文件内容，校验/资源准备成功后热重载；支持原子替换
 standalone = true                 # true：全部入站流量使用固定出站，无需 Rule Core
 standalone_outbound = "vless-tls" # 仅 standalone=true 时可设置；多节点必填，单节点可省略
@@ -1455,6 +1456,7 @@ mode = "auto"
 # 把上方 standalone 改为 false，删除 standalone_outbound，启动 astra-rule rule.toml。
 # rule_socket 与 rule.toml 的 socket 保持一致；也可直接由 astra-tui 管理配置。
 # BEGIN RULE CONFIG
+# auto_start = false
 # # Astra 0.1.0：全部规则设置与匹配类型示例。
 # # 配套 example_proxy.toml；两端 UDS 路径必须一致。
 # # 校验：target/release/astra-rule --check example_rule.toml

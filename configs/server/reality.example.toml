@@ -1,5 +1,6 @@
 # SERVER ONLY. Insert a server_private_key from --generate-reality-keys.
 # Client configuration belongs in configs/client/ and uses the public key.
+auto_start = false
 allow_private_targets = false
 
 [[listeners]]

@@ -1,4 +1,5 @@
 # Default to loopback. Do NOT bind publicly without an auth/firewall layer.
+auto_start = false
 rule_socket = "/tmp/astra-rule.sock"
 socks5_listen = "127.0.0.1:1080"
 http_listen = "127.0.0.1:8080"

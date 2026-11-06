@@ -7,6 +7,7 @@
 # 随机凭据最小配置：astra-server-core --init server.toml
 # --status / --reload / --stop 管理核心；多实例分别指定 --control PATH。
 # TLS 路径相对本配置目录；公网使用实际域名证书，核心不自动续期。
+auto_start = false
 allow_private_targets = false # 本地互通测试按需改 true
 max_connections = 1024 # 1..65536，含复用子流
 max_udp_flows = 512 # 1..65536

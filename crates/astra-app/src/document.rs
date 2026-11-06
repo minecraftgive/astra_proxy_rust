@@ -58,9 +58,9 @@ impl Document {
     }
     pub fn template(kind: CoreKind) -> String {
         match kind {
-            CoreKind::Proxy => "standalone = true\nstandalone_outbound = \"node\"\nsocks5_listen = \"127.0.0.1:1080\"\n\n[[outbounds]]\ntag = \"node\"\nkind = \"socks5\"\nserver = \"127.0.0.1:7890\"\n",
-            CoreKind::Rule => "socket = \"/tmp/astra-rule.sock\"\ndefault_action = \"direct\"\nrules = []\n",
-            CoreKind::Server => "max_connections = 1024\nmax_udp_flows = 512\nallow_private_targets = false\n\n[[listeners]]\ntag = \"socks\"\nprotocol = \"socks5\"\nlisten = \"127.0.0.1:1080\"\n[[listeners.users]]\nname = \"user\"\npassword = \"change-me\"\n",
+            CoreKind::Proxy => "auto_start = false\nstandalone = true\nstandalone_outbound = \"node\"\nsocks5_listen = \"127.0.0.1:1080\"\n\n[[outbounds]]\ntag = \"node\"\nkind = \"socks5\"\nserver = \"127.0.0.1:7890\"\n",
+            CoreKind::Rule => "auto_start = false\nsocket = \"/tmp/astra-rule.sock\"\ndefault_action = \"direct\"\nrules = []\n",
+            CoreKind::Server => "auto_start = false\nmax_connections = 1024\nmax_udp_flows = 512\nallow_private_targets = false\n\n[[listeners]]\ntag = \"socks\"\nprotocol = \"socks5\"\nlisten = \"127.0.0.1:1080\"\n[[listeners.users]]\nname = \"user\"\npassword = \"change-me\"\n",
         }.into()
     }
     pub fn undo(&mut self) -> bool {

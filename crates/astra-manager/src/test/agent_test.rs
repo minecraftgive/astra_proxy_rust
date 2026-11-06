@@ -1,4 +1,91 @@
 use super::*;
+
+#[tokio::test]
+async fn remote_instance_metadata_refreshes_per_config_auto_start_for_every_core_kind() {
+    let root = tempfile::tempdir().unwrap();
+    let config = ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().into(),
+        runtime_dir: Some(root.path().join("runtime")),
+        ..Default::default()
+    };
+    let agent = AgentService::new(config.clone()).unwrap();
+    #[derive(serde::Serialize)]
+    struct RegistryFixture {
+        instances: Vec<old::Instance>,
+    }
+    let instances: Vec<_> = [("proxy", old::Kind::Proxy), ("rule", old::Kind::Rule)]
+        .into_iter()
+        .map(|(name, kind)| old::Instance {
+            name: name.into(),
+            kind,
+            config: config.config_dir.join(format!("{name}.toml")),
+        })
+        .collect();
+    for instance in &instances {
+        std::fs::write(&instance.config, "auto_start = true\n").unwrap();
+    }
+    let mut paths: Vec<_> = instances.iter().map(|i| i.config.clone()).collect();
+    std::fs::write(
+        config.config_dir.join("instances.toml"),
+        toml::to_string(&RegistryFixture { instances }).unwrap(),
+    )
+    .unwrap();
+    let native = agent.start_native().await.unwrap();
+    let server_path = config.config_dir.join("server.toml");
+    std::fs::write(&server_path, "auto_start = true\n").unwrap();
+    agent
+        .store
+        .add_server("server", &server_path)
+        .await
+        .unwrap();
+    paths.push(server_path);
+
+    for (text, expected, unavailable) in [
+        (Some("auto_start = true\n"), true, false),
+        (Some("auto_start = false\n"), false, false),
+        (Some("# no opt-in\n"), false, false),
+        (Some("auto_start = 'true'\n"), false, false),
+        (Some("[nested]\nauto_start = true\n"), false, false),
+        (Some("auto_start = true\ninvalid = [\n"), false, true),
+        (None, false, true),
+    ] {
+        for path in &paths {
+            if let Some(text) = text {
+                std::fs::write(path, text).unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let response = agent
+            .handle_remote(Request::new(
+                "instances",
+                RequestBody::Query(Query::Instances),
+            ))
+            .await;
+        // Controllers and Web clients receive the same v2 JSON envelope.
+        let json = serde_json::to_vec(&response).unwrap();
+        let response: Response = serde_json::from_slice(&json).unwrap();
+        let ResponseBody::Instances(rows) = response.result.unwrap() else {
+            panic!("Expected instance list");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let details = row.details.unwrap();
+            assert_eq!(details.auto_start, expected, "{}: {text:?}", row.name);
+            assert_eq!(
+                details.config_unavailable, unavailable,
+                "{}: {text:?}",
+                row.name
+            );
+            assert!(row.pid.is_none());
+        }
+    }
+    agent.call(old::Action::Shutdown).await.unwrap();
+    native.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn monitor_queries_resolve_instance_ids_and_are_readonly_for_rule_and_server() {
     let root = tempfile::tempdir().unwrap();

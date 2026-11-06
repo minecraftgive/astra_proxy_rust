@@ -264,7 +264,7 @@ fn configured_roots_resolve_home_aliases_and_missing_tail_but_not_managed_links(
 }
 
 #[test]
-fn mac_startup_escapes_xml_and_shell_without_applescript_or_keepalive() {
+fn mac_startup_runs_the_frontend_directly_and_escapes_xml_in_both_modes() {
     let temp = Temporary::new();
     let paths = Paths::new(Platform::Mac, &temp.0, None, "abc".into());
     let silent = mac_plist(&paths, &command(), true).unwrap();
@@ -274,16 +274,16 @@ fn mac_startup_escapes_xml_and_shell_without_applescript_or_keepalive() {
     assert!(silent.contains("<key>RunAtLoad</key>\n  <true/>"));
     assert!(!silent.contains("KeepAlive"));
     let interactive = mac_plist(&paths, &command(), false).unwrap();
-    assert!(interactive.contains("<string>/usr/bin/open</string>"));
-    assert!(interactive.contains("<string>Terminal</string>"));
+    assert!(interactive.contains("<string>/opt/Astra $build%/astra-tui</string>"));
+    assert!(interactive.contains("<string>/home/test/状态 &amp; &apos;state&apos;</string>"));
+    assert!(interactive.contains("<string>node;$HOME%h</string>"));
+    assert!(!interactive.contains("<string>/usr/bin/open</string>"));
+    assert!(!interactive.contains("<string>Terminal</string>"));
     assert!(!interactive.contains("--silent"));
-    let script = mac_script(&paths, &command()).unwrap();
-    assert!(script.starts_with(
-        "#!/bin/sh\n# Astra managed startup: abc\nexec '/opt/Astra $build%/astra-tui'"
-    ));
-    assert!(script.contains("'/home/test/状态 & '\"'\"'state'\"'\"''"));
-    assert!(script.contains("'node;$HOME%h'"));
-    assert!(!script.contains("osascript"));
+    assert!(!interactive.contains(".command"));
+    assert!(!interactive.contains("--terminal-child"));
+    assert!(!interactive.contains("KeepAlive"));
+    assert!(!interactive.contains("osascript"));
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn managed_files_can_be_replaced_and_removed_without_touching_unrelated_files() 
     assert!(!managed_file(&paths.file, &paths.prefix()).unwrap());
     apply(&paths, &command(), true, false).unwrap();
     assert!(managed_file(&paths.file, &paths.prefix()).unwrap());
-    assert!(paths.script.as_ref().unwrap().is_file());
+    assert!(!paths.script.as_ref().unwrap().exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -364,19 +364,24 @@ fn managed_files_can_be_replaced_and_removed_without_touching_unrelated_files() 
             std::fs::metadata(&paths.file).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(
-            std::fs::metadata(paths.script.as_ref().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
     }
+    // Older releases generated a helper alongside the plist. Re-registering
+    // either mode preserves it; only an explicit disable cleans it up.
+    let legacy_script = format!("{}exec /old/astra-tui\n", paths.script_prefix());
+    write_managed(
+        paths.script.as_ref().unwrap(),
+        legacy_script.as_bytes(),
+        0o700,
+    )
+    .unwrap();
     let unrelated = paths.file.with_file_name("unrelated.plist");
     std::fs::write(&unrelated, b"keep me").unwrap();
+    apply(&paths, &command(), true, false).unwrap();
     apply(&paths, &command(), true, true).unwrap();
-    assert!(paths.script.as_ref().unwrap().exists());
+    assert_eq!(
+        std::fs::read_to_string(paths.script.as_ref().unwrap()).unwrap(),
+        legacy_script
+    );
     apply(&paths, &command(), false, true).unwrap();
     assert!(!paths.file.exists());
     assert!(!paths.script.as_ref().unwrap().exists());
@@ -391,13 +396,21 @@ fn managed_files_can_be_replaced_and_removed_without_touching_unrelated_files() 
 }
 
 #[test]
-fn failed_plist_commit_restores_the_previous_interactive_helper() {
+fn failed_mac_plist_commit_preserves_registration_and_legacy_helper() {
     for previously_silent in [false, true] {
         let temp = Temporary::new();
         let paths = Paths::new(Platform::Mac, &temp.0, None, "abc".into());
         apply(&paths, &command(), true, previously_silent).unwrap();
         let previous_plist = std::fs::read(&paths.file).unwrap();
         let script = paths.script.as_ref().unwrap();
+        if !previously_silent {
+            write_managed(
+                script,
+                format!("{}exec /old/astra-tui\n", paths.script_prefix()).as_bytes(),
+                0o700,
+            )
+            .unwrap();
+        }
         let previous_script = std::fs::read(script).ok();
         let mut changed = command();
         changed.executable = "/opt/updated/astra-tui".into();
@@ -481,15 +494,17 @@ fn generated_unit_passes_systemd_analyze_without_loading_or_starting_it() {
 fn generated_plist_passes_plutil_without_loading_the_agent() {
     let temp = Temporary::new();
     let paths = Paths::new(Platform::Mac, &temp.0, None, "verify".into());
-    apply(&paths, &command(), true, true).unwrap();
-    let output = std::process::Command::new("/usr/bin/plutil")
-        .args(["-lint", "--"])
-        .arg(paths.file)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for silent in [false, true] {
+        apply(&paths, &command(), true, silent).unwrap();
+        let output = std::process::Command::new("/usr/bin/plutil")
+            .args(["-lint", "--"])
+            .arg(&paths.file)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

@@ -466,6 +466,18 @@ fn read_config(path: &Path) -> Result<String> {
     Ok(text)
 }
 
+fn config_auto_start(config: &toml::Value) -> bool {
+    config
+        .get("auto_start")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn read_config_auto_start(path: &Path) -> Result<bool> {
+    let config: toml::Value = toml::from_str(&read_config(path)?)?;
+    Ok(config_auto_start(&config))
+}
+
 /// Only NotFound creates a template; permission errors and existing files are preserved.
 fn ensure_config(kind: Kind, path: &Path) -> Result<bool> {
     anyhow::ensure!(
@@ -2081,6 +2093,7 @@ impl Manager {
             details.config_unavailable = true;
             return details;
         };
+        details.auto_start = config_auto_start(&config);
         if instance.kind == Kind::Rule {
             details.modes.push("Rules".into());
             details.rules = config

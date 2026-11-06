@@ -650,8 +650,16 @@ impl AgentService {
             } else {
                 "Stopped"
             };
+            let config_path = config.clone();
+            let auto_start = tokio::task::spawn_blocking(move || {
+                crate::manager::read_config_auto_start(&config_path)
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
             rows.push(Instance {
                 details: Some(old::InstanceDetails {
+                    config_unavailable: auto_start.is_err(),
+                    auto_start: auto_start.unwrap_or(false),
                     listeners: status
                         .as_ref()
                         .map(|r| r.listeners.clone())

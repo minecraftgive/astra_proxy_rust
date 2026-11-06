@@ -731,6 +731,39 @@ fn proxy_without_binding_starts_the_rule_core_its_config_uses() {
     assert_eq!(manager.start_plan("proxy").unwrap(), ["other", "proxy"]);
 }
 #[test]
+fn auto_start_summary_requires_an_explicit_top_level_boolean_in_readable_toml() {
+    let temp = Temp::new();
+    let manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+    for kind in [Kind::Proxy, Kind::Rule] {
+        let instance = Instance {
+            name: "configured".into(),
+            kind,
+            config: temp.0.join("configured.toml"),
+        };
+        for (text, expected, unavailable) in [
+            ("auto_start = true\n", true, false),
+            ("auto_start = false\n", false, false),
+            ("# no opt-in\n", false, false),
+            ("auto_start = 'true'\n", false, false),
+            ("auto_start = 1\n", false, false),
+            ("auto_start = [true]\n", false, false),
+            ("[nested]\nauto_start = true\n", false, false),
+            ("auto_start = true\ninvalid = [\n", false, true),
+        ] {
+            fs::write(&instance.config, text).unwrap();
+            let details = manager.details(&instance);
+            assert_eq!(details.auto_start, expected, "{kind:?}: {text}");
+            assert_eq!(details.config_unavailable, unavailable, "{kind:?}: {text}");
+        }
+        fs::remove_file(&instance.config).unwrap();
+        let details = manager.details(&instance);
+        assert!(!details.auto_start);
+        assert!(details.config_unavailable);
+        assert!(!instance.config.exists());
+    }
+}
+
+#[test]
 fn instance_summary_contains_endpoints_modes_tags_and_no_credentials() {
     let temp = Temp::new();
     let config = temp.0.join("proxy.toml");

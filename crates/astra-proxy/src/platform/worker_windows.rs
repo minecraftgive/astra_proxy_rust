@@ -15,17 +15,19 @@ use std::{
     path::Path,
     process::ExitStatus,
     ptr::{null, null_mut},
+    sync::OnceLock,
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
-        DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS,
+        ERROR_BAD_IMPERSONATION_LEVEL, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         DuplicateTokenEx, EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount,
         GetTokenInformation, IsValidSid, SecurityImpersonation, TokenElevation,
-        TokenIntegrityLevel, TokenLinkedToken, TokenPrimary, TokenSessionId, TokenUser,
+        TokenIntegrityLevel, TokenLinkedToken, TokenPrimary, TokenSessionId, TokenType, TokenUser,
         SECURITY_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
         TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
         TOKEN_USER,
@@ -34,11 +36,12 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         Threading::{
             CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
-            GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
-            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
-            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
+            OpenProcessToken, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+            WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
         },
     },
 };
@@ -123,18 +126,11 @@ fn same_identity(left: HANDLE, right: HANDLE) -> Result<()> {
     );
     Ok(())
 }
-fn filtered_token() -> Result<OwnedHandle> {
-    let current = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
-    let linked = information(raw(&current), TokenLinkedToken).context(
-        "no filtered UAC token; start the resident host from its ordinary-user supervisor",
-    )?;
-    let linked = unsafe { own((*linked.as_ptr().cast::<TOKEN_LINKED_TOKEN>()).LinkedToken) }?;
-    ordinary(raw(&linked))?;
-    same_identity(raw(&current), raw(&linked))?;
+fn duplicate_primary(source: HANDLE) -> io::Result<OwnedHandle> {
     let mut primary = null_mut();
     check(unsafe {
         DuplicateTokenEx(
-            raw(&linked),
+            source,
             TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
             null(),
             SecurityImpersonation,
@@ -142,7 +138,106 @@ fn filtered_token() -> Result<OwnedHandle> {
             &mut primary,
         )
     })?;
-    unsafe { own(primary) }.map_err(Into::into)
+    unsafe { own(primary) }
+}
+
+fn supervisor_token(
+    current: HANDLE,
+    owner: &astra_platform::lifecycle::ProcessIdentity,
+) -> Result<OwnedHandle> {
+    // Pin the exact process before inspecting its creation time or token. A
+    // reused PID must never select a different supervisor.
+    let process = unsafe {
+        own(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            owner.pid,
+        ))
+    }
+    .context("open original ordinary supervisor process")?;
+    ensure!(
+        unsafe { WaitForSingleObject(raw(&process), 0) } == WAIT_TIMEOUT,
+        "original ordinary supervisor has exited"
+    );
+    let [mut created, mut exit, mut kernel, mut user] = [FILETIME::default(); 4];
+    check(unsafe {
+        GetProcessTimes(
+            raw(&process),
+            &mut created,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    })
+    .context("verify original supervisor creation time")?;
+    let started = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    ensure!(
+        owner.started == started.to_string(),
+        "original supervisor process identity changed"
+    );
+    let source = token(raw(&process), TOKEN_QUERY | TOKEN_DUPLICATE)
+        .context("open original supervisor primary token")?;
+    let kind = information(raw(&source), TokenType)?;
+    ensure!(
+        unsafe { *kind.as_ptr().cast::<i32>() } == TokenPrimary,
+        "ordinary supervisor requires a primary token"
+    );
+    ordinary(raw(&source)).context("original supervisor must be an ordinary user process")?;
+    same_identity(current, raw(&source)).context("verify original supervisor user and session")?;
+    let primary = duplicate_primary(raw(&source))
+        .context("duplicate verified ordinary supervisor primary token")?;
+    ensure!(
+        unsafe { WaitForSingleObject(raw(&process), 0) } == WAIT_TIMEOUT,
+        "original ordinary supervisor exited during token acquisition"
+    );
+    Ok(primary)
+}
+
+fn duplicate_worker_token(
+    current: HANDLE,
+    linked: HANDLE,
+    owner: impl FnOnce() -> Result<astra_platform::lifecycle::ProcessIdentity>,
+) -> Result<OwnedHandle> {
+    ordinary(linked).context("validate filtered UAC token privileges")?;
+    same_identity(current, linked).context("verify filtered UAC token user and session")?;
+    match duplicate_primary(linked) {
+        Ok(primary) => Ok(primary),
+        Err(error) if error.raw_os_error() == Some(ERROR_BAD_IMPERSONATION_LEVEL as i32) => {
+            // Windows may expose a linked token at identification level only.
+            // It cannot be promoted to a primary token. Use the authenticated
+            // launcher's actual ordinary token instead, preserving all checks.
+            let owner = owner().context(
+                "linked UAC token is identification-only; restart through the ordinary-user manager to launch workers",
+            )?;
+            supervisor_token(current, &owner)
+                .context("obtain ordinary worker token from the original supervisor")
+        }
+        Err(error) => Err(error).context("duplicate filtered UAC token for ordinary worker"),
+    }
+}
+
+fn filtered_token() -> Result<OwnedHandle> {
+    // The original manager may exit after readiness and another manager may
+    // adopt the host. Retain only the verified ordinary token for later workers.
+    static PRIMARY: OnceLock<OwnedHandle> = OnceLock::new();
+    if let Some(primary) = PRIMARY.get() {
+        return duplicate_primary(raw(primary)).context("duplicate retained ordinary worker token");
+    }
+    let current =
+        token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).context("open resident host token")?;
+    let linked = information(raw(&current), TokenLinkedToken).context(
+        "no filtered UAC token; start the resident host from its ordinary-user supervisor",
+    )?;
+    let linked = unsafe { own((*linked.as_ptr().cast::<TOKEN_LINKED_TOKEN>()).LinkedToken) }
+        .context("open filtered UAC token")?;
+    let primary = duplicate_worker_token(raw(&current), raw(&linked), || {
+        let owner = std::env::var("ASTRA_SERVICE_OWNER")
+            .context("missing original supervisor process identity")?;
+        serde_json::from_str(&owner).context("invalid original supervisor process identity")
+    })?;
+    let _ = PRIMARY.set(primary);
+    duplicate_primary(raw(PRIMARY.get().expect("ordinary token initialized")))
+        .context("duplicate retained ordinary worker token")
 }
 
 struct Attributes {

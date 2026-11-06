@@ -18,12 +18,14 @@ mod manager;
 mod nettools;
 mod network_interfaces;
 mod protocol;
+mod self_update;
 mod shell;
 #[cfg(windows)]
 mod startup;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod startup_unix;
 use astra_management::subscription_view;
+mod terminals;
 mod theme;
 use astra_platform::tui_log;
 mod ui;
@@ -36,10 +38,4 @@ pub async fn run() -> anyhow::Result<()> {
 }
 pub async fn run_server() -> anyhow::Result<()> {
     entry::run(Some(protocol::Kind::Server)).await
-}
-
-/// Windows sign-in helper: leave the manager and requested instances running.
-#[cfg(windows)]
-pub async fn run_silent() -> anyhow::Result<()> {
-    entry::run_silent().await
 }

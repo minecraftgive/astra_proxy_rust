@@ -1,5 +1,51 @@
 use super::*;
 use ratatui::{backend::TestBackend, Terminal};
+
+#[test]
+fn instance_auto_start_can_be_toggled_saved_and_reset_in_every_config_editor() {
+    for kind in [CoreKind::Proxy, CoreKind::Rule, CoreKind::Server] {
+        let legacy = astra_app::Document::template(kind).replace("auto_start = false\n", "");
+        let source = format!("# Keep the instance comment\n{legacy}");
+        let mut editor = Editor::new("instance".into(), source.clone()).with_kind(kind);
+        let doc = editor.document().unwrap();
+        editor.focus_field(&doc, &[], "auto_start");
+        assert!(
+            matches!(editor.visible_rows(&doc).get(editor.form.selected),
+            Some(FlatRow::Field { path, spec }) if path.is_empty()
+                && spec.key == "auto_start" && matches!(spec.kind, Type::Boolean)
+                && spec.default == "false")
+        );
+        press(&mut editor, KeyCode::Enter);
+        assert!(matches!(editor.form.mode, Mode::Browse));
+        assert_eq!(
+            editor.document().unwrap()["auto_start"].as_bool(),
+            Some(true)
+        );
+        astra_app::Document::parse(kind, &editor.text())
+            .unwrap()
+            .validate_structure()
+            .unwrap();
+        assert!(editor.text().contains("# Keep the instance comment"));
+
+        let mut saved = Editor::new("instance".into(), editor.text()).with_kind(kind);
+        let doc = saved.document().unwrap();
+        saved.focus_field(&doc, &[], "auto_start");
+        press(&mut saved, KeyCode::Char(' '));
+        assert_eq!(
+            saved.document().unwrap()["auto_start"].as_bool(),
+            Some(false)
+        );
+        press(&mut saved, KeyCode::Char('d'));
+        assert!(saved.document().unwrap().get("auto_start").is_none());
+        astra_app::Document::parse(kind, &saved.text())
+            .unwrap()
+            .validate_structure()
+            .unwrap();
+        press(&mut editor, KeyCode::Char('u'));
+        assert_eq!(editor.text(), source);
+    }
+}
+
 #[test]
 fn subscription_update_proxy_offers_groups_nodes_and_direct() {
     let mut editor = Editor::new("proxy".into(), "standalone=true\n[[outbounds]]\ntag='node'\nkind='http'\nserver='127.0.0.1:1234'\n[subscriptions.remote]\nurl='https://example.com/sub'\n[proxy_groups.custom]\nmembers=['node']\n".into());

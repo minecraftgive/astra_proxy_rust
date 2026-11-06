@@ -14,6 +14,8 @@ python scripts/build.py --role server
 
 统一 TUI 的配置档类型包含 Proxy、Rule、Server；在 Server 配置档创建实例或绑定已有 server.toml，然后使用启动、停止、重启、校验与编辑命令。客户端和服务端共用终端输入、表单与布局，不再使用旧专用服务器 TUI 的快捷键或 `--config` 参数。多主机管理、权限与部署配置见 [MANAGEMENT.md](MANAGEMENT.md)，通用操作见 [TUI.md](TUI.md)。
 
+需要在打开主 TUI 或静默启动时自动启动某个已注册服务端实例，可在该实例的 TOML 顶层设置 `auto_start = true`（缺省 `false`），也可在实例配置编辑器修改并按 Ctrl-S 保存。此项只选择尚未运行的实例，不会重启已有进程；附加窗口不触发自动启动。Windows、macOS、Linux 均可直接运行 `astra-server-tui --silent`（Windows 加 `.exe`）；普通 Windows TUI 在独立终端窗口运行。Windows / macOS 登录启动和 Linux 用户服务文件仍在 TUI 设置页配置，旧版 Windows 静默快捷方式需重新生成，详见 [TUI 启动设置](TUI.md)。
+
 直接运行核心：
 
 ```powershell
@@ -75,4 +77,4 @@ python scripts/build.py --role server --package
 python scripts/test.py server package      # 回归 + 解压 dist/ 中的服务端包并验证
 ```
 
-互通脚本只启动 Astra 原生客户端和服务端，使用本地 TCP/UDP 回声目标与临时证书；不会启用 TUN 或系统代理。独立压缩包根目录为 `server/`，包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host`、版本清单和一份完整 `server.example.toml`。Windows 程序带 `.exe` 后缀，并附带静默自启动辅助程序 `astra-tui-startup.exe`，开关位于 TUI 设置页且默认关闭。说明、源码、许可材料与验证记录留在仓库，不放入运行包；验证记录见 `docs/SERVER_VERIFICATION.md`。
+互通脚本只启动 Astra 原生客户端和服务端，使用本地 TCP/UDP 回声目标与临时证书；不会启用 TUN 或系统代理。独立压缩包根目录为 `server/`，包含 `astra-server-core`、`astra-server-tui`、`astra-manager`、`astra-host`、版本清单和一份完整 `server.example.toml`。Windows 程序带 `.exe` 后缀；静默启动由 `astra-server-tui.exe --silent` 提供，登录自启动及静默开关位于 TUI 设置页且默认关闭。说明、源码、许可材料与验证记录留在仓库，不放入运行包；验证记录见 `docs/SERVER_VERIFICATION.md`。

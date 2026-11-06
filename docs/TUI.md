@@ -13,6 +13,18 @@
 
 发行构建使用 `./scripts/build.sh`，然后运行 `./target/<本机 Rust target>/release/astra-tui`。发行包解压后可直接运行；使用非默认核心目录时通过 `--bin-dir DIR` 指定。
 
+Windows 普通 TUI 按设置中的“终端”选择打开独立窗口，未找到可用宿主时使用原生控制台；客户端入口为 `astra-tui.exe`，服务端兼容入口为 `astra-server-tui.exe`。两者均直接支持 `--silent`，静默模式不创建终端窗口。帮助等命令的文本输出可用管道或重定向获取。
+
+PowerShell 脚本需要等待静默启动完成并读取退出码时：
+
+```powershell
+$p = Start-Process -FilePath .\astra-tui.exe -ArgumentList '--silent' -WindowStyle Hidden -PassThru
+$p.WaitForExit()
+$p.ExitCode
+```
+
+这里仅等待当前启动进程；[Start-Process -Wait](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process#-wait) 会等待整个进程树，可能一直等待仍在运行的后台管理器。
+
 界面支持简体中文、繁体中文和英文，优先使用 `--lang en|zh-CN|zh-TW`，其次使用 `ASTRA_LANG`、`LC_ALL`、`LC_MESSAGES`、`LANG`，未设置时读取 Windows 系统语言；其他语言回退到英文。例如 `astra-tui.exe --lang zh-TW`。语言仅影响界面，配置字段、节点名称和原始日志保持原值。
 
 编辑器按当前平台显示选项：TPROXY/REDIRECT 仅在 Linux 显示，系统代理的网络服务列表仅在 macOS 显示。已有配置中不适用的字段会保留，不会因为隐藏而删除。
@@ -27,18 +39,42 @@
 
 例如：`astra-tui --config-dir D:/Astra/config --state-dir D:/Astra/state`。
 
-在 **7 设置 → 启动** 中可独立控制以下选项，默认均关闭或未创建：
+在 **7 设置 → 启动** 中可选择终端和登录启动方式。“终端”默认自动，其余选项默认关闭或未创建：
 
+- **终端**：从自动扫描到的终端程序中选择，Windows 另提供“原生控制台”。选择影响后续普通主窗口、F8 等新窗口和普通登录启动；不会移动当前窗口，静默启动不使用此项。Windows 自动更新后的界面重启仍使用原生控制台。
 - **Windows 登录后启动 TUI**（仅 Windows）：为当前用户创建启动快捷方式，登录后打开 TUI；保存当前程序、状态目录、配置目录、核心目录和管理端点，无需管理员权限。关闭选项会删除对应快捷方式。移动或删除安装目录前应先关闭此选项，再从新位置启用。
-- **macOS 登录后启动 TUI**（仅 macOS）：在当前用户的 `~/Library/LaunchAgents/` 创建 [LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)，下次登录时通过 Terminal 打开 TUI，无需管理员权限。启用时不会立即打开新窗口；关闭选项会删除对应启动文件，已运行的管理器和实例继续运行。
-- **静默启动**（Windows / macOS）：配合登录自启动使用，登录后不打开终端窗口，在后台启动本地管理器，并按“自动启动实例”偏好启动实例。Windows 使用随包附带的 `astra-tui-startup.exe`，macOS 直接运行 TUI 的 `--silent` 模式。之后可手动打开普通 TUI 管理运行中的实例。连接独立管理端点时仍要求服务已运行；静默启动错误写入状态目录的 `startup.log`。静默启动不会请求交互式提权；Windows TUN 可使用下述权限服务，其他缺少权限的实例记录错误，等待手动处理。
-- **systemd 用户服务文件**（仅 Linux）：创建当前用户的 `.service` 文件，显示“已创建 / 未创建”及文件路径；不会调用 `systemctl`，也不会自动启用或启动服务。生成的单元始终使用 `--silent`，是否启动实例由“自动启动实例”决定。手动启用方法见下文。
+- **macOS 登录后启动 TUI**（仅 macOS）：在当前用户的 `~/Library/LaunchAgents/` 创建 [LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)，下次登录时按终端选择打开 TUI，无需管理员权限。启用时不会立即打开新窗口；关闭选项会删除对应启动文件，已运行的管理器和实例继续运行。
+- **静默启动**（Windows / macOS）：配合登录自启动使用，登录后不打开终端窗口，直接运行当前 TUI 的 `--silent` 模式，在后台启动本地管理器，并根据各实例配置的 `auto_start` 选择要启动的实例。之后可手动打开普通 TUI 管理运行中的实例。连接独立管理端点时仍要求服务已运行；静默启动错误写入状态目录的 `startup.log`。静默启动不会请求交互式提权；Windows TUN 可使用下述权限服务，其他缺少权限的实例记录错误，等待手动处理。
+- **systemd 用户服务文件**（仅 Linux）：创建当前用户的 `.service` 文件，显示“已创建 / 未创建”及文件路径；不会调用 `systemctl`，也不会自动启用或启动服务。生成的单元始终使用 `--silent`，按各实例配置的 `auto_start` 选择启动目标。手动启用方法见下文。
 - **Windows 权限服务**（仅 Windows 本地客户端）：首次开启时请求一次 UAC，将 `astra-service.exe`、`astra-proxy.exe` 和 `wintun.dll` 的受保护副本安装并注册为自动启动服务。之后当前账户的 TUN 启动、重启及静默自启动均优先使用服务，不逐次请求 UAC。需要当前账户本身是启用 UAC 的管理员账户；不保存密码，不支持输入另一个管理员账户来授权。关闭此选项需再次 UAC，以停止并卸载服务；已经运行的实例仍由管理器控制。
-- **自动启动实例**：下次打开主 TUI 并取得实例列表后，自动启动当前管理目标中已停止的已注册实例，复用正常启动检查和后台任务提示；不会重启正在运行的实例，也不会替换待恢复会话。F8、Alt+数字键及 `--view` / `--window-id` 打开的附加窗口不会触发自动启动。
 
-Windows / macOS 启用登录自启动和自动启动实例后，登录即可启动实例；再启用静默启动则不显示终端窗口。实例自动启动与静默启动偏好保存在状态目录的 `ui-preferences.json`，与该目录的其他窗口共享；开关变化不会立即启动或停止实例。仅启用登录自启动时，仍可手动启动实例。
+每次进入设置时会在后台扫描已知终端的可执行程序；按 **r** 可重新扫描。选中“终端”后按 **Enter / 空格** 或点击打开下拉列表，↑↓ 选择、Enter 保存、Esc 关闭；←→ 也可直接选择，Delete / Backspace 恢复“自动”。终端偏好保存在状态目录的 `ui-preferences.json`。原先选择的终端消失时会标为不可用并保留偏好，方便重新安装后继续使用。
 
-各平台的启动文件保留生成时的程序、状态目录、配置目录、核心目录和管理目标。升级或移动安装目录后，应在新版本中重新生成启动文件以更新程序路径。macOS 使用 `com.astra.tui.<标识>.plist`，普通启动还会在 `~/Library/Application Support/Astra/startup/` 保存对应的 `.command` 文件；变更在下次登录时生效。
+当前扫描范围及自动选择顺序如下，仅显示已找到的程序：
+
+| 平台 | 终端顺序 |
+|---|---|
+| Windows | Windows Terminal → WezTerm → Alacritty → 原生控制台 |
+| macOS | Terminal → WezTerm → Alacritty |
+| Linux | 系统终端（`x-terminal-emulator`）→ GNOME Terminal → Konsole → Xfce Terminal → WezTerm → Alacritty → Kitty → Foot → XTerm |
+
+Windows 的“自动”优先尝试扫描到的宿主，最后使用原生控制台。macOS / Linux 的普通启动在已有终端中使用“自动”时沿用当前终端；需要创建新窗口或没有终端时才选择扫描到的宿主。显式选择的终端未安装或无法创建启动进程时，会尝试自动候选；Linux 创建新窗口仍需要可用的图形终端及桌面会话。
+
+实例自动启动在每份 Proxy、Rule 或 Server 配置中单独设置，缺省为 `false`。在 **6 配置档** 选中实例并按 **e** 打开配置编辑器，修改根表单中的“自动启动此实例”（`auto_start`）后按 **Ctrl-S** 校验保存；也可在 TOML 的顶层、任何 `[表名]` 之前写入：
+
+```toml
+auto_start = true
+```
+
+每次打开主 TUI 或运行静默启动时，只将当前管理目标中已停止、配置可读取且 `auto_start = true` 的已注册实例作为自动启动入口。启动前会重新读取状态和配置；已经运行的实例不会被重启，待恢复会话和未保存草稿仍按原流程处理。F8、Alt+数字键及 `--view` / `--window-id` 打开的附加窗口不会触发自动启动。升级成功后的 TUI 自动重启也不会重复触发实例自启动；它保存草稿并恢复原窗口会话，详见 [本地升级流程](SEAMLESS_UPDATES.md)。保存此字段不会立即启动或停止实例，新开启的实例在下一次主 TUI 或静默启动时参与筛选。
+
+`auto_start` 决定实例是否主动触发启动，正常启动计划中的绑定依赖仍会一并启动，即使依赖实例的 `auto_start = false`。例如自动启动代理时仍会先启动它需要的规则实例；自动启动显式绑定了代理的规则实例时，也会启动这些绑定代理。多个实例若共享同一份配置文件，也共享该字段。
+
+Windows / macOS 启用登录自启动后，登录时会按上述配置选择实例；再启用静默启动则不显示终端窗口。静默启动偏好仍保存在状态目录的 `ui-preferences.json`，实例的 `auto_start` 保存在各自 TOML 中。旧版全局 `ui-preferences.json` 中的 `auto_start_instances` 不再生效，不会自动迁移或批量修改实例配置；升级后请逐个开启需要自动启动的实例。
+
+各平台的启动文件保留生成时的程序、状态目录、配置目录、核心目录和管理目标。升级或移动安装目录后，应在新版本中重新生成启动文件以更新程序路径。macOS 使用 `com.astra.tui.<标识>.plist` 直接启动当前 TUI，由 TUI 选择终端；变更在下次登录时生效。旧版通过 Terminal `.command` 文件启动的注册可关闭再开启以更新；旧的受管 `.command` 文件保留到关闭注册时清理，新注册不再生成该文件。
+
+Windows 旧版静默快捷方式可能仍指向已移除的 `astra-tui-startup.exe`。升级后，使用原来的客户端或服务端入口、状态目录和管理目标打开新版 TUI，将“Windows 登录后启动 TUI”关闭再开启，即可更新为当前程序加 `--silent`（保留“静默启动”开启）。登录自启动已开启时，将“静默启动”关闭再开启也会重写快捷方式。替换程序文件本身不会自动修改旧快捷方式。
 
 Linux 文件保存到绝对路径的 `$XDG_CONFIG_HOME/systemd/user/`（未设置或使用相对路径时为 `~/.config/systemd/user/`），名称为 `astra-tui-<标识>.service`。已有的主目录或配置根目录别名会解析到实际目录；生成文件的目录仍需属于当前用户。生成文件要求 **systemd 242 或更新版本**：`Type=exec` 在 [systemd 240](https://github.com/systemd/systemd/blob/v240/NEWS) 引入，用于保留参数中美元符号的 `:` 命令前缀在 [systemd 242](https://github.com/systemd/systemd/blob/v242/NEWS) 引入。
 
@@ -121,7 +157,7 @@ Proxy、Rule、Server 的 schema、模板、字段/集合编辑、引用重命�
 
 新窗口使用状态目录 `window-sessions/<窗口ID>.json` 独立保存草稿和会话，原窗口的 `ui-session.json` 不会被覆盖。需要恢复某个窗口时可带相同 `--window-id ID`，并使用原来的 `--state-dir` 和 `--config-dir`。例如 `astra-tui --view connections --instance edge --core proxy` 可直接打开指定页面；`--view` 默认也使用独立窗口会话。
 
-Windows 使用独立交互控制台，macOS 使用 Terminal，Linux 自动寻找 x-terminal-emulator、gnome-terminal、konsole 或 xterm；Linux 图形环境需安装其中一个终端程序。窗口创建在后台完成，启动失败会在原窗口显示原因。
+新窗口使用 **7 设置 → 启动 → 终端** 的选择，候选由当前系统扫描结果决定；Windows 可回退原生控制台，Linux 图形环境需安装可用终端。窗口创建在后台完成，创建启动进程失败会在原窗口显示原因。
 
 ## 后台任务、进度与 TUI 日志
 
