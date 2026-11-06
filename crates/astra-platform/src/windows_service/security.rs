@@ -125,7 +125,7 @@ fn process_user(process: HANDLE) -> io::Result<String> {
     })?;
     sid_text(unsafe { &*data.as_ptr().cast::<TOKEN_USER>() }.User.Sid)
 }
-pub(super) fn current_user_sid() -> io::Result<String> {
+pub(crate) fn current_user_sid() -> io::Result<String> {
     process_user(unsafe { GetCurrentProcess() })
 }
 /// Enrollment is for the installing administrator's own split-token account.
@@ -376,7 +376,7 @@ fn check_object(handle: HANDLE, leaf: bool) -> io::Result<()> {
     check_acl(owner, acl, leaf)
 }
 
-pub(super) struct ProtectedPath {
+pub(crate) struct ProtectedPath {
     path: PathBuf,
     _handles: Vec<OwnedHandle>,
 }
@@ -387,7 +387,7 @@ impl ProtectedPath {
 }
 /// Pin each ancestor against rename, and the final file against writes, until
 /// the caller finishes launching/loading it. Validate from the volume root down.
-pub(super) fn pin_protected(path: &Path) -> io::Result<ProtectedPath> {
+pub(crate) fn pin_protected(path: &Path) -> io::Result<ProtectedPath> {
     let path = local_absolute(path)?;
     let ancestors: Vec<_> = path.ancestors().collect();
     let mut handles = Vec::new();
@@ -422,14 +422,21 @@ pub(super) fn validate_protected(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn install_descriptor(user: &str) -> io::Result<LocalAllocation> {
+    installation_descriptor(user, true)
+}
+fn installation_descriptor(user: &str, readable: bool) -> io::Result<LocalAllocation> {
     // Owner is never the installing user's SID: a user owner can rewrite the
     // DACL even when its explicit ACE only grants read/execute.
     // The shared Program Files ancestor must be readable by every enrolled
     // account. These immutable executables contain no per-user secrets; only
     // the per-user pipe grants permission to request a privileged launch.
-    let sddl = format!(
-        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)(A;OICI;GRGX;;;{user})"
-    );
+    let sddl = if readable {
+        format!(
+            "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)(A;OICI;GRGX;;;{user})"
+        )
+    } else {
+        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".into()
+    };
     let mut descriptor = null_mut();
     check(unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -444,6 +451,16 @@ fn install_descriptor(user: &str) -> io::Result<LocalAllocation> {
 pub(super) fn prepare_install_directory(path: &Path) -> io::Result<()> {
     let user = current_user_sid()?;
     validate_owner_sid(&user)?;
+    prepare_admin_directory(path)
+}
+/// General system installation uses the same protected ACL without enrolling a broker.
+pub(crate) fn prepare_admin_directory(path: &Path) -> io::Result<()> {
+    if !crate::elevation::is_elevated()? {
+        return Err(denied(
+            "System installation requires administrator permission",
+        ));
+    }
+    let user = current_user_sid()?;
     let path = local_absolute(path)?;
     if path.exists() {
         let checked = pin_protected(&path)?;
@@ -459,7 +476,7 @@ pub(super) fn prepare_install_directory(path: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| denied("Service installation has no parent"))?;
     if !parent.exists() {
-        prepare_install_directory(parent)?;
+        prepare_admin_directory(parent)?;
     }
     let _parent = pin_protected(parent)?;
     let descriptor = install_descriptor(&user)?;
@@ -475,6 +492,24 @@ pub(super) fn prepare_install_directory(path: &Path) -> io::Result<()> {
 pub(super) fn secure_file(path: &Path) -> io::Result<()> {
     let user = current_user_sid()?;
     validate_owner_sid(&user)?;
+    secure_admin_file(path)
+}
+pub(crate) fn secure_admin_file(path: &Path) -> io::Result<()> {
+    secure_admin_object(path, false, true)
+}
+pub(crate) fn secure_admin_private_file(path: &Path) -> io::Result<()> {
+    secure_admin_object(path, false, false)
+}
+pub(crate) fn secure_admin_directory(path: &Path, readable: bool) -> io::Result<()> {
+    secure_admin_object(path, true, readable)
+}
+fn secure_admin_object(path: &Path, directory: bool, readable: bool) -> io::Result<()> {
+    if !crate::elevation::is_elevated()? {
+        return Err(denied(
+            "System installation requires administrator permission",
+        ));
+    }
+    let user = current_user_sid()?;
     let path = local_absolute(path)?;
     let _parent = pin_protected(
         path.parent()
@@ -486,12 +521,13 @@ pub(super) fn secure_file(path: &Path) -> io::Result<()> {
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let info = information(handle.as_raw_handle())?;
-    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
-        || info.nNumberOfLinks != 1
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+        || (!directory && info.nNumberOfLinks != 1)
     {
         return Err(denied("Installed file must be a regular, unlinked file"));
     }
-    let descriptor = install_descriptor(&user)?;
+    let descriptor = installation_descriptor(&user, readable)?;
     let (mut owner, mut defaulted, mut present, mut acl) = (null_mut(), 0, 0, null_mut());
     check(unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) })?;
     check(unsafe {

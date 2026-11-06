@@ -199,13 +199,89 @@ fn wait_for_exit_returns_once_the_process_is_gone() {
 }
 #[test]
 fn user_writable_program_is_allowed_with_warning() {
-    let exe = std::env::temp_dir().join(format!("astra-elevation-{}.exe", std::process::id()));
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("astra-proxy.exe");
     std::fs::write(&exe, b"").unwrap();
+    let mut warnings = Vec::new();
     assert_eq!(
-        ensure_admin_controlled(&exe).unwrap(),
+        prepare_uac_executable(&exe, |warning| warnings.push(warning.to_owned())).unwrap(),
         strip_verbatim(std::fs::canonicalize(&exe).unwrap())
     );
-    std::fs::remove_file(exe).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("continuing TUN elevation"));
+}
+#[test]
+fn unreadable_installation_acl_is_advisory() {
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("astra-proxy.exe");
+    std::fs::write(&exe, b"").unwrap();
+    let inspected = inspect_admin_controlled_with(&exe, |_, _| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ACL unavailable",
+        ))
+    })
+    .unwrap();
+    assert_eq!(
+        inspected.path,
+        strip_verbatim(std::fs::canonicalize(&exe).unwrap())
+    );
+    let warning = inspected.warning.unwrap();
+    assert!(warning.contains("cannot inspect the installation permissions"));
+    assert!(warning.contains("ACL unavailable"));
+    assert!(warning.contains("continuing TUN elevation"));
+}
+#[test]
+fn writable_installation_ancestor_is_advisory() {
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("astra-proxy.exe");
+    std::fs::write(&exe, b"").unwrap();
+    let parent = std::fs::canonicalize(directory.path()).unwrap();
+    let inspected = inspect_admin_controlled_with(&exe, |path, _| {
+        Ok((path == parent).then(|| "an ordinary user".to_owned()))
+    })
+    .unwrap();
+    let warning = inspected.warning.unwrap();
+    assert!(warning.contains(&parent.display().to_string()));
+    assert!(warning.contains("can be changed by an ordinary user"));
+}
+#[test]
+fn trusted_installation_has_no_warning() {
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("astra-proxy.exe");
+    std::fs::write(&exe, b"").unwrap();
+    let canonical = std::fs::canonicalize(&exe).unwrap();
+    let mut inspected_paths = Vec::new();
+    let inspected = inspect_admin_controlled_with(&exe, |path, _| {
+        inspected_paths.push(path.to_owned());
+        Ok(None)
+    })
+    .unwrap();
+    assert!(inspected.warning.is_none());
+    assert_eq!(
+        inspected_paths,
+        canonical
+            .ancestors()
+            .map(Path::to_owned)
+            .collect::<Vec<_>>()
+    );
+}
+#[test]
+fn invalid_program_paths_still_fail_before_warnings() {
+    let directory = tempfile::tempdir().unwrap();
+    for path in [
+        directory.path().to_owned(),
+        directory.path().join("missing.exe"),
+    ] {
+        assert!(inspect_admin_controlled_with(&path, |_, _| {
+            panic!("Invalid files must be rejected before ACL inspection")
+        })
+        .is_err());
+        assert!(prepare_uac_executable(&path, |_| {
+            panic!("Invalid files must not become advisory warnings")
+        })
+        .is_err());
+    }
 }
 #[test]
 fn system_program_is_admin_controlled() {

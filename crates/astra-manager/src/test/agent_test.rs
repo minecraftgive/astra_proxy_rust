@@ -1,5 +1,95 @@
 use super::*;
 
+#[tokio::test]
+async fn installation_capability_is_read_only_and_remote_helpers_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().join("absent-package"),
+        ..Default::default()
+    })
+    .unwrap();
+    let hello = agent
+        .handle(Request::new("hello", RequestBody::Query(Query::Hello)))
+        .await;
+    assert!(
+        matches!(hello.result, Ok(ResponseBody::Hello(Hello { capabilities, .. })) if capabilities.contains(&"installation".into()))
+    );
+    let status = agent
+        .handle_remote(Request::new(
+            "status",
+            RequestBody::Query(Query::InstallationStatus),
+        ))
+        .await;
+    assert!(
+        matches!(status.result, Ok(ResponseBody::InstallationStatus(InstallationStatus { packages, .. })) if packages.is_empty())
+    );
+    let launch = agent
+        .handle_remote(Request::new(
+            "remote-helper",
+            RequestBody::Local(LocalCommand::PrepareInstallation {
+                package_id: "untrusted".into(),
+                expected_release_id: "version".into(),
+                scope: InstallationScope::System,
+            }),
+        ))
+        .await;
+    assert!(matches!(
+        launch.result,
+        Err(ApiError {
+            code: ErrorCode::RequiresLocalAction,
+            ..
+        })
+    ));
+    assert!(!agent.config.bin_dir.exists());
+}
+
+#[tokio::test]
+async fn stale_installation_selection_has_a_durable_failed_task_and_is_not_replayed() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().join("absent-package"),
+        ..Default::default()
+    })
+    .unwrap();
+    let command = Command::InstallCurrentPackage {
+        package_id: "stale".into(),
+        expected_release_id: "version".into(),
+        scope: InstallationScope::User,
+    };
+    let response = agent
+        .handle(Request::new(
+            "install",
+            RequestBody::Execute {
+                operation_id: "installation-once".into(),
+                command: command.clone(),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        response.result,
+        Err(ApiError {
+            code: ErrorCode::Conflict,
+            ..
+        })
+    ));
+    let replay = agent
+        .execute("installation-once".into(), command)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ResponseBody::Task(Task {
+            state: TaskState::Failed,
+            ..
+        })
+    ));
+    assert!(!agent.config.bin_dir.exists());
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn execute_tun_carries_no_uac_policy_and_accepts_the_service_replacement_pid() {

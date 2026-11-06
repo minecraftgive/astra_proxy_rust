@@ -229,6 +229,23 @@ fn inventory(
 }
 
 pub(crate) fn verify(directory: &Path, options: &ImportOptions) -> Result<ReleaseManifest> {
+    verify_directory(directory, options, false)
+}
+
+/// Validate the manifest and its payload without copying unrelated neighbouring
+/// files (configuration and runtime files are not installation payload).
+pub fn verify_installation_directory(
+    directory: &Path,
+    options: &ImportOptions,
+) -> Result<ReleaseManifest> {
+    verify_directory(directory, options, true)
+}
+
+fn verify_directory(
+    directory: &Path,
+    options: &ImportOptions,
+    installation: bool,
+) -> Result<ReleaseManifest> {
     ensure!(
         plain_metadata(directory)?.is_dir(),
         "Release is not a directory"
@@ -240,33 +257,55 @@ pub(crate) fn verify(directory: &Path, options: &ImportOptions) -> Result<Releas
         "Manifest is too large or not a file"
     );
     let mut bytes = Vec::new();
-    File::open(&manifest_path)?
-        .take(MANIFEST_LIMIT + 1)
-        .read_to_end(&mut bytes)?;
+    (if installation {
+        astra_platform::installation::open_package_file(&manifest_path)?
+    } else {
+        File::open(&manifest_path)?
+    })
+    .take(MANIFEST_LIMIT + 1)
+    .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= MANIFEST_LIMIT,
         "Manifest is too large"
     );
     let manifest: ReleaseManifest =
         serde_json::from_slice(&bytes).context("Invalid release manifest")?;
-    manifest.validate(options)?;
-    let mut files = BTreeSet::new();
-    inventory(directory, "", &mut files, options, &mut 0)?;
-    let mut expected: BTreeSet<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
-    expected.insert(MANIFEST_FILE.into());
-    ensure!(
-        files == expected,
-        "Package contains missing or unlisted files"
-    );
+    if installation {
+        manifest.validate_installation(options)?;
+    } else {
+        manifest.validate(options)?;
+        let mut files = BTreeSet::new();
+        inventory(directory, "", &mut files, options, &mut 0)?;
+        let mut expected: BTreeSet<String> =
+            manifest.files.iter().map(|f| f.path.clone()).collect();
+        expected.insert(MANIFEST_FILE.into());
+        ensure!(
+            files == expected,
+            "Package contains missing or unlisted files"
+        );
+    }
     for entry in &manifest.files {
         let path = directory.join(&entry.path);
+        let mut parent = path.parent();
+        while let Some(item) = parent.filter(|item| *item != directory) {
+            ensure!(
+                item.starts_with(directory) && plain_metadata(item)?.is_dir(),
+                "Invalid package ancestor"
+            );
+            parent = item.parent();
+        }
         let metadata = plain_metadata(&path)?;
         ensure!(
             metadata.is_file() && metadata.len() == entry.size,
             "File size mismatch: {}",
             entry.path
         );
-        let mut file = File::open(&path)?.take(entry.size + 1);
+        let opened = if installation {
+            astra_platform::installation::open_package_file(&path)?
+        } else {
+            File::open(&path)?
+        };
+        let mut file = opened.take(entry.size + 1);
         let mut hash = Sha256::new();
         let read = std::io::copy(&mut file, &mut hash)?;
         ensure!(

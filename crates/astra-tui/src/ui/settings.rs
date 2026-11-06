@@ -131,6 +131,7 @@ pub(super) struct Preferences {
     pub(super) mouse: bool,
     pub(super) start_page: StartPage,
     pub(super) terminal: String,
+    pub(super) installation_notices: std::collections::BTreeSet<String>,
     /// The generated OS startup file is authoritative, not these preferences.
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[serde(skip)]
@@ -292,6 +293,7 @@ impl Default for Preferences {
             mouse: true,
             start_page: StartPage::Overview,
             terminal: "auto".into(),
+            installation_notices: Default::default(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_enabled: false,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -305,6 +307,7 @@ impl Default for Preferences {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Field {
+    Installation,
     Language,
     Accent,
     Colors,
@@ -344,6 +347,7 @@ const ALL_FIELDS: &[Field] = &[
     Field::SilentStartup,
     #[cfg(windows)]
     Field::WindowsService,
+    Field::Installation,
     Field::MarqueeBorder,
     Field::MarqueeText,
     Field::MarqueeBackground,
@@ -355,7 +359,7 @@ const ALL_FIELDS: &[Field] = &[
     Field::MarqueeTrueColor,
 ];
 /// Row of the first marquee field.
-const MARQUEE_ROW: usize = 8
+const MARQUEE_ROW: usize = 9
     + 3 * cfg!(windows) as usize
     + 2 * cfg!(target_os = "macos") as usize
     + cfg!(target_os = "linux") as usize;
@@ -367,16 +371,18 @@ fn fields(p: &Preferences) -> &'static [Field] {
         &ALL_FIELDS[..MARQUEE_ROW]
     }
 }
-const SECTIONS: [(&str, std::ops::Range<usize>); 4] = [
+const SECTIONS: [(&str, std::ops::Range<usize>); 5] = [
     ("Appearance", 0..4),
     ("Interaction", 4..7),
-    ("Startup", 7..MARQUEE_ROW),
+    ("Startup", 7..MARQUEE_ROW - 1),
+    ("Installation", MARQUEE_ROW - 1..MARQUEE_ROW),
     ("Marquee", MARQUEE_ROW..ALL_FIELDS.len()),
 ];
 
 impl Field {
     fn label(self) -> &'static str {
         match self {
+            Self::Installation => "Install current package",
             Self::Language => "Language",
             Self::Accent => "Accent color",
             Self::Colors => "Colors",
@@ -412,6 +418,7 @@ impl Field {
     }
     fn description(self) -> &'static str {
         match self {
+            Self::Installation => "Install a complete package already present on the selected management target. Review its location and installation scope before continuing.",
             Self::Language => "Interface language. System follows ASTRA_LANG, LANG and the OS locale; --lang on the command line wins for that run.",
             Self::Accent => "Color of the active page tab, key badges and selections.",
             Self::Colors => "Auto uses what the terminal reports. Pick fewer colors if highlights look wrong over SSH or in a basic console.",
@@ -448,6 +455,7 @@ impl Field {
     /// Choice names; language names are shown in their own language.
     fn choices(self) -> &'static [&'static str] {
         match self {
+            Self::Installation => &["Open"],
             Self::Terminal => &["Auto"], // Dynamic choices are supplied by Ui.
             Self::Language => &["System", "English", "简体中文", "繁體中文"],
             Self::Accent => &["Indigo", "Teal", "Green", "Violet", "Rose", "Amber"],
@@ -486,6 +494,7 @@ impl Field {
     fn get(self, p: &Preferences) -> usize {
         use animation::MotionMode;
         match self {
+            Self::Installation => 0,
             Self::Language => p.language as usize,
             Self::Accent => p.accent as usize,
             Self::Colors => p.colors as usize,
@@ -522,6 +531,7 @@ impl Field {
             None => index.min(self.choices().len() - 1),
         };
         match self {
+            Self::Installation => {}
             Self::Language => {
                 p.language = [
                     LanguageChoice::System,
@@ -855,6 +865,10 @@ impl Ui {
         }
     }
     fn choose_setting(&mut self, field: Field, index: usize) {
+        if field == Field::Installation {
+            self.open_installation();
+            return;
+        }
         if field == Field::Terminal {
             self.choose_terminal(index);
             return;

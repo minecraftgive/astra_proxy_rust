@@ -60,6 +60,12 @@ fn elevated_arguments(
     Ok(arguments)
 }
 
+#[cfg(windows)]
+fn report_elevation_warning(log: &Path, warning: &str, mut terminal: impl std::io::Write) {
+    let _ = writeln!(terminal, "WARN {warning}");
+    astra_platform::program_trust::append_warning(log, warning);
+}
+
 pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
     #[cfg(unix)]
     if tun_enabled && !has_tun_privilege() {
@@ -100,7 +106,9 @@ pub async fn delegate(path: &Path, tun_enabled: bool) -> Result<bool> {
                     LaunchMethod::Service => tracing::info!(log=%launch_log.display(), "Windows TUN starts a separate proxy core through the registered privilege service"),
                     LaunchMethod::Uac => tracing::info!(log=%launch_log.display(), "Windows TUN requests administrator permission for a separate proxy core"),
                 }
-                method.spawn(&std::env::current_exe()?, &arguments)
+                method.spawn_with_warning(&std::env::current_exe()?, &arguments, |warning| {
+                    report_elevation_warning(&launch_log, warning, std::io::stderr().lock());
+                })
             })
             .await??;
             let status = tokio::select! {

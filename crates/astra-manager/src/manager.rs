@@ -25,6 +25,22 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[cfg(windows)]
+fn report_windows_elevation_warning(
+    log: &Path,
+    name: &str,
+    progress: Option<&astra_ipc::progress::Sender>,
+    warning: &str,
+) {
+    astra_platform::program_trust::append_warning(log, warning);
+    if let Some(progress) = progress {
+        progress.send_replace(Some(astra_ipc::progress::Progress::new(
+            "Waiting for administrator approval",
+            format!("{name} · WARN {warning} · approve the Windows UAC prompt to run TUN"),
+        )));
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registry {
@@ -1032,8 +1048,16 @@ impl Manager {
                 format!("{name} · approve the Windows UAC prompt to run TUN"),
             );
         }
+        let progress = astra_ipc::progress::sender();
+        let log = self.log(name);
+        let name = name.to_owned();
         Ok(ManagedChild::Elevated(
-            tokio::task::spawn_blocking(move || method.spawn(&exe, &args)).await??,
+            tokio::task::spawn_blocking(move || {
+                method.spawn_with_warning(&exe, &args, |warning| {
+                    report_windows_elevation_warning(&log, &name, progress.as_ref(), warning);
+                })
+            })
+            .await??,
         ))
     }
     async fn start_one(&mut self, name: &str) -> Result<()> {

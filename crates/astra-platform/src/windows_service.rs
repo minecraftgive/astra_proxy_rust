@@ -37,7 +37,7 @@ use windows_sys::Win32::{
 
 mod client_io;
 mod host;
-mod security;
+pub(crate) mod security;
 
 const ASSETS: [&str; 3] = ["astra-service.exe", "astra-proxy.exe", "wintun.dll"];
 const MAX_FRAME: usize = 64 * 1024;

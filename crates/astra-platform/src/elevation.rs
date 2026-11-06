@@ -393,9 +393,16 @@ const ADMIN_SIDS: &[&str] = &[
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
 
-/// Resolve the executable path and warn if non-administrators can modify it.
-/// Ownership and ACL findings are advisory and do not block TUN elevation.
-pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
+/// Resolve an executable and inspect its installation permissions. Ownership,
+/// ACL findings and failures to inspect them are advisory; file errors are not.
+pub fn inspect_admin_controlled(path: &Path) -> io::Result<crate::program_trust::ProgramTrust> {
+    inspect_admin_controlled_with(path, foreign_writer)
+}
+
+fn inspect_admin_controlled_with(
+    path: &Path,
+    mut inspect: impl FnMut(&Path, u32) -> io::Result<Option<String>>,
+) -> io::Result<crate::program_trust::ProgramTrust> {
     let path = std::fs::canonicalize(path)?;
     if !std::fs::metadata(&path)?.is_file() {
         return Err(io::Error::new(
@@ -403,6 +410,7 @@ pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
             "the elevated program is not a regular file",
         ));
     }
+    let mut warning = None;
     let control = WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
     for (depth, item) in path.ancestors().enumerate() {
         let dangerous = match depth {
@@ -410,15 +418,32 @@ pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
             1 => control | DELETE | FILE_DELETE_CHILD | FILE_WRITE_DATA | GENERIC_WRITE,
             _ => control | DELETE | FILE_DELETE_CHILD,
         };
-        if let Some(principal) = foreign_writer(item, dangerous)? {
-            tracing::warn!(
-                "{} can be changed by {principal}; consider installing the core in a folder only administrators can modify (for example under Program Files); continuing TUN elevation",
+        let finding = match inspect(item, dangerous) {
+            Ok(None) => continue,
+            Ok(Some(principal)) => format!("{} can be changed by {principal}", item.display()),
+            Err(error) => format!(
+                "cannot inspect the installation permissions of {}: {error}",
                 item.display()
-            );
-            break;
-        }
+            ),
+        };
+        warning = Some(format!(
+            "{finding}; consider installing the core in a folder only administrators can modify (for example under Program Files); continuing TUN elevation"
+        ));
+        break;
     }
-    Ok(strip_verbatim(path))
+    Ok(crate::program_trust::ProgramTrust {
+        path: strip_verbatim(path),
+        warning,
+    })
+}
+
+/// Compatibility helper for callers that only need the resolved path.
+pub fn ensure_admin_controlled(path: &Path) -> io::Result<PathBuf> {
+    let inspected = inspect_admin_controlled(path)?;
+    if let Some(warning) = inspected.warning {
+        tracing::warn!("{warning}");
+    }
+    Ok(inspected.path)
 }
 /// The first non-administrator principal that owns `path` or holds any of
 /// `dangerous` on it.
@@ -712,9 +737,28 @@ impl LaunchMethod {
     /// Execute only the selected method. Service startup, authentication,
     /// version and availability failures must never fall back to UAC.
     pub fn spawn(self, exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
+        self.spawn_with_warning(exe, args, |message| {
+            use std::io::Write;
+            let _ = writeln!(io::stderr().lock(), "WARN {message}");
+            if args.first().is_some_and(|arg| arg == "--windows-elevated") {
+                if let Some(log) = args.get(3) {
+                    crate::program_trust::append_warning(Path::new(log), message);
+                }
+            }
+        })
+    }
+
+    /// Report an advisory installation warning before showing UAC. Callers
+    /// choose their log and UI sinks; the service path remains unchanged.
+    pub fn spawn_with_warning(
+        self,
+        exe: &Path,
+        args: &[OsString],
+        on_warning: impl FnMut(&str),
+    ) -> io::Result<ElevatedChild> {
         self.spawn_with(
             || crate::windows_service::spawn(exe, args),
-            || spawn_uac(exe, args),
+            || spawn_uac(exe, args, on_warning),
         )
     }
 
@@ -736,8 +780,20 @@ pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
     LaunchMethod::preferred(true)?.spawn(exe, args)
 }
 
-fn spawn_uac(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
-    let exe = ensure_admin_controlled(exe)?;
+fn prepare_uac_executable(exe: &Path, mut on_warning: impl FnMut(&str)) -> io::Result<PathBuf> {
+    let inspected = inspect_admin_controlled(exe)?;
+    if let Some(warning) = inspected.warning {
+        on_warning(&warning);
+    }
+    Ok(inspected.path)
+}
+
+fn spawn_uac(
+    exe: &Path,
+    args: &[OsString],
+    on_warning: impl FnMut(&str),
+) -> io::Result<ElevatedChild> {
+    let exe = prepare_uac_executable(exe, on_warning)?;
     let exe = wide(exe.as_os_str())?;
     let verb = wide(OsStr::new("runas"))?;
     let mut parameters = Vec::new();
@@ -781,7 +837,7 @@ fn spawn_uac(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
 
 /// Append to the core log only inside a folder the user owns, never through a
 /// final link, and only if the file that was opened is the user's own.
-fn open_log(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_log(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::{fs::OpenOptionsExt, io::FromRawHandle, io::IntoRawHandle};
     let parent = path
         .parent()

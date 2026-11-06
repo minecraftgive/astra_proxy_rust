@@ -152,10 +152,8 @@ pub(super) async fn prepare(
         .clone()
         .context("Elevation is unavailable outside the manager service")?;
     let sudo = find_sudo()?;
-    // sudo runs this file as root; if the user (or anything running as them)
-    // can replace it or a directory above it, that program gets root.
-    let binary = unix_handoff::ensure_root_controlled(&manager.bin.join(Kind::Proxy.binary()))
-        .context("The proxy core cannot be elevated safely; install it in a root-owned directory (for example `sudo install -o root -m 0755 astra-proxy /usr/local/bin/`)")?;
+    let program = unix_handoff::inspect_program(&manager.bin.join(Kind::Proxy.binary()))
+        .context("Resolve the proxy core for elevation")?;
     // Created here, as the user, so the root core never has to create
     // directories on a path the user controls.
     let runtime_dir = manager.runtime_dir.clone();
@@ -175,11 +173,14 @@ pub(super) async fn prepare(
     set_private(&socket_path, 0o600)?;
 
     rotate_log(&manager.log(&name));
+    if let Some(warning) = &program.warning {
+        astra_platform::program_trust::append_warning(&manager.log(&name), warning);
+    }
     let offer = Offer {
         version: unix_handoff::PROTOCOL_VERSION,
         socket: socket_path.clone(),
         ticket: ticket.clone(),
-        binary,
+        binary: program.path,
         sudo,
     };
     if let Some(hub) = &manager.publisher {

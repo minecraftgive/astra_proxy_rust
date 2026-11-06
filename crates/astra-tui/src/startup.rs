@@ -151,7 +151,7 @@ fn arguments(context: &Context, target: &Target, silent: bool) -> Result<OsStrin
 
 /// Windows argv quoting; there is no cmd.exe, PowerShell or percent expansion
 /// when the shortcut launches the executable. Double trailing backslashes too.
-fn quote_arguments(args: &[OsString]) -> Result<OsString> {
+pub(crate) fn quote_arguments(args: &[OsString]) -> Result<OsString> {
     let mut output = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if index != 0 {

@@ -4,6 +4,7 @@ mod connections;
 mod drafts;
 mod event_loop;
 mod focus;
+mod installation;
 mod server;
 pub(crate) fn wake() {
     animation::wake();
@@ -491,6 +492,7 @@ struct Ui {
     /// Ctrl+Home held on the accent setting: (first press, latest press, done).
     marquee_hold: Option<(Instant, Instant, bool)>,
     program_info: background::ProgramInformation,
+    installation: installation::State,
     /// Mouse capture change for the event loop, which owns the terminal.
     mouse_request: Option<bool>,
 }
@@ -512,6 +514,7 @@ enum Input {
     Run(Action, Option<Box<(Prompt, String)>>),
     ExternalEditor,
     OpenWindow(crate::windows::Launch),
+    Install(installation::Request),
 }
 
 impl Ui {
@@ -655,6 +658,7 @@ impl Ui {
             terminals: Default::default(),
             marquee_hold: None,
             program_info: Default::default(),
+            installation: Default::default(),
             mouse_request: None,
         }
     }
@@ -1259,6 +1263,9 @@ impl Ui {
     fn key(&mut self, mut key: event::KeyEvent) -> Input {
         if key.kind == KeyEventKind::Release {
             return Input::Idle;
+        }
+        if self.installation.visible() {
+            return self.installation_key(key);
         }
         if key.kind == KeyEventKind::Repeat {
             let navigation = matches!(
@@ -1980,6 +1987,7 @@ impl Ui {
         self.render_palette(f);
         self.render_page_help(f);
         self.render_background(f);
+        self.render_installation(f);
     }
 
     fn render_content(&self, f: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -2376,19 +2384,29 @@ async fn elevate(
             return;
         }
     };
-    // Re-check right before sudo runs it: the reply only names a path.
-    if let Err(error) = astra_platform::unix_handoff::ensure_root_controlled(&offer.binary)
-        .and_then(|_| astra_platform::unix_handoff::ensure_root_controlled(&offer.sudo))
-    {
-        ui.message = format!("{error:#}");
-        return;
-    }
+    // Re-check the paths immediately before launch. Installation trust is
+    // advisory for Astra; the system sudo helper must remain root-controlled.
+    let (program, sudo) = match astra_platform::unix_handoff::inspect_program(&offer.binary)
+        .and_then(|program| {
+            astra_platform::unix_handoff::ensure_root_controlled(&offer.sudo)
+                .map(|sudo| (program, sudo))
+        }) {
+        Ok(paths) => paths,
+        Err(error) => {
+            ui.message = format!("{error:#}");
+            return;
+        }
+    };
     let launched = (|| -> Result<std::process::ExitStatus> {
         screen.suspend()?;
+        if let Some(warning) = &program.warning {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "WARN: {warning}");
+        }
         #[cfg(unix)]
         let _interrupt = IgnoreInterrupt::install();
-        std::process::Command::new(&offer.sudo)
-            .arg(&offer.binary)
+        std::process::Command::new(&sudo)
+            .arg(&program.path)
             .args(["--unix-elevated"])
             .arg(&offer.socket)
             .arg(&offer.ticket)

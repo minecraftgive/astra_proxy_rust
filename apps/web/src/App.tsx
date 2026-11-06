@@ -6,6 +6,7 @@ import type { LogChunk, LogCursor } from "./generated/management";
 import Editor from "./components/Editor";
 import Login from "./components/Login";
 import Updates from "./components/Updates";
+import Installation from "./components/Installation";
 import ProgramInfo from "./components/ProgramInfo";
 import NetworkRecovery from "./components/NetworkRecovery";
 import Monitor from "./components/Monitor";
@@ -513,6 +514,20 @@ export default function App() {
                   )}
                 </div>
               </div>
+              {agent && (
+                <Installation
+                  key={agent}
+                  agent={agent}
+                  nodeName={node?.name}
+                  online={online}
+                  active={page === "settings"}
+                  onOpen={() => {
+                    setPage("settings");
+                    setResult(null);
+                  }}
+                  onError={fail}
+                />
+              )}
               {current && <NetworkRecovery details={current.details} />}
               {page === "monitor" && (
                 <Monitor

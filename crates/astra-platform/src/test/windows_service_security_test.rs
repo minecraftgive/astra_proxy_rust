@@ -152,3 +152,25 @@ fn shared_installation_ancestors_remain_readable_by_other_enrolled_accounts() {
         GENERIC_READ | windows_sys::Win32::Foundation::GENERIC_EXECUTE
     );
 }
+
+#[test]
+fn private_installation_staging_grants_only_system_and_administrators() {
+    let descriptor = installation_descriptor("S-1-5-21-1-2-3-1001", false).unwrap();
+    let (mut defaulted, mut present, mut acl) = (0, 0, null_mut());
+    check(unsafe {
+        GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
+    })
+    .unwrap();
+    assert_ne!(present, 0);
+    assert!(!acl.is_null());
+    assert_eq!(unsafe { (*acl).AceCount }, 2);
+    for (index, sid) in [(0, "S-1-5-18"), (1, "S-1-5-32-544")] {
+        let mut ace = null_mut();
+        check(unsafe { GetAce(acl, index, &mut ace) }).unwrap();
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(
+            sid_text(std::ptr::addr_of!(allowed.SidStart).cast_mut().cast()).unwrap(),
+            sid
+        );
+    }
+}

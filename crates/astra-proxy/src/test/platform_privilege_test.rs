@@ -41,6 +41,37 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn standalone_elevation_warning_reaches_terminal_and_log_without_tracing() {
+    let fixture = Fixture::new();
+    let directory = fixture.path.join("owned");
+    astra_platform::elevation::create_private_directory(&directory).unwrap();
+    let log = directory.join("proxy.log");
+    let mut terminal = Vec::new();
+    report_elevation_warning(
+        &log,
+        "Cannot inspect the core ACL; continuing TUN elevation",
+        &mut terminal,
+    );
+    let terminal = String::from_utf8(terminal).unwrap();
+    assert!(terminal.starts_with("WARN Cannot inspect the core ACL"));
+    assert!(terminal.contains("continuing TUN elevation"));
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("WARN installation: Cannot inspect the core ACL"));
+}
+
+#[test]
+fn standalone_elevation_warning_survives_unavailable_log() {
+    let fixture = Fixture::new();
+    let log = fixture.path.join("missing").join("proxy.log");
+    let mut terminal = Vec::new();
+    report_elevation_warning(&log, "continuing TUN elevation", &mut terminal);
+    assert!(!log.exists());
+    assert!(String::from_utf8(terminal)
+        .unwrap()
+        .contains("continuing TUN elevation"));
+}
+
+#[test]
 fn standalone_arguments_include_the_supervising_process_identity() {
     let fixture = Fixture::new();
     let config = fixture.path.join("proxy config.toml");

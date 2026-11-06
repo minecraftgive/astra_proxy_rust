@@ -6,6 +6,8 @@
 
 ## 客户端
 
+Windows、Linux 和 macOS 均可从普通用户目录运行 Astra。通过 UAC 或 TUI 的 sudo 流程提权时，核心文件及父目录的所有者、写权限或权限信息读取问题只产生警告，不要求迁移到可信安装目录，也不增加确认步骤。警告写入实例日志，并在终端或 TUI 的授权进度中显示；仍建议使用仅管理员可修改的位置（Windows 的 Program Files、Unix 的 `/usr/local/bin`）。文件缺失、路径无法解析或目标不是普通文件仍会报错。Windows 权限服务的受保护副本、系统 sudo、IPC、状态目录及自启动文件目录继续按原规则检查。
+
 解压 `astra-client-版本-平台-架构.tar.gz` 后进入 `client/`。包含 `astra-proxy`、`astra-rule`、`astra-tui`、`astra-manager`、兼容入口 `astra-host`、`astra-convert` 和 `client.example.toml`；Windows 程序带 `.exe` 后缀，有本地 Wintun 时附运行库 `wintun.dll`。直接运行 `astra-tui` 即可管理客户端。
 
 Windows 客户端包另含权限服务 `astra-service.exe`。`astra-tui.exe` 同时提供普通交互模式和 `--silent` 静默模式：普通模式按终端选择打开独立窗口，静默模式不打开终端。设置页中默认关闭的“静默启动”会在 Windows 登录时直接运行 `astra-tui.exe --silent`，后台启动管理器，并按各实例配置中的 `auto_start` 选择启动目标；之后可手动打开普通 TUI 管理。错误记录在状态目录的 `startup.log`。
@@ -44,6 +46,22 @@ python scripts/build.py --role web --profile release --package
 ```
 
 首次迁移前备份旧状态、配置、更新目录和凭据，正常退出旧管理服务。新的角色配置与 v2 API 不保证旧管理程序兼容；不可让两个管理进程共用同一状态目录。
+
+## 在 UI 中安装当前程序包
+
+客户端 TUI、服务端 TUI 和 Web 均提供 **设置 → 安装**。首次连接支持此功能的管理目标时会提示，可选择稍后；静默启动和附加 TUI 窗口不弹出提示。安装页列出目标主机、执行账户、可发现的完整包、源目录及安装位置。Web 与远程 TUI 操作所选 Agent 所在机器，不操作浏览器所在电脑。
+
+默认用户级安装，也可选择系统级。安装源是目标机器当前核心目录、Manager 自身目录和已配置的 Web 程序目录中的完整包；支持 client、server、controller、web，仅展示实际发现的包。缺少 `manifest.json` 的开发目录、缺文件、摘要不符或平台不匹配的包不可安装；不会在线下载其他角色，也不会复制清单外的配置或凭据。
+
+| 平台 | 用户级程序目录 | 系统级程序目录 |
+| --- | --- | --- |
+| Windows | `%LOCALAPPDATA%/Programs/Astra/<角色>` | 系统 Program Files 下的 `Astra/<角色>` |
+| Linux | `~/.local/share/astra/<角色>` | `/opt/astra/<角色>` |
+| macOS | `~/Library/Application Support/Astra/<角色>` | `/Library/Application Support/Astra/<角色>` |
+
+Windows 创建对应角色的开始菜单入口。Linux/macOS 提供 `astra-client`、`astra-server`、`astra-controller`、`astra-web` 命令，用户级位于 `~/.local/bin`，系统级位于 `/usr/local/bin`；不会覆盖其他程序的同名入口。若用户命令目录不在 PATH 中，界面显示设置方法，不自动修改 shell 配置。用户级使用 Agent 运行账户的目录；系统级需要管理员权限，本机 TUI 可通过一次 UAC/sudo 授权完成，Web 和远程 TUI 权限不足时提示到目标机器操作。
+
+安装会校验、暂存复制并发布到独立部署目录，重复安装可校验现有副本并补齐入口，修复时不覆盖正在运行的程序。完成后使用新入口启动；当前进程、配置和数据保留原处，界面同时给出携带现有自定义目录参数的启动命令。既有客户端更新选择继续生效，可能优先于新入口所带基础版本。自启动、Windows TUN 权限服务仍通过原设置单独管理；安装不会开启它们，也不删除源包或旧部署。
 
 ## 从源码构建及打包
 

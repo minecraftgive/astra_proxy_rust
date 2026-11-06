@@ -36,6 +36,21 @@ fn press(ui: &mut Ui, code: KeyCode) {
     ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+#[test]
+fn installation_settings_entry_stays_available_after_dismissal() {
+    let (mut ui, _) = settings_ui();
+    assert!(fields(&ui.preferences).contains(&Field::Installation));
+    ui.preferences
+        .installation_notices
+        .insert("client:target".into());
+    ui.choose_setting(Field::Installation, 0);
+    assert!(ui.installation.visible());
+    press(&mut ui, KeyCode::Esc);
+    assert!(!ui.installation.visible());
+    ui.choose_setting(Field::Installation, 0);
+    assert!(ui.installation.visible());
+}
+
 fn terminal_candidate(id: &str, label: &str) -> crate::terminals::Candidate {
     crate::terminals::Candidate {
         id: id.into(),

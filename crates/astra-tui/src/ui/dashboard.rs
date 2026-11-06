@@ -31,6 +31,7 @@ pub(super) enum Target {
     NetTools,
     /// A settings row and, when every choice is shown, the clicked choice.
     Setting(usize, Option<usize>),
+    Installation(super::installation::Click),
 }
 
 fn fit_cells(text: &str, width: usize) -> String {
@@ -1159,6 +1160,9 @@ impl Ui {
     }
 
     pub(super) fn mouse(&mut self, mouse: MouseEvent) -> Input {
+        if self.installation.visible() {
+            return self.installation_mouse(mouse);
+        }
         if self.monitor.is_some() {
             return Input::Idle;
         }
@@ -1233,6 +1237,7 @@ impl Ui {
             }
             Some(Target::Page(page)) if self.can_switch_page() => self.navigate(page),
             Some(Target::Setting(row, choice)) => self.click_setting(row, choice),
+            Some(Target::Installation(_)) => Input::Idle,
             Some(Target::Row(index)) => {
                 let slot = self.index();
                 self.selections[slot] = index;

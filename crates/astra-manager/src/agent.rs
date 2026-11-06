@@ -284,6 +284,19 @@ impl AgentService {
     }
     async fn local(&self, command: LocalCommand) -> Result<ResponseBody> {
         let action = match command {
+            LocalCommand::PrepareInstallation {
+                package_id,
+                expected_release_id,
+                scope,
+            } => {
+                let config = self.config.clone();
+                return Ok(ResponseBody::InstallationLaunch(
+                    tokio::task::spawn_blocking(move || {
+                        crate::install::prepare(&config, &package_id, &expected_release_id, scope)
+                    })
+                    .await??,
+                ));
+            }
             LocalCommand::PrepareElevation {
                 instance,
                 expected_pid,
@@ -344,9 +357,18 @@ impl AgentService {
                     "tasks".into(),
                     "monitor".into(),
                     "program_info".into(),
+                    "installation".into(),
                 ],
             }),
             Query::ProgramInfo => ResponseBody::ProgramInfo(program_info()),
+            Query::InstallationStatus => {
+                let config = self.config.clone();
+                let target = format!("{} ({})", self.identity.name, self.identity.id);
+                ResponseBody::InstallationStatus(
+                    tokio::task::spawn_blocking(move || crate::install::status(&config, target))
+                        .await??,
+                )
+            }
             Query::Agents => ResponseBody::Agents(vec![Agent {
                 last_seen_ms: store::now(),
                 ..self.identity.clone()
@@ -833,6 +855,32 @@ impl AgentService {
             }
         }
         let action = match command {
+            Command::InstallCurrentPackage {
+                package_id,
+                expected_release_id,
+                scope,
+            } => {
+                let config = self.config.clone();
+                let progress = astra_ipc::progress::sender();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::install::execute(
+                        &config,
+                        &package_id,
+                        &expected_release_id,
+                        scope,
+                        |message| {
+                            if let Some(progress) = &progress {
+                                progress.send_replace(Some(astra_ipc::progress::Progress::new(
+                                    "Installing package",
+                                    message,
+                                )));
+                            }
+                        },
+                    )
+                })
+                .await??;
+                return Ok(ResponseBody::InstallationResult(result));
+            }
             Command::CancelTask { operation_id } => {
                 let task = self.store.task(&operation_id).await?;
                 return Ok(ResponseBody::Cancellation(

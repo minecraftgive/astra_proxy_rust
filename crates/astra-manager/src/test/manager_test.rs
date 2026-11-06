@@ -34,6 +34,41 @@ impl Drop for Temp {
     }
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_elevation_warning_reaches_log_and_progress_from_blocking_worker() {
+    let temp = Temp::new();
+    let directory = temp.0.join("owned");
+    astra_platform::elevation::create_private_directory(&directory).unwrap();
+    let log = directory.join("proxy.log");
+    let worker_log = log.clone();
+    let (sender, mut receiver) = tokio::sync::watch::channel(None);
+    astra_ipc::progress::scope(sender, async move {
+        let progress = astra_ipc::progress::sender();
+        tokio::task::spawn_blocking(move || {
+            assert!(astra_ipc::progress::sender().is_none());
+            report_windows_elevation_warning(
+                &worker_log,
+                "proxy",
+                progress.as_ref(),
+                "The core directory is user-writable; continuing TUN elevation",
+            );
+        })
+        .await
+        .unwrap();
+    })
+    .await;
+    let event = receiver.borrow_and_update().clone().unwrap();
+    assert_eq!(event.phase, "Waiting for administrator approval");
+    assert!(event
+        .detail
+        .contains("WARN The core directory is user-writable"));
+    assert!(event.detail.contains("approve the Windows UAC prompt"));
+    let text = fs::read_to_string(log).unwrap();
+    assert!(text.contains("WARN installation:"));
+    assert!(text.contains("continuing TUN elevation"));
+}
+
 #[tokio::test]
 async fn silent_start_never_creates_a_missing_configuration() {
     let temp = Temp::new();

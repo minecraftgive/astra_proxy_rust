@@ -6,6 +6,9 @@ use astra_management::{
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub async fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--install-system")) {
+        return crate::install::run_helper(std::env::args_os().skip(2).collect());
+    }
     if let Some(command @ ("provision-agent" | "rotate-agent" | "revoke-agent")) =
         std::env::args().nth(1).as_deref()
     {

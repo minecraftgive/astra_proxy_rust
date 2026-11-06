@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use ts_rs::TS;
 
+mod installation;
+pub use installation::*;
+
 pub const VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -42,6 +45,7 @@ pub enum RequestBody {
 pub enum Query {
     Hello,
     ProgramInfo,
+    InstallationStatus,
     Agents,
     Instances,
     Monitor {
@@ -106,6 +110,11 @@ pub enum InstanceKind {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Command {
+    InstallCurrentPackage {
+        package_id: String,
+        expected_release_id: String,
+        scope: InstallationScope,
+    },
     CancelTask {
         operation_id: String,
     },
@@ -355,6 +364,9 @@ pub struct ApiError {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
+    InstallationStatus(InstallationStatus),
+    InstallationResult(InstallationResult),
+    InstallationLaunch(InstallationLaunch),
     Local(serde_json::Value),
     Cancellation(Cancellation),
     Hello(Hello),
@@ -461,6 +473,11 @@ pub struct Hello {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalCommand {
+    PrepareInstallation {
+        package_id: String,
+        expected_release_id: String,
+        scope: InstallationScope,
+    },
     PrepareElevation {
         instance: String,
         expected_pid: Option<u32>,

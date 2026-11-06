@@ -86,17 +86,52 @@ pub fn lifecycle_frame(command: LifelineCommand) -> io::Result<Vec<u8>> {
     frame(&command)
 }
 
-/// A program sudo runs as root must not be replaceable by the invoking user
-/// (or anything running as them) between this check and the exec: the file
-/// and every directory above it must be owned by root and writable only by
-/// root. Group write is tolerated only for gid 0.
+/// Resolve an Astra program and report installation ownership or permissions
+/// as an advisory. Invalid executable paths still prevent elevation.
+pub fn inspect_program(path: &std::path::Path) -> io::Result<crate::program_trust::ProgramTrust> {
+    let path = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err(invalid("the elevated program is not a regular file"));
+    }
+    let warning = program_warning(&path, Ok(metadata)).or_else(|| {
+        path.ancestors()
+            .skip(1)
+            .find_map(|ancestor| program_warning(ancestor, std::fs::metadata(ancestor)))
+    });
+    Ok(crate::program_trust::ProgramTrust { path, warning })
+}
+
+fn root_controlled(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o002 == 0 && (mode & 0o020 == 0 || gid == 0)
+}
+
+fn program_warning(
+    path: &std::path::Path,
+    metadata: io::Result<std::fs::Metadata>,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    match metadata {
+        Ok(metadata) if root_controlled(metadata.uid(), metadata.gid(), metadata.mode()) => None,
+        Ok(_) => Some(format!(
+            "{} can be changed by a non-root user; consider installing the core in a root-owned directory writable only by root (for example /usr/local/bin); continuing TUN elevation",
+            path.display()
+        )),
+        Err(error) => Some(format!(
+            "Cannot inspect installation ownership and permissions for {}: {error}; consider installing the core in a root-owned directory writable only by root (for example /usr/local/bin); continuing TUN elevation",
+            path.display()
+        )),
+    }
+}
+
+/// Validate the system elevation helper. Unlike the Astra installation,
+/// sudo and every directory above it must remain root-controlled. Group
+/// write is tolerated only for gid 0.
 pub fn ensure_root_controlled(path: &std::path::Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let path = std::fs::canonicalize(path)?;
     let check = |path: &std::path::Path, metadata: &std::fs::Metadata| {
-        let foreign_write =
-            metadata.mode() & 0o002 != 0 || (metadata.mode() & 0o020 != 0 && metadata.gid() != 0);
-        if metadata.uid() != 0 || foreign_write {
+        if !root_controlled(metadata.uid(), metadata.gid(), metadata.mode()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(

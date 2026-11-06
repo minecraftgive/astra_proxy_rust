@@ -2012,6 +2012,20 @@ tr:last-child td {
 
 /* Settings: build and host facts describe the selected managed node. */
 .program-info { min-width: 0; }
+.installation { min-width: 0; }
+.installation-reminder { flex-wrap: wrap; }
+.installation-reminder p { margin: 4px 0 0; }
+.installation-roles { padding: 0; list-style: none; display: grid; gap: 8px; }
+.installation-roles li { display: flex; gap: 16px; align-items: baseline; }
+.installation-roles strong { min-width: 64px; }
+.installation-roles span, .installation-path { overflow-wrap: anywhere; }
+.installation-scopes { display: flex; flex-wrap: wrap; gap: 16px; border: 1px solid var(--border); padding: 12px; margin: 12px 0; }
+.installation-scopes label { display: flex; align-items: center; gap: 6px; }
+.installation-paths { display: grid; gap: 8px; }
+.installation-paths div { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 12px; }
+.installation-paths dt { color: var(--muted); }
+.installation-paths dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.installation-task, .installation-result { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 8px; }
 .program-info-heading, .program-info-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .program-info-heading { justify-content: space-between; }
 .program-info .program-info-heading h2 { margin: 0 0 4px; }

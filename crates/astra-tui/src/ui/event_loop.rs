@@ -28,6 +28,7 @@ pub(super) async fn run_local(
     if let Some(kind) = launch.kind {
         ui.kind = kind;
     }
+    ui.initialize_installation(&context, &socket, &launch, resume_ui);
     let window_id = launch.window_id.clone();
     let mut initial = Some(launch);
     let mut restart = update::Restart::new(resume_ui);
@@ -61,6 +62,7 @@ pub(super) async fn run_local(
         if refresh {
             let previous = MotionState::of(&ui);
             redraw |= ui.poll_terminal_scan().await;
+            redraw |= ui.poll_installation(&socket).await;
             redraw |= feeds.poll(&mut ui).await;
             if feeds.ready {
                 if let Some(launch) = initial.take() {
@@ -268,6 +270,26 @@ pub(super) async fn run_local(
             _ => Input::Idle,
         };
         let quit = match input {
+            Input::Install(request) => {
+                let result = if request.elevate {
+                    drop(events.take());
+                    let result = installation::elevate(&socket, &request, &mut screen).await;
+                    if let Err(error) = screen.resume() {
+                        break Err(error.into());
+                    }
+                    events = Some(event::EventStream::new());
+                    terminal.backend_mut().writer_mut().invalidate();
+                    ui.animations.resize();
+                    result
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => ui.start_installation(&socket, request),
+                    Err(error) => ui.installation_failed(format!("{error:#}")),
+                }
+                false
+            }
             Input::Quit => true,
             Input::Run(action, origin) => {
                 if let Action::PrepareElevation { name, expected_pid } = action {
@@ -402,6 +424,8 @@ fn restore_session(path: &std::path::Path, handoff: bool) -> Result<Ui> {
 impl Ui {
     fn restart_ready(&self) -> bool {
         let ready = !self.tasks.running()
+            && !self.installation.busy()
+            && !self.installation.visible()
             && !self.persistence_paused
             && self.recovery.is_none()
             // Confirmation overlays are intentionally not persisted.

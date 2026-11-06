@@ -202,6 +202,8 @@ impl Context {
 }
 #[cfg(windows)]
 mod console;
+#[cfg(windows)]
+pub(crate) mod installation;
 #[cfg(test)]
 use crate::shell::shell_quote;
 #[cfg(all(windows, test))]

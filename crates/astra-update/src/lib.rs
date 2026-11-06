@@ -2,8 +2,10 @@
 //!
 //! SHA-256 detects corruption; it does not authenticate a publisher. Selecting
 //! a release changes only the next-launch record, never running processes.
+pub mod installation;
 mod package;
 mod store;
+pub use package::verify_installation_directory;
 
 use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
@@ -137,6 +139,44 @@ pub(crate) fn validate_path(value: &str) -> Result<()> {
 
 impl ReleaseManifest {
     pub fn validate(&self, options: &ImportOptions) -> Result<()> {
+        ensure!(self.role == ReleaseRole::Client,
+            "This is a {:?} package, not a client worker update; install it through the corresponding service maintenance restart", self.role);
+        self.validate_common(options)?;
+        self.validate_components(
+            &["astra-proxy", "astra-rule", "astra-tui", "astra-host"],
+            options,
+        )
+    }
+
+    /// Local installation accepts complete packages for each independently shipped role.
+    /// Worker updates continue to use the narrower `validate` policy above.
+    pub fn validate_installation(&self, options: &ImportOptions) -> Result<()> {
+        self.validate_common(options)?;
+        let mut required = match self.role {
+            ReleaseRole::Client => vec![
+                "astra-proxy",
+                "astra-rule",
+                "astra-tui",
+                "astra-host",
+                "astra-manager",
+                "astra-convert",
+            ],
+            ReleaseRole::Server => vec![
+                "astra-server-core",
+                "astra-server-tui",
+                "astra-manager",
+                "astra-host",
+            ],
+            ReleaseRole::Controller => vec!["astra-manager"],
+            ReleaseRole::Web => vec!["astra-web"],
+        };
+        if self.role == ReleaseRole::Client && options.target.contains("windows") {
+            required.push("astra-service");
+        }
+        self.validate_components(&required, options)
+    }
+
+    fn validate_common(&self, options: &ImportOptions) -> Result<()> {
         ensure!(
             self.schema_version == 1,
             "Unsupported release manifest schema"
@@ -165,8 +205,6 @@ impl ReleaseManifest {
             ),
             _ => bail!("Build metadata requires profile and cargo_profile together"),
         }
-        ensure!(self.role == ReleaseRole::Client,
-            "This is a {:?} package, not a client worker update; install it through the corresponding service maintenance restart", self.role);
         validate_id(&self.release_id)?;
         ensure!(
             self.target == options.target,
@@ -193,7 +231,8 @@ impl ReleaseManifest {
         for file in &self.files {
             validate_path(&file.path)?;
             ensure!(
-                file.path != MANIFEST_FILE && names.insert(file.path.to_ascii_lowercase()),
+                !file.path.eq_ignore_ascii_case(MANIFEST_FILE)
+                    && names.insert(file.path.to_ascii_lowercase()),
                 "Duplicate/reserved release file"
             );
             ensure!(
@@ -214,20 +253,6 @@ impl ReleaseManifest {
         } else {
             ""
         };
-        for component in ["astra-proxy", "astra-rule", "astra-tui", "astra-host"] {
-            ensure!(
-                self.components
-                    .get(component)
-                    .is_some_and(|version| !version.trim().is_empty()),
-                "Missing component version: {component}"
-            );
-            ensure!(
-                self.files
-                    .iter()
-                    .any(|file| file.path == format!("{component}{suffix}")),
-                "Missing executable: {component}"
-            );
-        }
         for (component, version) in &self.components {
             validate_path(component)?;
             ensure!(
@@ -239,6 +264,29 @@ impl ReleaseManifest {
                     .iter()
                     .any(|file| file.path == format!("{component}{suffix}")),
                 "Missing executable for component: {component}"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_components(&self, required: &[&str], options: &ImportOptions) -> Result<()> {
+        let suffix = if options.target.contains("windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        for component in required {
+            ensure!(
+                self.components
+                    .get(*component)
+                    .is_some_and(|version| !version.trim().is_empty()),
+                "Missing component version: {component}"
+            );
+            ensure!(
+                self.files
+                    .iter()
+                    .any(|file| file.path == format!("{component}{suffix}")),
+                "Missing executable: {component}"
             );
         }
         Ok(())
