@@ -3,6 +3,7 @@ mod keys;
 mod model;
 mod pages;
 mod theme;
+pub mod widgets;
 mod window;
 use astra_client::{bootstrap, i18n, protocol::Kind};
 use gpui::AppContext;
