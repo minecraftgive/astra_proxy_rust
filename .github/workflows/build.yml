@@ -49,7 +49,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev
       - name: Install native build dependencies (Windows)
         if: runner.os == 'Windows'
         run: choco install nasm llvm --no-progress -y
@@ -66,6 +66,24 @@ jobs:
           echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
       - name: Build and package all roles with the release profile
         run: python scripts/build.py --role all --profile release --package --non-interactive --output-dir dist
+      - name: Build native desktop frontends
+        shell: python {0}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+        run: |
+          import subprocess, sys
+          sys.path.insert(0, 'scripts')
+          from astra_tools.workspace import build_environment
+          subprocess.run(['cargo', 'build', '--locked', '--release', '-p', 'astra-gui', '--bins'],
+                         env=build_environment(), check=True)
+      - name: Package desktop frontends (including macOS app bundles)
+        run: python scripts/package_gui.py --profile release --output-dir dist/gui
+      - uses: actions/upload-artifact@v5
+        with:
+          name: astra-gui-${{ matrix.name }}-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: dist/gui/*.tar.gz
       - name: Locate the build run
         run: |
           run_dir=$(python -c "import sys; sys.path.insert(0, 'scripts'); from astra_tools.artifacts import discover_index; print(discover_index().directory.as_posix())")

@@ -1,0 +1,35 @@
+[package]
+name = "astra-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+default-run = "astra-gui"
+
+[[bin]]
+name = "astra-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "astra-server-gui"
+path = "src/server_main.rs"
+
+[dependencies]
+astra-client = { path = "../astra-client" }
+astra-app = { path = "../astra-app" }
+astra-model = { path = "../astra-model" }
+astra-management = { path = "../astra-management" }
+astra-ipc = { path = "../astra-ipc" }
+astra-platform = { path = "../astra-platform" }
+gpui-component = "=0.9.0"
+# Component 0.9.0 does not re-export GPUI; use its exact underlying package,
+# so there is a single GPUI version and no crates.io gpui 0.2 dependency.
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["runtime_shaders", "font-kit", "wayland", "x11"] }
+async-channel = "2"
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }

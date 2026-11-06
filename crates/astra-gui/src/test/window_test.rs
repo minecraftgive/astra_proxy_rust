@@ -1,0 +1,183 @@
+use super::{keys, AppModel, AppWindow, Id, Kind, Panel, Root};
+use astra_client::editor::{Editor, Mode};
+use gpui::{AppContext, Focusable, TestAppContext};
+
+#[gpui::test]
+fn shortcuts_keep_working_after_palette_result_and_navigation(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, _) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model, Some(0), window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.palette);
+                assert!(app.search.read(cx).focus_handle(cx).is_focused(window));
+                // The same path used by clicking a palette result.
+                app.execute(Id::Tasks, window, cx);
+                assert!(!app.palette);
+                assert_eq!(app.panel, Some(Panel::Tasks));
+                assert!(app.focus.is_focused(window));
+            })
+        })
+        .unwrap();
+    cx.simulate_keystrokes(handle.into(), "escape 7 f1");
+    app.update(cx, |app, _| {
+        assert_eq!(app.page, Some(6));
+        assert_eq!(app.panel, Some(Panel::Help));
+    });
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.palette);
+                // The same path used by clicking the sidebar while search has focus.
+                app.navigate(5, window, cx);
+                assert!(app.focus.is_focused(window));
+            })
+        })
+        .unwrap();
+    cx.simulate_keystrokes(handle.into(), "f9");
+    app.update(cx, |app, _| assert_eq!(app.panel, Some(Panel::Monitor)));
+    cx.simulate_keystrokes(handle.into(), "f8 alt-7");
+    assert_eq!(cx.read(|cx| cx.windows().len()), 3);
+    app.update(cx, |app, _| assert_eq!(app.page, Some(5)));
+}
+
+#[gpui::test]
+fn printable_shortcuts_are_text_in_search_fields(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, receiver) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        let mut editor = Editor::new("test".into(), "standalone = true\n".into());
+        editor.history.push("standalone = false\n".into());
+        model.client.editor = Some(editor);
+    });
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model.clone(), Some(0), window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    for command in [Id::Palette, Id::Profiles] {
+        handle
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| app.execute(command, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(handle.into(), "q p / space 1 2 3 4 5 6 7");
+        app.update(cx, |app, cx| {
+            assert_eq!(app.search.read(cx).value().as_str(), "qp/ 1234567");
+            assert_eq!(app.page, Some(0));
+            assert_eq!(app.palette, command == Id::Palette);
+            assert_eq!(app.profile_chooser, command == Id::Profiles);
+        });
+        assert!(!receiver.is_closed(), "typing must not quit the app");
+        for chord in ["ctrl-z", "ctrl-y"] {
+            cx.simulate_keystrokes(handle.into(), chord);
+            model.update(cx, |model, _| {
+                assert!(!model.client.refresh_paused);
+                let editor = model.client.editor.as_ref().unwrap();
+                assert_eq!(editor.text(), "standalone = true\n");
+                assert_eq!(editor.history.len(), 1);
+                assert!(editor.future.is_empty());
+                assert!(matches!(editor.form.mode, Mode::Browse));
+            });
+        }
+        // Non-text app shortcuts remain available from either search field.
+        cx.simulate_keystrokes(handle.into(), "f6");
+        handle
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, _| {
+                    assert!(!app.palette);
+                    assert!(!app.profile_chooser);
+                    assert_eq!(app.panel, Some(Panel::Tasks));
+                    assert!(app.focus.is_focused(window));
+                });
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn only_the_visible_focused_editor_receives_keys_and_undo_runs_once(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, receiver) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new(Kind::Proxy, commands));
+    let original = "# original\nstandalone = true\n";
+    let previous = "# previous\nstandalone = true\n";
+    let current = "# current\nstandalone = true\n";
+    model.update(cx, |model, _| {
+        let mut editor = Editor::new("test".into(), current.into());
+        editor.history = vec![original.into(), previous.into()];
+        model.client.editor = Some(editor);
+    });
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model.clone(), Some(0), window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    // Retaining a draft while another page is visible must not make it editable.
+    cx.simulate_keystrokes(handle.into(), "u ctrl-z");
+    model.update(cx, |model, _| {
+        let editor = model.client.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), current);
+        assert_eq!(editor.history.len(), 2);
+    });
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.panel = Some(Panel::Editor);
+                window.focus(&app.focus, cx);
+                cx.notify();
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "ctrl-z");
+    model.update(cx, |model, _| {
+        let editor = model.client.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), previous);
+        assert_eq!(editor.history, [original]);
+        assert_eq!(editor.future, [current]);
+    });
+    // Raw editor keys still work, including printable application shortcuts in
+    // the shared editor's own text-entry mode.
+    cx.simulate_keystrokes(handle.into(), "/ q p space 1 2 3 4 5 6 7");
+    model.update(cx, |model, _| {
+        let Mode::Search(input) = &model.client.editor.as_ref().unwrap().form.mode else {
+            panic!("the focused editor must receive its search key");
+        };
+        assert_eq!(input.text, "qp 1234567");
+        assert!(!model.client.refresh_paused);
+    });
+    app.update(cx, |app, _| {
+        assert_eq!(app.page, Some(0));
+        assert_eq!(app.panel, Some(Panel::Editor));
+        assert!(!app.profile_chooser);
+    });
+    assert!(!receiver.is_closed());
+}

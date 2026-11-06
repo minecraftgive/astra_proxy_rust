@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/astra-client", "crates/astra-observe", "crates/astra-model", "crates/astra-platform", "crates/astra-resource", "crates/astra-management", "crates/astra-manager", "crates/astra-web", "crates/astra-tui-kit", "crates/astra-app", "crates/astra-update", "crates/astra-dns", "crates/astra-rule-data", "crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-core"]
+members = ["crates/astra-gui", "crates/astra-client", "crates/astra-observe", "crates/astra-model", "crates/astra-platform", "crates/astra-resource", "crates/astra-management", "crates/astra-manager", "crates/astra-web", "crates/astra-tui-kit", "crates/astra-app", "crates/astra-update", "crates/astra-dns", "crates/astra-rule-data", "crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-core"]
 resolver = "2"
 exclude = ["vendor/meow-proxy", "vendor/netstack-smoltcp", "vendor/meow-common"]
 
