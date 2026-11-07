@@ -311,6 +311,28 @@ impl AppModel {
         }
         cx.notify();
     }
+    /// Register a debug view and whether its window is on screen; memory
+    /// rounds run only while some registered view is visible.
+    pub fn watch_memory(&mut self, id: u64, visible: bool) {
+        let waker = self.client.waker.clone();
+        self.tokio(|client| {
+            client
+                .memory
+                .get_or_insert_with(|| astra_client::memory::View::new(waker))
+                .watch(id, visible)
+        });
+    }
+    /// Drop a debug view's registration; the state goes with the last one.
+    pub fn unwatch_memory(&mut self, id: u64) {
+        if self
+            .client
+            .memory
+            .as_mut()
+            .is_some_and(|memory| memory.unwatch(id))
+        {
+            self.client.memory = None;
+        }
+    }
     pub fn tokio<R>(&mut self, f: impl FnOnce(&mut Client) -> R) -> R {
         let _guard = self.handle.enter();
         f(&mut self.client)
@@ -387,6 +409,9 @@ impl AppModel {
             }
             if let Some(view) = &mut client.monitor {
                 changed |= view.poll_ready(&socket);
+            }
+            if let Some(view) = &mut client.memory {
+                changed |= view.poll_ready(&socket, &client.rows);
             }
             if !socket.as_os_str().is_empty() {
                 // The header's exit IP and TCP latency rounds, as in the TUI.

@@ -88,6 +88,10 @@ impl Ui {
                     self.client.open_monitor();
                 }
             }
+            Id::Debug => {
+                self.client.message =
+                    t("Memory composition is available in the desktop interface").into();
+            }
             Id::Settings => {
                 self.close_replaceable_overlays();
                 return self.navigate(shell::SETTINGS);

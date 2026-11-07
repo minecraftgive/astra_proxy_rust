@@ -263,6 +263,7 @@ impl AppWindow {
             });
         let tools = [
             (Panel::Monitor, Id::Monitor, "F9".to_owned()),
+            (Panel::Debug, Id::Debug, String::new()),
             (
                 Panel::Tasks,
                 Id::Tasks,

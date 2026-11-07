@@ -534,3 +534,21 @@ fn overview_proxies_card_folds_with_arrow_keys(cx: &mut TestAppContext) {
         .any(|event| matches!(event, ViewEvent::Navigate(_))));
     assert!(events.borrow().iter().any(|event| matches!(event,ViewEvent::Input(ClientInput::Run(Action::Runtime{command:Command::Select{member,..},..},_))if member=="second")));
 }
+#[gpui::test]
+fn debug_panel_samples_memory_only_while_mounted(cx: &mut TestAppContext) {
+    use crate::views::debug;
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    assert!(model.read_with(cx, |m, _| m.client.memory.is_none()));
+    let (view, window, _) = fixture(cx, model.clone(), debug::View::new);
+    assert!(model.read_with(cx, |m, _| m.client.memory.is_some()));
+    cx.simulate_keystrokes(window.into(), "space");
+    assert!(model.read_with(cx, |m, _| m.client.memory.as_ref().unwrap().paused));
+    assert!(!model.read_with(cx, |m, _| m.client.memory.as_ref().unwrap().active()));
+    drop(view);
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(model.read_with(cx, |m, _| m.client.memory.is_none()));
+}

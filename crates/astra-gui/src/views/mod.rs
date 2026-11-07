@@ -1,5 +1,6 @@
 //! Native views emit shared semantic operations to their owning window.
 pub mod connections;
+pub mod debug;
 pub mod diagnostics;
 pub mod editor;
 pub mod elevation;

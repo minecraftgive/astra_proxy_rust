@@ -139,6 +139,7 @@ impl AppWindow {
                 Screen::Panel(Panel::Updates) => mount!(views::updates::UpdatesView),
                 Screen::Panel(Panel::Tasks) => mount!(views::tasks::View),
                 Screen::Panel(Panel::Monitor) => mount!(views::monitor::View),
+                Screen::Panel(Panel::Debug) => mount!(views::debug::View),
                 Screen::Panel(Panel::Diagnostics) => mount!(views::diagnostics::View),
                 Screen::Panel(Panel::NetTools) => mount!(views::nettools::View),
                 Screen::Panel(Panel::GuiLog) => {

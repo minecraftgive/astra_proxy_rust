@@ -360,6 +360,8 @@ impl Session {
 pub struct Client {
     pub pending_proxy_selection: Option<crate::live::PendingProxySelection>,
     pub monitor: Option<crate::monitor::View>,
+    /// Memory composition; present only while a debug view is registered.
+    pub memory: Option<crate::memory::View>,
     pub marquee_hold: Option<(Instant, Instant, bool)>,
     pub terminals: crate::settings::TerminalState,
     #[cfg(windows)]
@@ -438,6 +440,7 @@ impl Client {
         let migration = session.keymap_notice_pending;
         Self {
             monitor: None,
+            memory: None,
             pending_proxy_selection: None,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_context: None,
@@ -1229,9 +1232,13 @@ impl Client {
                 Input::Idle
             }
             Id::Settings => self.navigate(crate::navigation::SETTINGS),
-            Id::Palette | Id::Help | Id::Profiles | Id::Tasks | Id::Logs | Id::Monitor => {
-                Input::Frontend(id)
-            }
+            Id::Palette
+            | Id::Help
+            | Id::Profiles
+            | Id::Tasks
+            | Id::Logs
+            | Id::Monitor
+            | Id::Debug => Input::Frontend(id),
         }
     }
 }

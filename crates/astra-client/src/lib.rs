@@ -35,6 +35,7 @@ pub mod intents;
 pub mod jobs;
 pub mod live;
 pub mod logs;
+pub mod memory;
 pub mod monitor;
 pub mod motion;
 pub mod navigation;

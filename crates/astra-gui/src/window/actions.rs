@@ -197,6 +197,7 @@ impl AppWindow {
                 | Id::Tasks
                 | Id::Logs
                 | Id::Monitor
+                | Id::Debug
         ) && !self.leave_editor(window, cx)
         {
             return;
@@ -278,6 +279,7 @@ impl AppWindow {
                 Id::Tasks => self.show_panel(Panel::Tasks, window, cx),
                 Id::Logs => self.show_panel(Panel::GuiLog, window, cx),
                 Id::Monitor => self.show_panel(Panel::Monitor, window, cx),
+                Id::Debug => self.show_panel(Panel::Debug, window, cx),
                 _ => {}
             },
         }
