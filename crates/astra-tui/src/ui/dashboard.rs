@@ -1,14 +1,9 @@
 //! Overview page and shared mouse hit testing. Never synthesize telemetry.
 use super::connections::{ConnectionRow, ConnectionRowKey};
-use super::shell::{duration, CONNECTIONS, PAGES, PROXIES};
+use super::shell::{CONNECTIONS, PROXIES};
 use super::*;
-use astra_model::runtime::Mode;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{
-    layout::Rect,
-    style::Modifier,
-    widgets::{BorderType, Sparkline},
-};
+use ratatui::{layout::Rect, style::Modifier, widgets::Sparkline};
 
 pub(super) use crate::theme::{BLUE, MUTED};
 
@@ -24,6 +19,8 @@ pub(super) enum Target {
     Runtime(astra_model::runtime::Command),
     Group(usize),
     Member(usize),
+    /// A node row of a group unfolded in the Overview: (group, member).
+    OverviewMember(usize, usize),
     Connection(u64),
     ConnectionRow(ConnectionRowKey),
     Connect,
@@ -107,169 +104,13 @@ impl Ui {
         self.hit(area, target);
     }
 
-    pub(super) fn overview_header_height(&self, _width: u16) -> u16 {
-        5
-    }
-
-    /// One bordered panel for the active instance, its profile and the page tabs.
-    pub(super) fn render_overview_header(&self, f: &mut Frame<'_>, area: Rect) {
-        if self.kind == Kind::Server {
-            self.render_server_header(f, area);
-            return;
-        }
-        let Some(row) = self.active_proxy() else {
-            return;
-        };
-        if area.width < 4 || area.height < 3 {
-            return;
-        }
-        let narrow = area.width < 80;
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let muted = Style::default().fg(MUTED);
-        let dark = Style::default().fg(Color::DarkGray);
-        let failed = row.state.starts_with("Exited")
-            || row.state.starts_with("Unresponsive")
-            || row.state.starts_with("Failed");
-        let (dot, color, state) = if failed {
-            ("●", Color::Red, t("Failed"))
-        } else if row.pid.is_some() && row.state == "Running" {
-            ("●", Color::Green, t("Connected"))
-        } else {
-            ("○", MUTED, t("Not connected"))
-        };
-        let color = self.indicator_color(color);
-        let mut title = vec![Span::styled(" Astra", bold.fg(BLUE))];
-        if narrow {
-            title.push(Span::styled(" · ", dark));
-            title.push(Span::styled(row.instance.name.clone(), bold));
-            title.push(Span::styled(" · ", dark));
-            title.push(Span::styled(
-                format!("{dot} {state}"),
-                Style::default().fg(color),
-            ));
-            if row.pid.is_some() {
-                title.push(Span::styled(
-                    format!(" · {} {}", t("Up"), duration(row.uptime)),
-                    muted,
-                ));
-            }
-        }
-        title.push(Span::raw(" "));
-        let block = Block::default()
-            .title(Line::from(title))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(dark);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-
-        let mode_style = |mode: Mode| match mode {
-            Mode::Rule => Style::default().fg(Color::Cyan),
-            Mode::Global => Style::default().fg(BLUE),
-            Mode::Direct => Style::default().fg(Color::Green),
-        };
-        let mut status = Vec::new();
-        if narrow {
-            // The title already carries the profile name, state and uptime.
-            status.push(Span::raw(" "));
-        } else {
-            status.push(Span::styled(format!(" {dot} "), Style::default().fg(color)));
-            status.push(Span::styled(row.instance.name.clone(), bold));
-            status.push(Span::styled(
-                format!(" {state}"),
-                Style::default().fg(color),
-            ));
-            if row.pid.is_some() {
-                status.push(Span::styled(format!(" {}", duration(row.uptime)), muted));
-            }
-        }
-        if let Some(snapshot) = self.live() {
-            if !narrow {
-                status.push(Span::styled("  │  ", dark));
-            }
-            status.push(Span::styled(
-                t(match snapshot.mode {
-                    Mode::Rule => "Rule",
-                    Mode::Global => "Global",
-                    Mode::Direct => "Direct",
-                }),
-                bold.patch(mode_style(snapshot.mode)),
-            ));
-            let (chain, delay, alive) = live::exit_chain(snapshot);
-            if !chain.is_empty() {
-                status.push(Span::styled(format!("  ·  {} ", t("Exit")), muted));
-                for (index, hop) in chain.iter().enumerate() {
-                    if index > 0 {
-                        status.push(Span::styled(" ▸ ", dark));
-                    }
-                    status.push(if index + 1 == chain.len() {
-                        Span::styled(hop.clone(), bold.fg(BLUE))
-                    } else {
-                        Span::raw(hop.clone())
-                    });
-                }
-                status.push(Span::raw("  "));
-                status.push(live::delay_span(delay, alive));
-            }
-            status.push(Span::styled(format!(" · {}", self.runtime_health()), muted));
-        } else if narrow {
-            status.push(Span::styled(t("Waiting for runtime data…"), muted));
-        } else {
-            status.push(Span::styled(
-                format!("  ·  {}", t("Waiting for runtime data…")),
-                muted,
-            ));
-        }
-        let compact = area.width < 110;
-        let rates = self.rate_spans(0, compact);
-        Self::render_right_aligned(
-            f,
-            Rect::new(inner.x, inner.y, inner.width, 1),
-            status,
-            rates,
-        );
-
-        let mut meta = vec![Span::raw(" ")];
-        if let Some(details) = self.details.get(&row.instance.name) {
-            if !details.listeners.is_empty() {
-                meta.push(Span::raw(details.listeners.join(" · ")));
-            }
-            if details.outbound_count > 0 {
-                if !details.listeners.is_empty() {
-                    meta.push(Span::styled("  ·  ", muted));
-                }
-                meta.push(Span::styled(
-                    tr!("{} outbounds", details.outbound_count),
-                    muted,
-                ));
-            }
-        }
-        if let Some(rule) = self.active_rule() {
-            if meta.len() > 1 {
-                meta.push(Span::styled("  ·  ", muted));
-            }
-            meta.push(Span::styled(tr!("Rule core {}", rule.instance.name), muted));
-        }
-        if meta.len() == 1 {
-            meta.push(Span::styled(t("No listener details yet."), muted));
-        }
-        let meta_row = inner.y + 1;
-        if meta_row < inner.bottom() {
-            Self::render_right_aligned(
-                f,
-                Rect::new(inner.x, meta_row, inner.width, 1),
-                meta,
-                self.rate_spans(1, compact),
-            );
-        }
-        // Span the whole panel so the separator replaces the side borders.
-        self.render_embedded_page_bar(f, Rect::new(area.x, inner.bottom() - 1, area.width, 1));
-    }
-
-    pub(super) fn rate_spans(&self, index: usize, compact: bool) -> Vec<Span<'static>> {
+    /// One rate row; `short` labels them P / D when the header runs out of room.
+    pub(super) fn rate_spans(
+        &self,
+        index: usize,
+        compact: bool,
+        short: bool,
+    ) -> Vec<Span<'static>> {
         let available = self.runtime_rates_available();
         let arrow = if index == 0 { "↑" } else { "↓" };
         let color = if index == 0 {
@@ -286,12 +127,18 @@ impl Ui {
         };
         let value = |bytes| live::rate_value(available.then_some(bytes), compact);
         vec![
-            Span::styled("Proxy ", Style::default().fg(MUTED)),
+            Span::styled(
+                if short { "P " } else { "Proxy " },
+                Style::default().fg(MUTED),
+            ),
             Span::styled(
                 format!("{arrow} {}/s", value(self.rates[index])),
                 style(self.rates[index], color),
             ),
-            Span::styled(" · Direct ", Style::default().fg(MUTED)),
+            Span::styled(
+                if short { " · D " } else { " · Direct " },
+                Style::default().fg(MUTED),
+            ),
             Span::styled(
                 format!("{arrow} {}/s", value(self.direct_rates[index])),
                 style(self.direct_rates[index], color),
@@ -330,49 +177,6 @@ impl Ui {
             left.extend(right);
         }
         f.render_widget(Paragraph::new(Line::from(left)), area);
-    }
-
-    /// Page tabs drawn on a separator row inside the merged Astra panel.
-    fn render_embedded_page_bar(&self, f: &mut Frame<'_>, area: Rect) {
-        if area.width < 3 || area.height == 0 {
-            return;
-        }
-        let border = Style::default().fg(Color::DarkGray);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("├", border),
-                Span::styled("─".repeat(area.width.saturating_sub(2) as usize), border),
-                Span::styled("┤", border),
-            ])),
-            area,
-        );
-        let compact = area.width < 100;
-        let mut x = area.x + 2;
-        for (index, page) in PAGES.iter().enumerate() {
-            let label = if compact && index != self.page {
-                format!(" {} ", index + 1)
-            } else {
-                format!(" {} {} ", index + 1, t(page))
-            };
-            let width = Line::from(label.as_str()).width() as u16;
-            if x + width + 1 >= area.right() {
-                break;
-            }
-            let rect = Rect::new(x, area.y, width, 1);
-            f.render_widget(
-                Paragraph::new(label).style(if index == self.page {
-                    Style::default()
-                        .bg(BLUE)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(MUTED)
-                }),
-                rect,
-            );
-            self.hit(rect, Target::Page(index));
-            x = x.saturating_add(width + 1);
-        }
     }
 
     pub(super) fn render_overview(&self, f: &mut Frame<'_>, area: Rect) {
@@ -524,7 +328,17 @@ impl Ui {
         );
         if footer {
             f.render_widget(
-                Paragraph::new(Span::styled(format!(" {}", t("p switch profiles")), muted)),
+                Paragraph::new(Span::styled(
+                    format!(
+                        " {}",
+                        if self.focus.region == focus::Region::Secondary {
+                            t("↑↓ move · →/← fold · Enter pick · t test")
+                        } else {
+                            t("Tab groups · p switch profiles")
+                        }
+                    ),
+                    muted,
+                )),
                 Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
             );
         }
@@ -615,25 +429,69 @@ impl Ui {
             .unwrap_or(0)
             .min(18);
         let visible = area.height as usize;
-        let total = snapshot.groups.len();
-        let selected = if self.focus.region == focus::Region::Secondary {
-            Some(self.group_selection)
+        // Groups and, under an unfolded group, its nodes as a fold-out menu.
+        let rows = self.overview_group_rows();
+        let total = rows.len();
+        let focused = self.focus.region == focus::Region::Secondary;
+        let cursor = self.overview_group_row();
+        let selected = if focused {
+            rows.iter().position(|row| *row == cursor)
         } else if self.overview_cursor >= self.connection_rows().len()
             && self.overview_cursor < self.overview_item_count.get()
         {
-            Some(start)
+            rows.iter().position(|row| *row == (start, None))
         } else {
             None
         };
         let start = self.live_list_offset(live::Viewport::OverviewGroups, selected, total, visible);
-        for (offset, group) in snapshot.groups.iter().skip(start).take(visible).enumerate() {
+        let highlight = |row: (usize, Option<usize>)| {
+            if focused && row == cursor {
+                crate::theme::selected_keep_colors()
+            } else {
+                Style::default()
+            }
+        };
+        for (offset, &(group_index, member_index)) in
+            rows.iter().skip(start).take(visible).enumerate()
+        {
+            let group = &snapshot.groups[group_index];
+            let rect = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+            let open = self.overview_unfolded.as_deref() == Some(group.name.as_str());
+            if let Some(member_index) = member_index {
+                let member = &group.members[member_index];
+                let pending = self.proxy_member_pending(&group.name, &member.name);
+                let chosen = group.selected.as_deref() == Some(member.name.as_str()) || pending;
+                let accent = Style::default().fg(BLUE).add_modifier(Modifier::BOLD);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("   │ ", Style::default().fg(MUTED)),
+                        Span::styled(if chosen { "✓ " } else { "  " }, accent),
+                        Span::styled(
+                            format!(
+                                "{}  ",
+                                if pending {
+                                    format!("{} · {}", member.name, t("Selecting…"))
+                                } else {
+                                    member.name.clone()
+                                }
+                            ),
+                            if chosen { accent } else { Style::default() },
+                        ),
+                        live::delay_span(member.delay_ms, member.alive),
+                    ]))
+                    .style(highlight((group_index, Some(member_index)))),
+                    rect,
+                );
+                self.hit(rect, Target::OverviewMember(group_index, member_index));
+                continue;
+            }
             let selected = group.selected.as_deref().unwrap_or("—");
             let member = group.members.iter().find(|m| m.name == selected);
-            let rect = Rect::new(area.x, area.y + offset as u16, area.width, 1);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
+                    Span::styled(if open { "▾" } else { "▸" }, Style::default().fg(MUTED)),
                     Span::styled(
-                        format!(" {:<name_width$} ", group.name),
+                        format!("{:<name_width$} ", group.name),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -650,18 +508,10 @@ impl Ui {
                         )
                     },
                 ]))
-                .style(
-                    if self.focus.region == focus::Region::Secondary
-                        && self.group_selection == start + offset
-                    {
-                        crate::theme::selected_keep_colors()
-                    } else {
-                        Style::default()
-                    },
-                ),
+                .style(highlight((group_index, None))),
                 rect,
             );
-            self.hit(rect, Target::Group(start + offset));
+            self.hit(rect, Target::Group(group_index));
         }
         let hidden = total.saturating_sub(start + visible);
         if hidden > 0 && area.height > 0 {
@@ -1073,6 +923,14 @@ impl Ui {
                 self.active_operation(super::Operation::NetTools)
             }
             Some(Target::Runtime(command)) => self.runtime_action(command),
+            // The Overview unfolds groups in place; other pages open the picker.
+            Some(Target::Group(index)) if self.page == super::shell::OVERVIEW => {
+                self.toggle_overview_group(index);
+                Input::Idle
+            }
+            Some(Target::OverviewMember(group, member)) => {
+                self.choose_overview_member(group, member)
+            }
             Some(Target::Group(index)) => {
                 if self.page != PROXIES {
                     self.navigate(PROXIES);

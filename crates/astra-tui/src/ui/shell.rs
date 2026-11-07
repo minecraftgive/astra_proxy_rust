@@ -312,36 +312,17 @@ impl Ui {
     /// Status bar, page bar and hint line; returns the page content area.
     pub(super) fn render_frame(&self, f: &mut Frame<'_>) -> Rect {
         let area = f.area();
-        let header_height = self.overview_header_height(area.width);
-        let merged = self.page == OVERVIEW
-            && self.active_proxy().is_some()
-            && area.height >= header_height.saturating_add(4);
-        let rows = if merged {
-            Layout::vertical([
-                Constraint::Length(header_height),
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area)
-        } else {
-            Layout::vertical([
-                Constraint::Length(if self.kind == Kind::Server { 1 } else { 2 }),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area)
-        };
-        let (content, hint) = if merged {
-            self.render_overview_header(f, rows[0]);
-            (rows[1], rows[2])
-        } else {
-            self.render_status_bar(f, rows[0]);
-            self.render_page_bar(f, rows[1]);
-            (rows[2], rows[3])
-        };
+        let rows = Layout::vertical([
+            Constraint::Length(if self.kind == Kind::Server { 1 } else { 2 }),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        self.render_status_bar(f, rows[0]);
+        self.render_page_bar(f, rows[1]);
+        let (content, hint) = (rows[2], rows[3]);
         // This page's keys, whole entries only; results live in the status line below.
         let hint_text = format!("[{}] Tab focus · {}", self.focus_label(), self.hint());
         let global = Line::from(crate::theme::key_hints(t("F2 / Ctrl-K commands · F1 help")));
@@ -364,14 +345,20 @@ impl Ui {
         f.render_widget(Paragraph::new(Line::from(spans)), hints);
         content
     }
+    /// The same two header rows on every page: profile, mode and exit with upload
+    /// rates; listeners, switches and telemetry health with download rates.
     fn render_status_bar(&self, f: &mut Frame<'_>, area: Rect) {
         if self.kind == Kind::Server {
             self.render_server_header(f, area);
             return;
         }
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let muted = Style::default().fg(MUTED);
-        let sep = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
+        let dark = Style::default().fg(Color::DarkGray);
+        let sep = || Span::styled(" │ ", dark);
         let brand = vec![Span::styled(" Astra", bold.fg(BLUE)), sep()];
         let Some(row) = self.active_proxy() else {
             let mut spans = brand;
@@ -382,104 +369,204 @@ impl Ui {
             f.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         };
-        let (dot, color, state) = if row.pid.is_some() {
-            ("● ", Color::Green, t("Profile connected"))
-        } else if row.state.starts_with("Exited") || row.state == "Unresponsive" {
-            ("● ", Color::Red, t("Failed"))
+        let failed = row.state.starts_with("Exited")
+            || row.state.starts_with("Unresponsive")
+            || row.state.starts_with("Failed");
+        let (dot, color, state) = if failed {
+            ("●", Color::Red, t("Failed"))
+        } else if row.pid.is_some() {
+            ("●", Color::Green, t("Profile connected"))
         } else {
-            ("○ ", MUTED, t("Not connected"))
+            ("○", MUTED, t("Not connected"))
         };
         let color = self.indicator_color(color);
         let live = self.live();
         let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-        // Detail levels, richest first; the first that fits the bar is drawn, so a
-        // narrow terminal drops rates, off switches, uptime, the state word, then
-        // the switches and finally the mode.
-        const LAST: usize = 6;
-        for level in 0..=LAST {
-            let mut profile = vec![
-                Span::styled(dot, Style::default().fg(color)),
-                Span::styled(row.instance.name.clone(), bold),
-            ];
+
+        // Row one, richest first: a narrow terminal drops the exit IP, uptime,
+        // intermediate hops, the state word, the exit and finally the mode.
+        let mut connect = (0, 0);
+        let first = |level: usize, connect: &mut (usize, usize)| {
+            let mut spans = brand.clone();
+            connect.0 = width(&spans);
+            spans.push(Span::styled(format!("{dot} "), Style::default().fg(color)));
+            spans.push(Span::styled(row.instance.name.clone(), bold));
             if level < 4 {
-                profile.push(Span::styled(
+                spans.push(Span::styled(
                     format!(" {state}"),
                     Style::default().fg(color),
                 ));
             }
-            if level < 3 && row.pid.is_some() {
-                profile.push(Span::styled(format!(" {}", duration(row.uptime)), muted));
+            if level < 2 && row.pid.is_some() {
+                spans.push(Span::styled(format!(" {}", duration(row.uptime)), muted));
             }
-            let mut left = brand.clone();
-            let start = width(&left);
-            left.extend(profile);
-            let end = width(&left);
-            let mut right = vec![];
-            if let Some(snapshot) = live {
-                let (mode, mode_color) = match snapshot.mode {
-                    Mode::Rule => ("Rule", Color::Cyan),
-                    Mode::Global => ("Global", BLUE),
-                    Mode::Direct => ("Direct", Color::Green),
-                };
-                if level < 6 {
-                    left.push(sep());
-                    left.push(Span::styled(t(mode), bold.fg(mode_color)));
+            connect.1 = width(&spans);
+            if level >= 6 {
+                return spans;
+            }
+            spans.push(sep());
+            let Some(snapshot) = live else {
+                spans.push(Span::styled(t("Waiting for runtime data…"), muted));
+                return spans;
+            };
+            let (mode, mode_color) = match snapshot.mode {
+                Mode::Rule => ("Rule", Color::Cyan),
+                Mode::Global => ("Global", BLUE),
+                Mode::Direct => ("Direct", Color::Green),
+            };
+            spans.push(Span::styled(t(mode), bold.fg(mode_color)));
+            let (chain, _, _) = live::exit_chain(snapshot);
+            if level >= 5 {
+                return spans;
+            }
+            if !chain.is_empty() {
+                spans.push(Span::styled(format!(" {} ", t("Exit")), muted));
+                let skip = if level < 3 { 0 } else { chain.len() - 1 };
+                for (index, hop) in chain.iter().enumerate().skip(skip) {
+                    if index > skip {
+                        spans.push(Span::styled(" ▸ ", dark));
+                    }
+                    spans.push(if index + 1 == chain.len() {
+                        Span::styled(hop.clone(), bold.fg(BLUE))
+                    } else {
+                        Span::raw(hop.clone())
+                    });
                 }
+                // Shared rule: a known result always shows (every connect and
+                // switch probes once); an enabled setting keeps its place.
+                let exit = chain.last().map(String::as_str).unwrap_or_default();
+                let (ip, latency) = self.exit_probe_fields(&row.instance.name, exit);
+                let mut fields = vec![];
+                if let Some(ip) = ip.filter(|_| level < 1) {
+                    fields.push(Span::styled(format!("ip: {ip}"), muted));
+                }
+                if let Some(latency) = latency {
+                    use astra_client::overview::ExitLatency;
+                    fields.push(match latency {
+                        ExitLatency::Measured(ms) => live::delay_span(Some(ms), Some(true)),
+                        ExitLatency::Failed => live::delay_span(None, Some(false)),
+                        ExitLatency::Pending => live::delay_span(None, None),
+                    });
+                }
+                if !fields.is_empty() {
+                    spans.push(Span::styled(" (", muted));
+                    for (index, field) in fields.into_iter().enumerate() {
+                        if index > 0 {
+                            spans.push(Span::styled(" | ", muted));
+                        }
+                        spans.push(field);
+                    }
+                    spans.push(Span::styled(")", muted));
+                }
+            }
+            spans.push(sep());
+            spans
+        };
+        // Row two: listeners, every switch, then telemetry health; narrow terminals
+        // drop the health, then the off switches, then the listeners.
+        let listeners = self
+            .details
+            .get(&row.instance.name)
+            .map(|details| details.listeners.join(" · "))
+            .unwrap_or_default();
+        let second = |level: usize| {
+            let mut spans = vec![Span::raw(" ")];
+            if level < 3 && !listeners.is_empty() {
+                spans.push(Span::raw(listeners.clone()));
+                spans.push(Span::raw("  "));
+            }
+            if let Some(snapshot) = live {
                 let switches = [
                     (t("System proxy"), snapshot.system_proxy),
                     ("TUN", snapshot.tun),
                     ("LAN", snapshot.allow_lan),
                 ];
-                // Full: every switch with its state. Compact: only those that are on.
-                let shown: Vec<_> = switches
-                    .iter()
-                    .filter(|(_, on)| level < 2 || (*on && level < 5))
-                    .collect();
-                if !shown.is_empty() {
-                    left.push(sep());
-                    for (index, (label, on)) in shown.into_iter().enumerate() {
-                        if index > 0 {
-                            left.push(Span::raw("  "));
-                        }
-                        let style = if *on {
+                for (label, on) in switches.iter().filter(|(_, on)| level < 2 || *on) {
+                    spans.push(Span::styled(
+                        format!("{} {label}  ", if *on { "●" } else { "○" }),
+                        if *on {
                             Style::default().fg(Color::Green)
                         } else {
                             muted
-                        };
-                        left.push(Span::styled(
-                            format!("{} {label}", if *on { "●" } else { "○" }),
-                            style,
-                        ));
-                    }
-                }
-                if level == 0 && area.height >= 2 {
-                    right = self.rate_spans(0, area.width < 110);
+                        },
+                    ));
                 }
             }
-            let used = width(&left) + width(&right);
-            if used <= area.width as usize || level == LAST {
-                if !right.is_empty() {
-                    left.push(Span::raw(" ".repeat(area.width as usize - used)));
-                    left.extend(right);
-                    Self::render_right_aligned(
-                        f,
-                        Rect::new(area.x, area.y + 1, area.width, 1),
-                        vec![Span::styled(format!(" {}", self.runtime_health()), muted)],
-                        self.rate_spans(1, area.width < 110),
-                    );
-                }
-                // Clicking the profile segment connects or disconnects, like the GUI switch.
-                self.hit(
-                    Rect::new(area.x + start as u16, area.y, (end - start) as u16, 1)
-                        .intersection(area),
-                    Target::Connect,
-                );
-                f.render_widget(
-                    Paragraph::new(Line::from(left)),
-                    Rect::new(area.x, area.y, area.width, area.height.min(1)),
-                );
-                return;
+            if level < 1 {
+                spans.push(Span::styled(
+                    format!("    {}", self.runtime_health()),
+                    muted,
+                ));
             }
+            spans
+        };
+        const LEVELS: [usize; 2] = [6, 3];
+        // Rates share one format on both rows so the columns line up. Out of room,
+        // they switch to P / D labels, then short numbers (while the rows drop
+        // detail), and are left out only when even that cannot fit.
+        let rates = |row: usize, variant: usize| {
+            // Shown as — before runtime data arrives so the columns never jump.
+            if variant < 3 {
+                self.rate_spans(row, variant >= 2, variant >= 1)
+            } else {
+                vec![]
+            }
+        };
+        let fits =
+            |left: &[Span], right: &[Span]| width(left) + width(right) <= area.width as usize;
+        // Rates may push out the IP, uptime, middle hops and off switches, but
+        // never the state, the exit node or the switches that are on.
+        let deepest = |row: usize, variant: usize| match variant {
+            0 | 1 => 0,
+            2 => [3, 2][row],
+            _ => LEVELS[row],
+        };
+        let fitting_level = |row: usize, variant: usize, connect: &mut (usize, usize)| {
+            let right = rates(row, variant);
+            (0..=deepest(row, variant)).find(|&level| {
+                let left = if row == 0 {
+                    first(level, connect)
+                } else {
+                    second(level)
+                };
+                fits(&left, &right)
+            })
+        };
+        let variant = (0..3)
+            .find(|&variant| {
+                fitting_level(0, variant, &mut connect).is_some()
+                    && (area.height < 2 || fitting_level(1, variant, &mut connect).is_some())
+            })
+            .unwrap_or(3);
+        let pick = |row: usize, build: &mut dyn FnMut(usize) -> Vec<Span<'static>>| {
+            let right = rates(row, variant);
+            let mut left = (0..=LEVELS[row])
+                .map(&mut *build)
+                .find(|left| fits(left, &right))
+                .unwrap_or_else(|| build(LEVELS[row]));
+            // The trailing separator only leads into the rates.
+            if right.is_empty() && left.last().is_some_and(|span| span.content == " │ ") {
+                left.pop();
+            }
+            (left, right)
+        };
+        let (left, right) = pick(0, &mut |level| first(level, &mut connect));
+        // `connect` now spans the profile segment of the row actually drawn.
+        let (start, end) = connect;
+        Self::render_right_aligned(f, Rect::new(area.x, area.y, area.width, 1), left, right);
+        // Clicking the profile segment connects or disconnects, like the GUI switch.
+        self.hit(
+            Rect::new(area.x + start as u16, area.y, (end - start) as u16, 1).intersection(area),
+            Target::Connect,
+        );
+        if area.height >= 2 {
+            let (left, right) = pick(1, &mut |level| second(level));
+            Self::render_right_aligned(
+                f,
+                Rect::new(area.x, area.y + 1, area.width, 1),
+                left,
+                right,
+            );
         }
     }
     fn render_page_bar(&self, f: &mut Frame<'_>, area: Rect) {

@@ -107,7 +107,10 @@ python scripts/install_wintun.py --bin-dir target/x86_64-pc-windows-msvc/debug
 
 ```sh
 ./scripts/build.sh
+./scripts/build.sh --debug
 ```
+
+与 Windows 一致，`build.sh` 是 POSIX `sh` 脚本（不依赖 bash），优先使用 `PYTHON` 环境变量指定的解释器，否则依次查找 `python3`、`python3.14`…`python3.11`、`python` 中第一个 3.11+ 版本，并原样返回 `build.py` 的退出码。构建前检查 Cargo、rustc、CMake 及 C/C++ 编译器（`CC`/`CXX`，或 `cc`/`clang`/`gcc` 与 `c++`/`clang++`/`g++`），对应 Windows 的 MSVC/NASM 检查。未设置 `LIBCLANG_PATH` 时，与 Windows 相同地识别项目内 libclang：`python3 -m pip install --target .build-tools/unix/python libclang`，或安装在 `.build-tools` 虚拟环境中的 libclang；系统 LLVM/Xcode 的 libclang 由 bindgen 自行查找。
 
 `build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖，以 `fast` 模式构建本机 `debug` 客户端程序，**不运行测试、不打包**。在终端运行时显示表单，输入字段编号修改 profile（debug/release/both）、模式（fast/runtime）、架构（native/64bits）、角色、打包及耗时报告；输入选项编号或值并回车。表单显示实际 Cargo profile，命令行参数作为初始值。输入 `B` 并回车开始编译，`Q` 取消；没有倒计时自动构建，输入结束或 Ctrl-C 也会取消。`--interactive` 强制显示表单，`--non-interactive` 跳过；非终端输入默认直接使用命令行参数。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
 

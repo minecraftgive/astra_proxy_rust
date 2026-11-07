@@ -4,8 +4,9 @@ use astra_client::{
     nettools::{Field, Kind, RECORDS},
 };
 use gpui::{
-    div, px, uniform_list, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window,
+    div, prelude::FluentBuilder, px, uniform_list, App, AppContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    Styled, Subscription, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -49,14 +50,29 @@ impl View {
                 input.set_value(value, window, cx);
                 input
             });
-            observations.push(
-                cx.subscribe(&input, move |view, state, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
+            observations.push(cx.subscribe_in(
+                &input,
+                window,
+                move |view, state, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => {
                         let value = state.read(cx).value().to_string();
                         view.mutate(move |v| v.set_text(field, value), cx);
                     }
-                }),
-            );
+                    // Keep the shared field cursor on the box the pointer chose.
+                    InputEvent::Focus => view.mutate(
+                        move |v| {
+                            v.field = field;
+                            Ok(())
+                        },
+                        cx,
+                    ),
+                    InputEvent::PressEnter { .. } => {
+                        view.start(cx);
+                        window.focus(&view.focus, cx);
+                    }
+                    InputEvent::Blur => {}
+                },
+            ));
             inputs.push((field, input));
         }
         let egress = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search egress")));
@@ -117,6 +133,133 @@ impl View {
             }
         }
     }
+    fn tools<R>(
+        &self,
+        cx: &App,
+        read: impl FnOnce(&astra_client::nettools::View) -> R,
+    ) -> Option<R> {
+        self.model
+            .read(cx)
+            .client
+            .diagnostics
+            .as_ref()
+            .and_then(|d| d.tools.as_ref())
+            .map(read)
+    }
+    /// Copy model-owned text back into the native boxes after a shared key changed it.
+    fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(values) = self.tools(cx, |v| {
+            [v.target.clone(), v.server.clone(), v.count.to_string()]
+        }) else {
+            return;
+        };
+        for (field, input) in &self.inputs {
+            let value = match field {
+                Field::Target => &values[0],
+                Field::Server => &values[1],
+                _ => &values[2],
+            };
+            if input.read(cx).value().as_ref() != value.as_str() {
+                let value = value.clone();
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+    }
+    fn back(&mut self, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, cx| {
+            model.tokio(|c| {
+                if let Some(d) = &mut c.diagnostics {
+                    d.tools = None;
+                    if d.tools_only {
+                        c.diagnostics = None;
+                    }
+                }
+            });
+            cx.notify();
+        });
+        cx.notify();
+    }
+    /// The terminal form's keys. Native boxes own Target, DNS server and Count text;
+    /// the shared model owns egress, kind and record choices.
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        if stroke.modifiers.alt || stroke.modifiers.platform {
+            return;
+        }
+        if !self.focus.is_focused(window) {
+            // Inside a box: Escape returns to the form instead of closing the page.
+            if stroke.key == "escape" {
+                window.focus(&self.focus, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let Some(running) = self.tools(cx, |v| v.running()) else {
+            return;
+        };
+        match stroke.key.as_str() {
+            "escape" if running => self.mutate(
+                |v| {
+                    v.stop();
+                    Ok(())
+                },
+                cx,
+            ),
+            "escape" => self.back(cx),
+            "enter" if running => self.mutate(
+                |v| {
+                    v.stop();
+                    Ok(())
+                },
+                cx,
+            ),
+            "enter" => self.start(cx),
+            _ => {
+                if stroke.modifiers.control && stroke.key != "u" {
+                    return;
+                }
+                let Some(key) = crate::keys::from_keystroke(stroke, event.is_held) else {
+                    return;
+                };
+                let navigation = matches!(stroke.key.as_str(), "up" | "down" | "tab");
+                let field = self.tools(cx, |v| v.field).unwrap_or(Field::Egress);
+                let owned =
+                    |field: Field| matches!(field, Field::Target | Field::Server | Field::Count);
+                if !navigation && owned(field) {
+                    // Typing on a text row starts editing its native box.
+                    if let Some((_, input)) = self.inputs.iter().find(|(f, _)| *f == field) {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                // Function keys and other global shortcuts keep working on this page.
+                if !navigation
+                    && !matches!(
+                        key.code,
+                        astra_client::input::KeyCode::Left
+                            | astra_client::input::KeyCode::Right
+                            | astra_client::input::KeyCode::PageUp
+                            | astra_client::input::KeyCode::PageDown
+                            | astra_client::input::KeyCode::Backspace
+                            | astra_client::input::KeyCode::BackTab
+                            | astra_client::input::KeyCode::Char(_)
+                    )
+                {
+                    return;
+                }
+                self.mutate(
+                    |v| {
+                        v.key(key);
+                        Ok(())
+                    },
+                    cx,
+                );
+                self.sync_inputs(window, cx);
+            }
+        }
+        cx.stop_propagation();
+    }
     pub fn start(&mut self, cx: &mut Context<Self>) {
         let values = self
             .inputs
@@ -161,19 +304,32 @@ impl Render for View {
         let running = view.running();
         let record = view.record.clone();
         let selected = view.egress;
+        let current = view.field;
+        let query = view.egress_query.clone();
         let selected_label = astra_client::nettools::egress_label(&view.egresses[selected]);
         let choices =
             std::sync::Arc::new(view.egress_choices(self.egress.read(cx).value().as_ref()));
         let output = std::sync::Arc::new(view.output());
         for field in fields {
-            let mut row = div().flex().gap_2().items_center();
+            let mut row = div()
+                .flex()
+                .gap_2()
+                .items_center()
+                .pl_2()
+                .border_l_2()
+                .border_color(gpui::transparent_black())
+                .when(field == current, |row| row.border_color(cx.theme().primary));
             match field {
                 Field::Egress => {
                     let choices = choices.clone();
                     let weak = cx.entity().downgrade();
                     row = row.child(div().w(px(110.)).child(t("Egress"))).child(
                         Button::new("egress-picker")
-                            .label(format!("{} ▾", selected_label))
+                            .label(if query.is_empty() {
+                                format!("{} ▾", selected_label)
+                            } else {
+                                format!("{} ▾  /{}", selected_label, query)
+                            })
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.egress_open = !view.egress_open;
                                 cx.notify();
@@ -280,37 +436,30 @@ impl Render for View {
                 .child(
                     Button::new("probe-back")
                         .label(t("Back"))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.model.update(cx, |model, cx| {
-                                model.tokio(|c| {
-                                    if let Some(d) = &mut c.diagnostics {
-                                        d.tools = None;
-                                        if d.tools_only {
-                                            c.diagnostics = None;
-                                        }
-                                    }
-                                });
-                                cx.notify();
-                            });
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|view, _, _, cx| view.back(cx))),
                 ),
         );
         if let Some(error) = &self.error {
             root = root.child(div().text_color(cx.theme().danger).child(error.clone()));
         }
-        root.child(
-            uniform_list("probe-output", output.len(), move |range, _, _| {
-                range
-                    .map(|i| {
-                        div()
-                            .h(px(28.))
-                            .whitespace_nowrap()
-                            .child(output[i].clone())
-                    })
-                    .collect()
-            })
-            .flex_1(),
+        let surface = crate::widgets::surface(cx).flex_1().px_4().py_2();
+        let mono = crate::theme::mono(cx);
+        root.on_key_down(cx.listener(Self::key)).child(
+            surface.child(
+                uniform_list("probe-output", output.len(), move |range, _, _| {
+                    range
+                        .map(|i| {
+                            div()
+                                .h(px(24.))
+                                .text_xs()
+                                .font_family(mono.clone())
+                                .whitespace_nowrap()
+                                .child(output[i].clone())
+                        })
+                        .collect()
+                })
+                .flex_1(),
+            ),
         )
     }
 }

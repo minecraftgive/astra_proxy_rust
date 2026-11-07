@@ -51,6 +51,10 @@ pub enum Field {
     VimKeys,
     Mouse,
     StartPage,
+    ExitIp,
+    ExitLatency,
+    ExitInterval,
+    ExitKeepAlive,
     Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     StartupRegistration,
@@ -78,6 +82,10 @@ pub const ALL_FIELDS: &[Field] = &[
     Field::VimKeys,
     Field::Mouse,
     Field::StartPage,
+    Field::ExitIp,
+    Field::ExitLatency,
+    Field::ExitInterval,
+    Field::ExitKeepAlive,
     Field::Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     Field::StartupRegistration,
@@ -99,7 +107,7 @@ pub const ALL_FIELDS: &[Field] = &[
     Field::MarqueeTrueColor,
 ];
 /// Row of the first marquee field.
-pub const MARQUEE_ROW: usize = 9
+pub const MARQUEE_ROW: usize = 13
     + 4 * cfg!(windows) as usize
     + 3 * cfg!(target_os = "macos") as usize
     + 2 * cfg!(target_os = "linux") as usize;
@@ -111,10 +119,11 @@ pub fn fields(p: &Preferences) -> &'static [Field] {
         &ALL_FIELDS[..MARQUEE_ROW]
     }
 }
-pub const SECTIONS: [(&str, std::ops::Range<usize>); 5] = [
+pub const SECTIONS: [(&str, std::ops::Range<usize>); 6] = [
     ("Appearance", 0..4),
     ("Interaction", 4..7),
-    ("Startup", 7..MARQUEE_ROW - 1),
+    ("Exit probe", 7..11),
+    ("Startup", 11..MARQUEE_ROW - 1),
     ("Installation", MARQUEE_ROW - 1..MARQUEE_ROW),
     ("Marquee", MARQUEE_ROW..ALL_FIELDS.len()),
 ];
@@ -130,6 +139,10 @@ impl Field {
             Self::VimKeys => "Vim navigation",
             Self::Mouse => "Mouse",
             Self::StartPage => "Start page",
+            Self::ExitIp => "Exit IP",
+            Self::ExitLatency => "Exit TCP latency",
+            Self::ExitInterval => "Latency interval",
+            Self::ExitKeepAlive => "Keep probe process",
             Self::Terminal => "Terminal",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupFrontend => "Startup interface",
@@ -168,6 +181,10 @@ impl Field {
             Self::VimKeys => "h j k l g G move in lists and logs, in addition to the arrow keys.",
             Self::Mouse => "Off returns the mouse to the terminal so you can select and copy text.",
             Self::StartPage => "Page shown when a window opens without --view.",
+            Self::ExitIp => "Every connect or node switch looks up the exit IP once. On keeps its place in the header and retries a failed lookup; off shows the IP only once found.",
+            Self::ExitLatency => "Every connect or node switch measures the TCP handshake through the exit node once. On repeats it at the interval below and keeps its place in the header.",
+            Self::ExitInterval => "Seconds between latency rounds, 5–3600. ←→ ±5, Shift ±60.",
+            Self::ExitKeepAlive => "On keeps one probe process loaded and idle between rounds, so each round costs only a handshake. Off starts and ends a probe process every round. An idle probe process exits shortly after probes stop.",
             Self::Terminal => "Choose the terminal for the next TUI launch, new windows and non-silent startup. The current window stays here. Silent startup does not use a terminal. Press r to scan again.",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupFrontend => "Choose the graphical interface or terminal interface for future sign-in startup.",
@@ -205,6 +222,7 @@ impl Field {
             Self::MarqueeWidth => "Width of one color cycle. Wider values make a gentler gradient.",
             Self::MarqueeFps => "Banner animation frames per second. Higher values make motion smoother.",
             Self::MarqueeTrueColor => "Use full color for the banner regardless of the appearance color setting.",
+            Self::ExitInterval => "Seconds between latency rounds, 5–3600.",
             _ => self.description(),
         }
     }
@@ -239,13 +257,16 @@ impl Field {
             Self::WindowsService => &["On", "Off"],
             Self::VimKeys
             | Self::Mouse
+            | Self::ExitIp
+            | Self::ExitLatency
+            | Self::ExitKeepAlive
             | Self::MarqueeBorder
             | Self::MarqueeText
             | Self::MarqueeBackground
             | Self::MarqueeStatus
             | Self::MarqueeIndicator
             | Self::MarqueeTrueColor => &["On", "Off"],
-            Self::MarqueeSpeed | Self::MarqueeWidth | Self::MarqueeFps => &[],
+            Self::MarqueeSpeed | Self::MarqueeWidth | Self::MarqueeFps | Self::ExitInterval => &[],
             Self::StartPage => &crate::navigation::PAGES,
         }
     }
@@ -264,6 +285,10 @@ impl Field {
             Self::VimKeys => usize::from(!p.vim_keys),
             Self::Mouse => usize::from(!p.mouse),
             Self::StartPage => p.start_page.page(),
+            Self::ExitIp => usize::from(!p.exit_ip),
+            Self::ExitLatency => usize::from(!p.exit_latency),
+            Self::ExitInterval => usize::from(EXIT_INTERVAL.clamp(p.exit_interval)),
+            Self::ExitKeepAlive => usize::from(!p.exit_keep_alive),
             Self::Terminal => 0, // The cached terminal list resolves the saved ID.
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => usize::from(!p.startup_enabled),
@@ -316,6 +341,10 @@ impl Field {
             Self::VimKeys => p.vim_keys = index == 0,
             Self::Mouse => p.mouse = index == 0,
             Self::StartPage => p.start_page = StartPage::ALL[index],
+            Self::ExitIp => p.exit_ip = index == 0,
+            Self::ExitLatency => p.exit_latency = index == 0,
+            Self::ExitInterval => p.exit_interval = index as u16,
+            Self::ExitKeepAlive => p.exit_keep_alive = index == 0,
             Self::Terminal => p.terminal = "auto".into(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => p.startup_enabled = index == 0,
@@ -344,6 +373,7 @@ impl Field {
             Self::MarqueeSpeed => Some(SPEED),
             Self::MarqueeWidth => Some(WIDTH),
             Self::MarqueeFps => Some(FPS),
+            Self::ExitInterval => Some(EXIT_INTERVAL),
             _ => None,
         }
     }

@@ -94,10 +94,21 @@ fn should_launch_terminal(
     hosted: bool,
     native: bool,
     resume: bool,
+    here: bool,
     preference: &str,
     tty: bool,
 ) -> bool {
-    !hosted && !native && !resume && (cfg!(windows) || preference != "auto" || !tty)
+    !hosted && !native && !resume && !here && (cfg!(windows) || preference != "auto" || !tty)
+}
+
+/// A remote shell cannot see windows opened on the host's desktop, so an
+/// interactive SSH session always keeps the TUI in its own terminal.
+fn remote_session(tty: bool) -> bool {
+    !cfg!(windows)
+        && tty
+        && ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
 }
 
 fn terminal_arguments(
@@ -126,6 +137,7 @@ async fn launch_terminal(
     launch: &windows::Launch,
     terminal_child: bool,
     terminal_native: bool,
+    here: bool,
     resume_ui: bool,
 ) -> Result<bool> {
     use std::io::IsTerminal;
@@ -133,11 +145,20 @@ async fn launch_terminal(
         return Ok(false);
     }
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    anyhow::ensure!(!here || tty, "--here requires an interactive terminal");
+    let here = here || remote_session(tty);
     let args = terminal_arguments(context, launch, i18n::command_line_language())?;
     let context = context.clone();
     tokio::task::spawn_blocking(move || {
         let preference = ui::preferred_terminal(&context.home);
-        if !should_launch_terminal(terminal_child, terminal_native, resume_ui, &preference, tty) {
+        if !should_launch_terminal(
+            terminal_child,
+            terminal_native,
+            resume_ui,
+            here,
+            &preference,
+            tty,
+        ) {
             return Ok(false);
         }
         match crate::terminals::launch(&preference, &context.executable, &args)? {
@@ -173,6 +194,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         native_console,
         terminal_child,
         terminal_native,
+        here,
         resume_ui,
         restart_ready,
         silent,
@@ -188,6 +210,8 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         };
         println!("{program} [--lang en|zh-CN|zh-TW] [--state-dir DIR] [--config-dir DIR] [--bin-dir DIR]\n{}", i18n::t("--manager: run manager · --shutdown: stop all\nq: close UI; instances keep running"));
         println!("update PATH: apply a local update package\nupdate-status: show release and drain status\nrollback: return new sessions to the previous release\nastra-host runs the background manager by default; host updates take effect after an intentional restart");
+        #[cfg(not(windows))]
+        println!("--here: run the TUI in the current terminal instead of opening a terminal window (automatic over SSH)");
         println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         println!("--silent: start the manager and configured auto-start instances without opening the TUI; errors are saved to STATE_DIR/startup.log");
@@ -249,6 +273,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
                 &launch,
                 terminal_child,
                 terminal_native,
+                here,
                 resume_ui,
             )
             .await?
@@ -382,6 +407,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
             &launch,
             terminal_child,
             terminal_native,
+            here,
             resume_ui,
         )
         .await?

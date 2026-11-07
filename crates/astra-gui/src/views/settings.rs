@@ -319,7 +319,7 @@ impl Render for SettingsView {
         let current_fields = settings::fields(&self.model.read(cx).client.preferences).to_vec();
         let mut body = div().flex().flex_col().gap_4().child(
             Card::new(t("Program information"))
-                .child(
+                .action(
                     Button::new("refresh-program-info")
                         .label(t("Refresh"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -354,7 +354,6 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .size_full()
             .overflow_y_scroll()
-            .p_4()
             .child(body)
     }
 }

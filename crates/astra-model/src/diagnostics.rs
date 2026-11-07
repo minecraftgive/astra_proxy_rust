@@ -44,3 +44,16 @@ pub enum Event {
     },
     Done,
 }
+
+/// First stdin line of a `--probe-serve` core: the configuration it keeps loaded.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProbeServe {
+    pub config: String,
+}
+/// One request line to a `--probe-serve` core; the reply line is a [`Probe`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeRequest {
+    pub outbound: String,
+    /// Also look up the exit IP; otherwise only the TCP handshake is timed.
+    pub ip: bool,
+}

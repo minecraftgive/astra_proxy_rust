@@ -201,6 +201,8 @@ pub struct Options {
     pub native_console: bool,
     pub terminal_child: bool,
     pub terminal_native: bool,
+    /// Run the TUI in the invoking terminal instead of a selected terminal window.
+    pub here: bool,
     pub resume_ui: bool,
     pub restart_ready: Option<PathBuf>,
     pub silent: bool,
@@ -231,6 +233,7 @@ impl Options {
         let mut native_console = false;
         let mut terminal_child = false;
         let mut terminal_native = false;
+        let mut here = false;
         let mut resume_ui = false;
         let mut restart_ready = None;
         let mut args = arguments.into_iter();
@@ -292,6 +295,7 @@ impl Options {
                 "--native-console" => native_console = true,
                 "--terminal-child" => terminal_child = true,
                 "--terminal-native" => terminal_native = true,
+                "--here" => here = true,
                 "--resume-ui" => resume_ui = true,
                 "--restart-ready" => {
                     restart_ready = Some(PathBuf::from(
@@ -324,6 +328,14 @@ impl Options {
                 && (!(terminal_child || terminal_native)
                     || (!silent && !daemon && !shutdown && operation.is_none())),
             "Terminal host flags require an interactive frontend and cannot be combined"
+        );
+        anyhow::ensure!(
+            !here || (!silent && !daemon && !shutdown && operation.is_none()),
+            "--here requires an interactive frontend"
+        );
+        anyhow::ensure!(
+            !here || cfg!(not(windows)),
+            "--here is not supported on Windows; use --native-console"
         );
         anyhow::ensure!(
             restart_ready.is_none() || resume_ui,
@@ -374,6 +386,7 @@ impl Options {
             native_console,
             terminal_child,
             terminal_native,
+            here,
             resume_ui,
             restart_ready,
             silent,

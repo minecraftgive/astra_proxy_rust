@@ -192,3 +192,25 @@ fn force_start_palette_targets_the_selected_core_or_active_profile() {
         .iter()
         .any(|entry| matches!(entry.run, Intent::ForceStart)));
 }
+#[test]
+fn palette_opens_package_installation_in_both_languages() {
+    for language in [Language::English, Language::Simplified] {
+        crate::i18n::with_language(language, || {
+            for query in [t("Install current package").to_owned(), "install".into()] {
+                let mut ui = Ui::new(Session::default());
+                ui.palette = Some(Palette {
+                    query,
+                    profiles: false,
+                });
+                let index = ui
+                    .palette_matches()
+                    .iter()
+                    .position(|entry| matches!(entry.run, Intent::Installation))
+                    .expect("installation entry");
+                assert!(!ui.installation.visible());
+                assert!(matches!(ui.palette_run(index), Input::Idle));
+                assert!(ui.installation.visible(), "{language:?}");
+            }
+        });
+    }
+}

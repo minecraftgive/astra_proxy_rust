@@ -116,6 +116,13 @@ pub struct Preferences {
     #[serde(skip)]
     pub windows_service: bool,
     pub marquee: MarqueePreferences,
+    /// Look up the exit node's public IP after connecting.
+    pub exit_ip: bool,
+    /// Measure TCP latency through the exit node every `exit_interval` seconds.
+    pub exit_latency: bool,
+    pub exit_interval: u16,
+    /// Let the manager keep the probe core loaded and idle between rounds.
+    pub exit_keep_alive: bool,
 }
 
 /// Hidden until Ctrl+Home is held for three seconds on the accent color row.
@@ -210,6 +217,15 @@ pub const WIDTH: Range = Range {
     default: 30,
     unit: "cells",
 };
+/// Seconds between exit latency rounds.
+pub const EXIT_INTERVAL: Range = Range {
+    min: 5,
+    max: 3600,
+    step: 5,
+    big: 60,
+    default: 30,
+    unit: "s",
+};
 pub const FPS: Range = Range {
     min: 1,
     max: 120,
@@ -271,6 +287,10 @@ impl Default for Preferences {
             #[cfg(windows)]
             windows_service: false,
             marquee: MarqueePreferences::default(),
+            exit_ip: false,
+            exit_latency: true,
+            exit_interval: EXIT_INTERVAL.default,
+            exit_keep_alive: true,
         }
     }
 }

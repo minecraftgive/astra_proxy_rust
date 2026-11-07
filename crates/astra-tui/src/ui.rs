@@ -77,6 +77,10 @@ struct Ui {
     /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
     overview_cursor: usize,
     overview_item_count: std::cell::Cell<usize>,
+    /// Proxy group unfolded in place in the Overview's group column, and the
+    /// node row under the cursor inside it (None while the group row is focused).
+    overview_unfolded: Option<String>,
+    overview_member: Option<usize>,
     /// First time each transient notice was shown; errors remain until resolved.
     /// Next expiry from the last rendered notices, consumed once to wake an idle UI.
     hits: std::cell::RefCell<astra_tui_kit::HitMap<dashboard::Target>>,
@@ -162,6 +166,8 @@ impl Ui {
             profile_viewport: std::cell::Cell::new(1),
             overview_cursor: 0,
             overview_item_count: Default::default(),
+            overview_unfolded: None,
+            overview_member: None,
             hits: Default::default(),
             menu: None,
             vim_g: false,

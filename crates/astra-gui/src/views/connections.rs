@@ -5,8 +5,8 @@ use astra_client::{
     state::{Client, Input as ClientInput},
 };
 use gpui::{
-    div, px, uniform_list, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    div, prelude::FluentBuilder, px, uniform_list, App, AppContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::{
@@ -197,6 +197,7 @@ impl Render for View {
             );
         let entity = cx.entity().downgrade();
         let theme = cx.theme().clone();
+        let pal = crate::theme::palette(cx);
         let list = uniform_list("connections-table", rows.len(), move |range, _, _| {
             range
                 .map(|index| {
@@ -211,6 +212,7 @@ impl Render for View {
                     let c = &row.connection;
                     div()
                         .id(("connection", index))
+                        .w_full()
                         .h(px(44.))
                         .flex()
                         .items_center()
@@ -219,11 +221,11 @@ impl Render for View {
                         .border_b_1()
                         .border_color(theme.border)
                         .bg(if chosen {
-                            theme.accent
+                            pal.accent_soft
                         } else if row.fresh {
-                            theme.secondary
+                            pal.ok_soft
                         } else {
-                            theme.background
+                            pal.surface
                         })
                         .child(div().w(px(280.)).child(row.label()))
                         .child(div().w(px(70.)).text_sm().child(c.network.clone()))
@@ -269,14 +271,18 @@ impl Render for View {
                 .collect::<Vec<_>>()
         })
         .track_scroll(&self.scroll)
-        .h(px(410.))
-        .w(px(850.));
+        .flex_1();
         let mut header = div()
             .flex()
+            .flex_none()
             .gap_3()
             .px_3()
+            .py_2()
+            .bg(pal.surface_2)
+            .border_b_1()
+            .border_color(pal.border)
             .text_xs()
-            .text_color(cx.theme().muted_foreground);
+            .text_color(pal.muted);
         for (label, width) in [
             ("Target", 280.),
             ("Network", 70.),
@@ -298,18 +304,34 @@ impl Render for View {
             .min_h_0()
             .on_key_down(cx.listener(Self::key))
             .child(toolbar)
+            .when(!badges.is_empty(), |view| {
+                view.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(badges),
+                )
+            })
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(badges),
-            )
-            .child(
+                // The web UI's `.card.table-wrap`: a bordered surface with a grey header row.
                 div()
                     .id("connections-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.surface)
                     .overflow_x_scroll()
-                    .child(header)
-                    .child(list),
+                    .child(
+                        div()
+                            .min_w(px(850.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(header)
+                            .child(list),
+                    ),
             );
         if let Some(connection) = detail {
             let close_target = detail_target.clone();

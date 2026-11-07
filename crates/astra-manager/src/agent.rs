@@ -335,6 +335,7 @@ impl AgentService {
             | Query::NodeTags { instance }
             | Query::SubscriptionNodes { instance }
             | Query::DiagnosticTargets { instance }
+            | Query::ExitProbe { instance, .. }
             | Query::LogLevel { instance }
             | Query::Logs { instance }
             | Query::LogChunk { instance, .. } => {
@@ -428,6 +429,24 @@ impl AgentService {
                         .await?
                         .text,
                 )?))
+            }
+            Query::ExitProbe {
+                instance,
+                outbound,
+                ip,
+                keep_alive_secs,
+            } => {
+                let probe = self
+                    .native
+                    .get()
+                    .context("Native actor not initialized")?
+                    .exit_probe(
+                        &instance,
+                        astra_model::diagnostics::ProbeRequest { outbound, ip },
+                        keep_alive_secs.map(|secs| std::time::Duration::from_secs(secs.into())),
+                    )
+                    .await?;
+                ResponseBody::ExitProbe(browser_numbers(serde_json::to_value(probe)?))
             }
             Query::LogLevel { instance } => {
                 anyhow::ensure!(

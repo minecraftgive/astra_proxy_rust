@@ -32,7 +32,22 @@ pub struct Header {
     pub exit_chain: String,
     pub delay_ms: Option<u64>,
     pub alive: Option<bool>,
+    /// Exit IP once a probe finds it; `—` while the "Exit IP" setting waits for one.
+    pub exit_ip: Option<String>,
+    /// Latest latency probe of the final exit node; pending only while the
+    /// "Exit TCP latency" setting is on.
+    pub exit_latency: Option<ExitLatency>,
     pub rates: [Option<u64>; 2],
+}
+
+/// The header's exit latency field, as the TUI shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitLatency {
+    /// No round has finished for this node yet.
+    Pending,
+    Measured(u64),
+    /// The latest TCP handshake through the node failed or timed out.
+    Failed,
 }
 
 impl Client {
@@ -46,6 +61,11 @@ impl Client {
         let (chain, delay_ms, alive) = snapshot.map(crate::live::exit_chain).unwrap_or_default();
         let connected = row.is_some_and(|row| row.pid.is_some());
         let mode = snapshot.map(|snapshot| snapshot.mode);
+        let exit = chain.last().filter(|_| self.kind != Kind::Server);
+        let (exit_ip, exit_latency) = match (row, exit) {
+            (Some(row), Some(exit)) => self.exit_probe_fields(&row.instance.name, exit),
+            _ => (None, None),
+        };
         Header {
             name: row.map(|row| row.instance.name.clone()),
             state: row.map(indicator_state).unwrap_or(InstanceState::Stopped),
@@ -64,10 +84,36 @@ impl Client {
             exit_chain: chain.join(" ▸ "),
             delay_ms,
             alive,
+            exit_ip,
+            exit_latency,
             rates: self
                 .rates
                 .map(|rate| self.live_rates_available().then_some(rate)),
         }
+    }
+    /// The header's exit probe fields for `exit` in `profile`. A known result
+    /// always shows: every connect and node switch probes the IP and latency
+    /// once. A setting that is on also keeps its field's place (`—`) while
+    /// nothing has been measured yet.
+    pub fn exit_probe_fields(
+        &self,
+        profile: &str,
+        exit: &str,
+    ) -> (Option<String>, Option<ExitLatency>) {
+        use crate::exit_probe::Latency;
+        let ip = self
+            .exit_ip(profile, exit)
+            .map(|ip| ip.to_string())
+            .or_else(|| self.preferences.exit_ip.then(|| "—".to_owned()));
+        let latency = match self.exit_probe.latency(profile, exit) {
+            Some(Latency::Measured(ms)) => Some(ExitLatency::Measured(ms)),
+            Some(Latency::Failed) => Some(ExitLatency::Failed),
+            None => self
+                .preferences
+                .exit_latency
+                .then_some(ExitLatency::Pending),
+        };
+        (ip, latency)
     }
     pub fn toggle_current(&mut self) -> crate::state::Input {
         if self.kind == Kind::Server {

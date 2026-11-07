@@ -8,8 +8,8 @@ use astra_client::{
     state::{Client, Input as ClientInput, Operation},
 };
 use gpui::{
-    div, px, uniform_list, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    div, prelude::FluentBuilder, px, uniform_list, App, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -94,36 +94,38 @@ impl Render for View {
         if let Some(summary) = summary {
             let details = summary.details.clone();
             content = content.child(super::profiles::instance_card(summary, cx));
-            if let Some(details) = details {
-                content = content.child(
-                    Card::new(t("Rules"))
-                        .child(div().child(astra_client::tr!("{} rules", details.rules))),
-                );
-            }
-            content =
-                content.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            Button::new("rule-test")
-                                .primary()
-                                .label(t("Test a route"))
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.operation(Operation::Explain, cx)
-                                })),
-                        )
-                        .child(Button::new("rule-edit").label(t("Edit rules")).on_click(
-                            cx.listener(|view, _, _, cx| view.operation(Operation::Edit, cx)),
-                        ))
-                        .child(Button::new("rule-search").label(t("Search")).on_click(
+            // The rule set card carries its own actions, like the web UI's card tools.
+            let card = Card::new(t("Rules"))
+                .action(
+                    Button::new("rule-search")
+                        .ghost()
+                        .label(t("Search"))
+                        .on_click(
                             cx.listener(|view, _, _, cx| view.dispatch(Client::rule_search, cx)),
-                        ))
-                        .child(Button::new("rule-logs").label(t("Logs")).on_click(
-                            cx.listener(|view, _, _, cx| view.operation(Operation::Logs, cx)),
-                        )),
-                );
+                        ),
+                )
+                .action(
+                    Button::new("rule-logs").ghost().label(t("Logs")).on_click(
+                        cx.listener(|view, _, _, cx| view.operation(Operation::Logs, cx)),
+                    ),
+                )
+                .action(
+                    Button::new("rule-edit").label(t("Edit rules")).on_click(
+                        cx.listener(|view, _, _, cx| view.operation(Operation::Edit, cx)),
+                    ),
+                )
+                .action(
+                    Button::new("rule-test")
+                        .primary()
+                        .label(t("Test a route"))
+                        .on_click(
+                            cx.listener(|view, _, _, cx| view.operation(Operation::Explain, cx)),
+                        ),
+                )
+                .when_some(details, |card, details| {
+                    card.child(div().child(astra_client::tr!("{} rules", details.rules)))
+                });
+            content = content.child(card);
         } else {
             content = content.child(Empty::new(t("Rules"), empty)).child(
                 Button::new("rule-profiles")

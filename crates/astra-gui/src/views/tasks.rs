@@ -103,7 +103,7 @@ impl Render for View {
             .flex_col()
             .gap_3()
             .child(
-                div().flex().gap_2().child(t("Tasks")).child(
+                div().flex().justify_end().gap_2().child(
                     Button::new("task-refresh")
                         .label(t("Refresh"))
                         .on_click(cx.listener(|_, _, _, cx| {
@@ -114,29 +114,45 @@ impl Render for View {
                         })),
                 ),
             )
-            .child(list);
+            .child(crate::widgets::surface(cx).p_2().child(list));
         if let Some((id, title, running, events, _)) = selected {
             root = root.child(
-                div().flex().gap_2().child(title).child(
-                    Button::new("task-cancel")
-                        .label(t("Cancel"))
-                        .disabled(!running)
-                        .on_click(cx.listener(move |view, _, _, cx| view.cancel(id, cx))),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        Button::new("task-cancel")
+                            .label(t("Cancel"))
+                            .disabled(!running)
+                            .on_click(cx.listener(move |view, _, _, cx| view.cancel(id, cx))),
+                    ),
             );
             let events = std::sync::Arc::new(events);
+            let mono = crate::theme::mono(cx);
             root = root.child(
-                uniform_list("task-events", events.len(), move |range, _, _| {
-                    range
-                        .map(|i| {
-                            div()
-                                .h(px(26.))
-                                .whitespace_nowrap()
-                                .child(events[i].clone())
-                        })
-                        .collect()
-                })
-                .flex_1(),
+                crate::widgets::surface(cx).flex_1().px_4().py_2().child(
+                    uniform_list("task-events", events.len(), move |range, _, _| {
+                        range
+                            .map(|i| {
+                                div()
+                                    .h(px(24.))
+                                    .text_xs()
+                                    .font_family(mono.clone())
+                                    .whitespace_nowrap()
+                                    .child(events[i].clone())
+                            })
+                            .collect()
+                    })
+                    .flex_1(),
+                ),
             );
         }
         root.on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {

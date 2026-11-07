@@ -17,7 +17,7 @@ use gpui::{
 use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     ActiveTheme,
 };
 use std::sync::Arc;
@@ -214,6 +214,7 @@ impl Render for View {
         let rows: Arc<[_]> = client
             .profile_rows(self.search.read(cx).value().as_ref())
             .into();
+        let row_count = rows.len();
         let summary = client.selected_summary();
         let operations = client.operations();
         let mut tabs = div().flex().gap_2();
@@ -245,26 +246,71 @@ impl Render for View {
                 .label(t("New instance"))
                 .on_click(cx.listener(|view, _, _, cx| view.action(ProfileAction::Create, cx))),
         );
+        // Everyday lifecycle actions stay visible; the rest go in a "More" menu,
+        // like the web UI's page tools, so the toolbar fits on one line.
+        let everyday = |operation: Operation| {
+            matches!(
+                operation,
+                Operation::Start
+                    | Operation::Stop
+                    | Operation::Restart
+                    | Operation::Reload
+                    | Operation::Edit
+                    | Operation::Logs
+            )
+        };
         for (index, operation) in operations.iter().copied().enumerate() {
-            toolbar = toolbar.child(
-                Button::new(("instance-operation", index))
-                    .label(operation.label())
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.action(ProfileAction::Operation(operation), cx)
-                    })),
-            );
+            if everyday(operation) {
+                toolbar = toolbar.child(
+                    Button::new(("instance-operation", index))
+                        .label(operation.label())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.action(ProfileAction::Operation(operation), cx)
+                        })),
+                );
+            }
         }
-        if summary.is_some() {
+        let more: Vec<Operation> = operations
+            .iter()
+            .copied()
+            .filter(|operation| !everyday(*operation))
+            .collect();
+        let validate = summary.is_some();
+        if !more.is_empty() || validate {
+            let entity = cx.entity().downgrade();
             toolbar = toolbar.child(
-                Button::new("validate-instance")
-                    .label(t("Validate configuration"))
-                    .on_click(
-                        cx.listener(|view, _, _, cx| view.action(ProfileAction::Validate, cx)),
-                    ),
+                Button::new("instance-more")
+                    .label(format!("{} ▾", t("More")))
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for operation in more.iter().copied() {
+                            let entity = entity.clone();
+                            menu = menu.item(PopupMenuItem::new(operation.label()).on_click(
+                                move |_, _, cx| {
+                                    let _ = entity.update(cx, |view, cx| {
+                                        view.action(ProfileAction::Operation(operation), cx)
+                                    });
+                                },
+                            ));
+                        }
+                        if validate {
+                            let entity = entity.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(t("Validate configuration")).on_click(
+                                    move |_, _, cx| {
+                                        let _ = entity.update(cx, |view, cx| {
+                                            view.action(ProfileAction::Validate, cx)
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    }),
             );
         }
         let entity = cx.entity().downgrade();
         let theme = cx.theme().clone();
+        let pal = crate::theme::palette(cx);
         let list = uniform_list("profile-table", rows.len(), move |range, _, _| {
             range
                 .map(|index| {
@@ -279,6 +325,7 @@ impl Render for View {
                     let operations = astra_client::intents::row_operations(&row);
                     div()
                         .id(("profile-row", index))
+                        .w_full()
                         .h(px(48.))
                         .flex()
                         .items_center()
@@ -287,9 +334,9 @@ impl Render for View {
                         .border_b_1()
                         .border_color(theme.border)
                         .bg(if selected {
-                            theme.accent
+                            pal.accent_soft
                         } else {
-                            theme.background
+                            pal.surface
                         })
                         .child(div().w(px(180.)).child(name))
                         .child(StatusDot::new(status(
@@ -338,7 +385,8 @@ impl Render for View {
                 .collect::<Vec<_>>()
         })
         .track_scroll(&self.scroll)
-        .h(px(300.));
+        // Grow with the profiles, up to six rows, instead of a fixed empty block.
+        .h(px(48. * row_count.clamp(1, 6) as f32));
         let mut content = div()
             .id("profiles-view")
             .key_context("AstraProfiles")
@@ -353,7 +401,16 @@ impl Render for View {
             .child(tabs)
             .child(Input::new(&self.search))
             .child(toolbar)
-            .child(list);
+            .child(
+                div()
+                    .flex_none()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.surface)
+                    .overflow_hidden()
+                    .child(list),
+            );
         if let Some(summary) = summary {
             content = content.child(instance_card(summary, cx));
         }
@@ -363,7 +420,7 @@ impl Render for View {
         content
     }
 }
-pub(super) fn status(state: astra_client::overview::InstanceState) -> Status {
+pub(crate) fn status(state: astra_client::overview::InstanceState) -> Status {
     use astra_client::overview::InstanceState;
     match state {
         InstanceState::Running => Status::Running,

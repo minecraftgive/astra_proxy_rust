@@ -14,6 +14,11 @@ pub struct Page {
     pub new_window: bool,
 }
 
+#[cfg(target_os = "macos")]
+pub const PLATFORM_CHORDS: &[(&str, Id)] = &[("cmd-k", Id::Palette)];
+#[cfg(not(target_os = "macos"))]
+pub const PLATFORM_CHORDS: &[(&str, Id)] = &[];
+
 pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     let context = |source| {
         Some(std::rc::Rc::new(
@@ -77,6 +82,21 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
                 .expect("page chord"),
             );
         }
+    }
+    // Spotlight's chord on macOS, alongside the shared Ctrl-K / F2; it works from
+    // any screen, including inside text fields and the editor.
+    for (chord, id) in PLATFORM_CHORDS {
+        bindings.push(
+            KeyBinding::load(
+                chord,
+                Box::new(Command(*id)),
+                application.clone(),
+                false,
+                None,
+                cx,
+            )
+            .expect("platform chord"),
+        );
     }
     bindings
 }

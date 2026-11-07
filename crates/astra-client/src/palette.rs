@@ -36,6 +36,8 @@ pub enum Intent {
     NodeImport,
     Validate,
     Update(update::Command),
+    /// Opens the package installation overlay (also under Settings → Installation).
+    Installation,
     Registered(commands::Id),
 }
 
@@ -383,6 +385,13 @@ impl Client {
                 command.unavailable(self.update_status.as_ref()),
             );
         }
+        add(
+            "Updates",
+            "Install current package",
+            "",
+            Intent::Installation,
+            None,
+        );
         for spec in commands::SPECS {
             add(
                 "General",
@@ -531,6 +540,10 @@ impl Client {
                 None => Input::Idle,
             },
             Intent::Update(command) => command.run(self),
+            Intent::Installation => {
+                self.open_installation();
+                Input::Idle
+            }
             Intent::Registered(id) => self.run_command(id),
         }
     }

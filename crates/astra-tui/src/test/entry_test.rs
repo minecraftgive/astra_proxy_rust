@@ -4,15 +4,32 @@ use super::*;
 fn terminal_handoffs_do_not_relaunch_hosted_native_or_update_children() {
     for preference in ["auto", "native", "wezterm", "missing-terminal"] {
         for tty in [false, true] {
-            assert!(!should_launch_terminal(true, false, false, preference, tty));
-            assert!(!should_launch_terminal(false, true, false, preference, tty));
-            assert!(!should_launch_terminal(false, false, true, preference, tty));
+            assert!(!should_launch_terminal(
+                true, false, false, false, preference, tty
+            ));
+            assert!(!should_launch_terminal(
+                false, true, false, false, preference, tty
+            ));
+            assert!(!should_launch_terminal(
+                false, false, true, false, preference, tty
+            ));
         }
     }
-    assert!(should_launch_terminal(false, false, false, "wezterm", true));
-    assert!(should_launch_terminal(false, false, false, "auto", false));
+    assert!(should_launch_terminal(
+        false, false, false, false, "wezterm", true
+    ));
+    for preference in ["auto", "native", "wezterm"] {
+        for tty in [false, true] {
+            assert!(!should_launch_terminal(
+                false, false, false, true, preference, tty
+            ));
+        }
+    }
+    assert!(should_launch_terminal(
+        false, false, false, false, "auto", false
+    ));
     assert_eq!(
-        should_launch_terminal(false, false, false, "auto", true),
+        should_launch_terminal(false, false, false, false, "auto", true),
         cfg!(windows)
     );
 }

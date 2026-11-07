@@ -177,28 +177,7 @@ impl Ui {
             return Some(Input::Idle);
         }
         if self.client.page == OVERVIEW {
-            let count = self.live()?.groups.len();
-            let page = self.live_page_size(Viewport::OverviewGroups);
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.group_selection = (self.group_selection + 1).min(count.saturating_sub(1))
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.group_selection = self.group_selection.saturating_sub(1)
-                }
-                KeyCode::PageDown => {
-                    self.group_selection =
-                        (self.group_selection + page).min(count.saturating_sub(1))
-                }
-                KeyCode::PageUp => self.group_selection = self.group_selection.saturating_sub(page),
-                KeyCode::Home => self.group_selection = 0,
-                KeyCode::End => self.group_selection = count.saturating_sub(1),
-                KeyCode::Enter => {
-                    self.navigate(PROXIES);
-                    self.open_runtime_group();
-                }
-                _ => return None,
-            }
+            return self.overview_groups_key(key);
         } else if self.client.page == CONNECTIONS {
             let page = self
                 .live_page_size(Viewport::Details)
@@ -227,6 +206,127 @@ impl Ui {
             }
         } else {
             return None;
+        }
+        Some(Input::Idle)
+    }
+    /// Group column rows in display order: each group, then the nodes of the
+    /// group unfolded in place.
+    pub(super) fn overview_group_rows(&self) -> Vec<(usize, Option<usize>)> {
+        let Some(snapshot) = self.live() else {
+            return vec![];
+        };
+        let mut rows = vec![];
+        for (index, group) in snapshot.groups.iter().enumerate() {
+            rows.push((index, None));
+            if self.overview_unfolded.as_deref() == Some(group.name.as_str()) {
+                rows.extend((0..group.members.len()).map(|member| (index, Some(member))));
+            }
+        }
+        rows
+    }
+    /// The row under the Overview group cursor.
+    pub(super) fn overview_group_row(&self) -> (usize, Option<usize>) {
+        let unfolded = self
+            .live()
+            .and_then(|s| s.groups.get(self.group_selection))
+            .is_some_and(|g| self.overview_unfolded.as_deref() == Some(g.name.as_str()));
+        (
+            self.group_selection,
+            self.overview_member.filter(|_| unfolded),
+        )
+    }
+    fn set_overview_group_row(&mut self, (group, member): (usize, Option<usize>)) {
+        self.group_selection = group;
+        self.overview_member = member;
+    }
+    /// Unfolds a group in the Overview (or folds it again) without leaving the page.
+    pub(super) fn toggle_overview_group(&mut self, index: usize) {
+        let Some(name) = self
+            .live()
+            .and_then(|s| s.groups.get(index))
+            .map(|g| g.name.clone())
+        else {
+            return;
+        };
+        self.focus.region = focus::Region::Secondary;
+        self.group_selection = index;
+        self.overview_member = None;
+        self.overview_unfolded = if self.overview_unfolded.as_deref() == Some(name.as_str()) {
+            None
+        } else {
+            Some(name)
+        };
+    }
+    /// Picks a node of an Overview group and folds the group back up.
+    pub(super) fn choose_overview_member(&mut self, group: usize, member: usize) -> Input {
+        let Some((group_name, member_name)) = self.live().and_then(|s| {
+            let g = s.groups.get(group)?;
+            Some((g.name.clone(), g.members.get(member)?.name.clone()))
+        }) else {
+            return Input::Idle;
+        };
+        let input = self.client.select_proxy_member(&group_name, &member_name);
+        // The Proxies page's member picker must not capture Overview keys.
+        self.runtime_picker = None;
+        self.focus.region = focus::Region::Secondary;
+        self.group_selection = group;
+        self.overview_member = None;
+        self.overview_unfolded = None;
+        input
+    }
+    /// Overview group column: ↑/↓ walk groups and unfolded nodes, → unfolds,
+    /// ← folds, Enter/Space toggles a group or picks a node, t tests the group.
+    fn overview_groups_key(&mut self, key: event::KeyEvent) -> Option<Input> {
+        let rows = self.overview_group_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let current = self.overview_group_row();
+        let position = rows.iter().position(|row| *row == current).unwrap_or(0);
+        let last = rows.len() - 1;
+        let page = self.live_page_size(Viewport::OverviewGroups);
+        let step = |next: usize| Some(rows[next.min(last)]);
+        let target = match key.code {
+            KeyCode::Down | KeyCode::Char('j') => step(position + 1),
+            KeyCode::Up | KeyCode::Char('k') => step(position.saturating_sub(1)),
+            KeyCode::PageDown => step(position + page),
+            KeyCode::PageUp => step(position.saturating_sub(page)),
+            KeyCode::Home => step(0),
+            KeyCode::End => step(last),
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.set_overview_group_row(target);
+            return Some(Input::Idle);
+        }
+        let (group, member) = current;
+        let unfolded = self
+            .live()
+            .and_then(|s| s.groups.get(group))
+            .is_some_and(|g| self.overview_unfolded.as_deref() == Some(g.name.as_str()));
+        match (key.code, member) {
+            (KeyCode::Right | KeyCode::Char('l'), None) if unfolded => {
+                if rows.get(position + 1).is_some_and(|row| row.0 == group) {
+                    self.overview_member = Some(0);
+                }
+            }
+            (KeyCode::Right | KeyCode::Char('l'), None) => self.toggle_overview_group(group),
+            (KeyCode::Right | KeyCode::Char('l'), Some(_)) => {}
+            (KeyCode::Left | KeyCode::Char('h'), Some(_)) => {
+                self.overview_member = None;
+                self.overview_unfolded = None;
+            }
+            (KeyCode::Left | KeyCode::Char('h'), None) if unfolded => self.overview_unfolded = None,
+            (KeyCode::Left | KeyCode::Char('h'), None) => {}
+            (KeyCode::Enter | KeyCode::Char(' '), None) => self.toggle_overview_group(group),
+            (KeyCode::Enter | KeyCode::Char(' '), Some(member)) => {
+                return Some(self.choose_overview_member(group, member))
+            }
+            (KeyCode::Char('t'), _) => {
+                let name = self.live()?.groups.get(group)?.name.clone();
+                return Some(self.runtime_action(Command::TestGroup(name)));
+            }
+            _ => return None,
         }
         Some(Input::Idle)
     }

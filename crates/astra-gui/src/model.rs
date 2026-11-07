@@ -383,11 +383,14 @@ impl AppModel {
             }
             if let Some(view) = &mut client.diagnostics {
                 changed |= view.poll();
+                client.remember_exit_ips();
             }
             if let Some(view) = &mut client.monitor {
                 changed |= view.poll_ready(&socket);
             }
             if !socket.as_os_str().is_empty() {
+                // The header's exit IP and TCP latency rounds, as in the TUI.
+                changed |= client.poll_exit_probe(&socket);
                 let overlay_clear = client.prompt.is_none() && client.editor.is_none();
                 changed |= client.poll_installation_ready(&socket, overlay_clear);
             }

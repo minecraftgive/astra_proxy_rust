@@ -3,7 +3,6 @@ use super::*;
 enum Screen {
     Page(usize),
     Panel(Panel),
-    Palette(bool),
     Installation,
     Recovery,
 }
@@ -81,8 +80,6 @@ impl AppWindow {
                 .owns_overlay(crate::model::Overlay::Recovery, self.id)
         {
             Screen::Recovery
-        } else if self.palette || self.profile_chooser {
-            Screen::Palette(self.profile_chooser)
         } else if client.installation.visible()
             && self
                 .model
@@ -150,33 +147,13 @@ impl AppWindow {
                 }
                 Screen::Panel(Panel::Recovery) | Screen::Recovery => mount!(views::recovery::View),
                 Screen::Installation => mount!(views::installation::InstallationView),
-                Screen::Palette(profiles) => {
-                    let mode = if profiles {
-                        astra_client::palette::PaletteMode::Profiles(model.read(cx).client.kind)
-                    } else {
-                        astra_client::palette::PaletteMode::Commands
-                    };
-                    let view = cx.new(|cx| {
-                        views::palette::View::new(
-                            model,
-                            self.search.clone(),
-                            mode,
-                            views::palette::PaletteContext {
-                                page: self.page.unwrap_or(self.model.read(cx).client.page),
-                                window_id: self.id,
-                                editor_active: self.panel == Some(Panel::Editor)
-                                    && self.model.read(cx).editor_owned_by(self.id),
-                            },
-                            window,
-                            cx,
-                        )
-                    });
-                    self.mount(key, view, window, cx);
-                }
             }
         }
         let mounted = self.mounted.as_ref().unwrap();
-        if self.focus.is_focused(window) || window.focused(cx).is_none() {
+        // The floating palette keeps focus while it is open over this view.
+        if self.palette_view.is_none()
+            && (self.focus.is_focused(window) || window.focused(cx).is_none())
+        {
             window.focus(&mounted.focus, cx);
         }
         mounted.view.clone().into_any_element()

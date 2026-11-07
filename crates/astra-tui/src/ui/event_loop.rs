@@ -108,7 +108,9 @@ pub(super) async fn run_local(
             }
             if let Some(view) = &mut ui.client.diagnostics {
                 redraw |= view.poll();
+                ui.client.remember_exit_ips();
             }
+            redraw |= ui.client.poll_exit_probe(&socket);
             if let Some(view) = &mut ui.monitor {
                 redraw |= view.poll(&socket).await;
             }

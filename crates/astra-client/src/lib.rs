@@ -24,6 +24,7 @@ pub mod connections;
 pub mod diagnostics;
 pub mod drafts;
 pub mod editor;
+pub mod exit_probe;
 pub mod explanation;
 pub mod feeds;
 pub mod format;

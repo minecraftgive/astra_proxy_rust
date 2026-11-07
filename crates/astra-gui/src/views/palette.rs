@@ -122,13 +122,15 @@ impl Render for View {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entries = Arc::new(self.entries(cx));
         self.selected = self.selected.min(entries.len().saturating_sub(1));
+        let pal = crate::theme::palette(cx);
+        let mono = crate::theme::mono(cx);
         div()
             .key_context("AstraPalette")
             .size_full()
             .flex()
             .flex_col()
-            .p_5()
-            .gap_3()
+            .p_3()
+            .gap_2()
             .on_action(cx.listener(|this, _: &Previous, _, cx| {
                 this.select(-1, cx);
                 cx.stop_propagation();
@@ -145,10 +147,6 @@ impl Render for View {
                 cx.emit(ViewEvent::Dismiss);
                 cx.stop_propagation();
             }))
-            .child(div().text_xl().child(t(match self.mode {
-                PaletteMode::Commands => "Command palette",
-                PaletteMode::Profiles(_) => "Switch current profile",
-            })))
             .child(Input::new(&self.search))
             .child(
                 uniform_list(
@@ -160,13 +158,15 @@ impl Render for View {
                                 let entry = &entries[index];
                                 div()
                                     .id(("entry", index))
-                                    .h(px(58.))
+                                    .h(px(48.))
                                     .px_3()
                                     .flex()
                                     .flex_col()
                                     .justify_center()
                                     .rounded_md()
-                                    .when(index == this.selected, |row| row.bg(cx.theme().accent))
+                                    .when(index == this.selected, |row| {
+                                        row.bg(crate::theme::palette(cx).accent_soft)
+                                    })
                                     .text_color(if entry.unavailable.is_some() {
                                         cx.theme().muted_foreground
                                     } else {
@@ -175,15 +175,38 @@ impl Render for View {
                                     .child(
                                         div()
                                             .flex()
-                                            .justify_between()
-                                            .child(format!("{} · {}", t(entry.scope), entry.label))
-                                            .child(entry.key),
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .text_color(pal.muted)
+                                                    .child(t(entry.scope).to_owned()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(entry.label.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .font_family(mono.clone())
+                                                    .text_color(pal.faint)
+                                                    .child(entry.key),
+                                            ),
                                     )
-                                    .children(
-                                        entry
-                                            .unavailable
-                                            .map(|reason| div().text_xs().child(t(reason))),
-                                    )
+                                    .children(entry.unavailable.map(|reason| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(pal.faint)
+                                            .truncate()
+                                            .child(t(reason))
+                                    }))
                                     .on_click(
                                         cx.listener(move |this, _, _, cx| this.run(index, cx)),
                                     )

@@ -373,8 +373,9 @@ impl Render for View {
                 _ => cx.theme().foreground,
             };
             let row = div()
-                .min_h(px(24.))
-                .text_sm()
+                .min_h(px(20.))
+                .text_xs()
+                .font_family(crate::theme::mono(cx))
                 .text_color(color)
                 .child(record.text.clone());
             if wrap {
@@ -385,15 +386,24 @@ impl Render for View {
         })
         .size_full();
 
+        // The web UI's `.log-view`: a bordered monospace surface.
+        let pal = crate::theme::palette(cx);
+        let surface = |view: gpui::Stateful<gpui::Div>| {
+            view.flex_1()
+                .min_h_0()
+                .px_4()
+                .py_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(pal.border)
+                .bg(pal.surface)
+        };
         root = root
             .child(if wrap {
-                div().id("log-wrapped").flex_1().min_h_0().child(list)
+                surface(div().id("log-wrapped")).child(list)
             } else {
-                div()
-                    .id("log-horizontal")
+                surface(div().id("log-horizontal"))
                     .overflow_x_scroll()
-                    .flex_1()
-                    .min_h_0()
                     .child(list)
             })
             .child(

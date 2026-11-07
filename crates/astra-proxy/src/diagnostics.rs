@@ -82,6 +82,130 @@ pub async fn run(app: &App) -> Report {
         .await
         .expect("infallible diagnostic collector")
 }
+fn connector() -> Result<TlsConnector> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+/// Time the TCP/proxy handshake through one node and, with `ip`, look up its exit IP.
+async fn probe(
+    app: &App,
+    connector: &TlsConnector,
+    action: RouteAction,
+    ip: bool,
+    deadline: tokio::time::Instant,
+    emit: &impl Fn(Event) -> Result<()>,
+) -> Result<Probe> {
+    let start = Instant::now();
+    let outbound = action_name(&action);
+    emit(Event::Running {
+        outbound: outbound.clone(),
+    })?;
+    let mut connect_ms = None;
+    let end = deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+    let result = tokio::time::timeout_at(end, async {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "batch time limit reached; select fewer nodes and retry"
+        );
+        let target = Target {
+            host: HOST.into(),
+            port: 443,
+        };
+        let connection = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
+            app.connect(&target, &action),
+        )
+        .await
+        .context("TCP/proxy handshake timed out after 3s")??;
+        connect_ms = Some(start.elapsed().as_millis() as u64);
+        emit(Event::Connected {
+            outbound: outbound.clone(),
+            connect_ms: connect_ms.unwrap(),
+        })?;
+        if !ip {
+            return Ok(None);
+        }
+        let tls = connector
+            .connect(ServerName::try_from(HOST)?, connection)
+            .await
+            .context("HTTPS handshake")?;
+        request_ip(tls).await.map(Some)
+    })
+    .await;
+    let result = result.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "node test timed out (5s per node, 30s per batch)"
+        ))
+    });
+    let (ip, error) = match result {
+        Ok(ip) => (ip, None),
+        Err(error) => {
+            // Arbitrary protocol errors may contain peer-provided data: bound and sanitize it.
+            let message: String = format!("{error:#}")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(240)
+                .collect();
+            (None, Some(message))
+        }
+    };
+    Ok(Probe {
+        outbound,
+        direct: action == RouteAction::Direct,
+        connect_ms,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ip,
+        error,
+    })
+}
+/// `--probe-serve`: keep the configuration loaded and answer one probe per
+/// request line, idling between requests until the manager closes stdin.
+pub async fn serve(
+    app: &App,
+    mut requests: impl tokio::io::AsyncBufRead + Unpin,
+    mut replies: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let connector = connector()?;
+    let available = targets(app);
+    loop {
+        let mut line = String::new();
+        if (&mut requests).take(64 * 1024).read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        ensure!(line.ends_with('\n'), "Probe request exceeds limit");
+        let request: astra_model::diagnostics::ProbeRequest = serde_json::from_str(&line)?;
+        let probe = if available.contains(&request.outbound) {
+            let action = if request.outbound == "DIRECT" {
+                RouteAction::Direct
+            } else {
+                RouteAction::Proxy(request.outbound)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            probe(app, &connector, action, request.ip, deadline, &|_| Ok(())).await?
+        } else {
+            Probe {
+                outbound: request.outbound,
+                direct: false,
+                connect_ms: None,
+                elapsed_ms: 0,
+                ip: None,
+                error: Some("Unknown diagnostic node; the profile changed".into()),
+            }
+        };
+        let mut reply = serde_json::to_vec(&probe)?;
+        reply.push(b'\n');
+        replies.write_all(&reply).await?;
+        replies.flush().await?;
+    }
+}
 async fn run_actions(
     app: &App,
     actions: Vec<RouteAction>,
@@ -94,79 +218,11 @@ async fn run_actions(
         running_config: false,
     })?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = connector()?;
     let emit = &emit;
     let connector = &connector;
     let mut pending = stream::iter(actions)
-        .map(|action| async move {
-            let start = Instant::now();
-            let outbound = action_name(&action);
-            emit(Event::Running {
-                outbound: outbound.clone(),
-            })?;
-            let mut connect_ms = None;
-            let end = deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
-            let result = tokio::time::timeout_at(end, async {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "batch time limit reached; select fewer nodes and retry"
-                );
-                let target = Target {
-                    host: HOST.into(),
-                    port: 443,
-                };
-                let connection = tokio::time::timeout_at(
-                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
-                    app.connect(&target, &action),
-                )
-                .await
-                .context("TCP/proxy handshake timed out after 3s")??;
-                connect_ms = Some(start.elapsed().as_millis() as u64);
-                emit(Event::Connected {
-                    outbound: outbound.clone(),
-                    connect_ms: connect_ms.unwrap(),
-                })?;
-                let tls = connector
-                    .connect(ServerName::try_from(HOST)?, connection)
-                    .await
-                    .context("HTTPS handshake")?;
-                request_ip(tls).await
-            })
-            .await;
-            let result = result.unwrap_or_else(|_| {
-                Err(anyhow::anyhow!(
-                    "node test timed out (5s per node, 30s per batch)"
-                ))
-            });
-            let (ip, error) = match result {
-                Ok(ip) => (Some(ip), None),
-                Err(error) => {
-                    // Arbitrary protocol errors may contain peer-provided data: bound and sanitize it.
-                    let message: String = format!("{error:#}")
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(240)
-                        .collect();
-                    (None, Some(message))
-                }
-            };
-            Ok::<_, anyhow::Error>(Probe {
-                outbound,
-                direct: action == RouteAction::Direct,
-                connect_ms,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                ip,
-                error,
-            })
-        })
+        .map(|action| async move { probe(app, connector, action, true, deadline, emit).await })
         .buffer_unordered(8);
     let mut probes = Vec::new();
     while let Some(probe) = pending.next().await {

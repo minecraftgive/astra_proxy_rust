@@ -46,6 +46,7 @@ fn apply_preferences(preferences: &Preferences, cx: &mut App) {
         })
         .into();
         let colors = &mut theme.colors;
+        web_palette(colors, dark);
         colors.primary = primary;
         colors.ring = primary;
         colors.accent = primary;
@@ -101,6 +102,100 @@ fn apply_preferences(preferences: &Preferences, cx: &mut App) {
             theme.motion.duration_slow = Duration::ZERO;
         }
     });
+}
+
+/// The management web UI's neutral and semantic palette (apps/web/src/styles.css),
+/// so both graphical frontends read as one product. Accent stays a preference.
+fn web_palette(colors: &mut ThemeColor, dark: bool) {
+    let pick = |light: u32, night: u32| -> Hsla { rgb(if dark { night } else { light }).into() };
+    let bg = pick(0xf4f5f8, 0x13151b);
+    let surface = pick(0xffffff, 0x1b1e26);
+    let surface_2 = pick(0xeef0f4, 0x232733);
+    let border = pick(0xe1e4ea, 0x2c3140);
+    let text = pick(0x1a1d23, 0xe7e9ee);
+    let muted = pick(0x667085, 0x9aa3b2);
+    colors.background = bg;
+    colors.foreground = text;
+    colors.border = border;
+    colors.input = border;
+    colors.muted = surface_2;
+    colors.muted_foreground = muted;
+    colors.secondary = surface_2;
+    colors.secondary_hover = border;
+    colors.secondary_foreground = text;
+    colors.popover = surface;
+    colors.popover_foreground = text;
+    colors.sidebar = surface;
+    colors.sidebar_border = border;
+    colors.sidebar_foreground = muted;
+    colors.sidebar_accent = surface_2;
+    colors.sidebar_accent_foreground = text;
+    colors.list = surface;
+    colors.list_even = surface;
+    colors.list_head = surface_2;
+    colors.list_hover = surface_2;
+    colors.table = surface;
+    colors.table_even = surface;
+    colors.table_head = surface_2;
+    colors.table_head_foreground = muted;
+    colors.table_hover = surface_2;
+    colors.table_row_border = border;
+    colors.button = surface;
+    colors.button_foreground = text;
+    colors.button_hover = surface_2;
+    colors.button_active = border;
+    colors.success = pick(0x1f9d55, 0x3ccb7f);
+    colors.warning = pick(0xb7790a, 0xe5b33e);
+    colors.danger = pick(0xd64545, 0xf06a6a);
+}
+
+/// Surfaces and soft fills derived from the active theme, so color depth
+/// preferences (mono, high contrast) reach every custom widget too.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub bg: Hsla,
+    pub surface: Hsla,
+    pub surface_2: Hsla,
+    pub border: Hsla,
+    pub text: Hsla,
+    pub muted: Hsla,
+    pub faint: Hsla,
+    pub accent: Hsla,
+    pub accent_soft: Hsla,
+    pub ok: Hsla,
+    pub ok_soft: Hsla,
+    pub warn: Hsla,
+    pub warn_soft: Hsla,
+    pub err: Hsla,
+    pub err_soft: Hsla,
+}
+pub fn palette(cx: &App) -> Palette {
+    let theme = gpui_component::ActiveTheme::theme(cx);
+    let soft = if theme.is_dark() { 0.2 } else { 0.12 };
+    Palette {
+        bg: theme.background,
+        surface: theme.sidebar,
+        surface_2: theme.secondary,
+        border: theme.border,
+        text: theme.foreground,
+        muted: theme.muted_foreground,
+        faint: theme.muted_foreground.opacity(0.7),
+        accent: theme.primary,
+        accent_soft: theme.primary.opacity(soft),
+        ok: theme.success,
+        ok_soft: theme.success.opacity(soft),
+        warn: theme.warning,
+        warn_soft: theme.warning.opacity(soft),
+        err: theme.danger,
+        err_soft: theme.danger.opacity(soft),
+    }
+}
+
+/// The theme's monospace family; GPUI does not resolve a generic `monospace` name.
+pub fn mono(cx: &App) -> gpui::SharedString {
+    gpui_component::ActiveTheme::theme(cx)
+        .mono_font_family
+        .clone()
 }
 
 fn lightness(mut color: Hsla, change: f32) -> Hsla {

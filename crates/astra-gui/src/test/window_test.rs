@@ -277,3 +277,65 @@ fn server_windows_reject_proxy_pages_in_navigation_and_shortcuts(cx: &mut TestAp
     assert_eq!(cx.read(|cx| cx.windows().len()), 2);
     app.read_with(cx, |app, _| assert_eq!(app.page, Some(6)));
 }
+
+#[gpui::test]
+fn palette_floats_over_any_screen_and_escape_closes_only_the_palette(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, _) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model, Some(0), window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    // Open a panel first; the palette must appear over it without unmounting it.
+    cx.simulate_keystrokes(handle.into(), "f6");
+    let mounted = |app: &AppWindow| app.mounted.as_ref().map(|m| m.view.entity_id());
+    let tasks = app.read_with(cx, |app, _| mounted(app));
+    assert!(tasks.is_some());
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.palette && app.palette_view.is_some());
+                assert_eq!(app.panel, Some(Panel::Tasks));
+                assert_eq!(
+                    mounted(app),
+                    tasks,
+                    "the screen under the palette stays mounted"
+                );
+                assert!(app.search.read(cx).focus_handle(cx).is_focused(window));
+            })
+        })
+        .unwrap();
+    // Escape closes the palette only and returns focus to the panel underneath.
+    cx.simulate_keystrokes(handle.into(), "escape");
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, _| {
+                assert!(!app.palette && app.palette_view.is_none());
+                assert_eq!(app.panel, Some(Panel::Tasks));
+                assert!(app.mounted.as_ref().unwrap().focus.is_focused(window));
+            })
+        })
+        .unwrap();
+    // The shortcut toggles, like Spotlight, and works again after closing.
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    app.read_with(cx, |app, _| assert!(app.palette_view.is_some()));
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    app.read_with(cx, |app, _| {
+        assert!(app.palette_view.is_none());
+        assert_eq!(app.panel, Some(Panel::Tasks));
+    });
+    for chord in super::keys::PLATFORM_CHORDS.iter().map(|(chord, _)| *chord) {
+        cx.simulate_keystrokes(handle.into(), chord);
+        app.read_with(cx, |app, _| assert!(app.palette_view.is_some(), "{chord}"));
+        cx.simulate_keystrokes(handle.into(), "escape");
+    }
+}

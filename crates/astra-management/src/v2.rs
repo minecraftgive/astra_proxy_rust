@@ -74,6 +74,14 @@ pub enum Query {
     DiagnosticTargets {
         instance: String,
     },
+    /// One header probe of `outbound`: TCP handshake time, plus the exit IP when `ip`.
+    ExitProbe {
+        instance: String,
+        outbound: String,
+        ip: bool,
+        /// Keep the probe core loaded this long for the next round; none exits after answering.
+        keep_alive_secs: Option<u32>,
+    },
     LogLevel {
         instance: String,
     },
@@ -385,6 +393,7 @@ pub enum ResponseBody {
     ),
     DiagnosticTargets(serde_json::Value),
     Diagnostics(serde_json::Value),
+    ExitProbe(serde_json::Value),
     RouteExplanation(serde_json::Value),
     NetTool(Vec<serde_json::Value>),
     LogLevel(

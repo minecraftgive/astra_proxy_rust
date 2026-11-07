@@ -1,19 +1,19 @@
 use crate::{
     model::AppModel,
     views::ViewEvent,
-    widgets::{DelayChip, Empty},
+    widgets::{DelayChip, Empty, Pill},
 };
 use astra_client::{
     i18n::t,
     state::{Client, Input as ClientInput},
 };
 use gpui::{
-    div, px, uniform_list, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    div, prelude::FluentBuilder, px, uniform_list, App, AppContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use gpui_component::{
-    button::{Button, ButtonVariants},
+    button::Button,
     input::{Input, InputEvent, InputState},
     ActiveTheme,
 };
@@ -158,6 +158,7 @@ impl Render for View {
             .into();
         let entity = cx.entity().downgrade();
         let theme = cx.theme().clone();
+        let pal = crate::theme::palette(cx);
         let group_list = uniform_list("proxy-groups", groups.len(), move |range, _, _| {
             range
                 .map(|index| {
@@ -172,9 +173,9 @@ impl Render for View {
                         .border_b_1()
                         .border_color(theme.border)
                         .bg(if selected {
-                            theme.accent
+                            pal.accent_soft
                         } else {
-                            theme.background
+                            pal.surface
                         })
                         .child(div().text_sm().child(name.clone()))
                         .child(
@@ -191,9 +192,31 @@ impl Render for View {
                 .collect::<Vec<_>>()
         })
         .track_scroll(&self.scroll)
-        .h(px(420.))
-        .w(px(220.));
-        let mut member_panel = div().flex().flex_col().flex_1().min_w_0().gap_3();
+        .flex_1();
+        // Two `.card` panes: the group list, then the web UI's member grid.
+        let pane = || {
+            div()
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .gap_3()
+                .p_4()
+                .rounded_lg()
+                .border_1()
+                .border_color(pal.border)
+                .bg(pal.surface)
+        };
+        let group_list = pane()
+            .w(px(240.))
+            .flex_none()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(t("Proxies")),
+            )
+            .child(group_list);
+        let mut member_panel = pane().flex_1().min_w_0();
         if let Some(group) = group {
             let title = group.name.clone();
             let testing = group.testing;
@@ -201,9 +224,15 @@ impl Render for View {
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_3()
-                    .child(div().child(title.clone()))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(title.clone()),
+                    )
+                    .child(Pill::new(group.mode.clone()))
+                    .child(div().flex_1())
                     .child(
                         Button::new("test-proxy-group")
                             .label(if testing {
@@ -223,39 +252,60 @@ impl Render for View {
                 move |range, _, _| {
                     range
                         .map(|row| {
-                            let mut line = div().h(px(84.)).flex().gap_2();
-                            for index in row * 3..((row + 1) * 3).min(members.len()) {
-                                let (member, pending) = &members[index];
+                            let mut line = div().w_full().h(px(76.)).pb_2().flex().gap_2();
+                            for index in row * 3..row * 3 + 3 {
+                                let Some((member, pending)) = members.get(index) else {
+                                    // Keep tiles the same width on the last row.
+                                    line = line.child(div().flex_1());
+                                    continue;
+                                };
                                 let name = member.name.clone();
                                 let target = title.clone();
                                 let entity = entity.clone();
-                                let mut button =
-                                    Button::new(("proxy-member", index)).label(if *pending {
-                                        format!("{} · {}", name, t("Selecting…"))
-                                    } else {
-                                        name.clone()
-                                    });
-                                if group.selected.as_ref() == Some(&name) || *pending {
-                                    button = button.primary();
-                                }
+                                let chosen = group.selected.as_ref() == Some(&name) || *pending;
+                                let hover = pal.surface_2;
                                 line = line.child(
                                     div()
+                                        .id(("proxy-member", index))
                                         .flex_1()
                                         .min_w_0()
                                         .flex()
                                         .flex_col()
-                                        .gap_1()
-                                        .child(button.on_click(move |_, _, cx| {
+                                        .justify_between()
+                                        .p_3()
+                                        .rounded_md()
+                                        .border_1()
+                                        .cursor_pointer()
+                                        .border_color(if chosen { pal.accent } else { pal.border })
+                                        .bg(if chosen { pal.accent_soft } else { pal.surface })
+                                        .when(!chosen, |tile| tile.hover(move |s| s.bg(hover)))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .truncate()
+                                                .when(chosen, |name| {
+                                                    name.text_color(pal.accent)
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                })
+                                                .child(if *pending {
+                                                    format!("{} · {}", name, t("Selecting…"))
+                                                } else {
+                                                    name.clone()
+                                                }),
+                                        )
+                                        .child(
+                                            div().flex().child(DelayChip::new(
+                                                member
+                                                    .alive
+                                                    .filter(|alive| *alive)
+                                                    .and(member.delay_ms),
+                                            )),
+                                        )
+                                        .on_click(move |_, _, cx| {
                                             let _ = entity.update(cx, |view, cx| {
                                                 view.choose(target.clone(), name.clone(), cx)
                                             });
-                                        }))
-                                        .child(DelayChip::new(
-                                            member
-                                                .alive
-                                                .filter(|alive| *alive)
-                                                .and(member.delay_ms),
-                                        )),
+                                        }),
                                 );
                             }
                             line
@@ -263,7 +313,7 @@ impl Render for View {
                         .collect::<Vec<_>>()
                 },
             )
-            .h(px(370.));
+            .flex_1();
             member_panel = member_panel.child(member_list);
         } else {
             member_panel =

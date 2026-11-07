@@ -413,6 +413,10 @@ pub struct Client {
     pub details: HashMap<String, InstanceDetails>,
     pub details_supported: bool,
     pub diagnostics: Option<crate::diagnostics::View>,
+    /// Exit IPs measured by node tests, keyed by (profile, outbound); shown in the header.
+    pub exit_ips: HashMap<(String, String), std::net::IpAddr>,
+    /// Background exit IP and TCP latency rounds for the header.
+    pub exit_probe: crate::exit_probe::Prober,
     pub open_nettools: bool,
     pub explanation: Option<crate::explanation::View>,
     pub help_scroll: Option<u16>,
@@ -486,6 +490,8 @@ impl Client {
             details: HashMap::new(),
             details_supported: false,
             diagnostics: None,
+            exit_ips: HashMap::new(),
+            exit_probe: Default::default(),
             open_nettools: false,
             explanation: None,
             help_scroll: migration.then_some(0),

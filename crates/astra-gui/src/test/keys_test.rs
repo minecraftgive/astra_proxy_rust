@@ -8,7 +8,7 @@ fn every_shared_spec_shortcut_has_a_gpui_action(cx: &mut TestAppContext) {
             .iter()
             .map(|spec| spec.key.split(" / ").filter(|key| !key.is_empty()).count())
             .sum();
-        assert_eq!(keys.len(), count + 13); // `7` is supplied by Settings.
+        assert_eq!(keys.len(), count + 13 + PLATFORM_CHORDS.len()); // `7` is supplied by Settings.
         for (index, binding) in keys.iter().enumerate() {
             assert!(keys[..index]
                 .iter()

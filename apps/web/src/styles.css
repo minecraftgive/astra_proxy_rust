@@ -1784,6 +1784,38 @@ pre.raw {
 .top-context {
   margin-left: auto;
 }
+.top-exit {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.top-chain {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.exit-probe {
+  flex: none;
+  font-size: 12px;
+}
+.exit-probe-settings .setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+}
+.exit-probe-settings .setting > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.exit-probe-settings input[type="number"] {
+  width: 96px;
+  flex: none;
+}
 .notice-bar {
   padding: 12px 16px;
   border: 1px solid var(--border);

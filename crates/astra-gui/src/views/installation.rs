@@ -124,9 +124,8 @@ impl Render for InstallationView {
                                 match detail.kind {
                                     DetailKind::Package { index, selected } => {
                                         if selected {
-                                            row = row
-                                                .bg(cx.theme().accent)
-                                                .text_color(cx.theme().accent_foreground);
+                                            let pal = crate::theme::palette(cx);
+                                            row = row.bg(pal.accent_soft).text_color(pal.accent);
                                         }
                                         let view = view.clone();
                                         row = row.cursor_pointer().on_click(move |_, _, cx| {

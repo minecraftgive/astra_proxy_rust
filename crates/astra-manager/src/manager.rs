@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod elevation;
+mod probes;
 mod recovery;
 mod server;
 mod updates;

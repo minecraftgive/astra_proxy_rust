@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-from astra_tools.workspace import ROOT, BuildLayout, build_environment, cargo_profile
+from astra_tools.workspace import ROOT, BuildLayout, build_environment, cargo_profile, missing_c_compiler
 from astra_tools.artifacts import ROLES, ArtifactIndex, role_binaries, role_packages, stage, package
 
 
@@ -135,6 +135,10 @@ def main():
     for tool in ('cargo', 'rustc', 'cmake'):
         if not shutil.which(tool, path=env['PATH']):
             parser.error(f'{tool} is required; see docs/INSTALL.md')
+    compiler = missing_c_compiler(env)
+    if compiler:
+        language = 'C' if compiler == 'CC' else 'C++'
+        parser.error(f'A {language} compiler is required (set {compiler} or install Clang/GCC); see docs/INSTALL.md')
     layout, metadata = BuildLayout.discover(env)
     if env.get('CARGO_BUILD_TARGET', layout.target) not in (layout.target, 'host-tuple'):
         parser.error('Native builds require CARGO_BUILD_TARGET to match the Rust host')

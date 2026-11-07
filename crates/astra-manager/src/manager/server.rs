@@ -319,8 +319,19 @@ pub(crate) struct NativeClient {
     sender: mpsc::Sender<Work>,
     stopped: mpsc::Sender<()>,
     diagnostics: Arc<Semaphore>,
+    probes: super::probes::Probes,
 }
 impl NativeClient {
+    /// One header exit probe; `keep_alive` keeps the probe core loaded between rounds.
+    pub(crate) async fn exit_probe(
+        &self,
+        name: &str,
+        request: astra_model::diagnostics::ProbeRequest,
+        keep_alive: Option<Duration>,
+    ) -> Result<astra_model::diagnostics::Probe> {
+        let plan = self.hub.plan(name)?;
+        self.probes.probe(name, plan, request, keep_alive).await
+    }
     pub(crate) async fn save(
         &self,
         name: String,
@@ -732,6 +743,7 @@ pub(super) async fn run(
             sender: sender.clone(),
             stopped: stopped.clone(),
             diagnostics: diagnostics.clone(),
+            probes: Default::default(),
         });
     }
     let followers = Arc::new(Semaphore::new(16));

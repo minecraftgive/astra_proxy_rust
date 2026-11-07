@@ -69,6 +69,32 @@ pub async fn request(socket: &Path, body: v::RequestBody) -> Result<v::ResponseB
 async fn query(p: &Path, q: v::Query) -> Result<v::ResponseBody> {
     request(p, v::RequestBody::Query(q)).await
 }
+/// One header exit probe through the manager's probe core for `instance`.
+pub async fn exit_probe(
+    p: &Path,
+    instance: String,
+    outbound: String,
+    ip: bool,
+    keep_alive: Option<Duration>,
+) -> Result<astra_model::diagnostics::Probe> {
+    let keep_alive_secs = keep_alive.map(|d| d.as_secs().min(u64::from(u32::MAX)) as u32);
+    match query(
+        p,
+        v::Query::ExitProbe {
+            instance,
+            outbound,
+            ip,
+            keep_alive_secs,
+        },
+    )
+    .await?
+    {
+        v::ResponseBody::ExitProbe(value) => {
+            Ok(serde_json::from_value(native_numbers(value, None))?)
+        }
+        other => anyhow::bail!("Expected exit probe, received {other:?}"),
+    }
+}
 pub async fn execute(p: &Path, c: v::Command) -> Result<v::ResponseBody> {
     execute_id(p, id(), c).await
 }

@@ -23,6 +23,8 @@ pub struct AppWindow {
     panel: Option<Panel>,
     palette: bool,
     profile_chooser: bool,
+    /// The Spotlight-style palette floating above whatever screen is mounted.
+    palette_view: Option<(Entity<views::palette::View>, Subscription)>,
     search: Entity<InputState>,
     prompt: Entity<widgets::PromptHost>,
     elevation: Entity<views::elevation::ElevationHost>,
@@ -170,6 +172,7 @@ impl AppWindow {
             panel: None,
             palette: false,
             profile_chooser: false,
+            palette_view: None,
             search,
             prompt,
             elevation,
@@ -200,11 +203,318 @@ impl AppWindow {
         });
     }
 }
+impl AppWindow {
+    fn title(&self, page: usize) -> &'static str {
+        if let Some(panel) = self.panel {
+            panel.title()
+        } else {
+            t(PAGES[page].title)
+        }
+    }
+    /// The web UI's sidebar: brand, numbered pages, then tools.
+    fn sidebar(&self, page: usize, running: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::theme::palette(cx);
+        let server = self.model.read(cx).server_mode;
+        let online = self.model.read(cx).online;
+        let on_page = self.panel.is_none();
+        let brand = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .pt_1()
+            .pb_4()
+            .child(
+                div()
+                    .size(px(22.))
+                    .rounded_md()
+                    .bg(p.accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().primary_foreground)
+                    .child("A"),
+            )
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.text)
+                    .child("Astra"),
+            )
+            .child(widgets::Pill::new(t(if server {
+                "Server"
+            } else {
+                "Proxy"
+            })));
+        let pages = PAGES
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !server || *index >= 4)
+            .map(|(index, item)| {
+                widgets::NavItem::new(("page", index), t(item.title))
+                    .shortcut((index + 1).to_string())
+                    .active(on_page && page == index)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.navigate(index, window, cx)),
+                    )
+            });
+        let tools = [
+            (Panel::Monitor, Id::Monitor, "F9".to_owned()),
+            (
+                Panel::Tasks,
+                Id::Tasks,
+                if running > 0 {
+                    format!("{running} · F6")
+                } else {
+                    "F6".to_owned()
+                },
+            ),
+            (Panel::Updates, Id::Settings, String::new()),
+            (Panel::Help, Id::Help, "F1".to_owned()),
+        ]
+        .into_iter()
+        .map(|(panel, id, key)| {
+            widgets::NavItem::new(SharedString::from(format!("tool-{panel:?}")), panel.title())
+                .shortcut(key)
+                .active(self.panel == Some(panel))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if panel == Panel::Updates {
+                        this.show_panel(panel, window, cx)
+                    } else {
+                        this.execute(id, window, cx)
+                    }
+                }))
+        });
+        div()
+            .w(px(200.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(10.))
+            .py(px(14.))
+            .bg(p.surface)
+            .border_r_1()
+            .border_color(p.border)
+            .child(brand)
+            .children(pages)
+            .child(
+                div()
+                    .px_3()
+                    .pt_4()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.muted)
+                    .child(t("Tools")),
+            )
+            .children(tools)
+            .child(
+                widgets::NavItem::new("tool-palette", t("Command palette"))
+                    .shortcut("Ctrl-K")
+                    .active(self.palette)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.execute(Id::Palette, window, cx)),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(if online { p.ok } else { p.warn }),
+                    )
+                    .child(t(if online { "Connected" } else { "Connecting…" })),
+            )
+    }
+    /// The web UI's top bar: status, current profile, state, then live rates.
+    fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::theme::palette(cx);
+        let model = self.model.read(cx);
+        let header = model.client.header();
+        let kind = model.client.kind;
+        let online = model.online;
+        let status = crate::views::profiles::status(header.state);
+        let state_tone = match status {
+            widgets::Status::Running => widgets::Tone::Ok,
+            widgets::Status::Starting => widgets::Tone::Warn,
+            widgets::Status::Error => widgets::Tone::Err,
+            widgets::Status::Stopped => widgets::Tone::Neutral,
+        };
+        let state_label = match status {
+            widgets::Status::Running => t("Running"),
+            widgets::Status::Starting => t("Starting"),
+            widgets::Status::Error => t("Error"),
+            widgets::Status::Stopped => t("Stopped"),
+        };
+        let profile = div()
+            .id("choose-profile")
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .px_3()
+            .py(px(5.))
+            .rounded_md()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .cursor_pointer()
+            .hover(move |style| style.bg(p.surface_2))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.text)
+                    .truncate()
+                    .child(
+                        header
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| t("No profile yet").into()),
+                    ),
+            )
+            .child(div().text_xs().text_color(p.faint).child("▾"))
+            .on_click(cx.listener(|this, _, window, cx| this.execute(Id::Profiles, window, cx)));
+        div()
+            .h(px(56.))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .bg(p.surface)
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .size(px(8.))
+                    .rounded_full()
+                    .bg(if online { p.ok } else { p.warn }),
+            )
+            .child(profile)
+            .child(widgets::Pill::new(t(match kind {
+                astra_client::protocol::Kind::Proxy => "Proxy",
+                astra_client::protocol::Kind::Rule => "Rule core",
+                astra_client::protocol::Kind::Server => "Server",
+            })))
+            .when(header.name.is_some(), |bar| {
+                bar.child(widgets::Pill::new(state_label).tone(state_tone))
+                    .when(!header.uptime.is_empty() && header.connected, |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.muted)
+                                .child(header.uptime.clone()),
+                        )
+                    })
+                    .when(header.mode.is_some(), |bar| {
+                        bar.child(widgets::Pill::new(header.mode_label).tone(widgets::Tone::Accent))
+                    })
+            })
+            .child(div().flex_1())
+            .when(!header.exit_chain.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(p.muted)
+                        .truncate()
+                        .child(header.exit_chain.clone()),
+                )
+                .child(widgets::ExitProbe::new(&header))
+            })
+            .when(header.connected, |bar| {
+                bar.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_family(crate::theme::mono(cx))
+                        .text_color(p.muted)
+                        .child(format!(
+                            "↑ {}/s  ↓ {}/s",
+                            astra_client::live::rate_value(header.rates[0], false).trim(),
+                            astra_client::live::rate_value(header.rates[1], false).trim()
+                        )),
+                )
+            })
+    }
+    /// `.page-head`: the title, then the current profile's common actions.
+    fn page_head(&self, page: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::theme::palette(cx);
+        let header = self.model.read(cx).client.header();
+        let on_page = self.panel.is_none();
+        let mut tools = div().flex().items_center().gap_2();
+        if on_page && header.name.is_some() && page != 6 {
+            tools = tools
+                .child(
+                    Button::new("head-edit")
+                        .label(t("Edit profile"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let input = this.model.update(cx, |model, cx| {
+                                let input = model.tokio(|client| {
+                                    client.active_operation(astra_client::state::Operation::Edit)
+                                });
+                                cx.notify();
+                                input
+                            });
+                            this.handle_input(input, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("connection-toggle")
+                        .primary()
+                        .label(header.connect_label)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let input = this.model.update(cx, |model, cx| {
+                                let input = model.tokio(|client| client.toggle_current());
+                                cx.notify();
+                                input
+                            });
+                            this.handle_input(input, window, cx);
+                        })),
+                );
+        } else if !on_page {
+            tools = tools.child(
+                Button::new("head-close")
+                    .ghost()
+                    .label(t("Close"))
+                    .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))),
+            );
+        }
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.text)
+                    .truncate()
+                    .child(self.title(page)),
+            )
+            .child(tools)
+    }
+}
 impl Render for AppWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page = self.page.unwrap_or(self.model.read(cx).client.page).min(6);
         let server = self.model.read(cx).server_mode;
-        let header = self.model.read(cx).client.header();
         let status = self.model.read(cx).client.message.clone();
         let running = self
             .model
@@ -223,68 +533,105 @@ impl Render for AppWindow {
             .cloned()
             .collect::<Vec<_>>()
             .join(" · ");
+        let offline = self.model.read(cx).ready && !self.model.read(cx).online;
         let content = self.content(window, cx);
+        // Any path that cleared the palette flags (navigation, a result, an effect)
+        // also drops the floating view.
+        if !self.palette && !self.profile_chooser {
+            self.palette_view = None;
+        }
+        let palette = self.palette_view.as_ref().map(|(view, _)| view.clone());
         if self.model.read(cx).ready && !self.ready_frame {
             self.ready_frame = true;
             cx.on_next_frame(window, |this, _, cx| {
                 this.model.update(cx, |model, _| model.mark_window_ready())
             });
         }
-        let sidebar = div()
-            .w(px(186.))
-            .h_full()
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .border_r_1()
-            .border_color(cx.theme().border)
+        let p = crate::theme::palette(cx);
+        let sidebar = self.sidebar(page, running, cx);
+        let top_bar = self.top_bar(cx);
+        let page_head = self.page_head(page, cx);
+        let body = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .bg(p.bg)
             .child(
                 div()
-                    .p_3()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .child("ASTRA"),
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(1180.))
+                            .h_full()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .px_6()
+                            .pt_5()
+                            .pb_4()
+                            .child(page_head)
+                            .when(offline, |column| {
+                                column.child(widgets::NoticeBar::new(
+                                    t("The manager is offline. Showing the last observed state; running cores keep running."),
+                                    widgets::Tone::Warn,
+                                ))
+                            })
+                            .when(!errors.is_empty(), |column| {
+                                column.child(widgets::NoticeBar::new(errors, widgets::Tone::Err))
+                            })
+                            .child(div().flex_1().min_h_0().min_w_0().child(content)),
+                    ),
             )
-            .children(
-                PAGES
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !server || *index >= 4)
-                    .map(|(index, item)| {
-                        Button::new(("page", index))
-                            .label(format!("{}   {}", index + 1, t(item.title)))
-                            .when(page == index, |button| button.primary())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.navigate(index, window, cx)
-                            }))
-                    }),
+            .child(div().absolute().top_3().right_3().child(self.toast.clone()));
+        let task_bar = div()
+            .id("task-bar")
+            .h(px(34.))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .bg(p.surface)
+            .border_t_1()
+            .border_color(p.border)
+            .text_xs()
+            .text_color(p.muted)
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(8.))
+                    .rounded_full()
+                    .bg(if running > 0 { p.accent } else { p.ok }),
             )
-            .child(div().flex_1())
-            .children(
-                [
-                    (Id::Palette, "Command palette"),
-                    (Id::Help, "Keyboard help"),
-                    (Id::Monitor, "Monitor"),
-                ]
-                .into_iter()
-                .map(|(id, label)| {
-                    Button::new(label).label(t(label)).on_click(
-                        cx.listener(move |this, _, window, cx| this.execute(id, window, cx)),
-                    )
-                }),
+            .child(
+                div()
+                    .id("status-message")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(status),
             )
-            .child(Button::new("updates").label(t("Updates")).on_click(
-                cx.listener(|this, _, window, cx| this.show_panel(Panel::Updates, window, cx)),
-            ));
+            .child(
+                div()
+                    .id("tasks")
+                    .flex_none()
+                    .child(format!("{} · {running}  F6", t("Tasks"))),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.execute(Id::Tasks, window, cx)));
         div()
             .id("astra-root")
             .key_context("Astra")
             .track_focus(&self.focus)
             .size_full()
             .flex()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(p.bg)
+            .text_color(p.text)
+            .text_size(px(13.))
             .on_action(cx.listener(|this, command: &keys::Command, window, cx| {
                 this.execute(command.0, window, cx);
                 cx.stop_propagation();
@@ -301,7 +648,11 @@ impl Render for AppWindow {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    this.dismiss(window, cx);
+                    if this.palette_view.is_some() {
+                        this.close_palette(window, cx);
+                    } else {
+                        this.dismiss(window, cx);
+                    }
                     cx.stop_propagation();
                 }
             }))
@@ -313,95 +664,42 @@ impl Render for AppWindow {
                     .flex()
                     .flex_col()
                     .child(self.marquee.clone())
-                    .child(
-                        div()
-                            .min_h(px(64.))
-                            .px_4()
-                            .py_2()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                Button::new("choose-profile")
-                                    .label(
-                                        header.name.unwrap_or_else(|| t("No profile yet").into()),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.execute(Id::Profiles, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("connection-toggle")
-                                    .label(t(header.connect_label))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let input = this.model.update(cx, |model, cx| {
-                                            let input =
-                                                model.tokio(|client| client.toggle_current());
-                                            cx.notify();
-                                            input
-                                        });
-                                        this.handle_input(input, window, cx);
-                                    })),
-                            )
-                            .child(div().text_sm().child(t(header.mode_label)))
-                            .child(div().flex_1().text_sm().child(header.exit_chain))
-                            .child(widgets::DelayChip::new(header.delay_ms))
-                            .child(div().text_sm().child(format!(
-                                "↑ {}  ↓ {}",
-                                astra_client::live::rate_value(header.rates[0], true),
-                                astra_client::live::rate_value(header.rates[1], true)
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .child(content)
-                            .child(div().absolute().top_3().right_3().child(self.toast.clone())),
-                    )
-                    .when(!errors.is_empty(), |view| {
-                        view.child(
-                            div()
-                                .px_4()
-                                .py_2()
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(errors),
-                        )
-                    })
-                    .child(
-                        div()
-                            .h(px(44.))
-                            .px_4()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .id("status-message")
-                                    .flex_1()
-                                    .text_sm()
-                                    .overflow_hidden()
-                                    .child(status)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.execute(Id::Tasks, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("tasks")
-                                    .label(format!("{} · {running}  F6", t("Tasks")))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.execute(Id::Tasks, window, cx)
-                                    })),
-                            ),
-                    ),
+                    .child(top_bar)
+                    .child(body)
+                    .child(task_bar),
             )
+            .when_some(palette, |root, palette| {
+                // Spotlight-style: a dimmed backdrop over the whole window and a
+                // floating panel near the top; clicking outside closes it.
+                root.child(
+                    div()
+                        .id("palette-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .justify_center()
+                        .pt(px(96.))
+                        .bg(gpui::black().opacity(0.4))
+                        .on_click(cx.listener(|this, _, window, cx| this.close_palette(window, cx)))
+                        .child(
+                            div()
+                                .id("palette-panel")
+                                .w(px(640.))
+                                .max_w(relative(0.9))
+                                .h(px(440.))
+                                .max_h(relative(0.7))
+                                .rounded_xl()
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.surface)
+                                .shadow_xl()
+                                .overflow_hidden()
+                                // Clicks inside the panel must not reach the backdrop.
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(palette),
+                        ),
+                )
+            })
     }
 }
 pub fn open(model: Entity<AppModel>, cx: &mut App) -> anyhow::Result<()> {

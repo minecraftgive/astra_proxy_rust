@@ -790,8 +790,7 @@ fn status_bar_colors_state_and_drops_detail_instead_of_cutting_words() {
     let mut snapshot = ui.live().unwrap().clone();
     snapshot.tun = true;
     ui.accept_runtime("proxy".into(), snapshot);
-    // Overview folds its status into the Astra header; the standalone status bar
-    // still serves every other page, so test it there.
+    // Every page shares the same header; test it away from Overview's panels.
     ui.navigate(PROXIES);
     ui.rates = [0, 48_000];
     let bar = |ui: &Ui, width: u16| {
@@ -829,12 +828,20 @@ fn status_bar_colors_state_and_drops_detail_instead_of_cutting_words() {
             text.contains("Proxy") && text.contains("Direct") && text.trim_end().ends_with("B/s"),
             "rates are right-aligned: {text}"
         );
-        // Narrower bars lose whole parts in order, never half a word.
-        let (text, _) = bar(&ui, 70);
+        // Out of room the rates shorten to P / D before any detail goes.
+        let (text, _) = bar(&ui, 110);
         assert!(
-            !text.contains("B/s") && text.contains("TUN") && !text.contains("LAN"),
+            text.contains("P ↑") && !text.contains("Proxy") && text.contains("Tokyo"),
             "{text}"
         );
+        // Narrower bars lose whole parts in order, never half a word; the rates
+        // go before the state or the exit node.
+        let (text, _) = bar(&ui, 70);
+        assert!(
+            !text.contains("/s") && text.contains("Connected") && text.contains("Exit"),
+            "{text}"
+        );
+        assert!(text.contains("TUN") && text.contains("LAN"), "{text}");
         for width in [48, 36, 24] {
             let (text, _) = bar(&ui, width);
             let words: Vec<_> = text.split_whitespace().collect();
@@ -849,7 +856,13 @@ fn status_bar_colors_state_and_drops_detail_instead_of_cutting_words() {
                         "Profile",
                         "connected",
                         "Rule",
-                        "TUN"
+                        "Exit",
+                        "Tokyo",
+                        "(—)",
+                        "○",
+                        "System",
+                        "TUN",
+                        "LAN"
                     ]
                     .contains(&word)
                         || word
@@ -1157,4 +1170,40 @@ fn live_cards_groups_and_connections_resize_and_old_process_data_is_hidden() {
             assert!(ui.live().is_none());
         });
     }
+}
+#[test]
+fn header_shows_found_exit_results_and_keeps_places_for_enabled_probes() {
+    let mut ui = sample();
+    ui.navigate(PROXIES);
+    let header = |ui: &Ui| {
+        let mut t = ratatui::Terminal::new(TestBackend::new(200, 12)).unwrap();
+        t.draw(|f| ui.render(f)).unwrap();
+        let buffer = t.backend().buffer();
+        (0..200)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+    };
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        // By default only the latency keeps a place; no round has finished yet.
+        assert!(header(&ui).contains("Tokyo (—)"));
+        // The connect/switch probe found an IP: it shows with the setting off.
+        ui.client.exit_ips.insert(
+            ("proxy".into(), "Tokyo".into()),
+            "203.0.113.7".parse().unwrap(),
+        );
+        assert!(header(&ui).contains("Tokyo (ip: 203.0.113.7 | —)"));
+        assert_eq!(
+            ui.client.exit_probe_target(),
+            None,
+            "the sample manager cannot run node tests"
+        );
+        ui.client.preferences.exit_latency = false;
+        assert!(header(&ui).contains("Tokyo (ip: 203.0.113.7)"));
+        ui.client.exit_ips.clear();
+        let text = header(&ui);
+        assert!(text.contains("Tokyo │") && !text.contains("ip:"), "{text}");
+        // An enabled IP setting keeps its place until a lookup succeeds.
+        ui.client.preferences.exit_ip = true;
+        assert!(header(&ui).contains("Tokyo (ip: —)"));
+    });
 }

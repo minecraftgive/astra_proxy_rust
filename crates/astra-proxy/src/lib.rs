@@ -703,6 +703,25 @@ pub async fn run() -> Result<()> {
         .await?;
         return Ok(());
     }
+    if first.as_deref() == Some("--probe-serve") {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let path = std::path::absolute(args.next().context("expected config path")?)?;
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        (&mut stdin)
+            .take(2 * 1024 * 1024 + 1)
+            .read_line(&mut line)
+            .await?;
+        anyhow::ensure!(line.ends_with('\n'), "Probe configuration exceeds limit");
+        let payload: astra_model::diagnostics::ProbeServe = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            payload.config.len() <= 480 * 1024,
+            "Configuration exceeds 480 KiB"
+        );
+        let app = subscription::cached_app(&path, App::from_text(&path, payload.config)?);
+        diagnostics::serve(&app, stdin, tokio::io::stdout()).await?;
+        return Ok(());
+    }
     if matches!(
         first.as_deref(),
         Some(

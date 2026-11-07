@@ -12,7 +12,7 @@ impl Render for DragLabel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .p_3()
-            .bg(cx.theme().background)
+            .bg(crate::theme::palette(cx).surface)
             .border_1()
             .border_color(cx.theme().border)
             .child(self.0.clone())
@@ -205,7 +205,7 @@ impl View {
                             });
                         });
                     if selected == index {
-                        item = item.bg(cx.theme().accent);
+                        item = item.bg(crate::theme::palette(cx).accent_soft);
                     }
                     if let Some(expanded) = row.expanded {
                         item = item.child(

@@ -44,6 +44,62 @@ impl AppWindow {
         self.record_page(cx);
         cx.notify();
     }
+    /// Open the floating palette over the current screen, or close it when the
+    /// same palette is already showing (the shortcut toggles, like Spotlight).
+    pub(super) fn open_palette(
+        &mut self,
+        profiles: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_view.is_some() && self.profile_chooser == profiles {
+            self.close_palette(window, cx);
+            return;
+        }
+        self.palette = !profiles;
+        self.profile_chooser = profiles;
+        let model = self.model.clone();
+        let mode = if profiles {
+            astra_client::palette::PaletteMode::Profiles(model.read(cx).client.kind)
+        } else {
+            astra_client::palette::PaletteMode::Commands
+        };
+        let context = views::palette::PaletteContext {
+            page: self.page.unwrap_or(model.read(cx).client.page),
+            window_id: self.id,
+            editor_active: self.panel == Some(Panel::Editor)
+                && model.read(cx).editor_owned_by(self.id),
+        };
+        let search = self.search.clone();
+        let view = cx.new(|cx| views::palette::View::new(model, search, mode, context, window, cx));
+        let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+            // A result closes the palette first, then runs like any other input.
+            this.close_palette(window, cx);
+            match event {
+                views::ViewEvent::Input(input) => this.handle_input(input.clone(), window, cx),
+                views::ViewEvent::Navigate(page) => this.navigate(*page, window, cx),
+                views::ViewEvent::Panel(panel) => this.show_panel(*panel, window, cx),
+                views::ViewEvent::Dismiss => {}
+                views::ViewEvent::Cancel(id) => this
+                    .model
+                    .update(cx, |model, cx| model.cancel_task(*id, cx)),
+            }
+            cx.notify();
+        });
+        self.palette_view = Some((view, subscription));
+        cx.notify();
+    }
+    /// Close only the palette and give focus back to the screen underneath.
+    pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = false;
+        self.profile_chooser = false;
+        self.palette_view = None;
+        match &self.mounted {
+            Some(mounted) => window.focus(&mounted.focus, cx),
+            None => window.focus(&self.focus, cx),
+        }
+        cx.notify();
+    }
     pub(super) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.leave_editor(window, cx) {
             return;
@@ -217,15 +273,7 @@ impl AppWindow {
                 cx.notify();
             }),
             Input::Frontend(id) => match id {
-                Id::Palette | Id::Profiles => {
-                    self.palette = id == Id::Palette;
-                    self.profile_chooser = id == Id::Profiles;
-                    self.mounted = None;
-                    self.search.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                        input.focus(window, cx);
-                    });
-                }
+                Id::Palette | Id::Profiles => self.open_palette(id == Id::Profiles, window, cx),
                 Id::Help => self.show_panel(Panel::Help, window, cx),
                 Id::Tasks => self.show_panel(Panel::Tasks, window, cx),
                 Id::Logs => self.show_panel(Panel::GuiLog, window, cx),

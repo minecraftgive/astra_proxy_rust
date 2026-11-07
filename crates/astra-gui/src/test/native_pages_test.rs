@@ -363,3 +363,174 @@ fn observability_monitor_and_network_tools_use_shared_models(cx: &mut TestAppCon
         .unwrap()
         .running()));
 }
+fn idle_diagnostics(model: &Entity<AppModel>, cx: &mut TestAppContext) {
+    model.update(cx, |model, _| {
+        model.tokio(|c| {
+            let mut diagnostics = astra_client::diagnostics::View::start(
+                std::path::Path::new("/missing-astra-socket"),
+                "proxy".into(),
+            );
+            if let Some(task) = diagnostics.task.take() {
+                task.abort();
+            }
+            diagnostics.receiver = None;
+            diagnostics.loading = false;
+            diagnostics.targets = vec!["first".into(), "second".into()];
+            c.diagnostics = Some(diagnostics);
+        })
+    });
+}
+#[gpui::test]
+fn diagnostics_keys_drive_the_shared_node_test_list(cx: &mut TestAppContext) {
+    use crate::views::diagnostics;
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    idle_diagnostics(&model, cx);
+    let (_, window, _) = fixture(cx, model.clone(), diagnostics::View::new);
+    let checked = |cx: &mut TestAppContext| {
+        model.read_with(cx, |m, _| {
+            let d = m.client.diagnostics.as_ref().unwrap();
+            let mut checked = d.checked.iter().cloned().collect::<Vec<String>>();
+            checked.sort();
+            (d.cursor, checked)
+        })
+    };
+    cx.simulate_keystrokes(window.into(), "j space");
+    assert_eq!(checked(cx), (1, vec!["second".to_owned()]));
+    cx.simulate_keystrokes(window.into(), "k a");
+    assert_eq!(
+        checked(cx),
+        (0, vec!["first".to_owned(), "second".to_owned()])
+    );
+    cx.simulate_keystrokes(window.into(), "c");
+    assert_eq!(checked(cx), (0, vec![]));
+    cx.simulate_keystrokes(window.into(), "n");
+    assert!(model.read_with(cx, |m, _| m
+        .client
+        .diagnostics
+        .as_ref()
+        .unwrap()
+        .tools
+        .is_some()));
+}
+#[gpui::test]
+fn network_tool_keys_move_fields_and_hand_text_to_native_boxes(cx: &mut TestAppContext) {
+    use crate::views::nettools;
+    use astra_client::nettools::Field;
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    idle_diagnostics(&model, cx);
+    model.update(cx, |model, _| {
+        model.tokio(|c| c.diagnostics.as_mut().unwrap().open_tools_page())
+    });
+    let (_, window, _) = fixture(cx, model.clone(), nettools::View::new);
+    let tools = |cx: &mut TestAppContext| {
+        model.read_with(cx, |m, _| {
+            let v = m.client.diagnostics.as_ref()?.tools.as_ref()?;
+            Some((v.field, v.kind, v.target.clone()))
+        })
+    };
+    let (_, kind, _) = tools(cx).unwrap();
+    cx.simulate_keystrokes(window.into(), "down right");
+    let (field, changed, default) = tools(cx).unwrap();
+    assert_eq!(field, Field::Kind);
+    assert_ne!(changed, kind);
+    // Single-letter shortcuts on a text row start editing instead of running commands.
+    cx.simulate_keystrokes(window.into(), "down x");
+    cx.simulate_input(window.into(), "example.com");
+    let (field, _, target) = tools(cx).unwrap();
+    assert_eq!(field, Field::Target);
+    // The box was synced to the kind's default target, then edited natively.
+    assert_eq!(target, format!("{default}example.com"));
+    // Escape leaves the box first, then closes the form.
+    cx.simulate_keystrokes(window.into(), "escape");
+    assert!(tools(cx).is_some());
+    cx.simulate_keystrokes(window.into(), "escape");
+    assert!(tools(cx).is_none());
+}
+
+#[gpui::test]
+fn header_exit_probe_fields_show_found_results_and_enabled_places(cx: &mut TestAppContext) {
+    use astra_client::overview::ExitLatency;
+    let model = model(cx);
+    model.update(cx, |model, _| {
+        let client = &mut model.client;
+        // By default only the latency keeps a place, pending until a round finishes.
+        let header = client.header();
+        assert_eq!(header.exit_chain, "PROXY ▸ first");
+        assert_eq!(header.exit_ip, None);
+        assert_eq!(header.exit_latency, Some(ExitLatency::Pending));
+        // The connect/switch probe found the IP: it shows with the setting off.
+        client.exit_ips.insert(
+            ("proxy".into(), "first".into()),
+            "203.0.113.7".parse().unwrap(),
+        );
+        assert_eq!(client.header().exit_ip.as_deref(), Some("203.0.113.7"));
+        client.preferences.exit_latency = false;
+        assert_eq!(client.header().exit_latency, None);
+        client.exit_ips.clear();
+        client.preferences.exit_ip = true;
+        assert_eq!(client.header().exit_ip.as_deref(), Some("—"));
+    });
+}
+#[gpui::test]
+fn overview_proxies_card_manages_groups_without_navigating(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    let (view, _, events) = fixture(cx, model.clone(), overview::View::new);
+    view.update(cx, |view, cx| view.toggle_group("PROXY".into(), cx));
+    view.update(cx, |view, cx| {
+        view.choose("PROXY".into(), "second".into(), cx)
+    });
+    view.update(cx, |view, cx| view.test_group("PROXY".into(), cx));
+    let events = events.borrow();
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ViewEvent::Navigate(_))));
+    assert!(events.iter().any(|event| matches!(event,ViewEvent::Input(ClientInput::Run(Action::Runtime{command:Command::Select{member,..},..},_))if member=="second")));
+    assert!(events.iter().any(|event| matches!(event,ViewEvent::Input(ClientInput::Run(Action::Runtime{command:Command::TestGroup(group),..},_))if group=="PROXY")));
+    assert!(model.read_with(cx, |model, _| model
+        .client
+        .proxy_member_pending("PROXY", "second")));
+}
+#[gpui::test]
+fn overview_proxies_card_folds_with_arrow_keys(cx: &mut TestAppContext) {
+    use overview::CardRow;
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    let (view, window, events) = fixture(cx, model.clone(), overview::View::new);
+    let state = |cx: &mut TestAppContext| {
+        view.read_with(cx, |view, _| {
+            (
+                view.cursor().cloned(),
+                view.expanded_group().map(str::to_owned),
+            )
+        })
+    };
+    cx.simulate_keystrokes(window.into(), "down");
+    assert_eq!(state(cx), (Some(CardRow::Group("PROXY".into())), None));
+    cx.simulate_keystrokes(window.into(), "right");
+    assert_eq!(
+        state(cx),
+        (Some(CardRow::Group("PROXY".into())), Some("PROXY".into()))
+    );
+    cx.simulate_keystrokes(window.into(), "left");
+    assert_eq!(state(cx), (Some(CardRow::Group("PROXY".into())), None));
+    cx.simulate_keystrokes(window.into(), "right down down");
+    assert_eq!(
+        state(cx),
+        (
+            Some(CardRow::Member("PROXY".into(), "second".into())),
+            Some("PROXY".into())
+        )
+    );
+    cx.simulate_keystrokes(window.into(), "left");
+    assert_eq!(state(cx), (Some(CardRow::Group("PROXY".into())), None));
+    cx.simulate_keystrokes(window.into(), "enter down down enter");
+    assert_eq!(state(cx), (Some(CardRow::Group("PROXY".into())), None));
+    assert!(!events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, ViewEvent::Navigate(_))));
+    assert!(events.borrow().iter().any(|event| matches!(event,ViewEvent::Input(ClientInput::Run(Action::Runtime{command:Command::Select{member,..},..},_))if member=="second")));
+}

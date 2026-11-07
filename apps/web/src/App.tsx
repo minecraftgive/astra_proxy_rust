@@ -11,6 +11,16 @@ import ProgramInfo from "./components/ProgramInfo";
 import NetworkRecovery from "./components/NetworkRecovery";
 import Monitor from "./components/Monitor";
 import { Details, Empty, Table } from "./components/common";
+import {
+  EXIT_INTERVAL,
+  ExitProbeFields,
+  clampInterval,
+  exitChain,
+  readExitProbe,
+  retainExitProbe,
+  useExitProbe,
+  type ExitProbeSettings,
+} from "./exitProbe";
 
 type Row = Record<string, unknown>;
 const pages = [
@@ -65,6 +75,13 @@ export default function App() {
   const [kind, setKind] = useState<API.Instance["kind"]>("proxy");
   const [busy, setBusy] = useState(false);
   const [theme, setTheme] = useState(readTheme);
+  const [exitProbe, setExitProbe] = useState(readExitProbe);
+  const updateExitProbe = (change: Partial<ExitProbeSettings>) =>
+    setExitProbe((old) => {
+      const next = { ...old, ...change };
+      retainExitProbe(next);
+      return next;
+    });
   const epoch = useRef(0);
   const scope = useRef("");
   scope.current = `${agent}/${selected}`;
@@ -385,6 +402,36 @@ export default function App() {
     testing: boolean;
     members: { name: string; alive: boolean | null; delay_ms: string | null }[];
   }[];
+  // The connected profile's mode and exit chain, then the exit probe fields.
+  const chain = current?.kind === "proxy" ? exitChain(runtime) : [];
+  const exitNode = chain[chain.length - 1];
+  const details = current?.details as
+    | { diagnostics_supported?: boolean }
+    | null
+    | undefined;
+  const probe = useExitProbe(
+    authenticated &&
+      online &&
+      current &&
+      current.kind === "proxy" &&
+      current.pid != null &&
+      current.state === "Running" &&
+      details?.diagnostics_supported &&
+      runtime &&
+      String(runtime.pid) === String(current.pid) &&
+      exitNode
+      ? {
+          agent,
+          instance: current.id,
+          pid: String(current.pid),
+          outbound: exitNode,
+        }
+      : null,
+    exitProbe,
+  );
+  const modeLabel = (
+    { rule: "规则", global: "全局", direct: "直连" } as Record<string, string>
+  )[String(runtime?.mode)];
   if (!authenticated) return <Login onLogin={() => setAuthenticated(true)} />;
   return (
     <div className="app">
@@ -452,6 +499,16 @@ export default function App() {
             </option>
           ))}
         </select>
+        {modeLabel && current?.kind === "proxy" && (
+          <span className="pill acc">{modeLabel}</span>
+        )}
+        {chain.length > 0 && (
+          <span className="top-exit">
+            <span className="muted">出口 </span>
+            <span className="top-chain">{chain.join(" ▸ ")}</span>{" "}
+            <ExitProbeFields {...probe} />
+          </span>
+        )}
         <span className="top-context muted">
           {current?.state ?? "未选择实例"}
         </span>
@@ -1056,6 +1113,83 @@ export default function App() {
                       <option value="light">浅色</option>
                       <option value="dark">深色</option>
                     </select>
+                  </section>
+                  <section className="card card-pad exit-probe-settings">
+                    <h2>出口探测</h2>
+                    <label className="setting">
+                      <input
+                        type="checkbox"
+                        checked={exitProbe.ip}
+                        onChange={(e) =>
+                          updateExitProbe({ ip: e.target.checked })
+                        }
+                      />
+                      <span>
+                        <strong>出口 IP</strong>
+                        <span className="muted">
+                          每次连接或切换节点都会查询一次出口
+                          IP。开启时在顶栏保留其位置并重试失败的查询；关闭时只在查到后显示
+                          IP。
+                        </span>
+                      </span>
+                    </label>
+                    <label className="setting">
+                      <input
+                        type="checkbox"
+                        checked={exitProbe.latency}
+                        onChange={(e) =>
+                          updateExitProbe({ latency: e.target.checked })
+                        }
+                      />
+                      <span>
+                        <strong>出口 TCP 延迟</strong>
+                        <span className="muted">
+                          每次连接或切换节点都会测量一次经出口节点的
+                          TCP
+                          握手耗时。开启时按下方间隔重复测量，并在顶栏保留其位置。
+                        </span>
+                      </span>
+                    </label>
+                    <label className="setting">
+                      <input
+                        className="input"
+                        type="number"
+                        min={EXIT_INTERVAL.min}
+                        max={EXIT_INTERVAL.max}
+                        step={EXIT_INTERVAL.step}
+                        value={exitProbe.interval}
+                        aria-label="延迟测试间隔"
+                        onChange={(e) =>
+                          updateExitProbe({
+                            interval: clampInterval(Number(e.target.value)),
+                          })
+                        }
+                      />
+                      <span>
+                        <strong>延迟测试间隔</strong>
+                        <span className="muted">
+                          两次延迟测试的间隔秒数，5–3600。
+                        </span>
+                      </span>
+                    </label>
+                    <label className="setting">
+                      <input
+                        type="checkbox"
+                        checked={exitProbe.keepAlive}
+                        onChange={(e) =>
+                          updateExitProbe({ keepAlive: e.target.checked })
+                        }
+                      />
+                      <span>
+                        <strong>探测进程保活</strong>
+                        <span className="muted">
+                          开启时保留一个已加载配置的探测进程，在两次测试之间休眠，每次只需一次握手。关闭时每次测试都启动并结束一个探测进程。停止探测后，休眠的探测进程会很快退出。
+                        </span>
+                      </span>
+                    </label>
+                    <p className="muted">
+                      这些设置保存在当前浏览器，只影响本网页的顶栏。
+                    </p>
                   </section>
                   <section className="card card-pad">
                     <h2>节点身份</h2>

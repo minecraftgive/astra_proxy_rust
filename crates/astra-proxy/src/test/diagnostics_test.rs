@@ -149,3 +149,48 @@ async fn bounded_ip_response_supports_v4_v6_and_chunking_and_rejects_errors() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn probe_server_times_handshakes_per_request_without_the_ip_and_ends_on_eof() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // A SOCKS5 node that accepts every CONNECT; the IP lookup is never attempted.
+    let node = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut head = [0; 5];
+            socket.read_exact(&mut head).await.unwrap();
+            let mut rest = vec![0; head[4] as usize + 2];
+            socket.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest[..head[4] as usize], HOST.as_bytes());
+            socket
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        }
+    });
+    let app = App::from_text(std::path::Path::new("probe.toml"),format!("standalone=true\nstandalone_outbound='node'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='{address}'\n")).unwrap();
+    let requests = b"{\"outbound\":\"node\",\"ip\":false}\n{\"outbound\":\"gone\",\"ip\":false}\n{\"outbound\":\"node\",\"ip\":false}\n";
+    let mut replies = Vec::new();
+    serve(&app, &requests[..], &mut replies).await.unwrap();
+    node.await.unwrap();
+    let probes: Vec<Probe> = std::str::from_utf8(&replies)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(probes.len(), 3, "one reply per request, then EOF ends it");
+    for probe in [&probes[0], &probes[2]] {
+        assert!(probe.connect_ms.is_some(), "{probe:?}");
+        assert!(probe.ip.is_none() && probe.error.is_none(), "{probe:?}");
+    }
+    assert!(probes[1].connect_ms.is_none());
+    assert!(probes[1]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("Unknown diagnostic node"));
+}

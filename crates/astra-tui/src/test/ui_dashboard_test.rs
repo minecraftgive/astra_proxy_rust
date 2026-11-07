@@ -1,5 +1,6 @@
 use super::super::shell::{OVERVIEW, PROFILES};
 use super::*;
+use astra_model::runtime::Mode;
 use ratatui::backend::TestBackend;
 
 #[test]
@@ -286,7 +287,7 @@ fn overview_layout_prioritizes_connections_and_adapts_to_width() {
         let ui = live_sample();
         let text = screen(&render(&ui, 140, 40));
         assert_eq!(text.matches("Astra").count(), 1);
-        assert!(text.contains("├─ 1 Overview"));
+        assert!(text.contains(" 1 Overview "));
         assert!(text.contains("LIVE CONNECTIONS · 3/3"));
         assert!(text.contains("SNAPSHOT"));
         assert!(text.contains("●G proxy-00 · P"));
@@ -311,9 +312,10 @@ fn overview_layout_prioritizes_connections_and_adapts_to_width() {
         assert!(text.contains("S System proxy ●"));
 
         let text = screen(&render(&ui, 70, 30));
-        assert!(text.contains("Astra · proxy-00 · ● Connected"));
-        assert_eq!(text.matches("Connected").count(), 1);
-        assert!(text.contains("├─ 1 Overview"));
+        // Too narrow for rates: the header keeps the profile, mode and exit node.
+        assert!(text.contains("Astra │ ● proxy-00 Connected │ Rule Exit AJP-80-Direct-Vision (—)"));
+        assert!(!text.contains("/s"));
+        assert!(text.contains(" 1 Overview "));
         assert!(text.contains("DIRECT · Tcp"));
         assert!(text.contains("S proxy ●"));
         assert!(text.contains("A LAN ○"));
@@ -323,7 +325,7 @@ fn overview_layout_prioritizes_connections_and_adapts_to_width() {
 #[test]
 fn header_rates_keep_columns_and_actions_stay_in_controls() {
     crate::i18n::with_language(crate::i18n::Language::English, || {
-        for width in [70, 100, 140] {
+        for width in [120, 140, 190] {
             let mut ui = live_sample();
             let mut columns = None;
             for value in [0, 1_023, 1_048_575, 1 << 30, u64::MAX] {
@@ -332,10 +334,10 @@ fn header_rates_keep_columns_and_actions_stay_in_controls() {
                 let terminal = render(&ui, width, 30);
                 let buffer = terminal.backend().buffer();
                 let up: Vec<_> = (0..width)
-                    .filter(|&x| buffer[(x, 1)].symbol() == "↑")
+                    .filter(|&x| buffer[(x, 0)].symbol() == "↑")
                     .collect();
                 let down: Vec<_> = (0..width)
-                    .filter(|&x| buffer[(x, 2)].symbol() == "↓")
+                    .filter(|&x| buffer[(x, 1)].symbol() == "↓")
                     .collect();
                 assert_eq!(up.len(), 2, "both rate columns at width {width}");
                 assert_eq!(up, down, "upload and download columns align");
@@ -357,9 +359,10 @@ fn header_rates_keep_columns_and_actions_stay_in_controls() {
                     .find(|(_, target)| matches!(target, Target::NetTools))
                     .unwrap()
                     .0;
+                // The header's profile segment also connects; this is the Controls button.
                 let connect = hits
                     .iter()
-                    .find(|(_, target)| matches!(target, Target::Connect))
+                    .find(|(rect, target)| matches!(target, Target::Connect) && rect.y > 2)
                     .unwrap()
                     .0;
                 assert!(tools.y > controls_y);
@@ -368,13 +371,20 @@ fn header_rates_keep_columns_and_actions_stay_in_controls() {
                 assert!(tools.right() < connect.x);
                 assert!(connect.right() >= width - 3 && connect.right() < width);
             }
-            // Missing telemetry keeps the same columns as live values.
+            // Missing telemetry still reserves both aligned rate columns.
             let terminal = render(&sample(), width, 30);
             let buffer = terminal.backend().buffer();
             let up: Vec<_> = (0..width)
-                .filter(|&x| buffer[(x, 1)].symbol() == "↑")
+                .filter(|&x| buffer[(x, 0)].symbol() == "↑")
                 .collect();
-            assert_eq!(columns.unwrap(), up);
+            let down: Vec<_> = (0..width)
+                .filter(|&x| buffer[(x, 1)].symbol() == "↓")
+                .collect();
+            assert_eq!(up.len(), 2);
+            assert_eq!(up, down);
+            if width >= 190 {
+                assert_eq!(columns.unwrap(), up, "same format, same columns");
+            }
         }
     });
 }
@@ -660,4 +670,59 @@ async fn overview_opens_network_tools_and_esc_returns_to_overview() {
     ui.execute(std::path::Path::new("unused-overview.sock"), action, None)
         .await;
     assert!(!ui.diagnostics.as_ref().unwrap().handles_escape());
+}
+#[test]
+fn overview_group_column_folds_out_nodes_without_leaving_overview() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        use astra_model::runtime::{Command, Member};
+        let mut ui = live_sample();
+        let mut snapshot = ui.live().unwrap().clone();
+        snapshot.groups[0].members.push(Member {
+            name: "HK-02".into(),
+            delay_ms: Some(55),
+            alive: Some(true),
+        });
+        ui.accept_runtime("proxy-00".into(), snapshot);
+        let key = |ui: &mut Ui, code| ui.key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let _ = render(&ui, 140, 40);
+        // Arrows belong to the connections until Tab moves focus to the group column.
+        key(&mut ui, KeyCode::Tab);
+        assert_eq!(ui.focus.region, focus::Region::Secondary);
+        key(&mut ui, KeyCode::Right);
+        assert_eq!(ui.overview_unfolded.as_deref(), Some("PROXY"));
+        let text = screen(&render(&ui, 140, 40));
+        assert!(text.contains("▾PROXY"), "group did not unfold: {text}");
+        assert!(text.contains("✓ AJP-80-Direct-Vision"));
+        assert!(text.contains("HK-02"));
+        key(&mut ui, KeyCode::Left);
+        assert_eq!(ui.overview_unfolded, None);
+        key(&mut ui, KeyCode::Right);
+        key(&mut ui, KeyCode::Down);
+        key(&mut ui, KeyCode::Down);
+        assert_eq!(ui.overview_group_row(), (0, Some(1)));
+        let input = key(&mut ui, KeyCode::Enter);
+        assert!(matches!(
+            input,
+            Input::Run(Action::Runtime { command: Command::Select { ref member, .. }, .. }, _)
+                if member == "HK-02"
+        ));
+        assert_eq!(ui.page, OVERVIEW);
+        assert_eq!(ui.overview_unfolded, None);
+        assert!(ui.runtime_picker.is_none());
+        assert_eq!(ui.overview_group_row(), (0, None));
+        // ↓ past the folded group reaches the next group.
+        key(&mut ui, KeyCode::Down);
+        assert_eq!(ui.overview_group_row(), (1, None));
+        // A mouse click on a group row unfolds it in place too.
+        let _ = render(&ui, 140, 40);
+        let rect = ui
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(rect, target)| matches!(target, Target::Group(0)).then_some(*rect))
+            .unwrap();
+        ui.mouse(click(rect));
+        assert_eq!(ui.page, OVERVIEW);
+        assert_eq!(ui.overview_unfolded.as_deref(), Some("PROXY"));
+    });
 }

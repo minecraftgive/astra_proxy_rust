@@ -96,6 +96,65 @@ pub fn exit_chain(snapshot: &Snapshot) -> (Vec<String>, Option<u64>, Option<bool
 }
 
 impl Client {
+    /// Keep exit IPs from node tests after the diagnostics page closes.
+    pub fn remember_exit_ips(&mut self) {
+        let Some(view) = &self.diagnostics else {
+            return;
+        };
+        for probe in view.report.iter().flat_map(|r| &r.probes) {
+            if let Some(ip) = probe.ip {
+                self.exit_ips
+                    .insert((view.name.clone(), probe.outbound.clone()), ip);
+            }
+        }
+    }
+    /// The connected profile's final exit node, while the manager can test it.
+    pub fn exit_probe_target(&self) -> Option<crate::exit_probe::Exit> {
+        let row = self.active_proxy()?;
+        let pid = row.pid.filter(|_| row.state == "Running")?;
+        if !self
+            .details
+            .get(&row.instance.name)
+            .is_some_and(|d| d.diagnostics_supported)
+        {
+            return None;
+        }
+        let snapshot = self.live().filter(|s| s.pid == pid)?;
+        let outbound = exit_chain(snapshot).0.pop()?;
+        Some(crate::exit_probe::Exit {
+            profile: row.instance.name.clone(),
+            pid,
+            outbound,
+        })
+    }
+    /// Advance the header's exit probes; true when the header should redraw.
+    pub fn poll_exit_probe(&mut self, socket: &std::path::Path) -> bool {
+        let p = &self.preferences;
+        let plan = crate::exit_probe::Plan {
+            ip: p.exit_ip,
+            latency: p.exit_latency.then(|| {
+                Duration::from_secs(
+                    crate::preferences::EXIT_INTERVAL
+                        .clamp(p.exit_interval)
+                        .into(),
+                )
+            }),
+            keep_alive: p.exit_keep_alive,
+        };
+        let target = self.exit_probe_target();
+        let waker = self.waker.clone();
+        let changed = self.exit_probe.tick(socket, target, plan, &waker);
+        if let Some((exit, ip)) = self.exit_probe.found_ip.take() {
+            self.exit_ips.insert((exit.profile, exit.outbound), ip);
+        }
+        changed
+    }
+    /// Last measured exit IP of `outbound` in `profile`, if a node test found one.
+    pub fn exit_ip(&self, profile: &str, outbound: &str) -> Option<std::net::IpAddr> {
+        self.exit_ips
+            .get(&(profile.to_owned(), outbound.to_owned()))
+            .copied()
+    }
     pub fn live_rates_available(&self) -> bool {
         self.live().is_some() && self.runtime_rates_available()
     }

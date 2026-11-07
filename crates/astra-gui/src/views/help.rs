@@ -26,11 +26,9 @@ impl Render for View {
             .track_focus(&self.focus)
             .size_full()
             .overflow_y_scroll()
-            .p_6()
             .flex()
             .flex_col()
             .gap_4()
-            .child(div().text_xl().child(t("Keyboard help")))
             .children(commands::help_groups().into_iter().map(|(label, specs)| {
                 div()
                     .flex()

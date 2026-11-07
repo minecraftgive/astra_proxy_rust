@@ -102,9 +102,38 @@ def build_environment():
                 if (candidate / 'libclang.dll').is_file():
                     env['LIBCLANG_PATH'] = str(candidate)
                     break
-    elif not shutil.which('cmake') and (ROOT / '.build-tools/bin/cmake').is_file():
-        env['PATH'] = str(ROOT / '.build-tools/bin') + os.pathsep + env.get('PATH', '')
+    else:
+        _unix_toolchain(env)
     return env
+
+
+def _unix_toolchain(env):
+    """Use project-local build tools the same way the Windows build does."""
+    tools = ROOT / '.build-tools'
+    if not shutil.which('cmake', path=env.get('PATH')) and (tools / 'bin/cmake').is_file():
+        env['PATH'] = str(tools / 'bin') + os.pathsep + env.get('PATH', '')
+    if env.get('LIBCLANG_PATH'):
+        return
+    # `pip install --target .build-tools/unix/python libclang`, or libclang in the
+    # .build-tools virtualenv; system LLVM is found by clang-sys itself.
+    library = 'libclang.dylib' if platform.system() == 'Darwin' else 'libclang.so'
+    candidates = [tools / 'unix/python/clang/native',
+                  *sorted(tools.glob('lib/python3*/site-packages/clang/native'), reverse=True)]
+    for candidate in candidates:
+        if (candidate / library).is_file():
+            env['LIBCLANG_PATH'] = str(candidate)
+            break
+
+
+def missing_c_compiler(env):
+    """Unix counterpart of the Windows MSVC check: BoringSSL and bindgen need C/C++."""
+    if os.name == 'nt':
+        return None
+    for variable, defaults in (('CC', ('cc', 'clang', 'gcc')), ('CXX', ('c++', 'clang++', 'g++'))):
+        names = [env[variable].split()[0]] if env.get(variable, '').strip() else defaults
+        if not any(shutil.which(name, path=env.get('PATH')) for name in names):
+            return variable
+    return None
 
 
 def host_target(env):
