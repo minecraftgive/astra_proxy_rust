@@ -156,12 +156,16 @@ fn install_ignores_private_neighbours_and_is_idempotent() {
 fn repair_publishes_a_new_directory_without_overwriting_the_old_program() {
     let fixture = Fixture::new(ReleaseRole::Web);
     let old = fixture.install().unwrap().directory.unwrap();
-    let binary = executable(&old, ReleaseRole::Web);
+    let binary = old.join(astra_platform::platform::executable("astra-web"));
     fs::write(&binary, "damaged").unwrap();
     let new = fixture.install().unwrap().directory.unwrap();
     assert_ne!(old, new);
     assert_eq!(fs::read_to_string(binary).unwrap(), "damaged");
-    assert!(platform::entry_matches(&fixture.paths, &executable(&new, ReleaseRole::Web)).unwrap());
+    assert!(platform::entry_matches(
+        &fixture.paths,
+        &new.join(astra_platform::platform::executable("astra-web"))
+    )
+    .unwrap());
 }
 
 #[test]
@@ -196,7 +200,9 @@ fn copy_verification_failure_preserves_the_previous_installation() {
     let result = install_at(source, &release, &hash, fixture.paths.clone(), |phase| {
         if phase == "Copying the current program package" {
             fs::write(
-                executable(&fixture.source, ReleaseRole::Web),
+                fixture
+                    .source
+                    .join(astra_platform::platform::executable("astra-web")),
                 "changed while copying",
             )
             .unwrap();
@@ -228,7 +234,9 @@ fn incomplete_role_and_linked_payloads_are_rejected() {
     .unwrap();
     assert!(fixture.install().is_err());
     let fixture = Fixture::new(ReleaseRole::Web);
-    let binary = executable(&fixture.source, ReleaseRole::Web);
+    let binary = fixture
+        .source
+        .join(astra_platform::platform::executable("astra-web"));
     fs::hard_link(&binary, fixture.temporary.path().join("alias")).unwrap();
     assert!(fixture.install().is_err());
     assert!(!fixture.paths.root.exists());
@@ -260,7 +268,7 @@ fn missing_execute_permissions_are_repaired_instead_of_treated_as_installed() {
     assert_eq!(fixture.install().unwrap().directory.as_ref(), Some(&first));
     assert!(platform::executable_ready(&fixture.paths.entry, InstallScope::User).unwrap());
     fs::set_permissions(
-        executable(&first, ReleaseRole::Web),
+        first.join(astra_platform::platform::executable("astra-web")),
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
@@ -271,8 +279,80 @@ fn missing_execute_permissions_are_repaired_instead_of_treated_as_installed() {
     );
     let second = fixture.install().unwrap().directory.unwrap();
     assert_ne!(first, second);
-    assert!(
-        platform::executable_ready(&executable(&second, ReleaseRole::Web), InstallScope::User)
-            .unwrap()
-    );
+    assert!(platform::executable_ready(
+        &second.join(astra_platform::platform::executable("astra-web")),
+        InstallScope::User
+    )
+    .unwrap());
+}
+
+#[test]
+fn verified_gui_components_select_native_frontends_and_tui_packages_stay_terminal() {
+    for (role, component) in [
+        (ReleaseRole::Client, "astra-gui"),
+        (ReleaseRole::Server, "astra-server-gui"),
+    ] {
+        let fixture = Fixture::new(role);
+        #[cfg(unix)]
+        let mut fixture = fixture;
+        let terminal = source(&fixture.source).unwrap();
+        assert_eq!(
+            entry_binary(&terminal.manifest),
+            if role == ReleaseRole::Client {
+                "astra-tui"
+            } else {
+                "astra-server-tui"
+            }
+        );
+        let mut manifest = terminal.manifest;
+        let name = astra_platform::platform::executable(component);
+        let bytes = b"native frontend fixture";
+        fs::write(fixture.source.join(&name), bytes).unwrap();
+        manifest.components.insert(component.into(), "1.0".into());
+        manifest.files.push(ReleaseFile {
+            path: name,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        });
+        fs::write(
+            fixture.source.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            fixture.paths.entry = fixture
+                .temporary
+                .path()
+                .join("Applications/Astra.app/Contents/MacOS/astra-launch");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            fixture.paths.entry = fixture.temporary.path().join("applications/astra.desktop");
+        }
+        let verified = source(&fixture.source).unwrap();
+        assert_eq!(entry_binary(&verified.manifest), component);
+        let status = fixture.install().unwrap();
+        let directory = status.directory.unwrap();
+        assert!(platform::entry_matches(
+            &fixture.paths,
+            &executable(&directory, &verified.manifest)
+        )
+        .unwrap());
+        assert!(fixture.install().unwrap().installed);
+        #[cfg(target_os = "macos")]
+        {
+            let contents = fixture.paths.entry.parent().unwrap().parent().unwrap();
+            assert!(contents.join("Resources/Astra.icns").is_file());
+            let info = fs::read_to_string(contents.join("Info.plist")).unwrap();
+            assert!(info.contains("NSHighResolutionCapable"));
+            assert!(info.contains("<key>LSUIElement</key><false/>"));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let entry = fs::read_to_string(&fixture.paths.entry).unwrap();
+            assert!(entry.contains("Terminal=false"));
+            assert!(entry.contains(component));
+        }
+    }
 }

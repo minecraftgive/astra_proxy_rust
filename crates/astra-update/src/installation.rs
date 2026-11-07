@@ -71,16 +71,20 @@ pub fn role_name(role: ReleaseRole) -> &'static str {
         ReleaseRole::Web => "web",
     }
 }
-fn entry_binary(role: ReleaseRole) -> &'static str {
-    match role {
+fn entry_binary(manifest: &ReleaseManifest) -> &'static str {
+    match manifest.role {
+        ReleaseRole::Client if manifest.components.contains_key("astra-gui") => "astra-gui",
+        ReleaseRole::Server if manifest.components.contains_key("astra-server-gui") => {
+            "astra-server-gui"
+        }
         ReleaseRole::Client => "astra-tui",
         ReleaseRole::Server => "astra-server-tui",
         ReleaseRole::Controller => "astra-manager",
         ReleaseRole::Web => "astra-web",
     }
 }
-fn executable(directory: &Path, role: ReleaseRole) -> PathBuf {
-    directory.join(astra_platform::platform::executable(entry_binary(role)))
+fn executable(directory: &Path, manifest: &ReleaseManifest) -> PathBuf {
+    directory.join(astra_platform::platform::executable(entry_binary(manifest)))
 }
 fn source(source: &Path) -> Result<Source> {
     ensure!(
@@ -185,7 +189,7 @@ fn inspect(source: &Source, paths: &InstallPaths) -> Result<InstallationStatus> 
     };
     let installed = match &directory {
         Some(directory) => {
-            platform::entry_matches(paths, &executable(directory, source.manifest.role))?
+            platform::entry_matches(paths, &executable(directory, &source.manifest))?
         }
         None => {
             platform::check_entry(paths)?;
@@ -209,7 +213,14 @@ fn inspect(source: &Source, paths: &InstallPaths) -> Result<InstallationStatus> 
 /// Read-only; querying installation never creates directories or launch entries.
 pub fn status(source_directory: &Path, scope: InstallScope) -> Result<InstallationStatus> {
     let source = source(source_directory)?;
-    let paths = platform::layout(scope, role_name(source.manifest.role))?;
+    let paths = platform::layout_for_frontend(
+        scope,
+        role_name(source.manifest.role),
+        matches!(
+            entry_binary(&source.manifest),
+            "astra-gui" | "astra-server-gui"
+        ),
+    )?;
     inspect(&source, &paths)
 }
 
@@ -221,7 +232,14 @@ pub fn install(
     on_progress: impl FnMut(&str),
 ) -> Result<InstallOutcome> {
     let source = source(source_directory)?;
-    let paths = platform::layout(scope, role_name(source.manifest.role))?;
+    let paths = platform::layout_for_frontend(
+        scope,
+        role_name(source.manifest.role),
+        matches!(
+            entry_binary(&source.manifest),
+            "astra-gui" | "astra-server-gui"
+        ),
+    )?;
     install_at(
         source,
         expected_release_id,
@@ -392,7 +410,7 @@ fn install_at(
     };
     platform::check_entry(&paths)?;
     on_progress("Publishing the installation entry");
-    platform::publish_entry(&paths, &executable(&directory, source.manifest.role))?;
+    platform::publish_entry(&paths, &executable(&directory, &source.manifest))?;
     let record_bytes = serde_json::to_vec_pretty(&record)?;
     if let Err(error) = platform::atomic_file(
         &paths.root.join("current.json"),

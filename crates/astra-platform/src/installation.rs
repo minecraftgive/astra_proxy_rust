@@ -125,6 +125,170 @@ pub fn layout(scope: InstallScope, role: &str) -> io::Result<InstallPaths> {
     })
 }
 
+/// GUI packages publish native desktop entries; terminal-only packages keep their existing paths.
+pub fn layout_for_frontend(
+    scope: InstallScope,
+    role: &str,
+    graphical: bool,
+) -> io::Result<InstallPaths> {
+    let paths = layout(scope, role)?;
+    if !graphical {
+        return Ok(paths);
+    }
+    if !matches!(role, "client" | "server") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "This role has no graphical frontend",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        Ok(paths)
+    }
+    #[cfg(unix)]
+    {
+        let mut paths = paths;
+        #[cfg(target_os = "macos")]
+        let directory = match scope {
+            InstallScope::User => {
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join("Applications")
+            }
+            InstallScope::System => PathBuf::from("/Applications"),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let directory = match scope {
+            InstallScope::User => {
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share/applications")
+            }
+            InstallScope::System => PathBuf::from("/usr/local/share/applications"),
+        };
+        #[cfg(target_os = "macos")]
+        {
+            paths.entry = directory
+                .join(format!("{}.app", gui_title(role)))
+                .join("Contents/MacOS/astra-launch");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            paths.entry = directory.join(format!("astra-{role}.desktop"));
+        }
+        Ok(paths)
+    }
+}
+#[cfg(unix)]
+fn gui_title(role: &str) -> &'static str {
+    if role == "server" {
+        "Astra Server"
+    } else {
+        "Astra"
+    }
+}
+#[cfg(unix)]
+fn desktop_entry(paths: &InstallPaths) -> bool {
+    paths
+        .entry
+        .extension()
+        .is_some_and(|extension| extension == "desktop")
+}
+#[cfg(target_os = "macos")]
+fn app_contents(paths: &InstallPaths) -> Option<&Path> {
+    let macos = paths.entry.parent()?;
+    let contents = macos.parent()?;
+    (paths.entry.file_name()? == "astra-launch"
+        && macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && contents.parent()?.extension()? == "app")
+        .then_some(contents)
+}
+#[cfg(unix)]
+fn desktop(paths: &InstallPaths, executable: &Path) -> io::Result<Vec<u8>> {
+    let path = executable.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Installation path is not UTF-8",
+        )
+    })?;
+    if path.contains(['\n', '\r']) {
+        return Err(denied("Installation path contains a line break"));
+    }
+    // Desktop Exec is parsed directly, not by a shell; escape both desktop and field-code syntax.
+    let quoted = path
+        .replace('\\', r"\\\\")
+        .replace('"', r#"\\\""#)
+        .replace('`', r"\\`")
+        .replace('$', r"\\$")
+        .replace('%', "%%");
+    let icon = paths.root.join("icon.svg");
+    let icon = icon.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Installation path is not UTF-8",
+        )
+    })?;
+    if icon.contains(['\n', '\r']) {
+        return Err(denied("Installation path contains a line break"));
+    }
+    Ok(format!("[Desktop Entry]\n# {}\nType=Application\nName={}\nExec=\"{}\"\nIcon={}\nTerminal=false\nCategories=Network;Utility;\n",marker(paths),gui_title(&paths.role),quoted,icon).into_bytes())
+}
+#[cfg(target_os = "macos")]
+fn app_info(paths: &InstallPaths) -> Vec<u8> {
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- {} -->\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>CFBundleName</key><string>{}</string><key>CFBundleIdentifier</key><string>org.astra.installed.{}</string><key>CFBundleExecutable</key><string>astra-launch</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleIconFile</key><string>Astra.icns</string><key>NSHighResolutionCapable</key><true/><key>LSUIElement</key><false/></dict></plist>\n",marker(paths),gui_title(&paths.role),paths.role).into_bytes()
+}
+#[cfg(unix)]
+const GUI_ICON_SVG: &[u8] = include_bytes!("../../astra-gui/assets/icon.svg");
+#[cfg(target_os = "macos")]
+const GUI_ICON_ICNS: &[u8] = include_bytes!("../../astra-gui/assets/icon.icns");
+#[cfg(unix)]
+fn native_assets_match(paths: &InstallPaths) -> io::Result<bool> {
+    if desktop_entry(paths) {
+        return Ok(
+            read_plain_file(&paths.root.join("icon.svg"), paths.scope, 1024 * 1024)
+                .is_ok_and(|bytes| bytes == GUI_ICON_SVG),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(contents) = app_contents(paths) {
+        return Ok(
+            read_plain_file(&contents.join("Info.plist"), paths.scope, 64 * 1024)
+                .is_ok_and(|bytes| bytes == app_info(paths))
+                && read_plain_file(
+                    &contents.join("Resources/Astra.icns"),
+                    paths.scope,
+                    1024 * 1024,
+                )
+                .is_ok_and(|bytes| bytes == GUI_ICON_ICNS),
+        );
+    }
+    Ok(true)
+}
+#[cfg(unix)]
+fn publish_native_assets(paths: &InstallPaths) -> io::Result<()> {
+    if desktop_entry(paths) {
+        atomic_file(
+            &paths.root.join("icon.svg"),
+            GUI_ICON_SVG,
+            paths.scope,
+            false,
+        )?;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(contents) = app_contents(paths) {
+        atomic_file(
+            &contents.join("Info.plist"),
+            &app_info(paths),
+            paths.scope,
+            false,
+        )?;
+        atomic_file(
+            &contents.join("Resources/Astra.icns"),
+            GUI_ICON_ICNS,
+            paths.scope,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
@@ -442,6 +606,9 @@ fn marker(paths: &InstallPaths) -> String {
 
 #[cfg(unix)]
 fn launcher(paths: &InstallPaths, executable: &Path) -> io::Result<Vec<u8>> {
+    if desktop_entry(paths) {
+        return desktop(paths, executable);
+    }
     let text = executable.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -459,6 +626,19 @@ fn launcher(paths: &InstallPaths, executable: &Path) -> io::Result<Vec<u8>> {
 /// A collision with an unrelated executable/shortcut is never overwritten.
 pub fn check_entry(paths: &InstallPaths) -> io::Result<()> {
     validate_destination(&paths.entry, paths.scope)?;
+    #[cfg(target_os = "macos")]
+    if let Some(contents) = app_contents(paths) {
+        let bundle = contents.parent().unwrap();
+        if bundle.try_exists()? {
+            // An existing bundle is ours only when its own metadata carries our marker.
+            let info = read_plain_file(&contents.join("Info.plist"), paths.scope, 64 * 1024)?;
+            if info != app_info(paths) {
+                return Err(denied(
+                    "Installation application belongs to another program",
+                ));
+            }
+        }
+    }
     match fs::symlink_metadata(&paths.entry) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
@@ -467,7 +647,15 @@ pub fn check_entry(paths: &InstallPaths) -> io::Result<()> {
     #[cfg(unix)]
     {
         let bytes = read_plain_file(&paths.entry, paths.scope, 64 * 1024)?;
-        let prefix = format!("#!/bin/sh\n# {}\n", marker(paths));
+        let prefix = format!(
+            "{}\n# {}\n",
+            if desktop_entry(paths) {
+                "[Desktop Entry]"
+            } else {
+                "#!/bin/sh"
+            },
+            marker(paths)
+        );
         if !bytes.starts_with(prefix.as_bytes()) {
             return Err(denied("Installation entry belongs to another program"));
         }
@@ -492,7 +680,10 @@ pub fn entry_matches(paths: &InstallPaths, executable: &Path) -> io::Result<bool
     }
     #[cfg(unix)]
     {
-        Ok(read_plain_file(&paths.entry, paths.scope, 64 * 1024)? == launcher(paths, executable)?)
+        Ok(
+            read_plain_file(&paths.entry, paths.scope, 64 * 1024)? == launcher(paths, executable)?
+                && native_assets_match(paths)?,
+        )
     }
     #[cfg(windows)]
     {
@@ -534,6 +725,7 @@ pub fn publish_entry(paths: &InstallPaths, executable: &Path) -> io::Result<()> 
     check_entry(paths)?;
     #[cfg(unix)]
     {
+        publish_native_assets(paths)?;
         atomic_file(
             &paths.entry,
             &launcher(paths, executable)?,
@@ -611,6 +803,8 @@ mod windows_entry {
             let link: IShellLinkW =
                 CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(error)?;
             link.SetPath(PCWSTR(wide(executable).as_ptr()))
+                .map_err(error)?;
+            link.SetIconLocation(PCWSTR(wide(executable).as_ptr()), 0)
                 .map_err(error)?;
             let description: Vec<u16> = description.encode_utf16().chain(Some(0)).collect();
             link.SetDescription(PCWSTR(description.as_ptr()))

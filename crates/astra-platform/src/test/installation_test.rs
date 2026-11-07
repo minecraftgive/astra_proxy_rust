@@ -87,3 +87,74 @@ fn user_links_and_writable_system_ancestors_are_rejected() {
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
     assert!(validate_destination(&directory.path().join("system"), InstallScope::System).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn desktop_entries_keep_gui_execution_separate_from_the_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut paths = paths(directory.path());
+    paths.entry = directory.path().join("applications/astra.desktop");
+    let executable = directory.path().join("GUI space $d `x` %F \"quoted\"");
+    publish_entry(&paths, &executable).unwrap();
+    assert!(entry_matches(&paths, &executable).unwrap());
+    let entry = fs::read_to_string(&paths.entry).unwrap();
+    assert!(entry.starts_with("[Desktop Entry]\n# Astra managed installation v1: client\n"));
+    assert!(entry.contains("Terminal=false"));
+    assert!(entry.contains("%%F"));
+    assert!(!entry.contains("sh -c"));
+    assert!(paths.root.join("icon.svg").is_file());
+    fs::write(paths.root.join("icon.svg"), "damaged").unwrap();
+    assert!(!entry_matches(&paths, &executable).unwrap());
+    publish_entry(&paths, &executable).unwrap();
+    assert!(entry_matches(&paths, &executable).unwrap());
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn native_app_collision_is_preserved_and_managed_bundle_is_repairable() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut paths = paths(directory.path());
+    paths.entry = directory
+        .path()
+        .join("Applications/Astra.app/Contents/MacOS/astra-launch");
+    let contents = paths.entry.parent().unwrap().parent().unwrap();
+    fs::create_dir_all(contents).unwrap();
+    fs::write(contents.join("Info.plist"), "another app").unwrap();
+    assert!(publish_entry(&paths, &directory.path().join("astra-gui")).is_err());
+    assert_eq!(
+        fs::read_to_string(contents.join("Info.plist")).unwrap(),
+        "another app"
+    );
+    fs::remove_dir_all(contents.parent().unwrap()).unwrap();
+    publish_entry(&paths, &directory.path().join("astra-gui")).unwrap();
+    assert!(entry_matches(&paths, &directory.path().join("astra-gui")).unwrap());
+    fs::remove_file(contents.join("Resources/Astra.icns")).unwrap();
+    assert!(!entry_matches(&paths, &directory.path().join("astra-gui")).unwrap());
+    publish_entry(&paths, &directory.path().join("astra-gui")).unwrap();
+    assert!(entry_matches(&paths, &directory.path().join("astra-gui")).unwrap());
+}
+
+#[test]
+fn graphical_layout_keeps_terminal_entries_and_uses_native_desktop_locations() {
+    let terminal = layout(InstallScope::System, "client").unwrap();
+    assert_eq!(
+        layout_for_frontend(InstallScope::System, "client", false)
+            .unwrap()
+            .entry,
+        terminal.entry
+    );
+    let gui = layout_for_frontend(InstallScope::System, "client", true).unwrap();
+    assert_eq!(gui.root, terminal.root);
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        gui.entry,
+        PathBuf::from("/Applications/Astra.app/Contents/MacOS/astra-launch")
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    assert_eq!(
+        gui.entry,
+        PathBuf::from("/usr/local/share/applications/astra-client.desktop")
+    );
+    #[cfg(windows)]
+    assert_eq!(gui.entry, terminal.entry);
+    assert!(layout_for_frontend(InstallScope::System, "controller", true).is_err());
+}
