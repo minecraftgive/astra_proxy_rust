@@ -87,6 +87,9 @@ pub struct Editor {
     #[serde(default)]
     pub col: usize,
     pub original: String,
+    /// Uncommitted source input is part of the draft, including invalid TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_buffer: Option<String>,
     pub name: String,
     #[serde(default)]
     pub kind: Option<CoreKind>,
@@ -329,14 +332,20 @@ impl Editor {
         self.node_tags = tags;
     }
     pub fn reference_values(&self, doc: &DocumentMut, key: &str) -> Option<Vec<String>> {
-        if key == "interface"
-            && (last_key(&self.form.path) == Some("tun")
-                || proxy_group_name(&self.form.path).is_some())
+        self.reference_values_at(doc, &self.form.path, key)
+    }
+    pub fn reference_values_at(
+        &self,
+        doc: &DocumentMut,
+        path: &[Part],
+        key: &str,
+    ) -> Option<Vec<String>> {
+        if key == "interface" && (last_key(path) == Some("tun") || proxy_group_name(path).is_some())
         {
             let mut values = vec![String::new()];
             values.extend(self.interfaces.iter().cloned());
             // Retain an existing override when an adapter is temporarily absent.
-            if let Some(current) = table_at(doc.as_table(), &self.form.path)
+            if let Some(current) = table_at(doc.as_table(), path)
                 .and_then(|table| table.get(key))
                 .and_then(Item::as_str)
                 .filter(|name| !name.is_empty() && !values.iter().any(|v| v == name))
@@ -346,9 +355,8 @@ impl Editor {
             return Some(values);
         }
         if key == "proxy"
-            && (last_key(&self.form.path) == Some("subscription")
-                || (self.form.path.len() == 2
-                    && self.form.path.first() == Some(&Part::Key("subscriptions".into()))))
+            && (last_key(path) == Some("subscription")
+                || (path.len() == 2 && path.first() == Some(&Part::Key("subscriptions".into()))))
         {
             let mut values = vec!["PROXY".into(), "DIRECT".into()];
             for target in proxy_targets(doc) {
@@ -358,17 +366,17 @@ impl Editor {
             }
             return Some(values);
         }
-        if key == "selected" && proxy_group_name(&self.form.path).is_some() {
+        if key == "selected" && proxy_group_name(path).is_some() {
             if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
-                if groups.contains_key(proxy_group_name(&self.form.path).unwrap()) {
+                if groups.contains_key(proxy_group_name(path).unwrap()) {
                     return Some(astra_model::groups::member_choices(
                         &groups,
-                        proxy_group_name(&self.form.path).unwrap(),
+                        proxy_group_name(path).unwrap(),
                     ));
                 }
             }
             return Some(
-                table_at(doc.as_table(), &self.form.path)
+                table_at(doc.as_table(), path)
                     .and_then(|g| g.get("members"))
                     .and_then(Item::as_array)
                     .map(|a| {
@@ -379,11 +387,9 @@ impl Editor {
                     .unwrap_or_default(),
             );
         }
-        let action = (key == "default_action" && self.form.path.is_empty() && !self.is_proxy(doc))
-            || (key == "action" && last_key(&self.form.path) == Some("rules"));
-        if action
-            || (key == "standalone_outbound" && self.form.path.is_empty() && self.is_proxy(doc))
-        {
+        let action = (key == "default_action" && path.is_empty() && !self.is_proxy(doc))
+            || (key == "action" && last_key(path) == Some("rules"));
+        if action || (key == "standalone_outbound" && path.is_empty() && self.is_proxy(doc)) {
             let mut tags = std::collections::BTreeSet::new();
             if self.is_proxy(doc) {
                 tags.extend(proxy_targets(doc));
@@ -412,8 +418,8 @@ impl Editor {
             );
             return Some(values);
         }
-        if key == "value" && last_key(&self.form.path) == Some("rules") {
-            return match table_at(doc.as_table(), &self.form.path)
+        if key == "value" && last_key(path) == Some("rules") {
+            return match table_at(doc.as_table(), path)
                 .and_then(|t| t.get("kind"))
                 .and_then(Item::as_str)
             {
@@ -665,6 +671,9 @@ impl Editor {
         self.form.rename_proxy_group = None;
     }
     pub fn can_close(&self) -> bool {
+        if self.source_buffer.is_some() {
+            return false;
+        }
         if !self.browsing() {
             return false;
         }
@@ -689,6 +698,7 @@ impl Editor {
         self.search_direction(&query, backwards)
     }
     pub fn prepare_save(&mut self) -> Result<String> {
+        self.commit_source().map_err(anyhow::Error::new)?;
         match self.form.mode {
             Mode::Field { .. } => self.commit_field()?,
             Mode::Browse => {}
@@ -1120,7 +1130,10 @@ impl Editor {
         self.focus_item(doc, "outbounds", index);
     }
     pub fn current_spec(&self, doc: &DocumentMut, key: &str) -> Result<Spec> {
-        self.rows(doc)
+        self.current_spec_at(doc, &self.form.path, key)
+    }
+    pub fn current_spec_at(&self, doc: &DocumentMut, path: &[Part], key: &str) -> Result<Spec> {
+        self.schema_rows(doc, path)
             .into_iter()
             .find_map(|r| {
                 if let Row::Field(s) = r {
@@ -1426,13 +1439,7 @@ impl Editor {
                 if spec.key == "interface"
                     && (last_key(&path) == Some("tun") || proxy_group_name(&path).is_some())
                 {
-                    let exclude = doc
-                        .get("tun")
-                        .and_then(Item::as_table_like)
-                        .and_then(|table| table.get("name"))
-                        .and_then(Item::as_str);
-                    self.interfaces = crate::network_interfaces::names(exclude)
-                        .context(t("Could not list local network adapters"))?;
+                    self.interfaces = self.interface_names()?;
                 }
                 if proxy_group_name(&path).is_some() && spec.key == "members" {
                     let name = proxy_group_name(&path).unwrap();
@@ -1969,34 +1976,7 @@ impl Editor {
                 }
             }
             if let Some(chosen) = commit {
-                let mut doc = self.document()?;
-                let group = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                group.insert(
-                    "members",
-                    value(
-                        chosen
-                            .iter()
-                            .map(String::as_str)
-                            .collect::<toml_edit::Array>(),
-                    ),
-                );
-                let name = proxy_group_name(&self.form.path).unwrap();
-                let groups = expanded_proxy_groups(&doc, &self.subscription_nodes)?;
-                if let Some(effective) = groups.get(name) {
-                    if effective.selected.as_ref().is_some_and(|s| {
-                        astra_model::groups::member_path(&groups, name, s).is_none()
-                    }) {
-                        let group = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                        if let Some(first) = effective.members.first() {
-                            group.insert("selected", value(first));
-                        } else {
-                            group.remove("selected");
-                        }
-                    }
-                }
-                self.update(doc);
-                self.form.mode = Mode::Browse;
-                self.focus_field(&self.document()?, &self.form.path.clone(), "members");
+                self.set_members(chosen)?;
             }
             return Ok(());
         }
@@ -2070,126 +2050,7 @@ impl Editor {
             match key.code {
                 KeyCode::Esc => self.cancel_input(),
                 KeyCode::Enter => {
-                    let key = input.text.trim().to_owned();
-                    if last_key(&self.form.path) == Some("subscriptions") {
-                        anyhow::ensure!(
-                            !key.is_empty() && key.len() <= 64 && key != "__legacy__",
-                            t("Enter a subscription name")
-                        );
-                        let mut doc = self.document()?;
-                        let table = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                        anyhow::ensure!(
-                            table.get(&key).is_none(),
-                            t("Subscription name already exists")
-                        );
-                        let mut source = Table::new();
-                        source["url"] = value("");
-                        source["interval"] = value(3600);
-                        table.insert(&key, Item::Table(source));
-                        let mut data: toml::Table = toml::from_str(&doc.to_string())?;
-                        astra_convert::subscription::prepare_groups(&mut data)?;
-                        let groups = data.get("proxy_groups").and_then(|v| v.as_table()).unwrap();
-                        for (name, group) in groups.iter().filter(|(_, g)| {
-                            g.get("subscription").and_then(|v| v.as_str()) == Some(key.as_str())
-                        }) {
-                            let snippet: DocumentMut = toml::to_string(group)?.parse()?;
-                            table_at_mut(doc.as_table_mut(), &[Part::Key("proxy_groups".into())])?
-                                .insert(name, Item::Table(snippet.as_table().clone()));
-                        }
-                        self.update(doc);
-                        self.cancel_input();
-                        self.form.path.push(Part::Key(key));
-                        self.focus_field(&self.document()?, &self.form.path.clone(), "url");
-                        self.enter(false)?;
-                        return Ok(());
-                    }
-                    if last_key(&self.form.path) == Some("proxy_groups") {
-                        anyhow::ensure!(
-                            !key.is_empty()
-                                && key.len() <= 64
-                                && !key.chars().any(char::is_control)
-                                && !astra_model::groups::reserved(&key),
-                            t("Enter a proxy group name")
-                        );
-                        let mut doc = self.document()?;
-                        let previous = self.form.rename_proxy_group.clone();
-                        let creating = previous.is_none();
-                        anyhow::ensure!(
-                            previous.as_deref() == Some(&key)
-                                || !proxy_targets(&doc).contains(&key),
-                            t("Proxy target name already exists")
-                        );
-                        let groups = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                        if let Some(previous) = previous {
-                            let group = groups.remove(&previous).context(t("Proxy groups"))?;
-                            groups.insert(&key, group);
-                            rename_proxy_references(&mut doc, &previous, &key);
-                            self.form
-                                .expanded_proxy_groups
-                                .retain(|name| name != &previous);
-                        } else {
-                            let mut group = Table::new();
-                            group["mode"] = value("select");
-                            group["members"] = value(toml_edit::Array::new());
-                            groups.insert(&key, Item::Table(group));
-                        }
-                        self.update(doc);
-                        self.cancel_input();
-                        self.form.path.push(Part::Key(key));
-                        self.focus_field(&self.document()?, &self.form.path.clone(), "members");
-                        if creating {
-                            self.enter(false)?;
-                        }
-                        return Ok(());
-                    }
-                    if last_key(&self.form.path) == Some("rule_sets") {
-                        anyhow::ensure!(
-                            !key.is_empty()
-                                && key.len() <= 128
-                                && !key.chars().any(char::is_control),
-                            t("请输入规则集名称")
-                        );
-                        if let Some(previous) = self.form.rename_rule_set.clone() {
-                            self.rename_rule_set(&previous, &key)?;
-                            self.cancel_input();
-                            return Ok(());
-                        }
-                        let mut doc = self.document()?;
-                        let table = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                        anyhow::ensure!(table.get(&key).is_none(), t("规则集名称已存在"));
-                        let mut source = Table::new();
-                        source["behavior"] = value("domain");
-                        source["format"] = value("yaml");
-                        source["payload"] = value(toml_edit::Array::new());
-                        table.insert(&key, Item::Table(source));
-                        self.update(doc);
-                        self.form.path.push(Part::Key(key));
-                        self.form.mode = Mode::Browse;
-                        self.focus_field(&self.document()?, &self.form.path.clone(), "payload");
-                        return Ok(());
-                    }
-
-                    anyhow::ensure!(
-                        !key.is_empty()
-                            && key
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric()
-                                    || b"!#$%&'*+-.^_`|~".contains(&b)),
-                        t("请输入有效的 HTTP 请求头名称")
-                    );
-                    let mut doc = self.document()?;
-                    let table = table_at_mut(doc.as_table_mut(), &self.form.path)?;
-                    anyhow::ensure!(table.get(&key).is_none(), t("该请求头已存在"));
-                    table.insert(&key, value(""));
-                    self.update(doc);
-                    let path = self.form.path.clone();
-                    let doc = self.document()?;
-                    self.focus_field(&doc, &path, &key);
-                    self.form.mode = Mode::Field {
-                        key,
-                        input: TextInput::new(String::new()),
-                        reveal: false,
-                    };
+                    self.commit_header()?;
                 }
                 _ => input.key(key),
             }
@@ -2204,19 +2065,8 @@ impl Editor {
                 KeyCode::Up => *selected = selected.saturating_sub(1),
                 KeyCode::Down => *selected = (*selected + 1).min(OUTBOUND_KINDS.len() - 1),
                 KeyCode::Enter => {
-                    let kind = [
-                        "socks5",
-                        "http",
-                        "native:vless",
-                        "native:vmess",
-                        "native:shadowsocks",
-                        "native:trojan",
-                        "native:hysteria2",
-                        "native:tuic",
-                        "trojan_tls",
-                        "vless_tls",
-                    ][*selected];
-                    self.append(outbound_template(kind, "edge"))?;
+                    let selected = *selected;
+                    self.create_outbound(selected)?;
                 }
                 _ => {}
             }
@@ -2330,40 +2180,10 @@ impl Editor {
                 self.form.selected = (self.form.selected + 1).min(rows.len().saturating_sub(1))
             }
             KeyCode::Char('r') => {
-                if let Some(name) = selected
-                    .as_ref()
-                    .and_then(|r| proxy_group_name(&r.path()).map(str::to_owned))
-                {
-                    self.form.path = vec![Part::Key("proxy_groups".into())];
-                    anyhow::ensure!(
-                        !astra_model::groups::reserved(&name),
-                        t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
-                    );
-                    self.form.rename_proxy_group = Some(name.clone());
-                    self.form.mode = Mode::Header(TextInput::new(name));
-                    return Ok(());
-                }
-                if let Some(name) = selected
-                    .as_ref()
-                    .and_then(|row| rule_set_name(&row.path()).map(str::to_owned))
-                {
-                    self.form.path = vec![Part::Key("rule_sets".into())];
-                    self.form.rename_rule_set = Some(name.clone());
-                    self.form.mode = Mode::Header(TextInput::new(name));
-                }
+                self.rename_selected()?;
             }
             KeyCode::Char('e') => {
-                if let Some(name) = selected
-                    .as_ref()
-                    .and_then(|row| rule_set_name(&row.path()).map(str::to_owned))
-                {
-                    let mut doc = self.document()?;
-                    let path = vec![Part::Key("rule_sets".into()), Part::Key(name)];
-                    let table = table_at_mut(doc.as_table_mut(), &path)?;
-                    let enabled = table.get("enabled").and_then(Item::as_bool).unwrap_or(true);
-                    table.insert("enabled", value(!enabled));
-                    self.update(doc);
-                }
+                self.toggle_rule_set()?;
             }
             KeyCode::PageUp => self.form.selected = self.form.selected.saturating_sub(10),
             KeyCode::PageDown => {
@@ -2392,169 +2212,13 @@ impl Editor {
                 }
             }
             KeyCode::Char('n') => {
-                let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
-                if path.first() == Some(&Part::Key("subscriptions".into())) {
-                    self.form.path = vec![Part::Key("subscriptions".into())];
-                    self.form.mode = Mode::Header(TextInput::default());
-                    return Ok(());
-                }
-                if path.first() == Some(&Part::Key("proxy_groups".into())) {
-                    self.form.path = vec![Part::Key("proxy_groups".into())];
-                    self.form.mode = Mode::Header(TextInput::default());
-                    return Ok(());
-                }
-                if path
-                    .iter()
-                    .any(|part| matches!(part,Part::Key(key) if key=="rule_sets"))
-                {
-                    self.form.path = vec![Part::Key("rule_sets".into())];
-                    self.form.mode = Mode::Header(TextInput::default());
-                } else if last_key(&path) == Some("headers") {
-                    self.form.path = path;
-                    self.form.mode = Mode::Header(TextInput::default());
-                } else if self.is_proxy(&doc) {
-                    self.form.path = vec![Part::Key("outbounds".into())];
-                    self.form.mode = Mode::NewOutbound(0);
-                } else {
-                    self.form.path = vec![Part::Key("rules".into())];
-                    let mut table = Table::new();
-                    table["kind"] = value("domain_suffix");
-                    table["value"] = value("example.com");
-                    table["action"] = value("direct");
-                    self.append(table)?;
-                }
+                self.new_entry()?;
             }
             KeyCode::Char('d') => {
-                match selected {
-                    Some(FlatRow::Field { path, spec, .. }) => {
-                        anyhow::ensure!(!spec.required, t("必填项不能删除，请按 Enter 修改"));
-                        // DIRECT/REJECT have no dynamic members to fall back on.
-                        anyhow::ensure!(
-                            !(spec.key == "members"
-                                && proxy_group_name(&path)
-                                    .is_some_and(astra_model::groups::builtin)),
-                            t("Choose at least one group member")
-                        );
-                        self.form.path = path;
-                        self.form.mode = Mode::Delete {
-                            key: Some(spec.key),
-                            index: None,
-                        };
-                    }
-                    Some(FlatRow::Node { index, .. }) => {
-                        if let Some(tag) = collection(&doc, &[Part::Key("outbounds".into())])
-                            .and_then(|a| a.get(index))
-                            .and_then(|node| node.get("tag"))
-                            .and_then(Item::as_str)
-                        {
-                            anyhow::ensure!(!proxy_references(&doc, tag), t("Proxy target is referenced; change its groups or default before deleting"));
-                        }
-                        self.form.path = vec![Part::Key("outbounds".into())];
-                        self.form.mode = Mode::Delete {
-                            key: None,
-                            index: Some(index),
-                        };
-                    }
-                    Some(FlatRow::Rule { index, .. }) => {
-                        self.form.path = vec![Part::Key("rules".into())];
-                        self.form.mode = Mode::Delete {
-                            key: None,
-                            index: Some(index),
-                        };
-                    }
-                    Some(
-                        FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. },
-                    ) => {
-                        if let Some(name) = proxy_group_name(&path) {
-                            anyhow::ensure!(
-                                !astra_model::groups::reserved(name),
-                                t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
-                            );
-                            anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
-                        }
-                        anyhow::ensure!(
-                            path != vec![Part::Key("proxy_groups".into())],
-                            t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
-                        );
-                        if path == vec![Part::Key("outbounds".into())] {
-                            anyhow::ensure!(!collection(&doc, &path).is_some_and(|nodes| nodes.iter().filter_map(|n| n.get("tag").and_then(Item::as_str)).any(|tag| proxy_references(&doc, tag))), t("Proxy target is referenced; change its groups or default before deleting"));
-                        }
-                        if let Some(name) = rule_set_name(&path) {
-                            anyhow::ensure!(
-                                rule_set_references(&doc, Some(name)) == 0,
-                                t("Rule set is referenced; change its rules before deleting")
-                            );
-                        } else if last_key(&path) == Some("rule_sets") {
-                            anyhow::ensure!(
-                                rule_set_references(&doc, None) == 0,
-                                t("Rule set is referenced; change its rules before deleting")
-                            );
-                        }
-                        if let Some(Part::Key(key)) = path.pop() {
-                            self.form.path = path;
-                            self.form.mode = Mode::Delete {
-                                key: Some(key),
-                                index: None,
-                            };
-                        }
-                    }
-                    _ => {}
-                }
-                // Deleting is immediate; undo replaces the old confirmation step.
-                if matches!(self.form.mode, Mode::Delete { .. }) {
-                    let result = self.confirm_delete();
-                    if result.is_err() {
-                        self.cancel_input();
-                    }
-                    result?;
-                }
+                self.delete_selected()?;
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
-                let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
-                if matches!(selected, Some(FlatRow::Node { .. })) {
-                    self.form.marked_rules.clear();
-                    if key.code == KeyCode::Char('V') {
-                        let nodes = collection(&doc, &[Part::Key("outbounds".into())])
-                            .context(t("Select a node to export"))?;
-                        let tags: Vec<String> = nodes
-                            .iter()
-                            .map(|node| {
-                                node.get("tag")
-                                    .and_then(Item::as_str)
-                                    .map(str::to_owned)
-                                    .context(t("Selected node has no tag"))
-                            })
-                            .collect::<Result<_>>()?;
-                        if tags.len() == self.form.marked_nodes.len()
-                            && tags.iter().all(|tag| self.form.marked_nodes.contains(tag))
-                        {
-                            self.form.marked_nodes.clear();
-                        } else {
-                            self.form.marked_nodes = tags;
-                        }
-                    } else {
-                        let tag = self.selected_node_tag()?;
-                        if self.form.marked_nodes.contains(&tag) {
-                            self.form.marked_nodes.retain(|marked| *marked != tag);
-                        } else {
-                            self.form.marked_nodes.push(tag);
-                        }
-                    }
-                } else if let Some(("rules", index)) = item_index(&path) {
-                    self.form.marked_nodes.clear();
-                    if key.code == KeyCode::Char('V') {
-                        let count = doc["rules"].as_array_of_tables().map_or(0, |a| a.len());
-                        if self.form.marked_rules.len() == count {
-                            self.form.marked_rules.clear();
-                        } else {
-                            self.form.marked_rules = (0..count).collect();
-                        }
-                    } else if self.form.marked_rules.contains(&index) {
-                        self.form.marked_rules.retain(|i| *i != index);
-                    } else {
-                        self.form.marked_rules.push(index);
-                    }
-                }
+                self.mark_selected(key.code == KeyCode::Char('V'))?;
             }
             KeyCode::Char('m') if !self.form.marked_rules.is_empty() => {
                 let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
@@ -2563,36 +2227,7 @@ impl Editor {
                 }
             }
             KeyCode::Char('K') | KeyCode::Char('J') => {
-                let path = selected.as_ref().map(FlatRow::path).unwrap_or_default();
-                let (kind, index) =
-                    item_index(&path).context(t("请先选择要调整顺序的规则或节点"))?;
-                if kind == "rules" && !self.form.marked_rules.is_empty() {
-                    self.move_marked_rules(None, key.code == KeyCode::Char('J'))?;
-                    return Ok(());
-                }
-                let array_path = vec![Part::Key(kind.into())];
-                let mut doc = self.document()?;
-                let array = collection_mut(&mut doc, &array_path)?;
-                let next = if key.code == KeyCode::Char('K') {
-                    index.saturating_sub(1)
-                } else {
-                    (index + 1).min(array.len().saturating_sub(1))
-                };
-                let mut tables: Vec<Table> = array.iter().cloned().collect();
-                tables.swap(index, next);
-                *array = tables.into_iter().collect();
-                if kind == "outbounds" {
-                    for expanded in &mut self.form.expanded_nodes {
-                        if *expanded == index {
-                            *expanded = next;
-                        } else if *expanded == next {
-                            *expanded = index;
-                        }
-                    }
-                }
-                self.update(doc);
-                let doc = self.document()?;
-                self.focus_item(&doc, kind, next);
+                self.move_selected(key.code == KeyCode::Char('J'))?;
             }
             _ => {}
         }
@@ -2732,3 +2367,8 @@ impl Editor {
 #[cfg(test)]
 #[path = "test/editor_test.rs"]
 mod tests;
+
+mod actions;
+
+mod presentation;
+pub use presentation::{FieldPresentation, Presentation, SourceError, TreeRow};
