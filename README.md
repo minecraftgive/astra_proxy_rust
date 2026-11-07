@@ -171,9 +171,9 @@ target/<本机 Rust target>/release/astra-proxy configs/proxy.toml
 
 若 UDS 路径已存在，程序拒绝覆盖。确认没有运行中的规则进程后再删除遗留 socket；正常 SIGINT/SIGTERM 会清理它。
 
-## GPUI 桌面框架
+## GPUI 桌面界面
 
-新增 `astra-gui` 和 `astra-server-gui`，通过 `astra-client` 与 TUI 共享客户端模型，使用固定版本 `gpui-component 0.9.0`。当前交付范围是共享核心与可运行桌面框架：侧栏、状态区、任务入口、命令面板和后台管理器连接。第 2–6 阶段的实时操作页、日志与诊断、编辑器、完整设置与系统集成、服务端专用视图仍以明确的 TODO 页面或面板呈现，尚未达到完整 TUI 功能对等；完整清单见 [GUI 实现说明](docs/GPUI_GUI.md)。
+新增 `astra-gui` 和 `astra-server-gui`，通过 `astra-client` 与 TUI 共享客户端模型，使用固定版本 `gpui-component 0.9.0`。桌面入口提供实时管理页、配置编辑、日志、诊断、任务和设置；安装、启动注册与更新使用共享客户端流程。功能和验收清单见 [GUI 实施说明](docs/GPUI_GUI_IMPLEMENTATION.md)，当前验证记录见 [实施进度](docs/GPUI_GUI_PROGRESS.md)。
 
 先构建与 GUI 同目录的管理器及运行核心，再启动桌面入口：
 
@@ -188,7 +188,9 @@ cargo run --locked -p astra-gui --bin astra-server-gui
 
 Linux 除上文的构建工具外，需要 `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev`；GUI 同时启用 Wayland 与 X11。Windows 使用 MSVC 与 Windows SDK，两个入口均不创建控制台窗口。macOS 应用包声明最低版本为 12.0。
 
-`python3 scripts/package_gui.py --profile debug --output-dir dist/gui` 将两种桌面入口分别与对应运行核心打包；macOS 产物包含 `.app`，Windows 客户端同时带入构建目录中已有的可选 `wintun.dll`。发布包使用 `release`，需先用同一 profile 构建两个角色及 GUI。CI 覆盖 Linux、Windows、macOS ARM64 和 x86_64；跨平台构建通过不代表尚未实现的页面已经完成验收。
+`python3 scripts/package_gui.py --profile debug --output-dir dist/gui` 将两种桌面入口分别与对应运行核心打包；macOS 产物包含带图标的 `.app`，Windows 可执行文件嵌入图标并带入构建目录中已有的可选 `wintun.dll`，Linux 包含 `.desktop` 文件和 PNG/SVG 图标。发布包使用 `release`，需先用同一 profile 构建两个角色及 GUI。CI 的桌面任务独立覆盖 Linux、Windows、macOS ARM64 和 x86_64，并在 Linux Xvfb 中验证窗口绘制、会话保存和 SIGTERM 正常退出。`astra-gui-update-<target>.tar.gz` 是供更新面板导入的客户端更新包；带 `.app` 的原生发布包用于解压启动，不直接作为更新包导入。
+
+可在有桌面的 Unix 环境运行 `python3 scripts/gui_smoke.py --bin-dir target/<本机 Rust target>/debug`；该检查使用临时管理节点和数据目录，不修改真实配置或安装位置；macOS 加 `--termination native` 可验证系统“退出”同样先保存会话并完成后台清理。
 
 ## 规则与缓存
 

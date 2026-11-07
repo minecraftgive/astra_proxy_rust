@@ -1,6 +1,8 @@
 """Desktop archive layout checks with fake binaries; no GUI or cores are started."""
 from pathlib import Path
 import plistlib
+import json
+import hashlib
 import sys
 import tarfile
 import tempfile
@@ -41,7 +43,29 @@ class DesktopPackageTests(unittest.TestCase):
                             self.assertEqual(info['CFBundleExecutable'], binary)
                             self.assertEqual(info['CFBundleShortVersionString'], '1.2.3')
                             self.assertEqual(info['LSMinimumSystemVersion'], MACOS_MINIMUM_VERSION)
+                            self.assertFalse(info['LSUIElement'])
+                            self.assertTrue(info['NSHighResolutionCapable'])
+                            self.assertEqual(info['CFBundleIconFile'], 'Astra.icns')
+                            self.assertIn(resources + 'Astra.icns', names)
                             self.assertTrue(packaged.getmember(programs + binary).mode & 0o111)
+                        elif 'windows' in target:
+                            self.assertIn(resources + binary + '.ico', names)
+                        else:
+                            desktop = packaged.extractfile(resources + binary + '.desktop').read().decode()
+                            self.assertIn(f'Exec={binary}\n', desktop)
+                            self.assertIn('Terminal=false', desktop)
+                            self.assertIn(resources + binary + '.png', names)
+                        manifest = json.load(packaged.extractfile(programs + 'manifest.json'))
+                        self.assertEqual(manifest['role'], role)
+                        self.assertIn(binary, manifest['components'])
+                        for file in manifest['files']:
+                            content = packaged.extractfile(programs + file['path']).read()
+                            self.assertEqual(file['sha256'], hashlib.sha256(content).hexdigest())
+                    if role == 'client':
+                        with tarfile.open(output / f'{binary}-update-{target}.tar.gz') as update:
+                            manifest = json.load(update.extractfile('client/manifest.json'))
+                            self.assertIn(binary, manifest['components'])
+                            self.assertIn('client/' + binary + extension, update.getnames())
 
     def test_incomplete_runtime_does_not_produce_an_archive(self):
         with tempfile.TemporaryDirectory() as temp:

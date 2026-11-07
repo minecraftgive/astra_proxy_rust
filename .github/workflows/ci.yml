@@ -268,13 +268,15 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '12.0'
     steps:
       - uses: actions/checkout@v5
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri
       - if: runner.os == 'Windows'
         run: choco install nasm llvm --no-progress -y
       - if: runner.os == 'Windows'
@@ -295,4 +297,20 @@ jobs:
           from astra_tools.workspace import build_environment
           env = build_environment()
           subprocess.run(['cargo', 'check', '--locked', '-p', 'astra-gui', '--all-targets'], env=env, check=True)
-          subprocess.run(['cargo', 'test', '--locked', '-p', 'astra-client', '-p', 'astra-gui', '--lib'], env=env, check=True)
+          subprocess.run(['cargo', 'test', '--locked', '-p', 'astra-client', '-p', 'astra-gui'], env=env, check=True)
+
+      - name: Build native window smoke executables
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: cargo build --locked -p astra-gui -p astra-manager -p astra-proxy --bin astra-gui --bin astra-host --bin astra-proxy
+      - name: Exercise the real manager and proxy from the GUI client bridge
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: cargo test --locked -p astra-gui --features test-support --test live_test -- --ignored
+      - name: Paint a real X11 window and stop gracefully
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WGPU_BACKEND: vulkan
+        shell: bash
+        run: |
+          bin_dir=$(python -c "import sys; sys.path.insert(0, 'scripts'); from astra_tools.workspace import BuildLayout, build_environment; print(BuildLayout.discover(build_environment())[0].binary_dir('debug'))")
+          xvfb-run -a -s "-screen 0 1280x800x24" python scripts/gui_smoke.py --bin-dir "$bin_dir"
