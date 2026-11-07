@@ -92,6 +92,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(server_frontend: bool) -> Self {
+        Self::with_graphical(server_frontend, false)
+    }
+    fn with_graphical(server_frontend: bool, graphical: bool) -> Self {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
         let nonce = std::time::SystemTime::now()
@@ -125,6 +128,9 @@ impl Fixture {
         let mut components = vec!["astra-proxy", "astra-rule", "astra-tui", "astra-host"];
         if server_frontend {
             components.push("astra-server-tui");
+        }
+        if graphical {
+            components.extend(["astra-gui", "astra-server-gui"]);
         }
         for component in components {
             let filename = astra_platform::platform::executable(component);
@@ -377,4 +383,46 @@ fn readiness_signal_does_not_overwrite_an_existing_file() {
     fs::write(&path, b"existing file").unwrap();
     assert!(signal_ready(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"existing file");
+}
+
+#[test]
+fn graphical_frontend_restarts_only_into_its_verified_matching_component() {
+    let mut fixture = Fixture::with_graphical(true, true);
+    for frontend in ["astra-gui", "astra-server-gui"] {
+        fixture.context.executable = fixture
+            .context
+            .bin
+            .join(astra_platform::platform::executable(frontend));
+        let next = resolve(&fixture.context, "new-release").unwrap().unwrap();
+        assert_eq!(
+            next.executable.file_name(),
+            fixture.context.executable.file_name()
+        );
+        assert_eq!(next.home, fixture.context.home);
+        assert_eq!(next.config, fixture.context.config);
+        assert!(resolve(&next, "new-release").unwrap().is_none());
+        let launch = windows::Launch {
+            view: Some(windows::View::Settings),
+            ..Default::default()
+        };
+        let args = restart_command(&next, &launch)
+            .get_args()
+            .map(|arg| arg.to_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--resume-ui"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--view" && pair[1] == "settings"));
+    }
+    let mut without_gui = Fixture::new(true);
+    without_gui.context.executable = without_gui
+        .context
+        .bin
+        .join(astra_platform::platform::executable("astra-gui"));
+    fs::write(&without_gui.context.executable, b"old gui").unwrap();
+    assert!(resolve(&without_gui.context, "new-release")
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("astra-gui"));
 }

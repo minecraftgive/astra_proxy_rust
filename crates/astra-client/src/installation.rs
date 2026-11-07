@@ -40,6 +40,15 @@ impl State {
     pub fn visible(&self) -> bool {
         self.open || self.notice
     }
+    pub fn can_install(&self) -> bool {
+        !self.busy()
+            && !self.refresh
+            && self.query.is_none()
+            && self.query_error.is_none()
+            && self
+                .destination()
+                .is_some_and(|destination| destination.unavailable_reason.is_none())
+    }
     pub fn busy(&self) -> bool {
         self.operation.is_some()
     }

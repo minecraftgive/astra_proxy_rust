@@ -84,6 +84,15 @@ impl StartPage {
     }
 }
 
+/// Which frontend the operating system starts at sign-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFrontend {
+    #[default]
+    Tui,
+    Gui,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -95,6 +104,7 @@ pub struct Preferences {
     pub mouse: bool,
     pub start_page: StartPage,
     pub terminal: String,
+    pub startup_frontend: StartupFrontend,
     pub installation_notices: std::collections::BTreeSet<String>,
     /// The generated OS startup file is authoritative, not these preferences.
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -252,6 +262,7 @@ impl Default for Preferences {
             mouse: true,
             start_page: StartPage::Overview,
             terminal: "auto".into(),
+            startup_frontend: StartupFrontend::Tui,
             installation_notices: Default::default(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_enabled: false,

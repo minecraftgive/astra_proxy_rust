@@ -336,7 +336,8 @@ async fn perform_logs(
 ) -> JobResult {
     // The legacy UI rows retain each instance's kind, while the server adapter
     // deliberately offers log reading without dynamic capture-level control.
-    let capture_supported = name == "@tui" || input.target(&name).kind != Kind::Server;
+    let capture_supported =
+        name == "@tui" || (name != "@gui" && input.target(&name).kind != Kind::Server);
     let mut viewer = logs::Viewer::new(
         name.clone(),
         input.log_settings.remove(&name).unwrap_or_default(),
@@ -609,11 +610,16 @@ pub fn apply_operation<H: OperationHost>(
         if context.same {
             host.accept_runtime(name, snapshot);
         }
-        host.client_mut().message = message;
+        let client = host.client_mut();
+        client.message = message;
+        client.tasks.notice_result(&client.message, false);
         return false;
     }
     let ui = host.client_mut();
     let failed = result.failed();
+    if failed {
+        ui.reject_proxy_selection(action);
+    }
     let mut message = result.message();
     let mut quit = false;
     ui.operation_failed = failed;
@@ -692,7 +698,7 @@ pub fn apply_operation<H: OperationHost>(
             ui.update_view = Some(view);
         }
         JobResult::Logs(viewer) => {
-            if viewer.name == "@tui" {
+            if crate::tui_log::source_file(&viewer.name).is_some() {
                 if context.log_target_current {
                     ui.tui_viewer = Some(viewer);
                 }
@@ -720,7 +726,9 @@ pub fn apply_operation<H: OperationHost>(
             if let Some(observed) = observed {
                 merge_observation(ui, &observed);
             }
-            if matches!(action,Action::Logs(name) if name=="@tui") && context.log_target_current {
+            if matches!(action,Action::Logs(name) if crate::tui_log::source_file(name).is_some())
+                && context.log_target_current
+            {
                 ui.tui_viewer = None;
             }
             if context.same
@@ -739,12 +747,14 @@ pub fn apply_operation<H: OperationHost>(
         }
     }
     ui.message = message;
+    ui.tasks.notice_result(&ui.message, failed);
     quit
 }
 
 pub fn action_description(action: &Action) -> String {
     let (label, name) = match action {
         Action::Logs(name) if name == "@tui" => ("TUI log", ""),
+        Action::Logs(name) if name == "@gui" => ("GUI log", ""),
         Action::Logs(name) => ("Logs", name.as_str()),
         Action::Diagnostics(name) => ("Connectivity / Exit IP", name.as_str()),
         Action::NetTool { name, .. } => ("Network tools", name.as_str()),

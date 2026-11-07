@@ -506,3 +506,22 @@ fn generated_plist_passes_plutil_without_loading_the_agent() {
         );
     }
 }
+
+#[test]
+fn gui_startup_uses_a_separate_identity_and_keeps_silent_mode_explicit() {
+    let temp = Temporary::new();
+    let original = context(&temp.0);
+    let gui = original
+        .for_frontend(crate::preferences::StartupFrontend::Gui)
+        .unwrap();
+    assert_ne!(identity(&gui, &None), identity(&original, &None));
+    let command = Command::from_context(&gui, &None).unwrap();
+    let paths = Paths::new(Platform::Mac, &temp.0, None, identity(&gui, &None));
+    let plist = mac_plist(&paths, &command, false).unwrap();
+    assert!(plist.contains("astra-gui"));
+    assert!(!plist.contains("--native-console"));
+    assert!(!plist.contains("--silent"));
+    assert!(mac_plist(&paths, &command, true)
+        .unwrap()
+        .contains("--silent"));
+}

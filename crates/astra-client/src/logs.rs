@@ -134,14 +134,13 @@ impl Viewer {
         }
     }
     pub async fn connect(&mut self, socket: &Path) -> Result<()> {
-        self.source = socket
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(if self.name == "@tui" {
-                "tui.log".to_owned()
+        self.source = socket.parent().unwrap_or(Path::new(".")).join(
+            if let Some(file) = crate::tui_log::source_file(&self.name) {
+                file.to_owned()
             } else {
                 format!("{}.log", self.name)
-            });
+            },
+        );
         let mut stream = crate::log_stream::connect(socket, self.name.clone(), self.cursor).await?;
         let (sender, receiver) = mpsc::channel(16);
         let waker = self.waker.clone();
@@ -359,6 +358,51 @@ impl Viewer {
             .iter()
             .map(|record| self.row_count(record))
             .sum()
+    }
+    pub fn set_filter(&mut self, value: String) {
+        self.settings.filter = value;
+        self.top = 0;
+    }
+    pub fn set_search(&mut self, value: String) {
+        self.settings.search = value;
+        self.jump(false);
+    }
+    pub fn set_wrap(&mut self, value: bool) {
+        self.settings.wrap = value;
+        self.horizontal = 0;
+        self.top = 0;
+    }
+    pub fn set_follow(&mut self, value: bool) {
+        self.settings.follow = value;
+        if value {
+            self.frozen = None;
+        }
+    }
+    pub fn set_display_level(&mut self, value: Option<LogLevel>) {
+        self.settings.min_level = value;
+        self.top = 0;
+    }
+    pub fn set_memory_limit(&mut self, value: &str) -> Result<(), String> {
+        let limit = value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=100_000).contains(n))
+            .ok_or_else(|| t("Enter a line limit from 1 to 100000").to_owned())?;
+        self.settings.memory_lines = limit;
+        self.evict();
+        self.records.shrink_to_fit();
+        self.status = t("Log memory limit updated").into();
+        Ok(())
+    }
+    pub fn selected_record_index(&self) -> usize {
+        let mut rows = 0;
+        self.visible()
+            .iter()
+            .position(|record| {
+                rows += self.row_count(record);
+                rows > self.top
+            })
+            .unwrap_or(0)
     }
     pub fn begin_search(&mut self) {
         if self.browsing() {
@@ -719,3 +763,49 @@ pub fn wrapped_rows(text: &str, width: u16) -> usize {
 #[cfg(test)]
 #[path = "test/logs_test.rs"]
 mod tests;
+
+impl crate::state::Client {
+    pub fn log_sources(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.rows.iter().map(|r| r.instance.name.clone()).collect();
+        names.extend(["@tui".into(), "@gui".into()]);
+        names
+    }
+    pub fn log_viewer(&self, frontend: bool) -> Option<&Viewer> {
+        if frontend {
+            self.tui_viewer.as_ref()
+        } else {
+            self.viewer.as_ref()
+        }
+    }
+    pub fn log_viewer_mut(&mut self, frontend: bool) -> Option<&mut Viewer> {
+        if frontend {
+            self.tui_viewer.as_mut()
+        } else {
+            self.viewer.as_mut()
+        }
+    }
+    pub fn frontend_log_command(&mut self, command: Command) -> crate::state::Input {
+        let Some(viewer) = &self.tui_viewer else {
+            return crate::state::Input::Idle;
+        };
+        let name = viewer.name.clone();
+        match command {
+            Command::Close => {
+                let viewer = self.tui_viewer.take().unwrap();
+                self.log_settings.insert(name, viewer.settings);
+                self.active_log = None;
+                self.overlay_epoch = self.overlay_epoch.wrapping_add(1);
+            }
+            Command::Reconnect => return crate::state::Input::Run(Action::Logs(name), None),
+            Command::Capture(level) if viewer.capture_supported => {
+                return crate::state::Input::Run(Action::SetLogLevel { name, level }, None)
+            }
+            _ => {}
+        }
+        crate::state::Input::Idle
+    }
+}
+
+#[cfg(test)]
+#[path = "test/observability_test.rs"]
+mod observability_tests;

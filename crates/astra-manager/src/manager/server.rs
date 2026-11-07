@@ -991,8 +991,8 @@ async fn serve(
                 let _permit = followers
                     .try_acquire()
                     .context("Too many log subscribers")?;
-                let path = if name == "@tui" {
-                    hub.home.join("tui.log")
+                let path = if let Some(file) = crate::tui_log::source_file(name) {
+                    hub.home.join(file)
                 } else {
                     hub.route(name)?;
                     hub.home.join(format!("{name}.log"))
@@ -1257,7 +1257,7 @@ async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
             .await
         }
         Action::GetLogLevel(name) => {
-            if name == "@tui" {
+            if crate::tui_log::source_file(name).is_some() {
                 Ok(Reply::text("info"))
             } else {
                 hub.route(name).map(|_| {

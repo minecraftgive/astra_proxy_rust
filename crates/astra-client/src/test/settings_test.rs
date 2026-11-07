@@ -167,3 +167,31 @@ fn missing_file_keeps_session_choices_and_damaged_file_reports() {
     assert_eq!(p, Preferences::default());
     assert!(error.is_some());
 }
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[test]
+fn startup_interface_is_persisted_without_registering_and_failed_save_rolls_back() {
+    let old: Preferences = serde_json::from_str(r#"{"mouse":false}"#).unwrap();
+    assert_eq!(old.startup_frontend, StartupFrontend::Tui);
+    let (mut client, dir) = settings_ui();
+    client.choose_setting(Field::StartupFrontend, 1);
+    assert_eq!(client.preferences.startup_frontend, StartupFrontend::Gui);
+    assert!(!client.preferences.startup_enabled);
+    assert_eq!(
+        load(&dir.0.join(FILE), &Session::default())
+            .0
+            .startup_frontend,
+        StartupFrontend::Gui
+    );
+    client.preferences_path = Some(dir.0.clone());
+    client.choose_setting(Field::StartupFrontend, 0);
+    assert_eq!(client.preferences.startup_frontend, StartupFrontend::Gui);
+    assert!(client
+        .message
+        .contains(t("Cannot save preferences: {}").split("{}").next().unwrap()));
+    client.preferences_path = Some(dir.0.join(FILE));
+    client.preferences.startup_enabled = true;
+    client.choose_setting(Field::StartupFrontend, 0);
+    assert_eq!(client.preferences.startup_frontend, StartupFrontend::Gui);
+    assert!(client.message.contains("Startup context is unavailable"));
+}

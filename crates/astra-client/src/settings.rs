@@ -54,6 +54,8 @@ pub enum Field {
     Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     StartupRegistration,
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    StartupFrontend,
     #[cfg(any(windows, target_os = "macos"))]
     SilentStartup,
     #[cfg(windows)]
@@ -79,6 +81,8 @@ pub const ALL_FIELDS: &[Field] = &[
     Field::Terminal,
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     Field::StartupRegistration,
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    Field::StartupFrontend,
     #[cfg(any(windows, target_os = "macos"))]
     Field::SilentStartup,
     #[cfg(windows)]
@@ -96,9 +100,9 @@ pub const ALL_FIELDS: &[Field] = &[
 ];
 /// Row of the first marquee field.
 pub const MARQUEE_ROW: usize = 9
-    + 3 * cfg!(windows) as usize
-    + 2 * cfg!(target_os = "macos") as usize
-    + cfg!(target_os = "linux") as usize;
+    + 4 * cfg!(windows) as usize
+    + 3 * cfg!(target_os = "macos") as usize
+    + 2 * cfg!(target_os = "linux") as usize;
 /// Rows shown now; the marquee section stays hidden until it is unlocked.
 pub fn fields(p: &Preferences) -> &'static [Field] {
     if p.marquee.unlocked {
@@ -128,13 +132,15 @@ impl Field {
             Self::StartPage => "Start page",
             Self::Terminal => "Terminal",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupFrontend => "Startup interface",
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => {
                 if cfg!(target_os = "macos") {
-                    "Start TUI at macOS login"
+                    "Start Astra at macOS login"
                 } else if cfg!(target_os = "linux") {
                     "systemd user service file"
                 } else {
-                    "Start TUI with Windows"
+                    "Start Astra with Windows"
                 }
             }
             #[cfg(any(windows, target_os = "macos"))]
@@ -164,17 +170,19 @@ impl Field {
             Self::StartPage => "Page shown when a window opens without --view.",
             Self::Terminal => "Choose the terminal for the next TUI launch, new windows and non-silent startup. The current window stays here. Silent startup does not use a terminal. Press r to scan again.",
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupFrontend => "Choose the graphical interface or terminal interface for future sign-in startup.",
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => {
                 if cfg!(target_os = "macos") {
-                    "Open this TUI in the selected terminal at the next macOS login. Silent startup runs it in the background instead. Each instance config controls startup with auto_start. No administrator permission is required."
+                    "Open the selected interface at the next macOS login. Silent startup runs in the background. Instance auto_start settings control which instances start. No administrator permission is required."
                 } else if cfg!(target_os = "linux") {
                     "Create or remove a user systemd service file for silent startup. Enable it manually with systemctl. Each instance config controls startup with auto_start. Removing the file does not stop running instances."
                 } else {
-                    "Open this TUI when the current user signs in to Windows, using the current directories and manager target. Set auto_start = true in each instance config to start it too."
+                    "Open the selected interface when the current user signs in to Windows, using the current directories and manager target. Instance auto_start settings control which instances start."
                 }
             }
             #[cfg(any(windows, target_os = "macos"))]
-            Self::SilentStartup => "At sign-in, start in the background without a terminal window. Each instance config controls startup with auto_start. Open the TUI manually to manage them; failures are recorded in startup.log.",
+            Self::SilentStartup => "At sign-in, start in the background without an interface window. Instance auto_start settings control which instances start. Open Astra to manage them; failures are recorded in startup.log.",
             #[cfg(windows)]
             Self::WindowsService => "Register a local Windows service with one UAC approval so TUN can start silently later. Requires an administrator account. Removing or updating the protected service requires approval again.",
             Self::MarqueeBorder => "A rainbow runs around the border of the focused panel.",
@@ -186,6 +194,18 @@ impl Field {
             Self::MarqueeWidth => "Cells one whole rainbow spans, 2–400; wider is a gentler gradient. ←→ ±1, Shift ±10.",
             Self::MarqueeFps => "Redraws per second while the marquee moves, 1–120. Higher is smoother but sends more to the terminal; over SSH keep it low. ←→ ±1, Shift ±10.",
             Self::MarqueeTrueColor => "Marquee colors ignore the Colors setting and are always sent as 24-bit color. Needs a terminal with true color.",
+        }
+    }
+    pub fn desktop_description(self) -> &'static str {
+        match self {
+            Self::Colors => "Full color, high contrast or grayscale appearance for the desktop interface.",
+            Self::Mouse => "This preference controls mouse capture in the terminal interface.",
+            Self::Terminal => "Choose the terminal used when opening the TUI. Scan again after installing a terminal.",
+            Self::MarqueeSpeed => "Color movement speed in degrees per second. Reduced or Off motion keeps the banner still.",
+            Self::MarqueeWidth => "Width of one color cycle. Wider values make a gentler gradient.",
+            Self::MarqueeFps => "Banner animation frames per second. Higher values make motion smoother.",
+            Self::MarqueeTrueColor => "Use full color for the banner regardless of the appearance color setting.",
+            _ => self.description(),
         }
     }
     /// Choice names; language names are shown in their own language.
@@ -203,6 +223,8 @@ impl Field {
                 "Monochrome",
             ],
             Self::Motion => &["Normal", "Reduced", "Off"],
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupFrontend => &["TUI", "GUI"],
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => {
                 if cfg!(target_os = "linux") {
@@ -245,6 +267,8 @@ impl Field {
             Self::Terminal => 0, // The cached terminal list resolves the saved ID.
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => usize::from(!p.startup_enabled),
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupFrontend => p.startup_frontend as usize,
             #[cfg(any(windows, target_os = "macos"))]
             Self::SilentStartup => usize::from(!p.silent_startup),
             #[cfg(windows)]
@@ -295,6 +319,10 @@ impl Field {
             Self::Terminal => p.terminal = "auto".into(),
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Self::StartupRegistration => p.startup_enabled = index == 0,
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Self::StartupFrontend => {
+                p.startup_frontend = [StartupFrontend::Tui, StartupFrontend::Gui][index]
+            }
             #[cfg(any(windows, target_os = "macos"))]
             Self::SilentStartup => p.silent_startup = index == 0,
             #[cfg(windows)]
@@ -340,6 +368,7 @@ impl Field {
 pub struct TerminalState {
     pub candidates: Vec<crate::terminals::Candidate>,
     pub scan: Option<tokio::task::JoinHandle<Vec<crate::terminals::Candidate>>>,
+    pub launch: Option<tokio::task::JoinHandle<Result<(), String>>>,
     pub pending: bool,
     pub inside_settings: bool,
     pub picker: Option<String>,
@@ -352,6 +381,9 @@ pub struct Choice {
 }
 
 impl Client {
+    pub fn refresh_program_info(&mut self) {
+        self.program_info.refresh = true;
+    }
     /// Load preferences at startup and apply all of them.
     pub fn load_preferences(&mut self, path: PathBuf) {
         let (preferences, error) = load(&path, &self.session);
@@ -365,7 +397,10 @@ impl Client {
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub fn load_startup_context(&mut self, context: &crate::windows::Context) {
         self.startup_context = Some(context.clone());
-        match startup_registration::enabled(context) {
+        match context
+            .for_frontend(self.preferences.startup_frontend)
+            .and_then(|context| startup_registration::enabled(&context))
+        {
             Ok(enabled) => self.preferences.startup_enabled = enabled,
             Err(error) => {
                 self.message = tr!("Cannot read startup registration: {}", format!("{error:#}"));
@@ -543,6 +578,11 @@ impl Client {
             self.choose_terminal(index);
             return;
         }
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        if field == Field::StartupFrontend {
+            self.choose_startup_frontend(index);
+            return;
+        }
         #[cfg(windows)]
         if field == Field::WindowsService {
             self.change_windows_service(index == 0);
@@ -554,9 +594,18 @@ impl Client {
                 .startup_context
                 .as_ref()
                 .context("Startup context is unavailable")
+                .and_then(|context| context.for_frontend(self.preferences.startup_frontend))
                 .and_then(|context| {
+                    if index == 0 {
+                        anyhow::ensure!(
+                            context.executable.is_file(),
+                            "{}: {}",
+                            t("Interface executable is unavailable"),
+                            context.executable.display()
+                        );
+                    }
                     startup_registration::set_enabled(
-                        context,
+                        &context,
                         index == 0,
                         self.preferences.silent_startup,
                     )
@@ -565,7 +614,10 @@ impl Client {
                 Ok(()) => self.preferences.startup_enabled = index == 0,
                 Err(error) => {
                     if let Some(context) = &self.startup_context {
-                        if let Ok(enabled) = startup_registration::enabled(context) {
+                        if let Ok(enabled) = context
+                            .for_frontend(self.preferences.startup_frontend)
+                            .and_then(|context| startup_registration::enabled(&context))
+                        {
                             self.preferences.startup_enabled = enabled;
                         }
                     }
@@ -583,7 +635,10 @@ impl Client {
             );
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(context) = &self.startup_context {
-                if let Ok(path) = startup_registration::managed_path(context) {
+                if let Ok(path) = context
+                    .for_frontend(self.preferences.startup_frontend)
+                    .and_then(|context| startup_registration::managed_path(&context))
+                {
                     self.message.push_str(&format!(" · {}", path.display()));
                 }
             }
@@ -596,7 +651,13 @@ impl Client {
                 .startup_context
                 .as_ref()
                 .context("Startup context is unavailable")
-                .and_then(|context| startup_registration::set_enabled(context, true, index == 0));
+                .and_then(|context| {
+                    context
+                        .for_frontend(self.preferences.startup_frontend)
+                        .and_then(|context| {
+                            startup_registration::set_enabled(&context, true, index == 0)
+                        })
+                });
             if let Err(error) = result {
                 self.message = tr!(
                     "Cannot change startup registration: {}",
@@ -606,7 +667,12 @@ impl Client {
             }
             if !self.change_preferences(|p| p.silent_startup = index == 0) {
                 if let Some(context) = &self.startup_context {
-                    if let Err(error) = startup_registration::set_enabled(context, true, previous) {
+                    if let Err(error) = context
+                        .for_frontend(self.preferences.startup_frontend)
+                        .and_then(|context| {
+                            startup_registration::set_enabled(&context, true, previous)
+                        })
+                    {
                         self.message.push_str(&format!(
                             "\n{}",
                             tr!(
@@ -634,7 +700,10 @@ impl Client {
         if field == Field::StartupRegistration {
             let mut details = Vec::new();
             if let Some(context) = &self.startup_context {
-                if let Ok(path) = startup_registration::managed_path(context) {
+                if let Ok(path) = context
+                    .for_frontend(self.preferences.startup_frontend)
+                    .and_then(|context| startup_registration::managed_path(&context))
+                {
                     details.push(
                         path.display()
                             .to_string()
@@ -644,7 +713,10 @@ impl Client {
                     );
                 }
                 if self.preferences.startup_enabled {
-                    if let Ok(instructions) = startup_registration::instructions(context) {
+                    if let Ok(instructions) = context
+                        .for_frontend(self.preferences.startup_frontend)
+                        .and_then(|context| startup_registration::instructions(&context))
+                    {
                         details.extend(instructions.lines().map(str::to_owned));
                     }
                 }
@@ -670,6 +742,97 @@ impl Client {
                 })
                 .unwrap_or_default(),
         )
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    pub fn choose_startup_frontend(&mut self, index: usize) {
+        let previous = self.preferences.startup_frontend;
+        let next = [StartupFrontend::Tui, StartupFrontend::Gui][index.min(1)];
+        if previous == next {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            if self.preferences.startup_enabled {
+                let base = self
+                    .startup_context
+                    .as_ref()
+                    .context("Startup context is unavailable")?;
+                let old = base.for_frontend(previous)?;
+                let new = base.for_frontend(next)?;
+                anyhow::ensure!(
+                    new.executable.is_file(),
+                    "{}: {}",
+                    t("Interface executable is unavailable"),
+                    new.executable.display()
+                );
+                startup_registration::set_enabled(&new, true, self.preferences.silent_startup)?;
+                if let Err(error) =
+                    startup_registration::set_enabled(&old, false, self.preferences.silent_startup)
+                {
+                    let _ = startup_registration::set_enabled(
+                        &new,
+                        false,
+                        self.preferences.silent_startup,
+                    );
+                    return Err(error);
+                }
+                if !self.change_preferences(|p| p.startup_frontend = next) {
+                    startup_registration::set_enabled(&old, true, self.preferences.silent_startup)?;
+                    startup_registration::set_enabled(
+                        &new,
+                        false,
+                        self.preferences.silent_startup,
+                    )?;
+                    return Ok(());
+                }
+            } else if !self.change_preferences(|p| p.startup_frontend = next) {
+                return Ok(());
+            }
+            self.message = format!(
+                "{}: {}",
+                t(Field::StartupFrontend.label()),
+                Field::StartupFrontend.value_label(&self.preferences)
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.message = tr!(
+                "Cannot change startup registration: {}",
+                format!("{error:#}")
+            );
+        }
+    }
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    pub fn start_terminal_interface(&mut self) -> Result<()> {
+        let context = self
+            .startup_context
+            .as_ref()
+            .context("Startup context is unavailable")?
+            .for_frontend(StartupFrontend::Tui)?;
+        anyhow::ensure!(
+            context.executable.is_file(),
+            "{}: {}",
+            t("Interface executable is unavailable"),
+            context.executable.display()
+        );
+        let launch = crate::windows::Launch::detached(
+            crate::windows::View::from_page(self.page),
+            self.active_profile.clone(),
+            self.kind,
+        );
+        if self.terminals.launch.is_some() {
+            return Ok(());
+        }
+        let terminal = self.preferences.terminal.clone();
+        let waker = self.waker.clone();
+        self.terminals.launch = Some(tokio::task::spawn_blocking(move || {
+            let result = context
+                .open(&launch, &terminal)
+                .map_err(|error| format!("{error:#}"));
+            waker.wake();
+            result
+        }));
+        Ok(())
     }
 
     pub fn terminal_choices(&self) -> Vec<Choice> {
@@ -770,6 +933,26 @@ impl Client {
             self.terminals.picker = None;
         }
         let mut changed = false;
+        if self
+            .terminals
+            .launch
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            let result = self
+                .terminals
+                .launch
+                .take()
+                .unwrap()
+                .now_or_never()
+                .expect("finished terminal launch")
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.message = error;
+            }
+            changed = true;
+        }
         if self
             .terminals
             .scan

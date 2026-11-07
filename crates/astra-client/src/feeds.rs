@@ -31,7 +31,7 @@ impl Feed {
             let mut previous = String::new();
             let log = socket
                 .parent()
-                .and_then(|p| crate::tui_log::Log::open(&p.join("tui.log")).ok());
+                .and_then(|p| crate::tui_log::Log::open(&crate::tui_log::frontend_path(p)).ok());
             let label = if matches!(&action, Action::WatchList) {
                 "instance state"
             } else {

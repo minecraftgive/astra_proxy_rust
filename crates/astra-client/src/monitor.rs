@@ -258,3 +258,42 @@ pub fn trend(values: &[Option<f64>], width: usize) -> String {
         })
         .collect()
 }
+
+/// Shared chart samples keep unavailable readings as gaps.
+#[derive(Default)]
+pub struct Series {
+    pub cpu: Vec<Option<f64>>,
+    pub memory: Vec<Option<f64>>,
+    pub virtual_memory: Vec<Option<f64>>,
+    pub upload: Vec<Option<f64>>,
+    pub download: Vec<Option<f64>>,
+}
+impl View {
+    pub fn series(&self) -> Series {
+        let mut series = Series::default();
+        for sample in &self.samples {
+            series
+                .cpu
+                .push(sample.snapshot.cpu_percent.filter(|n| n.is_finite()));
+            series.memory.push(
+                sample
+                    .snapshot
+                    .memory_bytes
+                    .as_deref()
+                    .and_then(number)
+                    .map(|n| n as f64),
+            );
+            series.virtual_memory.push(
+                sample
+                    .snapshot
+                    .virtual_memory_bytes
+                    .as_deref()
+                    .and_then(number)
+                    .map(|n| n as f64),
+            );
+            series.upload.push(sample.rates[0]);
+            series.download.push(sample.rates[1]);
+        }
+        series
+    }
+}

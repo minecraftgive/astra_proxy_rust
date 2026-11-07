@@ -5,38 +5,7 @@ use anyhow::{Context, Result};
 
 impl Client {
     pub fn operations(&self) -> Vec<Operation> {
-        let Some(row) = self.selected() else {
-            return Vec::new();
-        };
-        let mut operations = if row.pid.is_some() {
-            vec![Operation::Stop, Operation::Restart, Operation::Reload]
-        } else {
-            vec![Operation::Start]
-        };
-        if row.pid.is_none() && row.instance.kind != Kind::Server {
-            operations.push(Operation::ForceStart);
-        }
-        operations.extend([Operation::Edit, Operation::Logs, Operation::ExportConfig]);
-        if row.instance.kind != Kind::Server {
-            operations.extend([
-                Operation::Bind,
-                Operation::Config,
-                Operation::Copy,
-                Operation::ExportTerminal,
-            ]);
-        }
-        if row.instance.kind == Kind::Proxy {
-            operations.push(Operation::Diagnostics);
-            operations.push(Operation::NetTools);
-            operations.push(Operation::UpdateSubscriptions);
-        }
-        if row.instance.kind == Kind::Rule && row.pid.is_some() {
-            operations.push(Operation::Explain);
-        }
-        if row.pid.is_none() {
-            operations.push(Operation::Remove);
-        }
-        operations
+        self.selected().map(row_operations).unwrap_or_default()
     }
     pub fn switch_core(&mut self, kind: Kind) {
         self.kind = kind;
@@ -419,6 +388,7 @@ impl Client {
 
 impl Client {
     pub fn activate_profile(&mut self, name: String) {
+        self.pending_proxy_selection = None;
         self.suspend_editor();
         self.active_profile = Some(name);
         self.runtime_picker = None;
@@ -459,6 +429,7 @@ impl Client {
 
 #[derive(Clone, Copy)]
 pub enum BindingAction {
+    ToggleAt(usize),
     Previous,
     Next,
     Toggle,
@@ -467,9 +438,26 @@ pub enum BindingAction {
 }
 impl Client {
     pub fn binding_action(&mut self, action: BindingAction) -> Input {
-        let binding_is_proxy = self.kind == Kind::Proxy;
+        if let BindingAction::ToggleAt(index) = action {
+            if let Some(picker) = &mut self.binding_picker {
+                picker.selected = index;
+            }
+            return self.binding_action(BindingAction::Toggle);
+        }
+        let binding_is_proxy = self
+            .binding_picker
+            .as_ref()
+            .and_then(|picker| {
+                self.rows
+                    .iter()
+                    .find(|row| row.instance.name == picker.name)
+            })
+            .map_or(self.kind == Kind::Proxy, |row| {
+                row.instance.kind == Kind::Proxy
+            });
         if let Some(picker) = &mut self.binding_picker {
             match action {
+                BindingAction::ToggleAt(_) => unreachable!("handled above"),
                 BindingAction::Cancel => self.binding_picker = None,
                 BindingAction::Previous => picker.selected = picker.selected.saturating_sub(1),
                 BindingAction::Next => {
@@ -525,6 +513,13 @@ impl Client {
         Input::Idle
     }
     pub fn server_action(&mut self, action: ServerAction) -> Input {
+        if !matches!(action, ServerAction::Quit)
+            && !self
+                .selected()
+                .is_some_and(|row| row.instance.kind == Kind::Server)
+        {
+            return Input::Idle;
+        }
         match action {
             ServerAction::Quit => self.run_command(crate::commands::Id::Quit),
             ServerAction::Toggle => {
@@ -554,6 +549,65 @@ pub enum ServerAction {
 }
 
 impl Client {
+    /// Execute a command in the visible page, ignoring retained editors in other windows.
+    pub fn run_page_command(&mut self, page: usize, id: crate::commands::Id) -> Input {
+        use crate::commands::Id;
+        self.page = page;
+        match id {
+            Id::Search => {
+                if page == crate::navigation::LOGS {
+                    if let Some(viewer) = &mut self.viewer {
+                        viewer.begin_search();
+                    }
+                } else if matches!(page, OVERVIEW | CONNECTIONS) {
+                    self.page = CONNECTIONS;
+                    self.connection_filtering = true;
+                } else if page == RULES {
+                    return self.rule_search();
+                } else {
+                    self.prompt(Prompt::Find(page));
+                }
+                Input::Idle
+            }
+            Id::NextMatch | Id::PreviousMatch => {
+                let backwards = id == Id::PreviousMatch;
+                if page == crate::navigation::LOGS {
+                    if let Some(viewer) = &mut self.viewer {
+                        if viewer.browsing() {
+                            viewer.find_again(backwards);
+                        }
+                    }
+                } else if page == CONNECTIONS && !self.connection_filter.is_empty() {
+                    let count = self.connection_rows().len();
+                    if count > 0 {
+                        let current = self.connection_selection.min(count - 1);
+                        self.select_connection(if backwards {
+                            (current + count - 1) % count
+                        } else {
+                            (current + 1) % count
+                        });
+                    }
+                } else {
+                    let query = self.searches.get(&page).cloned().unwrap_or_default();
+                    if !query.is_empty() {
+                        self.find_direction(page, &query, backwards);
+                    }
+                }
+                Input::Idle
+            }
+            Id::Pause => {
+                if page == crate::navigation::LOGS {
+                    if let Some(viewer) = &mut self.viewer {
+                        viewer.toggle_pause();
+                    }
+                    Input::Idle
+                } else {
+                    self.toggle_live_pause()
+                }
+            }
+            _ => self.run_command(id),
+        }
+    }
     pub fn search_current(&mut self) -> Input {
         if let Some(editor) = &mut self.editor {
             editor.begin_search();
@@ -776,5 +830,160 @@ mod command_tests {
         client.editor.as_mut().unwrap().cancel_input();
         client.run_command(crate::commands::Id::Undo);
         assert_eq!(client.editor.as_ref().unwrap().text(), "standalone=true\n");
+    }
+}
+
+/// Instance facts shared by the native and terminal detail views.
+#[derive(Clone)]
+pub struct InstanceSummary {
+    pub row: Row,
+    pub state: crate::overview::InstanceState,
+    pub details: Option<InstanceDetails>,
+    pub warnings: Vec<String>,
+}
+impl Client {
+    pub fn instance_summary(&self, row: &Row) -> InstanceSummary {
+        let mut warnings = Vec::new();
+        if row.changed {
+            warnings.push(t("Configuration changed but not applied · r apply").into());
+        }
+        if row.instance.kind == Kind::Rule {
+            let users: Vec<_> = self
+                .rows
+                .iter()
+                .filter(|r| {
+                    r.instance.kind == Kind::Proxy
+                        && self
+                            .details
+                            .get(&r.instance.name)
+                            .is_some_and(|d| d.bindings.contains(&row.instance.name))
+                })
+                .map(|r| r.instance.name.as_str())
+                .collect();
+            if users.len() > 1 {
+                warnings.push(tr!(
+                    "   Shared by {}; edits apply to all of them",
+                    users.join(", ")
+                ));
+            }
+        }
+        InstanceSummary {
+            row: row.clone(),
+            state: crate::overview::indicator_state(row),
+            details: self.details.get(&row.instance.name).cloned(),
+            warnings,
+        }
+    }
+    pub fn rule_summary(&self) -> Option<InstanceSummary> {
+        self.active_rule().map(|row| self.instance_summary(row))
+    }
+    pub fn selected_summary(&self) -> Option<InstanceSummary> {
+        self.selected().map(|row| self.instance_summary(row))
+    }
+    pub fn rule_empty_message(&self) -> String {
+        let Some(proxy) = self.active_proxy() else {
+            return t("No profile yet").into();
+        };
+        if self
+            .details
+            .get(&proxy.instance.name)
+            .is_some_and(|d| d.modes.iter().any(|m| m == "Standalone"))
+        {
+            tr!(
+                "{} runs in standalone mode: every connection uses one outbound and no rule core.",
+                proxy.instance.name
+            )
+        } else {
+            tr!("{} has no rule core bound.", proxy.instance.name)
+        }
+    }
+    pub fn select_instance(&mut self, kind: Kind, name: &str) -> bool {
+        let Some(index) = self
+            .rows
+            .iter()
+            .filter(|row| row.instance.kind == kind)
+            .position(|row| row.instance.name == name)
+        else {
+            return false;
+        };
+        self.kind = kind;
+        self.selections[kind_index(kind)] = index;
+        true
+    }
+    pub fn profile_rows(&self, query: &str) -> Vec<Row> {
+        let query = query.to_lowercase();
+        self.rows()
+            .into_iter()
+            .filter(|row| {
+                format!(
+                    "{} {} {}",
+                    row.instance.name,
+                    row.instance.config.display(),
+                    row.state
+                )
+                .to_lowercase()
+                .contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+    pub fn named_profile_action(&mut self, kind: Kind, name: &str, action: ProfileAction) -> Input {
+        if self.select_instance(kind, name) {
+            self.profile_action(action)
+        } else {
+            Input::Idle
+        }
+    }
+    pub fn selected_server_summary(&self) -> Option<InstanceSummary> {
+        self.selected()
+            .filter(|row| row.instance.kind == Kind::Server)
+            .map(|row| self.instance_summary(row))
+    }
+}
+
+pub fn row_operations(row: &Row) -> Vec<Operation> {
+    let mut operations = if row.pid.is_some() {
+        vec![Operation::Stop, Operation::Restart, Operation::Reload]
+    } else {
+        vec![Operation::Start]
+    };
+    if row.pid.is_none() && row.instance.kind != Kind::Server {
+        operations.push(Operation::ForceStart);
+    }
+    operations.extend([Operation::Edit, Operation::Logs, Operation::ExportConfig]);
+    if row.instance.kind != Kind::Server {
+        operations.extend([
+            Operation::Bind,
+            Operation::Config,
+            Operation::Copy,
+            Operation::ExportTerminal,
+        ]);
+    }
+    if row.instance.kind == Kind::Proxy {
+        operations.push(Operation::Diagnostics);
+        operations.push(Operation::NetTools);
+        operations.push(Operation::UpdateSubscriptions);
+    }
+    if row.instance.kind == Kind::Rule && row.pid.is_some() {
+        operations.push(Operation::Explain);
+    }
+    if row.pid.is_none() {
+        operations.push(Operation::Remove);
+    }
+    operations
+}
+
+impl Client {
+    pub fn move_instance_selection(&mut self, delta: isize) {
+        let index = self.index();
+        self.selections[index] = self.selections[index]
+            .saturating_add_signed(delta)
+            .min(self.rows().len().saturating_sub(1));
+    }
+}
+
+impl Client {
+    pub fn close_explanation(&mut self) {
+        self.explanation = None;
     }
 }

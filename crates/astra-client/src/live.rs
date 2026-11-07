@@ -254,6 +254,9 @@ impl Client {
     }
 
     pub fn connection_rows(&self) -> Vec<ConnectionRow> {
+        self.connection_rows_at(self.page)
+    }
+    pub fn connection_rows_at(&self, page: usize) -> Vec<ConnectionRow> {
         let now = Instant::now();
         let fresh = self
             .live_state
@@ -262,14 +265,17 @@ impl Client {
             .filter_map(|(&id, &until)| (until > now).then_some(id))
             .collect();
         connections::build_rows(
-            self.visible_connections(),
+            self.visible_connections_at(page),
             &self.live_state.expanded_targets,
             &fresh,
         )
     }
 
     pub fn selected_connection_row_key(&self) -> Option<ConnectionRowKey> {
-        let rows = self.connection_rows();
+        self.selected_connection_row_key_at(self.page)
+    }
+    pub fn selected_connection_row_key_at(&self, page: usize) -> Option<ConnectionRowKey> {
+        let rows = self.connection_rows_at(page);
         if let Some(target) = &self.live_state.selected_target {
             return rows
                 .iter()
@@ -285,7 +291,7 @@ impl Client {
             return Some(key);
         }
         let target = self
-            .visible_connections()
+            .visible_connections_at(page)
             .into_iter()
             .find(|c| c.id == id)
             .map(ConnectionTarget::of)?;
@@ -363,10 +369,15 @@ impl Client {
     }
 
     pub fn selected_connection(&self) -> Option<&astra_model::runtime::Connection> {
-        let ConnectionRowKey::Connection(id) = self.selected_connection_row_key()? else {
+        self.selected_connection_at(self.page)
+    }
+    pub fn selected_connection_at(&self, page: usize) -> Option<&astra_model::runtime::Connection> {
+        let ConnectionRowKey::Connection(id) = self.selected_connection_row_key_at(page)? else {
             return None;
         };
-        self.visible_connections().into_iter().find(|c| c.id == id)
+        self.visible_connections_at(page)
+            .into_iter()
+            .find(|c| c.id == id)
     }
 
     pub fn toggle_connection_group(&mut self) -> bool {
@@ -482,7 +493,10 @@ impl Client {
     }
 
     pub fn visible_connections(&self) -> Vec<&astra_model::runtime::Connection> {
-        let filter = if self.page == CONNECTIONS {
+        self.visible_connections_at(self.page)
+    }
+    pub fn visible_connections_at(&self, page: usize) -> Vec<&astra_model::runtime::Connection> {
+        let filter = if page == CONNECTIONS {
             self.connection_filter.to_lowercase()
         } else {
             String::new()
@@ -511,3 +525,306 @@ impl Client {
         connections
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingProxySelection {
+    pub instance: String,
+    pub pid: u32,
+    pub group: String,
+    pub member: String,
+}
+impl Client {
+    pub fn proxy_groups(&self, query: &str) -> Vec<astra_model::runtime::Group> {
+        let query = query.to_lowercase();
+        self.live()
+            .map(|snapshot| {
+                snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        group.name.to_lowercase().contains(&query)
+                            || group
+                                .members
+                                .iter()
+                                .any(|member| member.name.to_lowercase().contains(&query))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn selected_proxy_group(&self) -> Option<&astra_model::runtime::Group> {
+        self.live()?.groups.get(self.group_selection)
+    }
+    pub fn select_proxy_group(&mut self, name: &str) -> bool {
+        let Some(index) = self
+            .live()
+            .and_then(|snapshot| snapshot.groups.iter().position(|group| group.name == name))
+        else {
+            return false;
+        };
+        self.group_selection = index;
+        self.runtime_picker = None;
+        true
+    }
+    pub fn select_proxy_member(&mut self, group: &str, member: &str) -> Input {
+        if !self.select_proxy_group(group) {
+            return Input::Idle;
+        }
+        let Some(index) = self
+            .selected_proxy_group()
+            .and_then(|group| group.members.iter().position(|item| item.name == member))
+        else {
+            return Input::Idle;
+        };
+        self.open_runtime_group();
+        let input = self.choose_runtime_member(index);
+        if let Input::Run(
+            Action::Runtime {
+                name,
+                expected_pid: Some(pid),
+                command: Command::Select { group, member },
+            },
+            _,
+        ) = &input
+        {
+            self.pending_proxy_selection = Some(PendingProxySelection {
+                instance: name.clone(),
+                pid: *pid,
+                group: group.clone(),
+                member: member.clone(),
+            });
+        }
+        input
+    }
+    pub fn proxy_member_pending(&self, group: &str, member: &str) -> bool {
+        self.pending_proxy_selection
+            .as_ref()
+            .is_some_and(|pending| {
+                self.active_proxy().is_some_and(|row| {
+                    row.instance.name == pending.instance && row.pid == Some(pending.pid)
+                }) && pending.group == group
+                    && pending.member == member
+            })
+    }
+    pub fn reconcile_proxy_selection(&mut self, name: &str, snapshot: &Snapshot) {
+        if self
+            .pending_proxy_selection
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.instance == name
+                    && (pending.pid != snapshot.pid
+                        || snapshot
+                            .groups
+                            .iter()
+                            .find(|group| group.name == pending.group)
+                            .is_none_or(|group| group.selected.as_ref() == Some(&pending.member)))
+            })
+        {
+            self.pending_proxy_selection = None;
+        }
+    }
+    pub fn reject_proxy_selection(&mut self, action: &Action) {
+        if let Action::Runtime {
+            name,
+            expected_pid: Some(pid),
+            command: Command::Select { group, member },
+        } = action
+        {
+            if self
+                .pending_proxy_selection
+                .as_ref()
+                .is_some_and(|pending| {
+                    &pending.instance == name
+                        && pending.pid == *pid
+                        && &pending.group == group
+                        && &pending.member == member
+                })
+            {
+                self.pending_proxy_selection = None;
+            }
+        }
+    }
+    pub fn filter_connections(&mut self, query: String) {
+        self.connection_filter = query;
+        self.sync_connection_selection();
+    }
+    pub fn show_connection(&mut self, key: ConnectionRowKey) -> Input {
+        if !self.connection_rows().iter().any(|row| row.key == key) {
+            return Input::Idle;
+        }
+        self.select_connection_row_key(key);
+        if !self.toggle_connection_group() {
+            self.live_state.detail_open = true;
+        }
+        Input::Idle
+    }
+    pub fn close_connection(&mut self, id: u64) -> Input {
+        if !self.runtime_error.is_empty()
+            || !self.live().is_some_and(|snapshot| {
+                snapshot
+                    .connections
+                    .iter()
+                    .any(|connection| connection.id == id)
+            })
+        {
+            self.message = t("Connection cannot be verified in the latest sample").into();
+            return Input::Idle;
+        }
+        self.runtime_action(Command::Disconnect(Some(id)))
+    }
+    pub fn close_connection_detail(&mut self) {
+        self.live_state.detail_open = false;
+    }
+    pub fn toggle_traffic_panel(&mut self) {
+        self.traffic_expanded = !self.traffic_expanded;
+    }
+    pub fn cycle_mode(&mut self) -> Input {
+        let Some(snapshot) = self.live() else {
+            return Input::Idle;
+        };
+        self.runtime_action(Command::SetMode(match snapshot.mode {
+            Mode::Rule => Mode::Global,
+            Mode::Global => Mode::Direct,
+            Mode::Direct => Mode::Rule,
+        }))
+    }
+    pub fn toggle_system_proxy(&mut self) -> Input {
+        let Some(value) = self.live().map(|s| !s.system_proxy) else {
+            return Input::Idle;
+        };
+        self.runtime_action(Command::SystemProxy(value))
+    }
+    pub fn toggle_tun(&mut self) -> Input {
+        let Some(value) = self.live().map(|s| !s.tun) else {
+            return Input::Idle;
+        };
+        self.runtime_action(Command::Tun(value))
+    }
+    pub fn toggle_lan(&mut self) -> Input {
+        let Some(value) = self.live().map(|s| !s.allow_lan) else {
+            return Input::Idle;
+        };
+        self.runtime_action(Command::AllowLan(value))
+    }
+}
+impl Client {
+    pub fn move_proxy_group(&mut self, delta: isize) {
+        self.group_selection = self.group_selection.saturating_add_signed(delta).min(
+            self.live()
+                .map_or(0, |snapshot| snapshot.groups.len().saturating_sub(1)),
+        );
+        self.runtime_picker = None;
+    }
+    pub fn proxy_members(&self, query: &str) -> Vec<astra_model::runtime::Member> {
+        let query = query.to_lowercase();
+        self.selected_proxy_group()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.name.to_lowercase().contains(&query)
+                            || group.name.to_lowercase().contains(&query)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn close_connection_row(&mut self, key: ConnectionRowKey) -> Input {
+        match key {
+            ConnectionRowKey::Connection(id) => self.close_connection(id),
+            ConnectionRowKey::Target(_) => Input::Idle,
+        }
+    }
+    pub fn move_connection_selection(&mut self, delta: isize) {
+        let current = self.selected_connection_row_index().unwrap_or(0);
+        self.select_connection(
+            current
+                .saturating_add_signed(delta)
+                .min(self.connection_rows().len().saturating_sub(1)),
+        );
+    }
+    pub fn activate_connection_selection(&mut self) -> Input {
+        if let Some(key) = self.selected_connection_row_key() {
+            self.show_connection(key)
+        } else {
+            Input::Idle
+        }
+    }
+    pub fn close_selected_connection(&mut self) -> Input {
+        if let Some(key) = self.selected_connection_row_key() {
+            self.close_connection_row(key)
+        } else {
+            Input::Idle
+        }
+    }
+}
+impl Client {
+    pub fn filter_proxy_groups(&mut self, query: &str) {
+        self.searches
+            .insert(crate::navigation::PROXIES, query.to_owned());
+        let groups = self.proxy_groups(query);
+        if !groups.iter().any(|group| {
+            self.selected_proxy_group()
+                .is_some_and(|selected| selected.name == group.name)
+        }) {
+            if let Some(group) = groups.first() {
+                self.select_proxy_group(&group.name);
+            }
+        }
+    }
+}
+
+pub fn decimal_bytes(value: &str) -> String {
+    value
+        .parse()
+        .map(bytes)
+        .unwrap_or_else(|_| format!("{value} B"))
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectionActionTarget {
+    pub instance: String,
+    pub pid: u32,
+    pub id: u64,
+}
+impl Client {
+    pub fn connection_action_target(
+        &self,
+        key: &ConnectionRowKey,
+    ) -> Option<ConnectionActionTarget> {
+        let ConnectionRowKey::Connection(id) = key else {
+            return None;
+        };
+        let snapshot = self.connection_snapshot()?;
+        snapshot
+            .connections
+            .iter()
+            .any(|connection| connection.id == *id)
+            .then(|| ConnectionActionTarget {
+                instance: self.runtime_instance.clone(),
+                pid: snapshot.pid,
+                id: *id,
+            })
+    }
+    pub fn close_connection_target(&mut self, target: ConnectionActionTarget) -> Input {
+        if !self
+            .active_proxy()
+            .is_some_and(|row| row.instance.name == target.instance && row.pid == Some(target.pid))
+        {
+            self.message = t("Connection cannot be verified in the latest sample").into();
+            return Input::Idle;
+        }
+        self.close_connection(target.id)
+    }
+    pub fn direct_rate_values(&self) -> [Option<u64>; 2] {
+        let available = self.live_rates_available();
+        self.direct_rates.map(|value| available.then_some(value))
+    }
+}
+
+#[cfg(test)]
+#[path = "test/live_actions_test.rs"]
+mod action_tests;

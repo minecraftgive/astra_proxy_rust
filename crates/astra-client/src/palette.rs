@@ -47,8 +47,57 @@ pub struct Entry {
     pub unavailable: Option<&'static str>,
 }
 
+impl Entry {
+    pub fn requires_editor(&self) -> bool {
+        match &self.run {
+            Intent::NodeImport | Intent::NodeExport(_) => true,
+            Intent::Registered(id) => commands::SPECS
+                .iter()
+                .any(|spec| spec.id == *id && spec.scope == commands::Scope::Editor),
+            _ => false,
+        }
+    }
+}
 impl Client {
+    pub fn palette_matches_for_view(
+        &self,
+        mode: PaletteMode,
+        query: &str,
+        page: usize,
+        editor_active: bool,
+    ) -> Vec<Entry> {
+        self.palette_matches_for_page(mode, query, page)
+            .into_iter()
+            .filter(|entry| editor_active || !entry.requires_editor())
+            .collect()
+    }
+    pub fn run_palette_entry_for_view(
+        &mut self,
+        entry: Entry,
+        page: usize,
+        editor_active: bool,
+    ) -> Input {
+        if entry.requires_editor() && !editor_active {
+            return Input::Idle;
+        }
+        self.page = page;
+        if !editor_active && entry.unavailable.is_none() {
+            if let Intent::Registered(id) = &entry.run {
+                return self.run_page_command(page, *id);
+            }
+        }
+        self.run_palette_entry(entry)
+    }
+
     pub fn palette_entries_in(&self, language: Language, mode: PaletteMode) -> Vec<Entry> {
+        self.palette_entries_for_page(language, mode, self.page)
+    }
+    pub fn palette_entries_for_page(
+        &self,
+        language: Language,
+        mode: PaletteMode,
+        page: usize,
+    ) -> Vec<Entry> {
         let mut entries = Vec::new();
         let chooser = match mode {
             PaletteMode::Commands => None,
@@ -150,7 +199,7 @@ impl Client {
             Intent::Op(Operation::Restart),
             not_running,
         );
-        let force_target = if self.page == PROFILES {
+        let force_target = if page == PROFILES {
             self.selected()
         } else {
             profile
@@ -346,9 +395,17 @@ impl Client {
         entries
     }
     pub fn palette_matches(&self, mode: PaletteMode, query: &str) -> Vec<Entry> {
+        self.palette_matches_for_page(mode, query, self.page)
+    }
+    pub fn palette_matches_for_page(
+        &self,
+        mode: PaletteMode,
+        query: &str,
+        page: usize,
+    ) -> Vec<Entry> {
         let query = query.to_lowercase();
         let current_language = language();
-        let entries = self.palette_entries_in(current_language, mode);
+        let entries = self.palette_entries_for_page(current_language, mode, page);
         if query.is_empty() {
             return entries;
         }
@@ -372,7 +429,7 @@ impl Client {
         // localized entries for display and dispatch; English is a search alias.
         entries
             .into_iter()
-            .zip(self.palette_entries_in(Language::English, mode))
+            .zip(self.palette_entries_for_page(Language::English, mode, page))
             .filter_map(|(entry, english)| {
                 (matches(&entry, current_language) || matches(&english, Language::English))
                     .then_some(entry)

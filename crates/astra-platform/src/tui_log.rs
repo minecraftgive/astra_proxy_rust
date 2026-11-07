@@ -8,6 +8,25 @@ use std::{
 };
 
 pub struct Log(Mutex<File>);
+static GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Select the process-local frontend activity log before starting background work.
+pub fn use_gui_log() {
+    GUI.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn source_file(source: &str) -> Option<&'static str> {
+    match source {
+        "@tui" => Some("tui.log"),
+        "@gui" => Some("gui.log"),
+        _ => None,
+    }
+}
+pub fn frontend_path(home: &Path) -> std::path::PathBuf {
+    home.join(if GUI.load(std::sync::atomic::Ordering::Relaxed) {
+        "gui.log"
+    } else {
+        "tui.log"
+    })
+}
 pub fn stamp(ms: u64) -> String {
     chrono::DateTime::<chrono::Local>::from(
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms),

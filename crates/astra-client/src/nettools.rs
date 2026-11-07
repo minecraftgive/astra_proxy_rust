@@ -152,6 +152,88 @@ impl View {
         }
         self.kind = kind;
     }
+    pub fn select_egress(&mut self, index: usize) {
+        if index < self.egresses.len() {
+            self.egress = index;
+            self.egress_query.clear();
+        }
+    }
+    pub fn set_text(&mut self, field: Field, value: String) -> Result<(), String> {
+        match field {
+            Field::Target => self.target = value,
+            Field::Server => self.server = value,
+            Field::Record if RECORDS.contains(&value.as_str()) => self.record = value,
+            Field::Count => {
+                self.count = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=MAX_COUNT).contains(n))
+                    .ok_or_else(|| format!("{}: 1–{MAX_COUNT}", t("Count")))?
+            }
+            _ => return Err(t("Invalid value").into()),
+        }
+        Ok(())
+    }
+    pub fn egress_choices(&self, query: &str) -> Vec<(usize, String)> {
+        let query = query.to_lowercase();
+        self.egresses
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, egress_label(e)))
+            .filter(|(_, label)| label.to_lowercase().contains(&query))
+            .collect()
+    }
+    pub fn output(&self) -> Vec<String> {
+        let mut output = vec![];
+        if let Some(note) = &self.note {
+            output.push(clean(note));
+        }
+        for attempt in &self.attempts {
+            output.push(match (&attempt.error, attempt.rtt_ms) {
+                (None, Some(ms)) => format!(
+                    "#{:<3} {:>9.2} ms  {}",
+                    attempt.seq,
+                    ms,
+                    clean(&attempt.detail)
+                ),
+                (error, _) => format!(
+                    "#{:<3} {:>12}  {}",
+                    attempt.seq,
+                    t("failed"),
+                    clean(error.as_deref().unwrap_or_default())
+                ),
+            });
+        }
+        if self.running() {
+            output.push(t("Testing…").into());
+        }
+        if let Some(summary) = &self.summary {
+            let stats = match (summary.min_ms, summary.avg_ms, summary.max_ms) {
+                (Some(min), Some(avg), Some(max)) => {
+                    format!(" · min/avg/max {min:.2}/{avg:.2}/{max:.2} ms")
+                }
+                _ => String::new(),
+            };
+            output.push(format!(
+                "{}{stats}",
+                tr!(
+                    "{} sent · {} received · {}% loss",
+                    summary.sent,
+                    summary.received,
+                    summary.loss_percent()
+                )
+            ));
+        }
+        if let Some(error) = &self.error {
+            output.push(clean(error));
+        }
+        if output.is_empty() {
+            output.push(
+                t("Pick an egress (system route, adapter or outbound), then press Enter").into(),
+            );
+        }
+        output
+    }
     pub fn request(&self) -> Result<Request, String> {
         let target = self.target.trim();
         if target.is_empty() {

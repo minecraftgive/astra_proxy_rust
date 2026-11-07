@@ -124,6 +124,55 @@ pub struct Context {
     pub language: Language,
 }
 impl Context {
+    pub fn graphical(&self) -> bool {
+        self.executable
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case("astra-gui")
+                        || name.eq_ignore_ascii_case("astra-server-gui")
+                } else {
+                    name == "astra-gui" || name == "astra-server-gui"
+                }
+            })
+    }
+    /// Preserve storage and manager identity while selecting the companion frontend.
+    pub fn for_frontend(&self, frontend: crate::preferences::StartupFrontend) -> Result<Self> {
+        use crate::preferences::StartupFrontend;
+        let stem = self
+            .executable
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let folded = if cfg!(windows) {
+            stem.to_ascii_lowercase()
+        } else {
+            stem.to_owned()
+        };
+        let server = match folded.as_str() {
+            "astra-server-tui" | "astra-server-gui" => true,
+            "astra-tui" | "astra-gui" => false,
+            _ => anyhow::bail!("Cannot identify the current interface executable"),
+        };
+        let name = match (server, frontend) {
+            (false, StartupFrontend::Tui) => "astra-tui",
+            (false, StartupFrontend::Gui) => "astra-gui",
+            (true, StartupFrontend::Tui) => "astra-server-tui",
+            (true, StartupFrontend::Gui) => "astra-server-gui",
+        };
+        let sibling = self
+            .executable
+            .with_file_name(astra_platform::platform::executable(name));
+        let mut context = self.clone();
+        context.executable =
+            if sibling.is_file() || self.executable.parent() == Some(self.bin.as_path()) {
+                sibling
+            } else {
+                self.bin.join(astra_platform::platform::executable(name))
+            };
+        Ok(context)
+    }
     pub fn arguments(&self, launch: &Launch) -> Vec<OsString> {
         let mut args = vec![
             "--state-dir".into(),
@@ -194,7 +243,7 @@ impl Context {
                 "No supported terminal is installed; install a terminal and rescan in Settings"
             );
         }
-        if let Ok(log) = crate::tui_log::Log::open(&self.home.join("tui.log")) {
+        if let Ok(log) = crate::tui_log::Log::open(&crate::tui_log::frontend_path(&self.home)) {
             log.write("window", &format!("opened {title}"));
         }
         Ok(())

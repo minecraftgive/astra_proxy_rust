@@ -284,3 +284,37 @@ fn bridge_child() {
     }
     std::process::exit(23);
 }
+
+#[test]
+fn external_command_resolution_rejects_missing_programs_and_preserves_paths() {
+    let executable = std::env::current_exe().unwrap();
+    assert_eq!(resolve_command(&executable).unwrap(), executable);
+    assert!(resolve_command(Path::new("/nonexistent/astra-terminal-command-test")).is_err());
+}
+
+#[test]
+fn external_editor_terminal_templates_do_not_add_frontend_arguments() {
+    let arguments = [
+        OsString::from("--wait"),
+        OsString::from("/tmp/config ' $();.toml"),
+    ];
+    let script = script_body(
+        Path::new("/usr/bin/editor"),
+        &arguments,
+        Path::new("/tmp/private-editor"),
+    )
+    .unwrap();
+    assert!(script.contains("exec '/usr/bin/editor' '--wait' '/tmp/config '\"'\"' $();.toml'"));
+    assert!(!script.contains("--terminal-child"));
+    let candidate = Candidate {
+        id: "xterm".into(),
+        label: "xterm".into(),
+        executable: Some("/usr/bin/xterm".into()),
+    };
+    let command = std::iter::once(OsString::from("/usr/bin/editor"))
+        .chain(arguments)
+        .collect::<Vec<_>>();
+    let launch = invocation(&candidate, Platform::Linux, &command).unwrap();
+    assert_eq!(&launch.args[1..], command);
+    assert!(!launch.args.iter().any(|arg| arg == "--terminal-child"));
+}

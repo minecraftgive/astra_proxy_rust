@@ -130,11 +130,11 @@ fn arguments(context: &Context, target: &Target, silent: bool) -> Result<OsStrin
         OsString::from("--bin-dir"),
         shell_path(&std::path::absolute(&context.bin)?),
     ];
-    args.push(OsString::from(if silent {
-        "--silent"
-    } else {
-        "--native-console"
-    }));
+    if silent {
+        args.push(OsString::from("--silent"));
+    } else if !context.graphical() {
+        args.push(OsString::from("--native-console"));
+    }
     if let Some((endpoint, agent)) = target {
         args.extend([
             OsString::from("--endpoint"),

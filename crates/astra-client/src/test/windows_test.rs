@@ -71,3 +71,34 @@ fn terminal_script_quoting_keeps_metacharacters_literal() {
     assert_eq!(shell_quote("a'b;$()"), "'a'\"'\"'b;$()'");
     assert_eq!(apple_quote("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
 }
+
+#[test]
+fn companion_frontends_preserve_server_role_and_storage_arguments() {
+    use crate::preferences::StartupFrontend;
+    for (source, gui, tui) in [
+        ("astra-gui", "astra-gui", "astra-tui"),
+        ("astra-server-tui", "astra-server-gui", "astra-server-tui"),
+    ] {
+        let context = Context {
+            executable: PathBuf::from("bundle").join(astra_platform::platform::executable(source)),
+            home: "state".into(),
+            config: "config".into(),
+            bin: "bundle".into(),
+            language: Language::Traditional,
+        };
+        for (choice, expected) in [(StartupFrontend::Gui, gui), (StartupFrontend::Tui, tui)] {
+            let companion = context.for_frontend(choice).unwrap();
+            assert_eq!(
+                companion.executable,
+                PathBuf::from("bundle").join(astra_platform::platform::executable(expected))
+            );
+            assert_eq!(companion.home, context.home);
+            assert_eq!(companion.config, context.config);
+            assert_eq!(companion.graphical(), choice == StartupFrontend::Gui);
+            assert_eq!(
+                companion.arguments(&Launch::default()),
+                context.arguments(&Launch::default())
+            );
+        }
+    }
+}

@@ -497,26 +497,54 @@ fn script_body(executable: &Path, args: &[OsString], parent: &Path) -> Result<St
     ))
 }
 
+pub fn resolve_command(executable: &Path) -> Result<PathBuf> {
+    if executable.components().count() == 1 && !executable.is_absolute() {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&paths) {
+                let path = directory.join(executable);
+                if executable_file(&path, false) {
+                    return Ok(std::path::absolute(path)?);
+                }
+                #[cfg(windows)]
+                if path.extension().is_none() {
+                    let path = path.with_extension("exe");
+                    if executable_file(&path, false) {
+                        return Ok(std::path::absolute(path)?);
+                    }
+                }
+            }
+        }
+    }
+    let path = std::path::absolute(executable)?;
+    anyhow::ensure!(
+        executable_file(&path, false),
+        "Executable is unavailable: {}",
+        path.display()
+    );
+    Ok(path)
+}
+
 /// Missing selections and failed terminal spawns try the same ordered Auto
 /// choices, then leave native/current-terminal fallback to the caller.
 pub fn launch(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOutcome> {
+    let mut arguments = args.to_vec();
+    arguments.push("--terminal-child".into());
+    launch_command(id, executable, &arguments)
+}
+
+/// Launch an arbitrary executable using the same fixed terminal templates.
+/// A bare command name is resolved from PATH; argument values never enter a shell command.
+pub fn launch_command(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOutcome> {
     let platform = Platform::current();
     if id == "native" && platform == Platform::Windows {
         return Ok(LaunchOutcome::Native);
     }
-    let executable = std::path::absolute(executable)?;
-    anyhow::ensure!(
-        executable.is_file(),
-        "TUI executable is unavailable: {}",
-        executable.display()
-    );
+    let executable = resolve_command(executable)?;
     let candidates = discover();
     let selected = ordered(id, &candidates);
     if selected.is_empty() {
         return Ok(LaunchOutcome::Native);
     }
-    let mut args = args.to_vec();
-    args.push("--terminal-child".into());
     let command = if platform == Platform::Windows {
         let Some(system) = std::env::var_os("SystemRoot")
             .map(PathBuf::from)
@@ -528,7 +556,7 @@ pub fn launch(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOu
         if !powershell.is_file() {
             return Ok(LaunchOutcome::Native);
         }
-        powershell_bridge(&executable, &args, &powershell)?
+        powershell_bridge(&executable, args, &powershell)?
     } else {
         std::iter::once(executable.as_os_str().to_owned())
             .chain(args.iter().cloned())
@@ -537,7 +565,7 @@ pub fn launch(id: &str, executable: &Path, args: &[OsString]) -> Result<LaunchOu
     for candidate in selected {
         #[cfg(target_os = "macos")]
         let (invocation, script) = if candidate.id == "terminal" {
-            let script = terminal_script(&executable, &args)?;
+            let script = terminal_script(&executable, args)?;
             (
                 Invocation {
                     program: "/usr/bin/open".into(),

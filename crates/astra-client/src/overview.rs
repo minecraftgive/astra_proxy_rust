@@ -20,6 +20,63 @@ pub enum InstanceState {
     Starting,
     Error,
 }
+
+pub struct Header {
+    pub name: Option<String>,
+    pub state: InstanceState,
+    pub connected: bool,
+    pub connect_label: &'static str,
+    pub uptime: String,
+    pub mode: Option<astra_model::runtime::Mode>,
+    pub mode_label: &'static str,
+    pub exit_chain: String,
+    pub delay_ms: Option<u64>,
+    pub alive: Option<bool>,
+    pub rates: [Option<u64>; 2],
+}
+
+impl Client {
+    pub fn header(&self) -> Header {
+        let row = if self.kind == Kind::Server {
+            self.selected()
+        } else {
+            self.active_proxy()
+        };
+        let snapshot = self.live();
+        let (chain, delay_ms, alive) = snapshot.map(crate::live::exit_chain).unwrap_or_default();
+        let connected = row.is_some_and(|row| row.pid.is_some());
+        let mode = snapshot.map(|snapshot| snapshot.mode);
+        Header {
+            name: row.map(|row| row.instance.name.clone()),
+            state: row.map(indicator_state).unwrap_or(InstanceState::Stopped),
+            connected,
+            connect_label: t(if connected { "Disconnect" } else { "Connect" }),
+            uptime: row
+                .map(|row| crate::format::duration(row.uptime))
+                .unwrap_or_default(),
+            mode,
+            mode_label: t(match mode {
+                Some(astra_model::runtime::Mode::Rule) => "Rule",
+                Some(astra_model::runtime::Mode::Global) => "Global",
+                Some(astra_model::runtime::Mode::Direct) => "Direct",
+                None => "—",
+            }),
+            exit_chain: chain.join(" ▸ "),
+            delay_ms,
+            alive,
+            rates: self
+                .rates
+                .map(|rate| self.live_rates_available().then_some(rate)),
+        }
+    }
+    pub fn toggle_current(&mut self) -> crate::state::Input {
+        if self.kind == Kind::Server {
+            self.server_action(crate::intents::ServerAction::Toggle)
+        } else {
+            self.toggle_active()
+        }
+    }
+}
 pub fn indicator_state(row: &Row) -> InstanceState {
     if row.state == "Starting" || row.state == "Stopping" {
         InstanceState::Starting

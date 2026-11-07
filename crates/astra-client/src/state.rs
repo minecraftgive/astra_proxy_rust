@@ -175,6 +175,8 @@ pub struct Recovery {
 #[serde(deny_unknown_fields)]
 pub struct Session {
     #[serde(default)]
+    pub gui_windows: Vec<usize>,
+    #[serde(default)]
     pub session_version: u32,
     #[serde(default)]
     pub keymap_version: u32,
@@ -214,6 +216,7 @@ pub fn launch_directory() -> PathBuf {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            gui_windows: Vec::new(),
             session_version: 1,
             keymap_version: drafts::KEYMAP_VERSION,
             keymap_notice_pending: false,
@@ -355,6 +358,7 @@ impl Session {
 }
 
 pub struct Client {
+    pub pending_proxy_selection: Option<crate::live::PendingProxySelection>,
     pub monitor: Option<crate::monitor::View>,
     pub marquee_hold: Option<(Instant, Instant, bool)>,
     pub terminals: crate::settings::TerminalState,
@@ -430,6 +434,7 @@ impl Client {
         let migration = session.keymap_notice_pending;
         Self {
             monitor: None,
+            pending_proxy_selection: None,
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             startup_context: None,
             #[cfg(windows)]
@@ -680,6 +685,7 @@ impl Client {
         self
     }
     pub fn reset_runtime_identity(&mut self) {
+        self.pending_proxy_selection = None;
         self.live_state = Default::default();
         self.connection_selection = 0;
         self.runtime_instance.clear();
@@ -734,6 +740,7 @@ impl Client {
         }
         // An immediate command result is not a sample from the host clock.
         if telemetry.is_none() && self.runtime_telemetry.is_some() && !identity_changed {
+            self.reconcile_proxy_selection(&name, &snapshot);
             self.track_new_connections(&snapshot);
             self.runtime_instance = name;
             self.runtime_snapshot = Some(snapshot);
@@ -785,6 +792,7 @@ impl Client {
         }
         self.runtime_received = Some(Instant::now());
         self.runtime_sample = Instant::now();
+        self.reconcile_proxy_selection(&name, &snapshot);
         self.track_new_connections(&snapshot);
         self.runtime_instance = name;
         self.runtime_snapshot = Some(snapshot);

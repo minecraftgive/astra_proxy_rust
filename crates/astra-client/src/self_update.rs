@@ -128,17 +128,22 @@ pub fn resolve(context: &windows::Context, release_id: &str) -> Result<Option<wi
         .file_name()
         .and_then(|name| name.to_str())
         .context("Cannot identify the current interface executable")?;
-    let component = ["astra-tui", "astra-server-tui"]
-        .into_iter()
-        .find(|component| {
-            let expected = astra_platform::platform::executable(component);
-            if cfg!(windows) {
-                name.eq_ignore_ascii_case(&expected)
-            } else {
-                name == expected
-            }
-        })
-        .context("Only Astra interface executables can restart after an update")?;
+    let component = [
+        "astra-tui",
+        "astra-server-tui",
+        "astra-gui",
+        "astra-server-gui",
+    ]
+    .into_iter()
+    .find(|component| {
+        let expected = astra_platform::platform::executable(component);
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(&expected)
+        } else {
+            name == expected
+        }
+    })
+    .context("Only Astra interface executables can restart after an update")?;
     anyhow::ensure!(
         release.manifest.components.contains_key(component),
         "The selected release does not contain {component}"

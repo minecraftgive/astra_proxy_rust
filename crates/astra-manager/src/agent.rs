@@ -516,7 +516,7 @@ impl AgentService {
                     reader
                 } else {
                     anyhow::ensure!(
-                        instance == "@tui"
+                        crate::tui_log::source_file(&instance).is_some()
                             || self
                                 .call(old::Action::List)
                                 .await?
@@ -528,11 +528,13 @@ impl AgentService {
                     let (reader, writer) = astra_platform::platform::stream_pair().await?;
                     tokio::spawn(crate::log_stream::serve(
                         writer,
-                        self.config.state_dir.join(if instance == "@tui" {
-                            "tui.log".into()
-                        } else {
-                            format!("{instance}.log")
-                        }),
+                        self.config.state_dir.join(
+                            if let Some(file) = crate::tui_log::source_file(&instance) {
+                                file.into()
+                            } else {
+                                format!("{instance}.log")
+                            },
+                        ),
                         cursor,
                     ));
                     reader

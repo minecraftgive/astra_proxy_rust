@@ -206,3 +206,23 @@ fn shortcut_com_round_trip_in_temporary_directory_only() {
     }
     std::fs::remove_file(context.executable).unwrap();
 }
+
+#[test]
+fn graphical_startup_does_not_request_a_terminal_console() {
+    let mut context = context();
+    context.executable = context.executable.with_file_name("astra-gui.exe");
+    let args = parse_arguments(&arguments(&context, &None, false).unwrap());
+    assert!(!args.contains(&OsString::from("--native-console")));
+    assert!(!args.contains(&OsString::from("--silent")));
+    let silent = parse_arguments(&arguments(&context, &None, true).unwrap());
+    assert!(silent.contains(&OsString::from("--silent")));
+    assert_ne!(
+        shortcut_name(&context, &None),
+        shortcut_name(
+            &context
+                .for_frontend(crate::preferences::StartupFrontend::Tui)
+                .unwrap(),
+            &None
+        )
+    );
+}

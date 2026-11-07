@@ -272,6 +272,25 @@ pub fn repeatable(key: crate::input::Key) -> bool {
             .any(|spec| spec.id == id && spec.repeat == Repeat::Navigation)
     })
 }
+/// Scope groups for native help, using the same command descriptions as terminal help.
+pub fn help_groups() -> Vec<(&'static str, Vec<&'static Spec>)> {
+    [
+        (Scope::Global, "General"),
+        (Scope::Live, "Runtime and traffic"),
+        (Scope::Editor, "Configuration editor"),
+    ]
+    .into_iter()
+    .map(|(scope, label)| {
+        (
+            label,
+            SPECS
+                .iter()
+                .filter(|spec| spec.scope == scope && !spec.key.is_empty())
+                .collect(),
+        )
+    })
+    .collect()
+}
 pub fn help() -> String {
     let mut text = String::from(t("Tab / Shift-Tab  Focus region\n↑↓ / Home / End / PgUp / PgDn  Navigate\nEnter  Activate focused item\nEsc  Back; configuration drafts are retained\n1–7  Pages (outside text input)\nCtrl-Z / Ctrl-Y  Undo / redo draft\nInsert / Delete  Add / remove selected item\n\n"));
     for spec in SPECS.iter().filter(|s| !s.key.is_empty()) {

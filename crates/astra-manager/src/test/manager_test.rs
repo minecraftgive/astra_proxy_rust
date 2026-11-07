@@ -1524,3 +1524,43 @@ async fn live_cores_and_config_lifecycle() {
     assert_eq!(manager.registry.instances.len(), 3);
     assert!(manager.running.is_empty());
 }
+
+#[tokio::test]
+async fn gui_and_legacy_tui_log_sources_stream_distinct_private_files() {
+    let temp = Temp::new();
+    let socket = temp.0.join("manager.sock");
+    let task = tokio::spawn(serve(temp.0.clone(), PathBuf::from("/nonexistent")));
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    crate::tui_log::Log::open(&temp.0.join("gui.log"))
+        .unwrap()
+        .write("gui", "native-window-ready");
+    crate::tui_log::Log::open(&temp.0.join("tui.log"))
+        .unwrap()
+        .write("tui", "terminal-window-ready");
+    for (source, expected) in [
+        ("@gui", "native-window-ready"),
+        ("@tui", "terminal-window-ready"),
+    ] {
+        let mut stream = crate::log_stream::connect(&socket, source.into(), None)
+            .await
+            .unwrap();
+        let event: LogEvent = timeout(
+            Duration::from_secs(1),
+            astra_ipc::receive_management(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(event,LogEvent::Data{bytes,..}if String::from_utf8_lossy(&bytes).contains(expected)),
+            "source {source}"
+        );
+    }
+    call(&socket, Action::Shutdown).await.unwrap();
+    task.await.unwrap().unwrap();
+}

@@ -253,6 +253,114 @@ impl View {
             Event::Done => {}
         }
     }
+    pub fn toggle_target(&mut self, index: usize) {
+        if let Some(tag) = self.targets.get(index) {
+            self.cursor = index;
+            if !self.checked.remove(tag) {
+                self.checked.insert(tag.clone());
+            }
+        }
+    }
+    pub fn select_all(&mut self, selected: bool) {
+        self.checked = if selected {
+            self.targets.iter().cloned().collect()
+        } else {
+            Default::default()
+        };
+    }
+    pub fn run_selected(&mut self) {
+        if self.receiver.is_some() {
+            return;
+        }
+        if self.targets.is_empty() {
+            self.request(true);
+        } else if self.checked.is_empty() {
+            self.error = Some(t("Select at least one node").into());
+        } else {
+            self.report = None;
+            self.request(false);
+        }
+    }
+    pub fn stop(&mut self) {
+        if self.receiver.is_none() || self.loading {
+            return;
+        }
+        self.finished = Some(Instant::now());
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.receiver = None;
+        self.active.clear();
+        self.error = Some(t("Diagnostics interrupted").into());
+    }
+    pub fn rows(&self) -> Vec<TargetRow> {
+        self.targets
+            .iter()
+            .map(|tag| {
+                let probe = self
+                    .report
+                    .as_ref()
+                    .and_then(|r| r.probes.iter().find(|p| &p.outbound == tag));
+                let (state, success) = if let Some(probe) = probe {
+                    (
+                        t(if probe.connect_ms.is_some() {
+                            "Connected"
+                        } else {
+                            "Connection failed"
+                        }),
+                        Some(probe.connect_ms.is_some()),
+                    )
+                } else if self.receiver.is_some() && !self.loading && self.submitted.contains(tag) {
+                    (
+                        t(if self.tcp.contains_key(tag) {
+                            "Querying exit IP…"
+                        } else if self.active.contains(tag) {
+                            "Testing…"
+                        } else {
+                            "Queued"
+                        }),
+                        None,
+                    )
+                } else {
+                    ("—", None)
+                };
+                TargetRow {
+                    name: clean(tag),
+                    checked: self.checked.contains(tag),
+                    state: state.into(),
+                    success,
+                    latency_ms: probe
+                        .and_then(|p| p.connect_ms)
+                        .or_else(|| self.tcp.get(tag).copied()),
+                    ip: probe.and_then(|p| p.ip).map(|ip| ip.to_string()),
+                    error: probe.and_then(|p| p.error.clone()),
+                }
+            })
+            .collect()
+    }
+    pub fn progress(&self) -> String {
+        if self.loading {
+            return t("Loading nodes…").into();
+        }
+        let completed = self.report.as_ref().map_or(0, |r| r.probes.len());
+        self.started
+            .map(|start| {
+                crate::tr!(
+                    "Progress {}/{} · Running {} · Queued {} · {}s",
+                    completed,
+                    self.submitted.len(),
+                    self.active.len(),
+                    self.submitted
+                        .len()
+                        .saturating_sub(completed + self.active.len()),
+                    self.finished
+                        .unwrap_or_else(Instant::now)
+                        .duration_since(start)
+                        .as_secs()
+                )
+            })
+            .unwrap_or_else(|| t("Select nodes, then press Enter to test").into())
+    }
     pub fn key(&mut self, key: KeyEvent) {
         if let Some(tools) = &mut self.tools {
             if !tools.key(key) {
@@ -313,4 +421,15 @@ impl View {
 }
 pub fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
+}
+
+#[derive(Clone)]
+pub struct TargetRow {
+    pub name: String,
+    pub checked: bool,
+    pub state: String,
+    pub success: Option<bool>,
+    pub latency_ms: Option<u64>,
+    pub ip: Option<String>,
+    pub error: Option<String>,
 }
