@@ -70,7 +70,13 @@ fn shortcuts_keep_working_after_palette_result_and_navigation(cx: &mut TestAppCo
                 app.execute(Id::Tasks, window, cx);
                 assert!(!app.palette);
                 assert_eq!(app.panel, Some(Panel::Tasks));
-                assert!(app.focus.is_focused(window));
+                assert!(
+                    app.focus.is_focused(window)
+                        || app
+                            .mounted
+                            .as_ref()
+                            .is_some_and(|mounted| mounted.focus.is_focused(window))
+                );
             })
         })
         .unwrap();
@@ -86,7 +92,13 @@ fn shortcuts_keep_working_after_palette_result_and_navigation(cx: &mut TestAppCo
                 assert!(app.palette);
                 // The same path used by clicking the sidebar while search has focus.
                 app.navigate(5, window, cx);
-                assert!(app.focus.is_focused(window));
+                assert!(
+                    app.focus.is_focused(window)
+                        || app
+                            .mounted
+                            .as_ref()
+                            .is_some_and(|mounted| mounted.focus.is_focused(window))
+                );
             })
         })
         .unwrap();
@@ -151,7 +163,13 @@ fn printable_shortcuts_are_text_in_search_fields(cx: &mut TestAppContext) {
                     assert!(!app.palette);
                     assert!(!app.profile_chooser);
                     assert_eq!(app.panel, Some(Panel::Tasks));
-                    assert!(app.focus.is_focused(window));
+                    assert!(
+                        app.focus.is_focused(window)
+                            || app
+                                .mounted
+                                .as_ref()
+                                .is_some_and(|mounted| mounted.focus.is_focused(window))
+                    );
                 });
             })
             .unwrap();
@@ -222,4 +240,40 @@ fn only_the_visible_focused_editor_receives_keys_and_undo_runs_once(cx: &mut Tes
         assert!(!app.profile_chooser);
     });
     assert!(!receiver.is_closed());
+}
+
+#[gpui::test]
+fn server_windows_reject_proxy_pages_in_navigation_and_shortcuts(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, _) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Server, commands));
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model.clone(), None, window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "1 2 3 4 alt-1 alt-2 alt-3 alt-4");
+    assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.page.unwrap_or(app.model.read(cx).client.page), 5)
+    });
+    handle
+        .update(cx, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                for page in 0..4 {
+                    app.navigate(page, window, cx);
+                }
+                assert_ne!(app.page, Some(0));
+            })
+        })
+        .unwrap();
+    cx.simulate_keystrokes(handle.into(), "7 alt-7");
+    assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+    app.read_with(cx, |app, _| assert_eq!(app.page, Some(6)));
 }

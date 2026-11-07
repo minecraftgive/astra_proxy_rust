@@ -22,7 +22,9 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     };
     // Native inputs own text and editing shortcuts. App navigation (for example
     // F1 and Ctrl-K) remains available. The shared editor also owns printable keys.
-    let shell = context("Astra && !Input && !AstraDialog");
+    let shell =
+        context("Astra && !Input && !AstraDialog && !AstraEditor && !AstraLogs && !AstraPalette");
+    let live = context("AstraLive && !Input && !AstraDialog");
     let editor = context("AstraEditor && !Input && !AstraDialog");
     let application = context("(Astra || AstraEditor) && !AstraDialog");
     let non_input = context("(Astra || AstraEditor) && !Input && !AstraDialog");
@@ -33,7 +35,7 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
             let chord = chord.to_ascii_lowercase();
             let context = match spec.scope {
                 Scope::Editor => &editor,
-                Scope::Live => &shell,
+                Scope::Live => &live,
                 Scope::Global if chord.chars().count() == 1 || chord == "space" => &shell,
                 Scope::Global if matches!(spec.id, Id::Quit | Id::Search) => &non_input,
                 Scope::Global => &application,

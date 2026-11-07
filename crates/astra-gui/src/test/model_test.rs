@@ -143,13 +143,10 @@ fn quit_result_checkpoints_current_session_and_draft_before_closing(cx: &mut Tes
             },
             cx,
         );
-        assert!(model.commands.is_closed());
+        assert!(!model.commands.is_closed());
     });
-    // The native quit observer runs after an explicit quit request and must not
-    // enqueue a second checkpoint or try to write into the now-closed channel.
-    cx.update(|cx| cx.shutdown());
     assert!(matches!(incoming.try_recv(), Ok(BackendCmd::Cancel(7))));
-    let BackendCmd::Checkpoint(session) = incoming.try_recv().unwrap() else {
+    let BackendCmd::CheckpointForQuit { session } = incoming.try_recv().unwrap() else {
         panic!("quit result must enqueue a checkpoint");
     };
     assert_eq!(session.active_profile.as_deref(), Some("proxy"));
@@ -158,6 +155,12 @@ fn quit_result_checkpoints_current_session_and_draft_before_closing(cx: &mut Tes
     assert_eq!(editor.original, original);
     assert_eq!(editor.text(), edited);
     assert_eq!(session.drafts["proxy\n"].editor.text(), edited);
+    // The native exit is allowed only after the backend confirms durable storage.
+    assert!(incoming.is_empty());
+    model.update(cx, |model, cx| {
+        model.apply(BackendEvent::QuitCheckpoint(Ok(())), cx)
+    });
+    cx.update(|cx| cx.shutdown());
     assert!(matches!(
         incoming.try_recv(),
         Err(async_channel::TryRecvError::Closed)
@@ -200,6 +203,8 @@ fn quitting_before_ready_does_not_overwrite_the_session_with_defaults(cx: &mut T
 
 #[gpui::test]
 fn quit_reports_checkpoint_failure_when_backend_is_closed(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(gpui_component::init);
     let (commands, incoming) = async_channel::unbounded();
     incoming.close();
     let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
@@ -210,5 +215,199 @@ fn quit_reports_checkpoint_failure_when_backend_is_closed(cx: &mut TestAppContex
             model.client.message,
             astra_client::tr!("Cannot save session: {}", "sending into a closed channel")
         );
+    });
+}
+
+fn restart_target() -> astra_client::windows::Context {
+    astra_client::windows::Context {
+        executable: "new/astra-gui".into(),
+        home: "state".into(),
+        config: "config".into(),
+        bin: "new".into(),
+        language: astra_client::i18n::Language::English,
+    }
+}
+#[gpui::test]
+fn failed_restart_checkpoint_preserves_live_interface_and_window_snapshot(cx: &mut TestAppContext) {
+    let (commands, incoming) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        model.ready = true;
+        model.register_window(8, 2);
+        model.register_window(4, 6);
+        model.client.input = "unsaved prompt".into();
+        model.checkpoint_restart(restart_target());
+    });
+    let BackendCmd::CheckpointForRestart { id, session } = incoming.try_recv().unwrap() else {
+        panic!("missing checkpoint")
+    };
+    assert_eq!(session.gui_windows, vec![6, 2]);
+    assert_eq!(session.input, "unsaved prompt");
+    model.update(cx, |model, cx| {
+        model.apply(
+            BackendEvent::RestartCheckpoint {
+                id,
+                result: Err("disk full".into()),
+            },
+            cx,
+        );
+        assert!(!model.commands.is_closed());
+        assert!(!model.quit_prepared);
+        assert!(model.restart_pending.is_none());
+        assert!(model.restart_plan.lock().unwrap().is_none());
+        assert!(model
+            .client
+            .recovery
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("disk full"));
+        assert_eq!(model.client.input, "unsaved prompt");
+    });
+}
+#[gpui::test]
+fn restart_waits_for_durable_latest_window_and_draft_snapshot(cx: &mut TestAppContext) {
+    let (commands, incoming) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        model.ready = true;
+        model.register_window(1, 0);
+        model.register_window(2, 6);
+        model.checkpoint_restart(restart_target());
+        assert!(!model.commands.is_closed());
+        model.update_window(2, 3);
+        model.client.input = "new edit while saving".into();
+    });
+    let BackendCmd::CheckpointForRestart { id, .. } = incoming.try_recv().unwrap() else {
+        panic!("missing checkpoint")
+    };
+    model.update(cx, |model, cx| {
+        model.apply(BackendEvent::RestartCheckpoint { id, result: Ok(()) }, cx)
+    });
+    let BackendCmd::CheckpointForRestart {
+        id: latest,
+        session,
+    } = incoming.try_recv().unwrap()
+    else {
+        panic!("changed state must be checkpointed again")
+    };
+    assert_ne!(latest, id);
+    assert_eq!(session.gui_windows, vec![0, 3]);
+    assert_eq!(session.input, "new edit while saving");
+    model.update(cx, |model, cx| {
+        model.apply(
+            BackendEvent::RestartCheckpoint {
+                id: latest,
+                result: Ok(()),
+            },
+            cx,
+        );
+        assert!(model.commands.is_closed());
+        assert!(model.quit_prepared);
+        let plan = model.restart_plan.lock().unwrap();
+        let (target, launch) = plan.as_ref().unwrap();
+        assert_eq!(target.executable, std::path::PathBuf::from("new/astra-gui"));
+        assert_eq!(launch.view, Some(astra_client::windows::View::Dashboard));
+    });
+}
+#[gpui::test]
+fn cancelled_tasks_finish_and_late_results_do_not_open_views(cx: &mut TestAppContext) {
+    let (commands, incoming) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, cx| {
+        model.start(Action::UpdateStatus, cx);
+        let id = model.next_job;
+        model.cancel_task(id, cx);
+        assert!(model
+            .client
+            .tasks
+            .records
+            .back()
+            .unwrap()
+            .finished
+            .is_some());
+        model.apply(
+            BackendEvent::JobDone {
+                id,
+                action: Box::new(Action::UpdateStatus),
+                result: Box::new(JobResult::Done {
+                    message: "late result".into(),
+                    rows: None,
+                    quit: false,
+                }),
+                origin: model.origin(),
+            },
+            cx,
+        );
+        assert_ne!(model.client.message, "late result");
+    });
+    assert!(matches!(incoming.try_recv(), Ok(BackendCmd::Start(_))));
+    assert!(matches!(incoming.try_recv(), Ok(BackendCmd::Cancel(1))));
+}
+
+#[gpui::test]
+fn task_history_caps_final_events_and_rejects_a_full_running_queue(cx: &mut TestAppContext) {
+    let (commands, incoming) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, cx| {
+        for id in 1..=32 {
+            model
+                .client
+                .tasks
+                .records
+                .push_back(astra_client::tasks::Record {
+                    id,
+                    title: "test".into(),
+                    started: std::time::Instant::now(),
+                    finished: None,
+                    events: std::iter::repeat_n("progress".into(), 128).collect(),
+                });
+        }
+        model.next_job = 32;
+        model.start(Action::UpdateStatus, cx);
+        assert_eq!(model.client.tasks.records.len(), 32);
+        assert!(incoming.try_recv().is_err());
+        assert!(model.client.tasks.verdict.as_ref().unwrap().1);
+        model.apply(
+            BackendEvent::Rejected {
+                id: 1,
+                message: "rejected for test".into(),
+            },
+            cx,
+        );
+        let first = model.client.tasks.records.front().unwrap();
+        assert_eq!(first.events.len(), 128);
+        assert_eq!(first.events.back().unwrap(), "rejected for test");
+        assert_eq!(
+            model.client.tasks.verdict.as_ref(),
+            Some(&("rejected for test".into(), true))
+        );
+        model.start(Action::UpdateStatus, cx);
+        assert_eq!(model.client.tasks.records.len(), 32);
+        assert!(model.client.tasks.records.iter().all(|task| task.id != 1));
+        assert!(matches!(incoming.try_recv(), Ok(BackendCmd::Start(_))));
+        let origin = model.origin();
+        model.apply(
+            BackendEvent::JobDone {
+                id: 2,
+                action: Box::new(Action::UpdateStatus),
+                result: Box::new(JobResult::Done {
+                    message: "completed for test".into(),
+                    rows: None,
+                    quit: false,
+                }),
+                origin,
+            },
+            cx,
+        );
+        let task = model
+            .client
+            .tasks
+            .records
+            .iter()
+            .find(|task| task.id == 2)
+            .unwrap();
+        assert_eq!(task.events.len(), 128);
+        assert_eq!(task.events.back().unwrap(), "completed for test");
     });
 }

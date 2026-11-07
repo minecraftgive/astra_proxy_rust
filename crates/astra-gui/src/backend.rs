@@ -14,6 +14,7 @@ use async_channel::{Receiver, Sender};
 use std::{thread::JoinHandle, time::Duration};
 
 pub use astra_client::jobs::Origin;
+pub(crate) mod elevation;
 
 pub struct Start {
     pub id: u64,
@@ -23,14 +24,29 @@ pub struct Start {
     pub origin: Origin,
 }
 pub enum BackendCmd {
+    CheckpointForQuit {
+        session: Box<astra_client::state::Session>,
+    },
     Start(Box<Start>),
     Runtime(Option<(String, u32)>),
     Cancel(u64),
     Checkpoint(Box<astra_client::state::Session>),
+    CheckpointForRestart {
+        id: u64,
+        session: Box<astra_client::state::Session>,
+    },
+    RefreshProgramInfo,
 }
 
 pub enum BackendEvent {
+    QuitCheckpoint(Result<(), String>),
+    Terminate,
     Ready(Box<(Prepared, astra_client::state::Session)>),
+    RestartCheckpoint {
+        id: u64,
+        result: Result<(), String>,
+    },
+    LocalProgramInfo(Box<astra_management::v2::ProgramInfo>),
     Progress {
         id: u64,
         value: astra_ipc::progress::Progress,
@@ -70,6 +86,7 @@ pub struct Backend {
 }
 impl Backend {
     pub fn start(options: Options) -> anyhow::Result<Self> {
+        astra_platform::tui_log::use_gui_log();
         // The shared Jobs executor enforces the eight-operation limit. The inbox
         // also carries the final checkpoint, which must not be lost on a full queue.
         let (commands, incoming) = async_channel::unbounded();
@@ -89,10 +106,13 @@ impl Backend {
                 match runtime {
                     Ok(runtime) => {
                         if started.send(Ok(runtime.handle().clone())).is_ok() {
-                            tokio::task::LocalSet::new().block_on(
-                                &runtime,
-                                run(options, incoming, outgoing, frontend_waker),
-                            );
+                            tokio::task::LocalSet::new().block_on(&runtime, async {
+                                run(options, incoming, outgoing, frontend_waker).await;
+                                elevation::shutdown().await;
+                            });
+                            // OS-owned consent/install work may outlive its window.
+                            // Never let a blocking UAC wait hold normal GUI exit forever.
+                            runtime.shutdown_timeout(Duration::from_secs(2));
                         }
                     }
                     Err(error) => {
@@ -127,6 +147,20 @@ async fn run(
     events: Sender<BackendEvent>,
     frontend_waker: Waker,
 ) {
+    #[cfg(unix)]
+    let _signals = {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Install SIGTERM handler");
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("Install SIGINT handler");
+        let events = events.clone();
+        tokio::spawn(async move {
+            tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+            let _ = events.send(BackendEvent::Terminate).await;
+        })
+    };
     let prepared = match bootstrap::prepare(&options).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -173,11 +207,20 @@ async fn run(
     let mut updates = Feed::start(socket.clone(), Action::WatchUpdates, waker.clone());
     let mut runtime: Option<((String, u32), Feed)> = None;
     let mut info_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut info_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
             command = commands.recv() => match command {
                 Err(_) => break,
+                Ok(BackendCmd::CheckpointForQuit { session }) => {
+                    let result = session.save(&session_path).map_err(|error| format!("{error:#}"));
+                    let _ = events.send(BackendEvent::QuitCheckpoint(result)).await;
+                },
                 Ok(BackendCmd::Checkpoint(session)) => { if let Err(error) = session.save(&session_path) { let _ = events.send(BackendEvent::Failed(format!("{error:#}"))).await; } },
+                Ok(BackendCmd::CheckpointForRestart { id, session }) => {
+                    let _ = events.send(checkpoint_for_restart(&session_path, id, &session)).await;
+                },
+                Ok(BackendCmd::RefreshProgramInfo) => info_timer.reset_immediately(),
                 Ok(BackendCmd::Cancel(id)) => jobs.cancel(id),
                 Ok(BackendCmd::Runtime(key)) => {
                     if key.as_ref() != runtime.as_ref().map(|(key, _)| key) {
@@ -198,10 +241,10 @@ async fn run(
             },
             _ = notify.notified() => {},
             _ = info_timer.tick() => {
-                match tokio::time::timeout(Duration::from_secs(3), protocol::request(&socket, astra_management::v2::RequestBody::Query(astra_management::v2::Query::ProgramInfo))).await {
-                    Ok(Ok(astra_management::v2::ResponseBody::ProgramInfo(info))) => { let _ = events.send(BackendEvent::ProgramInfo(Box::new(info))).await; }
-                    Ok(Err(error)) => { let _ = events.send(BackendEvent::Disconnected { source: "Program info", message: format!("{error:#}") }).await; }
-                    _ => {}
+                if info_task.as_ref().is_none_or(|task| task.is_finished()) {
+                    let socket = socket.clone();
+                    let events = events.clone();
+                    info_task = Some(tokio::spawn(async move { refresh_information(&socket, &events).await; }));
                 }
             }
         }
@@ -279,6 +322,69 @@ async fn run(
             }
         }
     }
+    if let Some(task) = info_task {
+        task.abort();
+    }
     // Shared Jobs and Feed owners abort all their tasks on drop, then LocalSet
     // and the runtime drop before the backend thread returns.
 }
+
+async fn refresh_information(socket: &std::path::Path, events: &Sender<BackendEvent>) {
+    let local = tokio::task::spawn_blocking(|| {
+        astra_platform::program_info::ProgramInfo::collect(astra_platform::build_info!(), vec![])
+    });
+    let remote = tokio::time::timeout(
+        Duration::from_secs(3),
+        protocol::request(
+            socket,
+            astra_management::v2::RequestBody::Query(astra_management::v2::Query::ProgramInfo),
+        ),
+    );
+    let (local, remote) = tokio::join!(local, remote);
+    match local {
+        Ok(info) => {
+            let _ = events
+                .send(BackendEvent::LocalProgramInfo(Box::new(info)))
+                .await;
+        }
+        Err(error) => {
+            let _ = events
+                .send(BackendEvent::Disconnected {
+                    source: "Local program info",
+                    message: error.to_string(),
+                })
+                .await;
+        }
+    }
+    let result = match remote {
+        Ok(Ok(astra_management::v2::ResponseBody::ProgramInfo(info))) => Ok(info),
+        Ok(Ok(_)) => Err(astra_client::i18n::t("Unexpected program information response").into()),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(error) => Err(error.to_string()),
+    };
+    match result {
+        Ok(info) => {
+            let _ = events.send(BackendEvent::ProgramInfo(Box::new(info))).await;
+        }
+        Err(message) => {
+            let _ = events
+                .send(BackendEvent::Disconnected {
+                    source: "Program info",
+                    message,
+                })
+                .await;
+        }
+    }
+}
+
+fn checkpoint_for_restart(
+    path: &std::path::Path,
+    id: u64,
+    session: &astra_client::state::Session,
+) -> BackendEvent {
+    let result = session.save(path).map_err(|error| format!("{error:#}"));
+    BackendEvent::RestartCheckpoint { id, result }
+}
+#[cfg(test)]
+#[path = "test/backend_test.rs"]
+mod tests;

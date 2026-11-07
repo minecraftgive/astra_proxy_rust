@@ -2,18 +2,19 @@ use crate::{
     keys,
     model::AppModel,
     pages::{Panel, PAGES},
+    views, widgets,
 };
-use astra_client::{
-    commands::{Id, SPECS},
-    i18n::t,
-    protocol::Kind,
-};
-use gpui::{div, prelude::*, px, *};
+#[cfg(test)]
+use astra_client::protocol::Kind;
+use astra_client::{commands::Id, i18n::t};
+use gpui::{prelude::*, *};
 use gpui_component::{
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
-    ActiveTheme, Disableable, Root, WindowExt,
+    input::InputState,
+    ActiveTheme, Root,
 };
+mod actions;
+mod content;
 
 pub struct AppWindow {
     model: Entity<AppModel>,
@@ -23,7 +24,16 @@ pub struct AppWindow {
     palette: bool,
     profile_chooser: bool,
     search: Entity<InputState>,
-    prompt: Entity<crate::widgets::PromptHost>,
+    prompt: Entity<widgets::PromptHost>,
+    elevation: Entity<views::elevation::ElevationHost>,
+    toast: Entity<widgets::ToastHost>,
+    marquee: Entity<views::marquee::MarqueeView>,
+    mounted: Option<content::Mounted>,
+    editor: Option<Entity<views::editor::View>>,
+    id: u64,
+    ready_frame: bool,
+    overlays: (bool, bool, bool, bool),
+    last_error: Option<String>,
     _observations: Vec<Subscription>,
 }
 impl AppWindow {
@@ -33,39 +43,127 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| {
+                if !this.leave_editor(window, cx) {
+                    return false;
+                }
+                this.elevation.update(cx, |host, cx| host.cancel(cx));
+                if cx.windows().len() == 1 {
+                    this.model.update(cx, |model, cx| model.request_quit(cx));
+                    return false;
+                }
+                true
+            })
+            .unwrap_or(true)
+        });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let preferences = model.read(cx).client.preferences.clone();
-        crate::theme::apply_for_window(&preferences, window, cx);
+        crate::theme::apply_for_window(&model.read(cx).client.preferences.clone(), window, cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search commands")));
-        let prompt = cx.new(|cx| crate::widgets::PromptHost::new(model.clone(), window, cx));
+        let prompt = cx.new(|cx| widgets::PromptHost::for_window(model.clone(), id, window, cx));
+        let elevation =
+            cx.new(|cx| views::elevation::ElevationHost::new(model.clone(), window, cx));
+        let toast = cx.new(|_| widgets::ToastHost::default());
+        let marquee = cx.new(|cx| views::marquee::MarqueeView::new(model.clone(), window, cx));
+        let page = page.or_else(|| model.read(cx).ready.then_some(model.read(cx).client.page));
+        let overlays = Self::overlay_flags(&model.read(cx).client);
+        model.update(cx, |model, cx| {
+            model.register_window(id, page.unwrap_or(model.client.page));
+            model.route_window_effects(id);
+            model.take_window_effects(id);
+            cx.notify();
+        });
         let appearance_model = model.clone();
         let observations = vec![
+            cx.observe(&elevation, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&elevation, window, |this, _, event, window, cx| {
+                if let views::ViewEvent::Input(input) = event {
+                    this.handle_input(input.clone(), window, cx);
+                }
+                if !this.elevation.read(cx).visible() {
+                    window.focus(&this.focus, cx);
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&prompt, window, |this, _, event, window, cx| {
                 match event {
-                    crate::widgets::PromptEvent::Input(input) => {
+                    widgets::PromptEvent::Input(input) => {
                         this.handle_input(input.clone(), window, cx)
                     }
-                    crate::widgets::PromptEvent::Cancelled => cx.notify(),
+                    widgets::PromptEvent::Cancelled => {
+                        this.model.update(cx, |model, cx| {
+                            model.route_window_effects(this.id);
+                            cx.notify();
+                        });
+                        cx.notify();
+                    }
                 }
                 if this.model.read(cx).client.prompt.is_none() {
                     window.focus(&this.focus, cx);
                 }
             }),
             window.observe_window_appearance(move |window, cx| {
-                let preferences = appearance_model.read(cx).client.preferences.clone();
-                crate::theme::apply_for_window(&preferences, window, cx);
+                crate::theme::apply_for_window(
+                    &appearance_model.read(cx).client.preferences.clone(),
+                    window,
+                    cx,
+                )
             }),
-            cx.observe(&model, |this, model, cx| {
+            cx.observe_in(&model, window, |this, model, window, cx| {
                 if this.page.is_none() && model.read(cx).ready {
                     this.page = Some(model.read(cx).client.page);
                 }
+                let flags = Self::overlay_flags(&model.read(cx).client);
+                this.apply_window_effects(window, cx);
+                this.overlays = flags;
+                let error = model
+                    .read(cx)
+                    .client
+                    .tasks
+                    .verdict
+                    .as_ref()
+                    .filter(|(message, failed)| {
+                        *failed && message == &model.read(cx).client.message
+                    })
+                    .map(|(message, _)| message.clone());
+                if error != this.last_error {
+                    if let Some(message) = &error {
+                        this.toast.update(cx, |host, cx| {
+                            host.show(widgets::ToastKind::Error, message.clone(), cx)
+                        });
+                    }
+                    this.last_error = error;
+                }
+                this.record_page(cx);
+                let restored = model.update(cx, |model, _| model.take_restored_windows());
+                for page in restored {
+                    let model = model.clone();
+                    cx.defer(move |cx| {
+                        let _ = open_at(model, Some(page), cx);
+                    });
+                }
+                // A disappearing overlay must not leave focus on a retained, hidden input.
+                if (!flags.0
+                    || !model
+                        .read(cx)
+                        .owns_overlay(crate::model::Overlay::Editor, this.id))
+                    && this.panel == Some(Panel::Editor)
+                {
+                    this.panel = None;
+                    window.focus(&this.focus, cx);
+                }
                 cx.notify();
             }),
-            cx.observe(&search, |_, _, cx| cx.notify()),
+            cx.on_release(|this, cx| {
+                this.model
+                    .update(cx, |model, _| model.remove_window(this.id))
+            }),
         ];
-        let page = page.or_else(|| model.read(cx).ready.then_some(model.read(cx).client.page));
-        Self {
+        let mut this = Self {
             model,
             focus,
             page,
@@ -74,583 +172,114 @@ impl AppWindow {
             profile_chooser: false,
             search,
             prompt,
+            elevation,
+            toast,
+            marquee,
+            mounted: None,
+            editor: None,
+            id,
+            ready_frame: false,
+            overlays,
+            last_error: None,
             _observations: observations,
-        }
-    }
-    fn shared_editor_active(&self, cx: &App) -> bool {
-        let model = self.model.read(cx);
-        self.panel == Some(Panel::Editor)
-            && !self.palette
-            && !self.profile_chooser
-            && model.startup_error.is_none()
-            && model.client.prompt.is_none()
-            && model.client.editor.is_some()
-    }
-    fn navigate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= PAGES.len() || (self.model.read(cx).client.kind == Kind::Server && index < 4) {
-            return;
-        }
-        window.focus(&self.focus, cx);
-        self.page = Some(index);
-        self.model.update(cx, |model, cx| {
-            model.client.suspend_editor();
-            model.client.page = index;
-            model.client.overlay_epoch += 1;
-            cx.notify();
-        });
-        self.panel = None;
-        self.palette = false;
-        self.profile_chooser = false;
-        cx.notify();
-    }
-    fn execute(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
-        // Search inputs outlive their rendered overlays. Explicitly restore the
-        // root focus before hiding them so subsequent shortcuts keep their context.
-        window.focus(&self.focus, cx);
-        self.palette = false;
-        self.profile_chooser = false;
-        let page = self.page;
-        let input = self.model.update(cx, |model, cx| {
-            let input = model.tokio(|client| {
-                if let Some(page) = page {
-                    client.page = page;
-                }
-                client.run_command(id)
-            });
-            cx.notify();
-            input
-        });
-        self.page = Some(self.model.read(cx).client.page);
-        self.handle_input(input, window, cx);
-    }
-    fn handle_input(
-        &mut self,
-        input: astra_client::state::Input,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let id = match input {
-            astra_client::state::Input::Idle => {
-                cx.notify();
-                return;
-            }
-            astra_client::state::Input::Run(action, prompt) => {
-                self.model.update(cx, |model, cx| {
-                    model.start_prompt(action, prompt.map(|prompt| *prompt), cx)
-                });
-                return;
-            }
-            astra_client::state::Input::Quit => {
-                self.model.update(cx, |model, cx| model.request_quit(cx));
-                return;
-            }
-            astra_client::state::Input::ExternalEditor => {
-                self.panel = Some(Panel::Editor);
-                cx.notify();
-                return;
-            }
-            astra_client::state::Input::OpenWindow(launch) => {
-                let _ = open_at(
-                    self.model.clone(),
-                    launch.view.and_then(|view| view.page()).or(self.page),
-                    cx,
-                );
-                return;
-            }
-            astra_client::state::Input::Install(request) => {
-                self.model.update(cx, |model, cx| {
-                    let socket = model.socket.clone();
-                    model.tokio(|client| client.start_installation(&socket, request));
-                    cx.notify();
-                });
-                return;
-            }
-            astra_client::state::Input::Frontend(id) => id,
         };
-        match id {
-            Id::Quit => {
-                self.model.update(cx, |model, cx| model.request_quit(cx));
-            }
-            Id::Palette => {
-                self.palette = true;
-                self.profile_chooser = false;
-                self.search.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                    input.focus(window, cx);
-                });
-            }
-            Id::Profiles => {
-                self.profile_chooser = true;
-                self.palette = false;
-                self.search.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                    input.focus(window, cx);
-                });
-            }
-            Id::Settings => self.navigate(6, window, cx),
-            Id::Help => self.panel = Some(Panel::Help),
-            Id::Tasks => self.panel = Some(Panel::Tasks),
-            Id::Logs => self.panel = Some(Panel::GuiLog),
-            Id::Monitor => self.panel = Some(Panel::Monitor),
-            Id::Window => {
-                let _ = open_at(self.model.clone(), self.page, cx);
-            }
-            Id::Pause => self.model.update(cx, |model, cx| {
-                model.client.refresh_paused = !model.client.refresh_paused;
-                cx.notify();
-            }),
-            Id::VimKeys => self.model.update(cx, |model, cx| {
-                model.client.vim_keys = !model.client.vim_keys;
-                cx.notify();
-            }),
-            Id::MotionFull | Id::MotionReduced | Id::MotionOff => {
-                self.model.update(cx, |model, cx| {
-                    model.client.preferences.motion = match id {
-                        Id::MotionFull => astra_client::motion::MotionMode::Normal,
-                        Id::MotionReduced => astra_client::motion::MotionMode::Reduced,
-                        _ => astra_client::motion::MotionMode::Off,
-                    };
-                    cx.notify();
-                })
-            }
-            _ => {}
-        }
-        cx.notify();
+        this.apply_window_effects(window, cx);
+        this
     }
-    fn panel_button(&self, panel: Panel, cx: &Context<Self>) -> Button {
-        Button::new(SharedString::from(format!("panel-{panel:?}")))
-            .label(panel.title())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                window.focus(&this.focus, cx);
-                this.panel = Some(panel);
-                if panel == Panel::Updates {
-                    this.model.update(cx, |model, cx| {
-                        model.start(astra_client::protocol::Action::UpdateStatus, cx)
-                    });
-                }
-                this.palette = false;
-                this.profile_chooser = false;
-                cx.notify();
-            }))
+    fn overlay_flags(client: &astra_client::state::Client) -> (bool, bool, bool, bool) {
+        (
+            client.editor.is_some(),
+            client.diagnostics.is_some(),
+            client.explanation.is_some(),
+            client.binding_picker.is_some(),
+        )
     }
-    fn content(&self, cx: &mut Context<Self>) -> AnyElement {
-        let model = self.model.read(cx);
-        let page_index = self.page.unwrap_or(model.client.page).min(6);
-        let page = &PAGES[page_index];
-        let mut body = div().flex().flex_col().gap_5().p_6();
-        if let Some(error) = &model.startup_error {
-            return body
-                .child(
-                    div()
-                        .text_2xl()
-                        .child(t("Unable to connect to the manager")),
-                )
-                .child(error.clone())
-                .child(t(
-                    "Check the manager path or start astra-host, then relaunch the GUI.",
-                ))
-                .into_any_element();
-        }
-        if model.client.prompt.is_some() {
-            return body.child(self.prompt.clone()).into_any_element();
-        }
-        if self.palette || self.profile_chooser {
-            let query = self.search.read(cx).value().to_string().to_lowercase();
-            body = body
-                .child(div().text_2xl().child(t(if self.profile_chooser {
-                    "Switch current profile"
-                } else {
-                    "Command palette"
-                })))
-                .child(Input::new(&self.search));
-            if self.profile_chooser {
-                for row in model.client.rows.iter().filter(|row| {
-                    row.instance.kind == model.client.kind
-                        && row.instance.name.to_lowercase().contains(&query)
-                }) {
-                    let name = row.instance.name.clone();
-                    body = body.child(
-                        Button::new(SharedString::from(format!("profile-{name}")))
-                            .label(name.clone())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                window.focus(&this.focus, cx);
-                                this.model.update(cx, |model, cx| {
-                                    let kind = model.client.kind;
-                                    if let Some(index) = model
-                                        .client
-                                        .rows
-                                        .iter()
-                                        .filter(|row| row.instance.kind == kind)
-                                        .position(|row| row.instance.name == name)
-                                    {
-                                        model.client.selections
-                                            [astra_client::state::kind_index(kind)] = index;
-                                    }
-                                    if kind == Kind::Proxy {
-                                        if model.client.active_profile.as_ref() != Some(&name) {
-                                            model.client.reset_runtime_identity();
-                                        }
-                                        model.client.active_profile = Some(name.clone());
-                                    }
-                                    model.client.overlay_epoch += 1;
-                                    let key = model
-                                        .client
-                                        .rows
-                                        .iter()
-                                        .find(|row| row.instance.name == name)
-                                        .and_then(|row| row.pid.map(|pid| (name.clone(), pid)));
-                                    let _ = model.commands.try_send(
-                                        crate::backend::BackendCmd::Runtime(
-                                            if kind == Kind::Server { None } else { key },
-                                        ),
-                                    );
-                                    cx.notify();
-                                });
-                                this.profile_chooser = false;
-                                cx.notify();
-                            })),
-                    );
-                }
-            } else {
-                for spec in SPECS.iter().filter(|spec| {
-                    format!("{} {}", t(spec.label), spec.key)
-                        .to_lowercase()
-                        .contains(&query)
-                }) {
-                    let id = spec.id;
-                    let unavailable = model.client.command_available(id);
-                    let label = format!(
-                        "{}    {}{}",
-                        t(spec.label),
-                        spec.key,
-                        unavailable
-                            .map(|reason| format!(" · {}", t(reason)))
-                            .unwrap_or_default()
-                    );
-                    body =
-                        body.child(
-                            Button::new(SharedString::from(format!("command-{id:?}")))
-                                .label(label)
-                                .disabled(unavailable.is_some())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.execute(id, window, cx)
-                                })),
-                        );
-                }
-            }
-            return body.into_any_element();
-        }
-        if let Some(panel) = self.panel {
-            body = body.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .child(div().text_2xl().child(panel.title()))
-                    .child(
-                        Button::new("close-panel")
-                            .label(t("Close"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                window.focus(&this.focus, cx);
-                                this.panel = None;
-                                cx.notify();
-                            })),
-                    ),
-            );
-            if panel == Panel::Help {
-                for spec in SPECS {
-                    body = body.child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child(t(spec.label))
-                            .child(spec.key),
-                    );
-                }
-            } else if panel == Panel::Tasks {
-                if model.client.tasks.records.is_empty() {
-                    body = body.child(t("No background tasks"));
-                }
-                for task in &model.client.tasks.records {
-                    let id = task.id;
-                    if !task.finished.is_some() {
-                        body = body.child(
-                            Button::new(("cancel-task", id as usize))
-                                .label(t("Cancel"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.model.update(cx, |model, cx| {
-                                        let _ = model
-                                            .commands
-                                            .try_send(crate::backend::BackendCmd::Cancel(id));
-                                        if let Some(task) = model
-                                            .client
-                                            .tasks
-                                            .records
-                                            .iter_mut()
-                                            .find(|task| task.id == id)
-                                        {
-                                            task.finished = Some(std::time::Instant::now());
-                                            task.events.push_back(t("Cancelled").into());
-                                        }
-                                        cx.notify();
-                                    });
-                                })),
-                        );
-                    }
-                    body = body.child(
-                        div()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(cx.theme().muted)
-                            .child(format!(
-                                "#{} · {} · {}",
-                                task.id,
-                                task.title,
-                                t(if task.finished.is_some() {
-                                    "Done"
-                                } else {
-                                    "Working"
-                                })
-                            ))
-                            .children(
-                                task.events
-                                    .iter()
-                                    .map(|event| div().text_sm().child(event.clone())),
-                            ),
-                    );
-                }
-            }
-            for pending in panel.pending() {
-                body = body.child(todo(pending, cx));
-            }
-            return body.into_any_element();
-        }
-        body = body
-            .child(
-                div()
-                    .text_2xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(t(page.title)),
-            )
-            .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(page.subtitle)),
-            );
-        if page_index == 0 {
-            let runtime = model.client.runtime_snapshot.as_ref();
-            body = body.child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .child(metric(
-                        t("Upload"),
-                        if model.client.runtime_rates_available() {
-                            format!("{} B/s", model.client.rates[0])
-                        } else {
-                            "—".into()
-                        },
-                        cx,
-                    ))
-                    .child(metric(
-                        t("Download"),
-                        if model.client.runtime_rates_available() {
-                            format!("{} B/s", model.client.rates[1])
-                        } else {
-                            "—".into()
-                        },
-                        cx,
-                    ))
-                    .child(metric(
-                        t("Connections"),
-                        runtime
-                            .map(|snapshot| snapshot.active.to_string())
-                            .unwrap_or_else(|| "—".into()),
-                        cx,
-                    )),
-            );
-        }
-        if page_index == 5 {
-            if model.client.kind == Kind::Server {
-                body = body.child(t("Server status and statistics"));
-            }
-            if model.client.rows().is_empty() {
-                body = body.child(t("No profiles"));
-            }
-            for row in model.client.rows() {
-                body = body.child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .p_3()
-                        .rounded_lg()
-                        .bg(cx.theme().muted)
-                        .child(row.instance.name.clone())
-                        .child(row.state.clone()),
-                );
-            }
-        }
-        body = body.child(
-            div()
-                .rounded_lg()
-                .border_1()
-                .border_color(cx.theme().border)
-                .p_4()
-                .child(t("Framework preview · planned features")),
-        );
-        for feature in page.pending {
-            body = body.child(todo(feature, cx));
-        }
-        if page_index == 6 {
-            body = body.child(self.panel_button(Panel::Updates, cx));
-            if let Some(info) = &model.client.program_info.data {
-                body = body.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_4()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded_lg()
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(t("Program information")),
-                        )
-                        .child(format!("{}  {}", info.build.name, info.build.version))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{} · {}",
-                                    info.system.os, info.system.architecture
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{} · {}",
-                                    t("Compiled at"),
-                                    info.build.compiled_at
-                                )),
-                        ),
-                );
-            }
-        }
-        body.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .child(self.panel_button(Panel::Editor, cx))
-                .child(self.panel_button(Panel::Diagnostics, cx))
-                .child(self.panel_button(Panel::NetTools, cx))
-                .child(self.panel_button(Panel::Recovery, cx)),
-        )
-        .into_any_element()
+    fn record_page(&self, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, _| {
+            model.update_window(self.id, self.page.unwrap_or(model.client.page))
+        });
     }
-}
-fn todo(feature: &str, cx: &App) -> impl IntoElement {
-    div()
-        .flex()
-        .gap_3()
-        .child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Planned")),
-        )
-        .child(t(feature).to_owned())
-}
-fn metric(label: &str, value: String, cx: &App) -> impl IntoElement {
-    div()
-        .flex_1()
-        .rounded_lg()
-        .border_1()
-        .border_color(cx.theme().border)
-        .p_4()
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.to_owned()),
-        )
-        .child(div().text_2xl().mt_2().child(value))
 }
 impl Render for AppWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let model = self.model.read(cx);
-        let page = self.page.unwrap_or(model.client.page);
-        let server = model.client.kind == Kind::Server;
-        let online = model.online;
-        let profile = if server {
-            model.client.selected().map(|row| row.instance.name.clone())
-        } else {
-            model.client.active_profile.clone()
-        }
-        .unwrap_or_else(|| t("No profile selected").into());
-        let status = model.client.message.clone();
-        let errors = model
-            .connection_errors
-            .iter()
-            .map(|(source, error)| format!("{}: {error}", t(source)))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let running = model
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = self.page.unwrap_or(self.model.read(cx).client.page).min(6);
+        let server = self.model.read(cx).server_mode;
+        let header = self.model.read(cx).client.header();
+        let status = self.model.read(cx).client.message.clone();
+        let running = self
+            .model
+            .read(cx)
             .client
             .tasks
             .records
             .iter()
-            .filter(|task| !task.finished.is_some())
+            .filter(|task| task.finished.is_none())
             .count();
-        let mut sidebar = div()
-            .w(px(210.))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .p_4()
+        let errors = self
+            .model
+            .read(cx)
+            .connection_errors
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let content = self.content(window, cx);
+        if self.model.read(cx).ready && !self.ready_frame {
+            self.ready_frame = true;
+            cx.on_next_frame(window, |this, _, cx| {
+                this.model.update(cx, |model, _| model.mark_window_ready())
+            });
+        }
+        let sidebar = div()
+            .w(px(186.))
+            .h_full()
+            .p_3()
             .flex()
             .flex_col()
             .gap_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_2xl()
+                    .p_3()
+                    .text_xl()
                     .font_weight(FontWeight::BOLD)
-                    .mb_5()
                     .child("ASTRA"),
-            );
-        for (index, item) in PAGES
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !server || *index >= 4)
-        {
-            sidebar = sidebar.child(
-                Button::new(("page", index))
-                    .label(format!("{}   {}", index + 1, t(item.title)))
-                    .when(index == page, |button| button.primary())
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.navigate(index, window, cx)),
-                    ),
-            );
-        }
-        sidebar =
-            sidebar
-                .child(div().flex_1())
-                .child(Button::new("palette").label(t("Command palette")).on_click(
-                    cx.listener(|this, _, window, cx| this.execute(Id::Palette, window, cx)),
-                ))
-                .child(Button::new("help").label(t("Keyboard help")).on_click(
-                    cx.listener(|this, _, window, cx| this.execute(Id::Help, window, cx)),
-                ));
+            )
+            .children(
+                PAGES
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !server || *index >= 4)
+                    .map(|(index, item)| {
+                        Button::new(("page", index))
+                            .label(format!("{}   {}", index + 1, t(item.title)))
+                            .when(page == index, |button| button.primary())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate(index, window, cx)
+                            }))
+                    }),
+            )
+            .child(div().flex_1())
+            .children(
+                [
+                    (Id::Palette, "Command palette"),
+                    (Id::Help, "Keyboard help"),
+                    (Id::Monitor, "Monitor"),
+                ]
+                .into_iter()
+                .map(|(id, label)| {
+                    Button::new(label).label(t(label)).on_click(
+                        cx.listener(move |this, _, window, cx| this.execute(id, window, cx)),
+                    )
+                }),
+            )
+            .child(Button::new("updates").label(t("Updates")).on_click(
+                cx.listener(|this, _, window, cx| this.show_panel(Panel::Updates, window, cx)),
+            ));
         div()
             .id("astra-root")
-            .key_context(if self.shared_editor_active(cx) {
-                "AstraEditor"
-            } else {
-                "Astra"
-            })
+            .key_context("Astra")
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -660,11 +289,9 @@ impl Render for AppWindow {
                 this.execute(command.0, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, page: &keys::Page, window, cx| {
+            .on_action(cx.listener(move |this, page: &keys::Page, window, cx| {
                 if page.new_window {
-                    if page.index < PAGES.len()
-                        && (this.model.read(cx).client.kind != Kind::Server || page.index >= 4)
-                    {
+                    if page.index < PAGES.len() && (!server || page.index >= 4) {
                         let _ = open_at(this.model.clone(), Some(page.index), cx);
                     }
                 } else {
@@ -674,28 +301,7 @@ impl Render for AppWindow {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    this.palette = false;
-                    this.profile_chooser = false;
-                    this.panel = None;
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                    return;
-                }
-                // A retained editor is not necessarily visible in this window.
-                // Let native inputs finish handling text after event bubbling.
-                if !this.shared_editor_active(cx)
-                    || !this.focus.is_focused(window)
-                    || window.has_focused_input(cx)
-                {
-                    return;
-                }
-                if let Some(key) = keys::from_keystroke(&event.keystroke, event.is_held) {
-                    this.model.update(cx, |model, cx| {
-                        if let Some(editor) = model.client.editor.as_mut() {
-                            let _ = editor.key(key);
-                            cx.notify();
-                        }
-                    });
+                    this.dismiss(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -706,42 +312,61 @@ impl Render for AppWindow {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .child(self.marquee.clone())
                     .child(
                         div()
-                            .h(px(64.))
-                            .px_6()
+                            .min_h(px(64.))
+                            .px_4()
+                            .py_2()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap_3()
                             .border_b_1()
                             .border_color(cx.theme().border)
-                            .child(Button::new("choose-profile").label(profile).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.execute(Id::Profiles, window, cx)
-                                }),
-                            ))
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if online {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().muted_foreground
-                                    })
-                                    .child(t(if online { "Connected" } else { "Connecting…" })),
-                            ),
+                                Button::new("choose-profile")
+                                    .label(
+                                        header.name.unwrap_or_else(|| t("No profile yet").into()),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.execute(Id::Profiles, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("connection-toggle")
+                                    .label(t(header.connect_label))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let input = this.model.update(cx, |model, cx| {
+                                            let input =
+                                                model.tokio(|client| client.toggle_current());
+                                            cx.notify();
+                                            input
+                                        });
+                                        this.handle_input(input, window, cx);
+                                    })),
+                            )
+                            .child(div().text_sm().child(t(header.mode_label)))
+                            .child(div().flex_1().text_sm().child(header.exit_chain))
+                            .child(widgets::DelayChip::new(header.delay_ms))
+                            .child(div().text_sm().child(format!(
+                                "↑ {}  ↓ {}",
+                                astra_client::live::rate_value(header.rates[0], true),
+                                astra_client::live::rate_value(header.rates[1], true)
+                            ))),
                     )
                     .child(
                         div()
-                            .id("page-content")
+                            .relative()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .child(self.content(cx)),
+                            .min_h_0()
+                            .min_w_0()
+                            .child(content)
+                            .child(div().absolute().top_3().right_3().child(self.toast.clone())),
                     )
                     .when(!errors.is_empty(), |view| {
                         view.child(
                             div()
-                                .px_6()
+                                .px_4()
                                 .py_2()
                                 .text_sm()
                                 .text_color(cx.theme().danger)
@@ -754,10 +379,20 @@ impl Render for AppWindow {
                             .px_4()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap_3()
                             .border_t_1()
                             .border_color(cx.theme().border)
-                            .child(div().text_sm().child(status))
+                            .child(
+                                div()
+                                    .id("status-message")
+                                    .flex_1()
+                                    .text_sm()
+                                    .overflow_hidden()
+                                    .child(status)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.execute(Id::Tasks, window, cx)
+                                    })),
+                            )
                             .child(
                                 Button::new("tasks")
                                     .label(format!("{} · {running}  F6", t("Tasks")))
@@ -772,7 +407,11 @@ impl Render for AppWindow {
 pub fn open(model: Entity<AppModel>, cx: &mut App) -> anyhow::Result<()> {
     open_at(model, None, cx)
 }
-fn open_at(model: Entity<AppModel>, page: Option<usize>, cx: &mut App) -> anyhow::Result<()> {
+pub(crate) fn open_at(
+    model: Entity<AppModel>,
+    page: Option<usize>,
+    cx: &mut App,
+) -> anyhow::Result<()> {
     let bounds = Bounds::centered(None, size(px(1120.), px(760.)), cx);
     cx.open_window(
         WindowOptions {
@@ -792,7 +431,9 @@ fn open_at(model: Entity<AppModel>, page: Option<usize>, cx: &mut App) -> anyhow
     cx.activate(true);
     Ok(())
 }
-
+#[cfg(test)]
+#[path = "test/window_routing_test.rs"]
+mod routing_tests;
 #[cfg(test)]
 #[path = "test/window_test.rs"]
 mod tests;

@@ -57,7 +57,12 @@ fn bindings_respect_native_input_and_editor_contexts(cx: &mut TestAppContext) {
                 .collect();
             assert_eq!(matches.len(), 1, "{chord} must have exactly one binding");
             let predicate = matches[0].predicate().unwrap();
-            assert!(predicate.eval(std::slice::from_ref(&shell)));
+            assert!(
+                predicate
+                    .depth_of(&[shell.clone(), gpui::KeyContext::parse("AstraLive").unwrap()])
+                    .is_some(),
+                "{chord}"
+            );
             assert!(!predicate.eval(std::slice::from_ref(&editor)));
             assert!(!predicate.eval(&[shell.clone(), input.clone()]));
             assert!(!predicate.eval(&[editor.clone(), input.clone()]));

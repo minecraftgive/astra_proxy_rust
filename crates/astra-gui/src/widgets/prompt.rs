@@ -8,7 +8,7 @@ use astra_client::{
 };
 use gpui::{
     div, px, uniform_list, AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle,
-    Global, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, ParentElement,
+    Focusable, Global, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, ParentElement,
     PathPromptOptions, Render, Styled, Subscription, Window,
 };
 use gpui_component::{
@@ -67,6 +67,7 @@ pub enum PromptEvent {
 
 pub struct PromptHost {
     model: Entity<AppModel>,
+    owner: Option<u64>,
     focus: FocusHandle,
     input: Entity<InputState>,
     multiline: Entity<TextareaState>,
@@ -80,12 +81,29 @@ impl EventEmitter<PromptEvent> for PromptHost {}
 
 impl PromptHost {
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::create(model, None, window, cx)
+    }
+    pub(crate) fn for_window(
+        model: Entity<AppModel>,
+        owner: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::create(model, Some(owner), window, cx)
+    }
+    fn create(
+        model: Entity<AppModel>,
+        owner: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         init(cx);
         let input = cx.new(|cx| InputState::new(window, cx));
         let multiline = cx.new(|cx| TextareaState::new(window, cx).submit_on_enter(true));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search")));
         let mut host = Self {
             model: model.clone(),
+            owner,
             focus: cx.focus_handle(),
             input: input.clone(),
             multiline: multiline.clone(),
@@ -131,6 +149,20 @@ impl PromptHost {
 
     fn reconcile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
+        if self
+            .owner
+            .is_some_and(|owner| !model.owns_overlay(crate::model::Overlay::Prompt, owner))
+        {
+            self.signature = None;
+            if self.focus.is_focused(window)
+                || self.input.focus_handle(cx).is_focused(window)
+                || self.multiline.focus_handle(cx).is_focused(window)
+                || self.search.focus_handle(cx).is_focused(window)
+            {
+                window.blur(cx);
+            }
+            return;
+        }
         let signature = model.client.prompt.as_ref().map(prompt_signature);
         let input = model.client.input.clone();
         let changed = signature != self.signature;
