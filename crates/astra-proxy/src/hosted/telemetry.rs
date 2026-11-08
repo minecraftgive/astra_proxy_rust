@@ -16,6 +16,8 @@ pub(super) struct Store {
     observed: HashMap<u64, u64>,
     health: BTreeMap<u64, bool>,
     pub origins: BTreeMap<u64, u64>,
+    pub node_traffic: Option<BTreeMap<String, astra_model::runtime::NodeTraffic>>,
+    pub traffic_history_error: Option<String>,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -27,6 +29,8 @@ impl Default for Store {
             observed: HashMap::new(),
             health: BTreeMap::new(),
             origins: BTreeMap::new(),
+            node_traffic: None,
+            traffic_history_error: None,
         }
     }
 }
@@ -107,6 +111,11 @@ impl Store {
                 })
                 .collect(),
             connection_generations: self.origins.clone(),
+            traffic: Some(Box::new(astra_model::runtime::TrafficTelemetry {
+                nodes: self.node_traffic.clone(),
+                history_error: self.traffic_history_error.clone(),
+                selected_node: None,
+            })),
         }
     }
 }

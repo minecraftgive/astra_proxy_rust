@@ -35,6 +35,9 @@ impl<S: AsyncWrite + Unpin> StableWrite<S> {
             }
             self.pending.drain(..n);
         }
+        // Pending writes are exceptional; do not retain their allocation for
+        // the rest of a potentially long-lived connection once drained.
+        self.pending = Vec::new();
         Poll::Ready(Ok(()))
     }
 }

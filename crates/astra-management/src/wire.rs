@@ -192,6 +192,8 @@ pub enum Action {
     /// Start normally, but never request interactive elevation (including dependencies).
     /// Append-only: preserve the existing management action discriminants.
     StartSilent(String),
+    /// Internal agent call; append-only to preserve existing wire discriminants.
+    MaintenanceRestore(Vec<String>),
 }
 impl Action {
     /// Safe activity description: never includes configuration text, URLs or credentials.

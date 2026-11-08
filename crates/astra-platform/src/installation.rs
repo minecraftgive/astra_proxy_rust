@@ -710,9 +710,7 @@ pub fn executable_ready(path: &Path, scope: InstallScope) -> io::Result<bool> {
         } else {
             0o700
         };
-        return Ok(metadata.uid() == uid
-            && metadata.mode() & 0o7777 == mode
-            && metadata.nlink() == 1);
+        Ok(metadata.uid() == uid && metadata.mode() & 0o7777 == mode && metadata.nlink() == 1)
     }
     #[cfg(windows)]
     {

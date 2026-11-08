@@ -73,7 +73,8 @@ async fn flow(
     output: mpsc::Sender<Datagram>,
     inbound: Inbound,
 ) -> Result<()> {
-    if let Some(host) = &app.hosted {
+    if let Some(host) = app.hosted.clone() {
+        drop(app);
         let process =
             crate::platform::process::lookup(astra_model::Network::Udp, source, destination).await;
         return host
@@ -116,6 +117,10 @@ async fn flow(
     )
     .await
     .context("UDP open timeout")??;
+    let cancellation = app.egress_signal.clone();
+    let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
+    let _route_leases = app.route_leases.clone();
+    drop(app);
     let (activity, _) = tokio::sync::watch::channel(Instant::now());
     let upload = async {
         while let Some(packet) = requests.recv().await {
@@ -142,7 +147,6 @@ async fn flow(
         Ok::<_, anyhow::Error>(())
     };
     let expiry = async {
-        let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
         loop {
             let deadline = *activity.borrow() + duration;
             tokio::time::sleep_until(deadline).await;
@@ -152,7 +156,7 @@ async fn flow(
         }
     };
     tokio::select! {
-        _=app.egress_cancelled()=>Ok(()),
+        _=cancellation.cancelled()=>Ok(()),
         // Do not cancel a framed receive when a new outgoing datagram arrives.
         result = async { tokio::try_join!(upload, download).map(|_| ()) } => result,
         _ = expiry => Ok(()),

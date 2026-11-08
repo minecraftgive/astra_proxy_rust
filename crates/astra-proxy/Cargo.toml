@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mimalloc = "0.1"
 astra-model = { path = "../astra-model" }
 astra-observe = { path = "../astra-observe" }
 astra-platform = { path = "../astra-platform" }
@@ -61,3 +62,7 @@ path = "src/test/outbound_binding_test.rs"
 [[test]]
 name = "runtime_controls"
 path = "src/test/runtime_controls_test.rs"
+
+[[test]]
+name = "file_limit"
+path = "src/test/file_limit_test.rs"

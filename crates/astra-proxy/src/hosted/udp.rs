@@ -39,6 +39,10 @@ impl Host {
             timeout(Duration::from_secs(15), receive(&mut stream)).await??;
         ready.map_err(anyhow::Error::msg)?;
         let app = self.app()?;
+        let cancellation = app.egress_signal.clone();
+        let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
+        let _route_leases = app.route_leases.clone();
+        drop(app);
         let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
         let (mut reader, mut writer) = tokio::io::split(stream);
         let upload = async {
@@ -63,7 +67,6 @@ impl Host {
         // Cancelling either framed direction always drops the whole channel;
         // partial reads/writes are never reused for a different datagram.
         let expiry = async {
-            let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
             loop {
                 let deadline = *activity.borrow() + duration;
                 tokio::time::sleep_until(deadline).await;
@@ -76,7 +79,7 @@ impl Host {
             result = upload => result,
             result = download => result,
             _ = expiry => Ok(()),
-            _ = app.egress_cancelled() => Ok(()),
+            _ = cancellation.cancelled() => Ok(()),
         }
     }
 
@@ -184,6 +187,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await?;
     let (destination, mapped, connection) = prepared?;
+    let cancellation = app.egress_signal.clone();
+    let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
+    let _route_leases = app.route_leases.clone();
+    drop(app);
     let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let (mut reader, mut writer) = tokio::io::split(stream);
     let upload = async {
@@ -211,7 +218,6 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         Ok::<_, anyhow::Error>(())
     };
     let expiry = async {
-        let duration = Duration::from_secs(app.config.udp_idle_timeout_secs);
         loop {
             let deadline = *activity.borrow() + duration;
             tokio::time::sleep_until(deadline).await;
@@ -224,7 +230,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         result = upload => result,
         result = download => result,
         _ = expiry => Ok(()),
-        _ = app.egress_cancelled() => Ok(()),
+        _ = cancellation.cancelled() => Ok(()),
     }
 }
 

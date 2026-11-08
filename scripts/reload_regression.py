@@ -96,7 +96,9 @@ server="127.0.0.1:{meters[1].server_address[1]}"
                 old.sendall(b'old3');assert exact(old,4)==b'old3'
             print('PASS proxy: switch path/node/listener, SIGHUP, file watch, parse/bind rollback, old TCP retained',flush=True)
         rule_config=d/'rules.toml';rule_socket=d/'rules.sock';rule_control=d/'rule-control.sock'
-        def rules(action='direct',watch=False,sock=rule_socket):return f'socket="{sock}"\nwatch_config={str(watch).lower()}\ndefault_action="{action}"\n'
+        # Exercise the default action for the loopback echo target instead of
+        # the independent direct-local fallback (enabled by default).
+        def rules(action='direct',watch=False,sock=rule_socket):return f'socket="{sock}"\nwatch_config={str(watch).lower()}\ndirect_local=false\ndefault_action="{action}"\n'
         rule_config.write_text(rules());config.write_text(f'rule_socket="{rule_socket}"\nsocks5_listen="127.0.0.1:{sp}"\ndecision_cache_ttl_secs=600\nshutdown_timeout_secs=1\n')
         with process(['env',f'ASTRA_CONTROL_SOCKET={rule_control}',str(binaries/'astra-rule'),str(rule_config)],d,'rule') as (rule,rule_log), process(['env',f'ASTRA_CONTROL_SOCKET={control}',str(binaries/'astra-proxy'),str(config)],d,'proxy-rules') as (app,log):
             wait_socket(rule_socket,rule,rule_log);wait_socket(rule_control,rule,rule_log);wait_port(sp,app,log);time.sleep(.15)

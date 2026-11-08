@@ -202,7 +202,7 @@ fn replacement_uses_verified_release_and_preserves_frontend_and_context() {
 fn resolution_rejects_stale_selection_and_corruption_in_any_component() {
     let fixture = Fixture::new(false);
     assert!(resolve(&fixture.context, "another-release").is_err());
-    fs::write(
+    corrupt_payload(
         fixture
             .store
             .release_dir("new-release")
@@ -425,4 +425,128 @@ fn graphical_frontend_restarts_only_into_its_verified_matching_component() {
         .unwrap()
         .to_string()
         .contains("astra-gui"));
+}
+
+async fn wait_for_launch_candidate(
+    restart: &mut crate::update::Restart,
+    client: &mut crate::state::Client,
+    context: &windows::Context,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !client.update_launch.pending() {
+            assert!(restart
+                .poll_client(client, context, true)
+                .unwrap()
+                .is_none());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn verified_update_waits_for_manual_launch_and_delivers_once() {
+    let fixture = Fixture::new(false);
+    let mut client = crate::state::Client::new(crate::protocol::Kind::Proxy);
+    client.update_status = Some(completed());
+    crate::update::Command::ToggleAutoLaunch.run(&mut client);
+    let mut restart = crate::update::Restart::new(true);
+    wait_for_launch_candidate(&mut restart, &mut client, &fixture.context).await;
+    assert!(restart
+        .poll_client(&mut client, &fixture.context, true)
+        .unwrap()
+        .is_none());
+    crate::update::Command::LaunchNow.run(&mut client);
+    assert!(restart
+        .poll_client(&mut client, &fixture.context, false)
+        .unwrap()
+        .is_none());
+    let target = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(target) = restart
+                .poll_client(&mut client, &fixture.context, true)
+                .unwrap()
+            {
+                break target;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        target.bin,
+        fixture.store.resolve_current().unwrap().unwrap().directory
+    );
+    assert!(restart
+        .poll_client(&mut client, &fixture.context, true)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn launch_rechecks_all_files_after_countdown_and_clears_failed_candidate() {
+    let fixture = Fixture::new(false);
+    let mut client = crate::state::Client::new(crate::protocol::Kind::Proxy);
+    client.update_status = Some(completed());
+    let mut restart = crate::update::Restart::new(true);
+    wait_for_launch_candidate(&mut restart, &mut client, &fixture.context).await;
+    let release = fixture.store.resolve_current().unwrap().unwrap();
+    corrupt_payload(
+        release
+            .directory
+            .join(astra_platform::platform::executable("astra-rule")),
+        b"corrupt",
+    )
+    .unwrap();
+    crate::update::Command::LaunchNow.run(&mut client);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match restart.poll_client(&mut client, &fixture.context, true) {
+                Err(_) => break,
+                Ok(target) => assert!(target.is_none()),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!client.update_launch.pending());
+}
+
+#[tokio::test]
+async fn a_new_incomplete_transaction_cancels_the_launch_countdown() {
+    let fixture = Fixture::new(false);
+    let mut client = crate::state::Client::new(crate::protocol::Kind::Proxy);
+    client.update_status = Some(completed());
+    let mut restart = crate::update::Restart::new(true);
+    wait_for_launch_candidate(&mut restart, &mut client, &fixture.context).await;
+    client
+        .update_status
+        .as_mut()
+        .unwrap()
+        .operation
+        .as_mut()
+        .unwrap()
+        .phase = updates::UpdatePhase::Preparing;
+    assert!(restart
+        .poll_client(&mut client, &fixture.context, true)
+        .unwrap()
+        .is_none());
+    assert!(!client.update_launch.pending());
+}
+
+fn corrupt_payload(path: PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    // Published releases are read-only. Explicitly simulate owner tampering.
+    let mut permissions = fs::metadata(&path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(&path, permissions)?;
+    fs::write(path, bytes)
 }

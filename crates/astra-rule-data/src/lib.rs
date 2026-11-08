@@ -23,15 +23,15 @@ impl RuleSetExt for RuleSet {
         if self.path.is_none() {
             return self.parse_entries(&self.payload);
         }
-        let bytes = loader.load_resource(
+        let (_, entries) = loader.load_resource_with(
             base,
             self.path.as_deref().unwrap(),
             self.url.as_deref(),
             self.interval,
             16 * 1024 * 1024,
-            |data| self.parse(data).map(|_| ()),
+            |data| self.parse(data),
         )?;
-        self.parse(&bytes)
+        Ok(entries)
     }
 }
 pub use astra_resource::{

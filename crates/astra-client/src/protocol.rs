@@ -168,6 +168,9 @@ impl CallPlan {
 fn call_plan(action: Action, local: bool) -> Result<CallPlan> {
     use v::{Command as C, Query as Q};
     Ok(match action {
+        Action::MaintenanceRestore(_) => {
+            anyhow::bail!("Maintenance restore is private to the local agent")
+        }
         Action::List | Action::WatchList => CallPlan::query(Q::Instances),
         Action::Add(i) => CallPlan::execute(C::Add {
             name: i.name,

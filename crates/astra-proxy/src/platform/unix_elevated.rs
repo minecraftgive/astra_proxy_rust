@@ -296,6 +296,8 @@ fn child_main(
     let grace = Duration::from_secs(app.config.shutdown_timeout_secs) + STOP_GRACE;
     let stop = watch_lifeline(stream, grace)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
+        .max_blocking_threads(32)
         .enable_all()
         .build()?;
     let result = runtime.block_on(crate::proxy::runtime::run_with_lifeline(

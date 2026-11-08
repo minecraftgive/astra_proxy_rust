@@ -1,5 +1,7 @@
 # Rule Core GEOIP 内存优化与后续审查
 
+> 2026-11-08 更新：GEOSITE、紧凑 Entry/动作表、运行时及 Proxy Core 连接内存优化已实施；新结果见 [Proxy / Rule Core 内存优化](PROXY_RULE_MEMORY_OPTIMIZATION.md)。下文保留 2026-10-20 的历史测量与当时审查结论。
+
 2026-10-20，Windows x64，32 逻辑处理器，release 构建。此次完成 GEOIP 优化；其余项目为源码审查结果，尚未实施或测定收益。
 
 ## 已完成的改动

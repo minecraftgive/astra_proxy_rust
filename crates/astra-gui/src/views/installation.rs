@@ -54,7 +54,28 @@ impl Render for InstallationView {
         let scope = state.scope_label();
         let busy = state.busy();
         let can_install = state.can_install();
-        let details = state.details();
+        let mut details = state.details();
+        let maintenance = &self.model.read(cx).client.maintenance;
+        let maintenance_label = maintenance.label();
+        let can_recover = maintenance.failed()
+            && maintenance
+                .record
+                .as_ref()
+                .is_some_and(|r| !r.phase.terminal());
+        let can_cancel = self.model.read(cx).client.update_launch.pending()
+            || maintenance
+                .record
+                .as_ref()
+                .map_or(maintenance.active(), |r| r.cancellable());
+        if let Some(log) = &maintenance.log {
+            details.extend(log.lines().map(|line| astra_client::installation::Detail {
+                text: line.into(),
+                kind: DetailKind::Plain,
+            }));
+        }
+        let launch = &self.model.read(cx).client.update_launch;
+        let launch_label = launch.label();
+        let can_launch = launch.pending() && !busy;
         let mut card = Card::new(t(if notice {
             "Install Astra"
         } else {
@@ -85,6 +106,65 @@ impl Render for InstallationView {
             let view = cx.entity().downgrade();
             let count = details.len();
             card = card
+                .child(div().child(maintenance_label))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("maintenance-retry")
+                                .label(t("Retry maintenance with new version"))
+                                .disabled(!can_recover)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::RetryMaintenance, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("maintenance-previous")
+                                .label(t("Restore previous version manually"))
+                                .disabled(!can_recover)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::RestorePrevious, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("maintenance-log")
+                                .label(t("Show maintenance log"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::MaintenanceLog, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("maintenance-cancel")
+                                .label(t("Cancel maintenance before shutdown"))
+                                .disabled(!can_cancel)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::CancelMaintenance, cx)
+                                })),
+                        ),
+                )
+                .child(div().child(launch_label))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("installation-launch")
+                                .label(t("Launch new version now"))
+                                .disabled(!can_launch)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::LaunchNow, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("installation-auto-launch")
+                                .label(t("Toggle automatic launch (30 seconds)"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action(InstallationAction::ToggleAutoLaunch, cx)
+                                })),
+                        ),
+                )
                 .child(div().text_sm().child(target))
                 .child(
                     div()

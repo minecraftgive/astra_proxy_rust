@@ -347,6 +347,44 @@ fn zip_files(path: &Path, entries: &[(&str, &[u8])]) {
 }
 
 #[test]
+fn imports_finder_zip_and_ignores_macos_metadata() {
+    let f = Fixture::new("release-a");
+    fs::write(f.source.join(".DS_Store"), b"finder").unwrap();
+    // A plain release directory with Finder litter still verifies.
+    f.store
+        .import(&f.source, &ImportOptions::default())
+        .unwrap();
+    let f = Fixture::new("release-a");
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("__MACOSX/._client".into(), b"appledouble".to_vec()),
+        ("client/.DS_Store".into(), b"finder".to_vec()),
+    ];
+    for entry in fs::read_dir(&f.source).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_str().unwrap().to_owned();
+        entries.push((format!("client/{name}"), fs::read(entry.path()).unwrap()));
+        entries.push((format!("__MACOSX/client/._{name}"), b"rsrc".to_vec()));
+    }
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let path = f._temp.path().join("client.zip");
+    zip_files(&path, &entries);
+    let installed = f.store.import(path, &ImportOptions::default()).unwrap();
+    assert_eq!(installed.manifest.release_id, "release-a");
+    assert!(!installed.directory.join(".DS_Store").exists());
+}
+
+#[test]
+fn metadata_skipping_still_rejects_traversal() {
+    let f = Fixture::new("release-a");
+    let path = f._temp.path().join("evil.zip");
+    zip_files(&path, &[("__MACOSX/../../escape", b"x")]);
+    assert!(f.store.import(path, &ImportOptions::default()).is_err());
+}
+
+#[test]
 fn imports_zip_and_tar_gz_with_client_wrapper() {
     for format in ["zip", "tar.gz"] {
         let f = Fixture::new("release-a");

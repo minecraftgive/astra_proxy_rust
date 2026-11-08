@@ -233,3 +233,50 @@ fn installation_details_include_missing_roles_and_selected_destination() {
         );
     });
 }
+
+#[tokio::test]
+async fn successful_installation_freezes_the_package_for_launch_not_the_current_selection() {
+    let mut ui = fixture();
+    let package = ui.installation.selected().unwrap().clone();
+    ui.installation.pending_package = Some((package.clone(), v::InstallationScope::User));
+    ui.installation.operation = Some(tokio::spawn(async {
+        Ok(v::InstallationResult {
+            role: "client".into(),
+            directory: "/installed/new".into(),
+            entry: "/installed/entry".into(),
+            already_installed: false,
+            message: "Installed".into(),
+            launch_command: "never execute IPC shell text".into(),
+        })
+    }));
+    // Changing the panel while installation runs must not redirect the launch.
+    ui.installation.status.as_mut().unwrap().packages[0].source = "/different/source".into();
+    ui.installation.scope = v::InstallationScope::System;
+    while !ui.installation.operation.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+    ui.poll_installation_ready(std::path::Path::new("unused.sock"), true);
+    let completed = ui.installation.completed.as_ref().unwrap();
+    assert_eq!(completed.source, package.source);
+    assert_eq!(completed.release_id, package.release_id);
+    assert_eq!(completed.scope, v::InstallationScope::User);
+    assert_eq!(completed.directory, PathBuf::from("/installed/new"));
+    ui.installation.query.take().unwrap().abort();
+}
+
+#[tokio::test]
+async fn failed_installation_never_arms_a_launch() {
+    let mut ui = fixture();
+    ui.installation.pending_package = Some((
+        ui.installation.selected().unwrap().clone(),
+        v::InstallationScope::User,
+    ));
+    ui.installation.operation = Some(tokio::spawn(async { Err("copy failed".into()) }));
+    while !ui.installation.operation.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+    ui.poll_installation_ready(std::path::Path::new("unused.sock"), true);
+    assert!(ui.installation.completed.is_none());
+    assert!(!ui.update_launch.pending());
+    ui.installation.query.take().unwrap().abort();
+}

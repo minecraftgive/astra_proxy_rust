@@ -52,9 +52,12 @@ async fn pending_bytes_are_replayed_unchanged_before_new_data() {
         Pin::new(&mut stream).poll_write(&mut cx, b"abc"),
         Poll::Ready(Ok(3))
     ));
+    assert!(stream.pending.capacity() >= 3);
     stream.write_all(b"defgh").await.unwrap();
     stream.flush().await.unwrap();
+    assert_eq!(stream.pending.capacity(), 0);
     stream.write_all(b"ij").await.unwrap();
     stream.shutdown().await.unwrap();
     assert_eq!(stream.inner.written, b"abcdefghij");
+    assert_eq!(stream.pending.capacity(), 0);
 }

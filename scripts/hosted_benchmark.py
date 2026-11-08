@@ -3,6 +3,7 @@
 
 Never enables TUN, OS proxy settings, transparent interception or external nodes.
 Optional psutil measures the complete proxy process tree (including workers).
+Measures direct and proxy-group routes, including retained idle tunnel memory.
 """
 from astra_tools.workspace import resolve_binary_dir
 import argparse
@@ -93,6 +94,7 @@ class Resources:
         self.roots = [psutil.Process(pid) for pid in pids] if psutil is not None else []
         self.cpu = {}
         self.peak_rss = 0
+        self.current_rss = None
         self.peak_processes = 0
         self.errors = set()
         self.process_names = set()
@@ -103,7 +105,13 @@ class Resources:
         with self.lock:
             return self._sample()
 
+    def rss(self):
+        with self.lock:
+            self._sample()
+            return self.current_rss if not self.errors else None
+
     def _sample(self):
+        self.current_rss = None
         if not self.roots:
             return None
         try:
@@ -124,6 +132,7 @@ class Resources:
                 alive += 1
             except psutil.Error as error:
                 self.errors.add(type(error).__name__)
+        self.current_rss = total_rss
         self.samples += 1
         self.peak_rss = max(self.peak_rss, total_rss)
         self.peak_processes = max(self.peak_processes, alive)
@@ -246,6 +255,65 @@ async def throughput(proxy, destination, duration, streams, resources):
                 await writer.wait_closed()
 
 
+async def idle_memory(proxy, destination, count, settle_seconds, resources):
+    """Keep CONNECT tunnels alive while sampling, then close every owned socket."""
+    async def settled_rss():
+        await asyncio.sleep(settle_seconds)
+        values = []
+        for _ in range(5):
+            value = await asyncio.to_thread(resources.rss)
+            if value is None:
+                return None
+            values.append(value)
+            await asyncio.sleep(.1)
+        return int(statistics.median(values))
+
+    baseline = await settled_rss()
+    channels = []
+    try:
+        for _ in range(count):
+            channel = await asyncio.wait_for(connect(proxy, destination), 10)
+            channels.append(channel)
+            reader, writer, _ = channel
+            # Confirm the complete forwarding path has started before idling.
+            writer.write(b'idle')
+            await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(4), 10) != b'idle':
+                raise RuntimeError('idle tunnel echo payload mismatch')
+        retained = await settled_rss()
+        if any(reader.at_eof() for reader, _, _ in channels):
+            raise RuntimeError('idle tunnel closed before RSS sample')
+        delta = retained - baseline if baseline is not None and retained is not None else None
+        return {
+            'connections': count,
+            'settle_seconds': settle_seconds,
+            'rss_samples_per_phase': 5,
+            'baseline_aggregate_rss_bytes': baseline,
+            'idle_aggregate_rss_bytes': retained,
+            'aggregate_rss_delta_bytes': delta,
+            'rss_bytes_per_connection': round(delta / count, 2) if delta is not None else None,
+            'collection_errors': sorted(resources.errors),
+        }
+    finally:
+        for _, writer, _ in channels:
+            writer.close()
+        for _, writer, _ in channels:
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+
+
+def trial_config(route, port, route_kind, max_connections):
+    action = 'proxy:bench' if route_kind == 'group' else 'direct'
+    rule = (f'socket = {json.dumps(str(route))}\ndefault_action = "{action}"\n'
+            'direct_local = false\n')
+    proxy = (f'rule_socket = {json.dumps(str(route))}\nsocks5_listen = "127.0.0.1:{port}"\n'
+             f'max_connections = {max_connections}\nshutdown_timeout_secs = 1\n')
+    if route_kind == 'group':
+        proxy += ('[proxy_groups.bench]\nmode = "select"\nmembers = ["DIRECT"]\n'
+                  'selected = "DIRECT"\ndisconnect_on_manual = true\n')
+    return rule, proxy
+
+
 async def run(args):
     binary = args.bin_dir.resolve() / executable('astra-proxy')
     rule_binary = args.bin_dir.resolve() / executable('astra-rule')
@@ -253,7 +321,7 @@ async def run(args):
         if not required.is_file():
             raise FileNotFoundError(f'Build the current client binaries first: {required}')
     report = {
-        'schema_version': 1,
+        'schema_version': 2,
         'timestamp_utc': datetime.now(timezone.utc).isoformat(),
         'platform': platform.platform(), 'machine': platform.machine(),
         'logical_cpus': os.cpu_count(), 'python': platform.python_version(),
@@ -264,7 +332,8 @@ async def run(args):
         'warmup_connections': args.warmup, 'rounds': args.rounds,
         'settle_seconds_after_warmup': args.settle_seconds,
         'throughput_seconds_requested': args.seconds,
-        'scope': 'Same proxy/rule binaries, direct-only IPv4 SOCKS5 over loopback. Each trial has one Rule Core with an empty rules table and default direct action. CPU/RSS include the rule process and proxy plus all worker descendants. Python asyncio client and echo server are excluded from CPU/RSS but limit measured throughput. No TUN, system proxy, DNS listener or external traffic. Setup latency excludes the client concurrency gate. Throughput counts acknowledged echo payload once, not upload plus download. RSS is sampled aggregate working set, not an OS lifetime peak.',
+        'routes': args.routes, 'idle_connections': args.idle_connections,
+        'scope': 'Same proxy/rule binaries, IPv4 SOCKS5 over loopback. Each trial has one Rule Core with an empty rules table and either direct action or a select proxy group pointing at DIRECT. Idle RSS is the median of five samples before and during N retained, echo-verified CONNECT tunnels; per-connection memory is (idle RSS - baseline RSS) / N, without clamping allocator noise. CPU/RSS include the rule process and proxy plus all worker descendants. Python asyncio client and echo server are excluded from CPU/RSS but limit measured throughput. No TUN, system proxy, DNS listener or external traffic. Setup latency excludes the client concurrency gate. Throughput counts acknowledged echo payload once, not upload plus download. RSS is sampled aggregate working set, not an OS lifetime peak.',
         'results': [],
     }
     server = await asyncio.start_server(echo_server, '127.0.0.1', 0, backlog=256)
@@ -274,49 +343,55 @@ async def run(args):
             order = (False, True) if round_index % 2 == 0 else (True, False)
             for hosted in order:
                 mode = 'hosted' if hosted else 'ordinary'
-                with tempfile.TemporaryDirectory(prefix='astra-hosted-bench-') as temporary:
-                    directory = pathlib.Path(temporary)
-                    port = free_port()
-                    rule_directory = directory / 'rule'
-                    rule_directory.mkdir()
-                    route = rule_directory / 'route.sock'
-                    rule_config = rule_directory / 'rule.toml'
-                    rule_config.write_text(f'socket = {json.dumps(str(route))}\ndefault_action = "direct"\n', encoding='utf-8')
-                    config = directory / 'proxy.toml'
-                    config.write_text(
-                        f'rule_socket = {json.dumps(str(route))}\nsocks5_listen = "127.0.0.1:{port}"\n'
-                        'max_connections = 4096\nshutdown_timeout_secs = 1\n', encoding='utf-8')
-                    with contextlib.ExitStack() as stack:
-                        rule, rule_log = stack.enter_context(proxy_process(rule_binary, rule_config, rule_directory, False))
-                        await asyncio.to_thread(wait_socket, route, rule, rule_log)
-                        child, log = stack.enter_context(proxy_process(binary, config, directory, hosted))
-                        await asyncio.to_thread(wait_port, port, child, log)
-                        await setup_samples(port, destination, args.warmup, args.concurrency)
-                        await asyncio.sleep(args.settle_seconds)
-                        resources = Resources(child.pid, rule.pid)
-                        sampler = asyncio.create_task(resources.monitor())
-                        try:
-                            setup = await setup_samples(port, destination, args.connections, args.concurrency)
-                            sustained = await throughput(port, destination, args.seconds, args.streams, resources)
-                        except Exception as error:
-                            raise RuntimeError(f'{mode} failed: {error}\n{log.read_text(encoding="utf-8", errors="replace")[-4000:]}') from error
-                        finally:
-                            sampler.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await sampler
-                        row = {'mode': mode, 'round': round_index + 1, 'samples': len(setup),
-                               'setup_ms': {f'p{p}': round(percentile(setup, p), 3) for p in (50, 95, 99)},
-                               'throughput': sustained}
-                        report['results'].append(row)
-                        print(json.dumps(row), flush=True)
+                for route_kind in args.routes:
+                    with tempfile.TemporaryDirectory(prefix='astra-hosted-bench-') as temporary:
+                        directory = pathlib.Path(temporary)
+                        port = free_port()
+                        rule_directory = directory / 'rule'
+                        rule_directory.mkdir()
+                        route = rule_directory / 'route.sock'
+                        rule_config = rule_directory / 'rule.toml'
+                        config = directory / 'proxy.toml'
+                        rule_text, proxy_text = trial_config(route, port, route_kind, max(4096, args.idle_connections + args.concurrency + 16))
+                        rule_config.write_text(rule_text, encoding='utf-8')
+                        config.write_text(proxy_text, encoding='utf-8')
+                        with contextlib.ExitStack() as stack:
+                            rule, rule_log = stack.enter_context(proxy_process(rule_binary, rule_config, rule_directory, False))
+                            await asyncio.to_thread(wait_socket, route, rule, rule_log)
+                            child, log = stack.enter_context(proxy_process(binary, config, directory, hosted))
+                            await asyncio.to_thread(wait_port, port, child, log)
+                            await setup_samples(port, destination, args.warmup, args.concurrency)
+                            await asyncio.sleep(args.settle_seconds)
+                            resources = Resources(child.pid, rule.pid)
+                            sampler = asyncio.create_task(resources.monitor())
+                            try:
+                                idle = await idle_memory(port, destination, args.idle_connections, args.settle_seconds, resources)
+                                setup = await setup_samples(port, destination, args.connections, args.concurrency)
+                                sustained = await throughput(port, destination, args.seconds, args.streams, resources)
+                            except Exception as error:
+                                raise RuntimeError(f'{mode}/{route_kind} failed: {error}\n{log.read_text(encoding="utf-8", errors="replace")[-4000:]}') from error
+                            finally:
+                                sampler.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await sampler
+                            row = {'mode': mode, 'route': route_kind, 'idle_memory': idle, 'round': round_index + 1, 'samples': len(setup),
+                                   'setup_ms': {f'p{p}': round(percentile(setup, p), 3) for p in (50, 95, 99)},
+                                   'throughput': sustained}
+                            report['results'].append(row)
+                            print(json.dumps(row), flush=True)
     report['summary'] = {}
     for mode in ('ordinary', 'hosted'):
-        rows = [row for row in report['results'] if row['mode'] == mode]
-        report['summary'][mode] = {
-            'median_round_setup_p50_ms': round(statistics.median(row['setup_ms']['p50'] for row in rows), 3),
-            'median_round_setup_p95_ms': round(statistics.median(row['setup_ms']['p95'] for row in rows), 3),
-            'median_echo_payload_mib_per_second': round(statistics.median(row['throughput']['echo_payload_mib_per_second'] for row in rows), 3),
-        }
+        report['summary'][mode] = {}
+        for route_kind in args.routes:
+            rows = [row for row in report['results'] if row['mode'] == mode and row['route'] == route_kind]
+            memory = [row['idle_memory']['rss_bytes_per_connection'] for row in rows
+                      if row['idle_memory']['rss_bytes_per_connection'] is not None]
+            report['summary'][mode][route_kind] = {
+                'median_round_setup_p50_ms': round(statistics.median(row['setup_ms']['p50'] for row in rows), 3),
+                'median_round_setup_p95_ms': round(statistics.median(row['setup_ms']['p95'] for row in rows), 3),
+                'median_echo_payload_mib_per_second': round(statistics.median(row['throughput']['echo_payload_mib_per_second'] for row in rows), 3),
+                'median_idle_rss_bytes_per_connection': round(statistics.median(memory), 2) if memory else None,
+            }
     if report['binary_sha256'] != {path.name: digest(path) for path in (binary, rule_binary)}:
         raise RuntimeError('Binaries changed during the benchmark; rebuild first and rerun the comparison')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -328,6 +403,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin-dir', type=pathlib.Path, default=None)
     parser.add_argument('--output', type=pathlib.Path, default=ROOT / 'docs/hosted-performance.json')
+    parser.add_argument('--routes', nargs='+', choices=('direct', 'group'), default=['direct', 'group'])
+    parser.add_argument('--idle-connections', type=int, default=100)
     parser.add_argument('--connections', type=int, default=100)
     parser.add_argument('--concurrency', type=int, default=1)
     parser.add_argument('--warmup', type=int, default=10)
@@ -336,7 +413,7 @@ def main():
     parser.add_argument('--streams', type=int, default=2)
     parser.add_argument('--settle-seconds', type=float, default=2)
     args = parser.parse_args(); args.bin_dir = resolve_binary_dir(args.bin_dir, profile='debug')
-    if min(args.connections, args.concurrency, args.warmup, args.rounds, args.seconds, args.streams) <= 0:
+    if min(args.idle_connections, args.connections, args.concurrency, args.warmup, args.rounds, args.seconds, args.streams) <= 0:
         parser.error('all workload sizes and durations must be positive')
     if args.settle_seconds < 0:
         parser.error('--settle-seconds must be nonnegative')

@@ -55,6 +55,9 @@ impl Render for UpdatesView {
             let mut button = Button::new(("update-command", index))
                 .label(t(command.label()))
                 .disabled(reason.is_some());
+            if matches!(command, Command::LaunchNow) {
+                button = button.disabled(!self.model.read(cx).client.update_launch.pending());
+            }
             if matches!(command, Command::Import) {
                 button = button.primary();
             }
@@ -87,6 +90,8 @@ impl Render for UpdatesView {
             .p_4()
             .gap_3()
             .child(Card::new(t("Updates")).child(toolbar))
+            .child(div().child(self.model.read(cx).client.update_launch.label()))
+            .child(div().child(self.model.read(cx).client.maintenance.label()))
             .child(
                 div()
                     .flex_1()

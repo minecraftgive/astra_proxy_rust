@@ -1,0 +1,1689 @@
+{
+  "date": "2026-11-08",
+  "baseline_commit": "b45fd95d5fdf16d382aac0367a039326bae33bbd",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "logical_cpus": 12,
+  "physical_memory_bytes": 38654705664,
+  "build": "release: opt-level=3, lto=fat, codegen-units=1",
+  "rule": {
+    "before": {
+      "binary_sha256": "29a4ff41234c2dc53f061c4619c8f96ab58ac4e0158ca78e6a9bd3e61745d91e",
+      "geosite_sha256": "a035629f0f9157e4d978896df53b88d6b9fe8458d603d6388d9034a9b1c962a7",
+      "geosite_bytes": 4125536,
+      "groups": {
+        "selected": [
+          "google",
+          "telegram"
+        ],
+        "many": [
+          "cn",
+          "google",
+          "youtube",
+          "github",
+          "apple",
+          "microsoft",
+          "netflix",
+          "telegram",
+          "twitter",
+          "facebook",
+          "amazon",
+          "openai",
+          "spotify",
+          "onedrive",
+          "geolocation-!cn"
+        ]
+      },
+      "samples": [
+        {
+          "scenario": "selected",
+          "run": 0,
+          "peak_rss_bytes": 42582016,
+          "idle_rss_bytes": 43220992
+        },
+        {
+          "scenario": "selected",
+          "run": 1,
+          "peak_rss_bytes": 41353216,
+          "idle_rss_bytes": 41336832
+        },
+        {
+          "scenario": "selected",
+          "run": 2,
+          "peak_rss_bytes": 43008000,
+          "idle_rss_bytes": 42565632
+        },
+        {
+          "scenario": "many",
+          "run": 0,
+          "peak_rss_bytes": 98385920,
+          "idle_rss_bytes": 101269504
+        },
+        {
+          "scenario": "many",
+          "run": 1,
+          "peak_rss_bytes": 98435072,
+          "idle_rss_bytes": 103022592
+        },
+        {
+          "scenario": "many",
+          "run": 2,
+          "peak_rss_bytes": 101040128,
+          "idle_rss_bytes": 101154816
+        }
+      ]
+    },
+    "after": {
+      "binary_sha256": "a7a13dee47b047ff607eff36fda08c39fb4284a9dad7fc0aa689982060327a7f",
+      "geosite_sha256": "a035629f0f9157e4d978896df53b88d6b9fe8458d603d6388d9034a9b1c962a7",
+      "geosite_bytes": 4125536,
+      "groups": {
+        "selected": [
+          "google",
+          "telegram"
+        ],
+        "many": [
+          "cn",
+          "google",
+          "youtube",
+          "github",
+          "apple",
+          "microsoft",
+          "netflix",
+          "telegram",
+          "twitter",
+          "facebook",
+          "amazon",
+          "openai",
+          "spotify",
+          "onedrive",
+          "geolocation-!cn"
+        ]
+      },
+      "samples": [
+        {
+          "scenario": "selected",
+          "run": 0,
+          "peak_rss_bytes": 23494656,
+          "idle_rss_bytes": 25264128
+        },
+        {
+          "scenario": "selected",
+          "run": 1,
+          "peak_rss_bytes": 23511040,
+          "idle_rss_bytes": 25313280
+        },
+        {
+          "scenario": "selected",
+          "run": 2,
+          "peak_rss_bytes": 23511040,
+          "idle_rss_bytes": 25313280
+        },
+        {
+          "scenario": "many",
+          "run": 0,
+          "peak_rss_bytes": 52953088,
+          "idle_rss_bytes": 52985856
+        },
+        {
+          "scenario": "many",
+          "run": 1,
+          "peak_rss_bytes": 52953088,
+          "idle_rss_bytes": 52936704
+        },
+        {
+          "scenario": "many",
+          "run": 2,
+          "peak_rss_bytes": 53002240,
+          "idle_rss_bytes": 52543488
+        }
+      ]
+    }
+  },
+  "proxy_hosted": {
+    "before": {
+      "schema_version": 2,
+      "timestamp_utc": "2026-11-07T19:09:16.695750+00:00",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary": "/private/tmp/astra-memory-before-bin/astra-proxy",
+      "binary_sha256": {
+        "astra-proxy": "430f06e0fb38ae8d37324ec7632222f673c1ef8dc72a30cf1aa051fd5f757609",
+        "astra-rule": "29a4ff41234c2dc53f061c4619c8f96ab58ac4e0158ca78e6a9bd3e61745d91e"
+      },
+      "build_profile_hint": "astra-memory-before-bin",
+      "connections_per_round": 100,
+      "concurrency": 10,
+      "warmup_connections": 10,
+      "rounds": 3,
+      "settle_seconds_after_warmup": 1.0,
+      "throughput_seconds_requested": 3.0,
+      "routes": [
+        "direct",
+        "group"
+      ],
+      "idle_connections": 200,
+      "scope": "Same proxy/rule binaries, IPv4 SOCKS5 over loopback. Each trial has one Rule Core with an empty rules table and either direct action or a select proxy group pointing at DIRECT. Idle RSS is the median of five samples before and during N retained, echo-verified CONNECT tunnels; per-connection memory is (idle RSS - baseline RSS) / N, without clamping allocator noise. CPU/RSS include the rule process and proxy plus all worker descendants. Python asyncio client and echo server are excluded from CPU/RSS but limit measured throughput. No TUN, system proxy, DNS listener or external traffic. Setup latency excludes the client concurrency gate. Throughput counts acknowledged echo payload once, not upload plus download. RSS is sampled aggregate working set, not an OS lifetime peak.",
+      "results": [
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 19988480,
+            "idle_aggregate_rss_bytes": 47087616,
+            "aggregate_rss_delta_bytes": 27099136,
+            "rss_bytes_per_connection": 135495.68,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 3.121,
+            "p95": 40.785,
+            "p99": 41.02
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2825453568,
+            "elapsed_seconds": 3.000199,
+            "echo_payload_mib_per_second": 898.128,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.855104,
+              "cpu_percent_one_core_100": 61.83,
+              "sampled_peak_aggregate_rss_bytes": 47415296,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20168704,
+            "idle_aggregate_rss_bytes": 47153152,
+            "aggregate_rss_delta_bytes": 26984448,
+            "rss_bytes_per_connection": 134922.24,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.952,
+            "p95": 21.0,
+            "p99": 21.184
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2825125888,
+            "elapsed_seconds": 3.0002,
+            "echo_payload_mib_per_second": 898.024,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.852768,
+              "cpu_percent_one_core_100": 61.75,
+              "sampled_peak_aggregate_rss_bytes": 47415296,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 31801344,
+            "idle_aggregate_rss_bytes": 79921152,
+            "aggregate_rss_delta_bytes": 48119808,
+            "rss_bytes_per_connection": 240599.04,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.99,
+            "p95": 12.629,
+            "p99": 12.792
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1546649600,
+            "elapsed_seconds": 3.000366,
+            "echo_payload_mib_per_second": 491.607,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.552258,
+              "cpu_percent_one_core_100": 218.38,
+              "sampled_peak_aggregate_rss_bytes": 81444864,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 31834112,
+            "idle_aggregate_rss_bytes": 80052224,
+            "aggregate_rss_delta_bytes": 48218112,
+            "rss_bytes_per_connection": 241090.56,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 2.271,
+            "p95": 12.933,
+            "p99": 13.087
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1498284032,
+            "elapsed_seconds": 3.123067,
+            "echo_payload_mib_per_second": 457.523,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.416179,
+              "cpu_percent_one_core_100": 205.44,
+              "sampled_peak_aggregate_rss_bytes": 81428480,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 63,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 31850496,
+            "idle_aggregate_rss_bytes": 79953920,
+            "aggregate_rss_delta_bytes": 48103424,
+            "rss_bytes_per_connection": 240517.12,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.929,
+            "p95": 14.637,
+            "p99": 14.81
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1538523136,
+            "elapsed_seconds": 3.000365,
+            "echo_payload_mib_per_second": 489.024,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.468241,
+              "cpu_percent_one_core_100": 215.58,
+              "sampled_peak_aggregate_rss_bytes": 81674240,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 31981568,
+            "idle_aggregate_rss_bytes": 80134144,
+            "aggregate_rss_delta_bytes": 48152576,
+            "rss_bytes_per_connection": 240762.88,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.517,
+            "p95": 17.93,
+            "p99": 18.052
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1373437952,
+            "elapsed_seconds": 3.002361,
+            "echo_payload_mib_per_second": 436.261,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.353717,
+              "cpu_percent_one_core_100": 211.62,
+              "sampled_peak_aggregate_rss_bytes": 81707008,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20021248,
+            "idle_aggregate_rss_bytes": 47071232,
+            "aggregate_rss_delta_bytes": 27049984,
+            "rss_bytes_per_connection": 135249.92,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 2.458,
+            "p95": 15.59,
+            "p99": 15.743
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2758868992,
+            "elapsed_seconds": 3.000205,
+            "echo_payload_mib_per_second": 876.961,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.834106,
+              "cpu_percent_one_core_100": 61.13,
+              "sampled_peak_aggregate_rss_bytes": 47267840,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20119552,
+            "idle_aggregate_rss_bytes": 47169536,
+            "aggregate_rss_delta_bytes": 27049984,
+            "rss_bytes_per_connection": 135249.92,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.493,
+            "p95": 36.47,
+            "p99": 36.887
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2755657728,
+            "elapsed_seconds": 3.024428,
+            "echo_payload_mib_per_second": 868.925,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.846219,
+              "cpu_percent_one_core_100": 61.04,
+              "sampled_peak_aggregate_rss_bytes": 47382528,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20086784,
+            "idle_aggregate_rss_bytes": 47071232,
+            "aggregate_rss_delta_bytes": 26984448,
+            "rss_bytes_per_connection": 134922.24,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 2.817,
+            "p95": 14.858,
+            "p99": 14.991
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2772762624,
+            "elapsed_seconds": 3.000177,
+            "echo_payload_mib_per_second": 881.386,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.838096,
+              "cpu_percent_one_core_100": 61.27,
+              "sampled_peak_aggregate_rss_bytes": 47349760,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20201472,
+            "idle_aggregate_rss_bytes": 47300608,
+            "aggregate_rss_delta_bytes": 27099136,
+            "rss_bytes_per_connection": 135495.68,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.656,
+            "p95": 16.992,
+            "p99": 17.16
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2811953152,
+            "elapsed_seconds": 3.000264,
+            "echo_payload_mib_per_second": 893.817,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.842127,
+              "cpu_percent_one_core_100": 61.4,
+              "sampled_peak_aggregate_rss_bytes": 47579136,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 31703040,
+            "idle_aggregate_rss_bytes": 79904768,
+            "aggregate_rss_delta_bytes": 48201728,
+            "rss_bytes_per_connection": 241008.64,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.537,
+            "p95": 14.831,
+            "p99": 14.996
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1415970816,
+            "elapsed_seconds": 3.004152,
+            "echo_payload_mib_per_second": 449.503,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.130665,
+              "cpu_percent_one_core_100": 204.07,
+              "sampled_peak_aggregate_rss_bytes": 81412096,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 32014336,
+            "idle_aggregate_rss_bytes": 80183296,
+            "aggregate_rss_delta_bytes": 48168960,
+            "rss_bytes_per_connection": 240844.8,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 2.752,
+            "p95": 18.516,
+            "p99": 18.713
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1480785920,
+            "elapsed_seconds": 3.030796,
+            "echo_payload_mib_per_second": 465.946,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.366388,
+              "cpu_percent_one_core_100": 210.06,
+              "sampled_peak_aggregate_rss_bytes": 81756160,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        }
+      ],
+      "summary": {
+        "ordinary": {
+          "direct": {
+            "median_round_setup_p50_ms": 2.817,
+            "median_round_setup_p95_ms": 15.59,
+            "median_echo_payload_mib_per_second": 881.386,
+            "median_idle_rss_bytes_per_connection": 135249.92
+          },
+          "group": {
+            "median_round_setup_p50_ms": 1.656,
+            "median_round_setup_p95_ms": 21.0,
+            "median_echo_payload_mib_per_second": 893.817,
+            "median_idle_rss_bytes_per_connection": 135249.92
+          }
+        },
+        "hosted": {
+          "direct": {
+            "median_round_setup_p50_ms": 1.929,
+            "median_round_setup_p95_ms": 14.637,
+            "median_echo_payload_mib_per_second": 489.024,
+            "median_idle_rss_bytes_per_connection": 240599.04
+          },
+          "group": {
+            "median_round_setup_p50_ms": 2.271,
+            "median_round_setup_p95_ms": 17.93,
+            "median_echo_payload_mib_per_second": 457.523,
+            "median_idle_rss_bytes_per_connection": 240844.8
+          }
+        }
+      }
+    },
+    "after": {
+      "schema_version": 2,
+      "timestamp_utc": "2026-11-07T19:11:14.630266+00:00",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary": "target/aarch64-apple-darwin/release/astra-proxy",
+      "binary_sha256": {
+        "astra-proxy": "472e0d7832707491775fa29ff8eb050e851af332766140880dbcd0e78605497e",
+        "astra-rule": "a7a13dee47b047ff607eff36fda08c39fb4284a9dad7fc0aa689982060327a7f"
+      },
+      "build_profile_hint": "release",
+      "connections_per_round": 100,
+      "concurrency": 10,
+      "warmup_connections": 10,
+      "rounds": 3,
+      "settle_seconds_after_warmup": 1.0,
+      "throughput_seconds_requested": 3.0,
+      "routes": [
+        "direct",
+        "group"
+      ],
+      "idle_connections": 200,
+      "scope": "Same proxy/rule binaries, IPv4 SOCKS5 over loopback. Each trial has one Rule Core with an empty rules table and either direct action or a select proxy group pointing at DIRECT. Idle RSS is the median of five samples before and during N retained, echo-verified CONNECT tunnels; per-connection memory is (idle RSS - baseline RSS) / N, without clamping allocator noise. CPU/RSS include the rule process and proxy plus all worker descendants. Python asyncio client and echo server are excluded from CPU/RSS but limit measured throughput. No TUN, system proxy, DNS listener or external traffic. Setup latency excludes the client concurrency gate. Throughput counts acknowledged echo payload once, not upload plus download. RSS is sampled aggregate working set, not an OS lifetime peak.",
+      "results": [
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20725760,
+            "idle_aggregate_rss_bytes": 29687808,
+            "aggregate_rss_delta_bytes": 8962048,
+            "rss_bytes_per_connection": 44810.24,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.79,
+            "p95": 16.62,
+            "p99": 16.774
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2780954624,
+            "elapsed_seconds": 3.00017,
+            "echo_payload_mib_per_second": 883.992,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.495004,
+              "cpu_percent_one_core_100": 49.83,
+              "sampled_peak_aggregate_rss_bytes": 30670848,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20840448,
+            "idle_aggregate_rss_bytes": 29818880,
+            "aggregate_rss_delta_bytes": 8978432,
+            "rss_bytes_per_connection": 44892.16,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.767,
+            "p95": 23.464,
+            "p99": 23.657
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2748055552,
+            "elapsed_seconds": 3.000175,
+            "echo_payload_mib_per_second": 873.532,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.486971,
+              "cpu_percent_one_core_100": 49.56,
+              "sampled_peak_aggregate_rss_bytes": 31653888,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33243136,
+            "idle_aggregate_rss_bytes": 58523648,
+            "aggregate_rss_delta_bytes": 25280512,
+            "rss_bytes_per_connection": 126402.56,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.49,
+            "p95": 26.071,
+            "p99": 26.259
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1468268544,
+            "elapsed_seconds": 3.141801,
+            "echo_payload_mib_per_second": 445.684,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.307661,
+              "cpu_percent_one_core_100": 200.77,
+              "sampled_peak_aggregate_rss_bytes": 61603840,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 63,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33406976,
+            "idle_aggregate_rss_bytes": 58245120,
+            "aggregate_rss_delta_bytes": 24838144,
+            "rss_bytes_per_connection": 124190.72,
+            "collection_errors": []
+          },
+          "round": 1,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.545,
+            "p95": 26.139,
+            "p99": 30.127
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1403846656,
+            "elapsed_seconds": 3.000342,
+            "echo_payload_mib_per_second": 446.22,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.059418,
+              "cpu_percent_one_core_100": 201.96,
+              "sampled_peak_aggregate_rss_bytes": 61587456,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33243136,
+            "idle_aggregate_rss_bytes": 58310656,
+            "aggregate_rss_delta_bytes": 25067520,
+            "rss_bytes_per_connection": 125337.6,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.749,
+            "p95": 17.642,
+            "p99": 17.802
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1435762688,
+            "elapsed_seconds": 3.000723,
+            "echo_payload_mib_per_second": 456.307,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.028607,
+              "cpu_percent_one_core_100": 200.91,
+              "sampled_peak_aggregate_rss_bytes": 61915136,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33259520,
+            "idle_aggregate_rss_bytes": 58212352,
+            "aggregate_rss_delta_bytes": 24952832,
+            "rss_bytes_per_connection": 124764.16,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.742,
+            "p95": 15.743,
+            "p99": 15.875
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1537671168,
+            "elapsed_seconds": 3.000295,
+            "echo_payload_mib_per_second": 488.764,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.414747,
+              "cpu_percent_one_core_100": 213.8,
+              "sampled_peak_aggregate_rss_bytes": 61915136,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20463616,
+            "idle_aggregate_rss_bytes": 29458432,
+            "aggregate_rss_delta_bytes": 8994816,
+            "rss_bytes_per_connection": 44974.08,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.522,
+            "p95": 23.255,
+            "p99": 23.417
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2685272064,
+            "elapsed_seconds": 3.000947,
+            "echo_payload_mib_per_second": 853.356,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.466022,
+              "cpu_percent_one_core_100": 48.85,
+              "sampled_peak_aggregate_rss_bytes": 30654464,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20791296,
+            "idle_aggregate_rss_bytes": 29982720,
+            "aggregate_rss_delta_bytes": 9191424,
+            "rss_bytes_per_connection": 45957.12,
+            "collection_errors": []
+          },
+          "round": 2,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.376,
+            "p95": 16.551,
+            "p99": 16.693
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2707488768,
+            "elapsed_seconds": 3.000243,
+            "echo_payload_mib_per_second": 860.618,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.476164,
+              "cpu_percent_one_core_100": 49.2,
+              "sampled_peak_aggregate_rss_bytes": 31162368,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20824064,
+            "idle_aggregate_rss_bytes": 29655040,
+            "aggregate_rss_delta_bytes": 8830976,
+            "rss_bytes_per_connection": 44154.88,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.569,
+            "p95": 16.606,
+            "p99": 16.77
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2725707776,
+            "elapsed_seconds": 3.000233,
+            "echo_payload_mib_per_second": 866.412,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.471799,
+              "cpu_percent_one_core_100": 49.06,
+              "sampled_peak_aggregate_rss_bytes": 31064064,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "ordinary",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 20594688,
+            "idle_aggregate_rss_bytes": 29491200,
+            "aggregate_rss_delta_bytes": 8896512,
+            "rss_bytes_per_connection": 44482.56,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 2.006,
+            "p95": 13.112,
+            "p99": 13.257
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 2542927872,
+            "elapsed_seconds": 3.00026,
+            "echo_payload_mib_per_second": 808.305,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 1.450693,
+              "cpu_percent_one_core_100": 48.35,
+              "sampled_peak_aggregate_rss_bytes": 31211520,
+              "peak_process_count": 2,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "direct",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33193984,
+            "idle_aggregate_rss_bytes": 58130432,
+            "aggregate_rss_delta_bytes": 24936448,
+            "rss_bytes_per_connection": 124682.24,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.693,
+            "p95": 34.742,
+            "p99": 35.166
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1489895424,
+            "elapsed_seconds": 3.034054,
+            "echo_payload_mib_per_second": 468.309,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.418245,
+              "cpu_percent_one_core_100": 211.54,
+              "sampled_peak_aggregate_rss_bytes": 62504960,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 63,
+              "collection_errors": []
+            }
+          }
+        },
+        {
+          "mode": "hosted",
+          "route": "group",
+          "idle_memory": {
+            "connections": 200,
+            "settle_seconds": 1.0,
+            "rss_samples_per_phase": 5,
+            "baseline_aggregate_rss_bytes": 33357824,
+            "idle_aggregate_rss_bytes": 58212352,
+            "aggregate_rss_delta_bytes": 24854528,
+            "rss_bytes_per_connection": 124272.64,
+            "collection_errors": []
+          },
+          "round": 3,
+          "samples": 100,
+          "setup_ms": {
+            "p50": 1.778,
+            "p95": 17.884,
+            "p99": 17.999
+          },
+          "throughput": {
+            "streams": 4,
+            "payload_chunk_bytes": 65536,
+            "echoed_payload_bytes": 1455685632,
+            "elapsed_seconds": 3.000347,
+            "echo_payload_mib_per_second": 462.696,
+            "resources": {
+              "collector": "psutil proxy tree plus rule process",
+              "cpu_seconds_during_throughput": 6.153443,
+              "cpu_percent_one_core_100": 205.09,
+              "sampled_peak_aggregate_rss_bytes": 62636032,
+              "peak_process_count": 3,
+              "process_names": [
+                "astra-proxy",
+                "astra-rule"
+              ],
+              "sample_interval_ms": 100,
+              "samples": 62,
+              "collection_errors": []
+            }
+          }
+        }
+      ],
+      "summary": {
+        "ordinary": {
+          "direct": {
+            "median_round_setup_p50_ms": 1.569,
+            "median_round_setup_p95_ms": 16.62,
+            "median_echo_payload_mib_per_second": 866.412,
+            "median_idle_rss_bytes_per_connection": 44810.24
+          },
+          "group": {
+            "median_round_setup_p50_ms": 1.767,
+            "median_round_setup_p95_ms": 16.551,
+            "median_echo_payload_mib_per_second": 860.618,
+            "median_idle_rss_bytes_per_connection": 44892.16
+          }
+        },
+        "hosted": {
+          "direct": {
+            "median_round_setup_p50_ms": 1.693,
+            "median_round_setup_p95_ms": 26.071,
+            "median_echo_payload_mib_per_second": 456.307,
+            "median_idle_rss_bytes_per_connection": 125337.6
+          },
+          "group": {
+            "median_round_setup_p50_ms": 1.742,
+            "median_round_setup_p95_ms": 17.884,
+            "median_echo_payload_mib_per_second": 462.696,
+            "median_idle_rss_bytes_per_connection": 124272.64
+          }
+        }
+      }
+    }
+  },
+  "validation": {
+    "cargo_test_passed": 207,
+    "cargo_test_ignored": 3,
+    "clippy_workspace_all_targets": "pass with pre-existing warnings",
+    "vendor_unit_tests_passed": 4,
+    "python_benchmark_tests_passed": 8,
+    "regressions": {
+      "ruleset": "pass",
+      "proxy_groups": "pass",
+      "reload": "pass",
+      "udp": "pass"
+    },
+    "reload_fixture": "Baseline and optimized binaries both failed with direct_local default true. Both passed after fixture explicitly set direct_local=false."
+  },
+  "short_connection_throughput": {
+    "before": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary_sha256": {
+        "astra-proxy": "430f06e0fb38ae8d37324ec7632222f673c1ef8dc72a30cf1aa051fd5f757609",
+        "astra-rule": "29a4ff41234c2dc53f061c4619c8f96ab58ac4e0158ca78e6a9bd3e61745d91e"
+      },
+      "connections_per_round": 300,
+      "rounds": 3,
+      "scope": "Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.",
+      "results": [
+        {
+          "rules": 1000,
+          "cache": "disabled",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.41,
+            "p95": 0.644,
+            "p99": 0.773
+          },
+          "echo_ms": {
+            "p50": 0.516,
+            "p95": 0.75,
+            "p99": 0.886
+          },
+          "completed_per_second_median": 1566.8
+        },
+        {
+          "rules": 1000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 13.103,
+            "p95": 26.895,
+            "p99": 29.99
+          },
+          "echo_ms": {
+            "p50": 14.132,
+            "p95": 28.706,
+            "p99": 31.928
+          },
+          "completed_per_second_median": 1529.5
+        },
+        {
+          "rules": 1000,
+          "cache": "warm",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.417,
+            "p95": 0.608,
+            "p99": 0.814
+          },
+          "echo_ms": {
+            "p50": 0.526,
+            "p95": 0.713,
+            "p99": 0.925
+          },
+          "completed_per_second_median": 1511.1
+        },
+        {
+          "rules": 1000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 12.513,
+            "p95": 24.564,
+            "p99": 28.079
+          },
+          "echo_ms": {
+            "p50": 13.711,
+            "p95": 26.233,
+            "p99": 30.081
+          },
+          "completed_per_second_median": 1540.9
+        },
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.427,
+            "p95": 0.624,
+            "p99": 0.675
+          },
+          "echo_ms": {
+            "p50": 0.531,
+            "p95": 0.73,
+            "p99": 0.776
+          },
+          "completed_per_second_median": 1510.6
+        },
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 14.986,
+            "p95": 26.764,
+            "p99": 30.264
+          },
+          "echo_ms": {
+            "p50": 16.218,
+            "p95": 28.433,
+            "p99": 32.218
+          },
+          "completed_per_second_median": 1340.4
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.382,
+            "p95": 2.009,
+            "p99": 2.189
+          },
+          "echo_ms": {
+            "p50": 0.485,
+            "p95": 2.115,
+            "p99": 2.287
+          },
+          "completed_per_second_median": 1533.8
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 10.442,
+            "p95": 19.095,
+            "p99": 21.757
+          },
+          "echo_ms": {
+            "p50": 11.507,
+            "p95": 20.905,
+            "p99": 24.467
+          },
+          "completed_per_second_median": 1840.6
+        }
+      ]
+    },
+    "after": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary_sha256": {
+        "astra-proxy": "472e0d7832707491775fa29ff8eb050e851af332766140880dbcd0e78605497e",
+        "astra-rule": "a7a13dee47b047ff607eff36fda08c39fb4284a9dad7fc0aa689982060327a7f"
+      },
+      "connections_per_round": 300,
+      "rounds": 3,
+      "scope": "Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.",
+      "results": [
+        {
+          "rules": 1000,
+          "cache": "disabled",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.401,
+            "p95": 0.569,
+            "p99": 0.793
+          },
+          "echo_ms": {
+            "p50": 0.504,
+            "p95": 0.684,
+            "p99": 0.902
+          },
+          "completed_per_second_median": 1546.0
+        },
+        {
+          "rules": 1000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 11.937,
+            "p95": 24.954,
+            "p99": 27.578
+          },
+          "echo_ms": {
+            "p50": 12.992,
+            "p95": 26.853,
+            "p99": 30.167
+          },
+          "completed_per_second_median": 1711.8
+        },
+        {
+          "rules": 1000,
+          "cache": "warm",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.374,
+            "p95": 1.784,
+            "p99": 1.931
+          },
+          "echo_ms": {
+            "p50": 0.481,
+            "p95": 1.89,
+            "p99": 2.032
+          },
+          "completed_per_second_median": 1604.6
+        },
+        {
+          "rules": 1000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 9.926,
+            "p95": 19.141,
+            "p99": 21.264
+          },
+          "echo_ms": {
+            "p50": 11.14,
+            "p95": 21.681,
+            "p99": 23.867
+          },
+          "completed_per_second_median": 1947.2
+        },
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.383,
+            "p95": 0.575,
+            "p99": 0.619
+          },
+          "echo_ms": {
+            "p50": 0.484,
+            "p95": 0.676,
+            "p99": 0.726
+          },
+          "completed_per_second_median": 1603.5
+        },
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 13.29,
+            "p95": 25.279,
+            "p99": 29.425
+          },
+          "echo_ms": {
+            "p50": 14.583,
+            "p95": 27.929,
+            "p99": 31.605
+          },
+          "completed_per_second_median": 1533.4
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 1,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 0.413,
+            "p95": 0.589,
+            "p99": 0.679
+          },
+          "echo_ms": {
+            "p50": 0.513,
+            "p95": 0.692,
+            "p99": 0.787
+          },
+          "completed_per_second_median": 1602.0
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 900,
+          "setup_ms": {
+            "p50": 14.076,
+            "p95": 26.531,
+            "p99": 30.138
+          },
+          "echo_ms": {
+            "p50": 15.336,
+            "p95": 27.985,
+            "p99": 31.597
+          },
+          "completed_per_second_median": 1446.9
+        }
+      ]
+    },
+    "measurement_note": "Initial after run hit macOS EADDRNOTAVAIL after successive high-volume connection tests (ephemeral ports49152..65535, MSL15000ms). Successful after data was collected after ports recovered; no OS settings changed."
+  },
+  "focused_short_connection_throughput": {
+    "before": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary_sha256": {
+        "astra-proxy": "430f06e0fb38ae8d37324ec7632222f673c1ef8dc72a30cf1aa051fd5f757609",
+        "astra-rule": "29a4ff41234c2dc53f061c4619c8f96ab58ac4e0158ca78e6a9bd3e61745d91e"
+      },
+      "connections_per_round": 300,
+      "rounds": 5,
+      "scope": "Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.",
+      "results": [
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 1500,
+          "setup_ms": {
+            "p50": 6.871,
+            "p95": 14.979,
+            "p99": 18.009
+          },
+          "echo_ms": {
+            "p50": 7.942,
+            "p95": 16.106,
+            "p99": 19.382
+          },
+          "completed_per_second_median": 2720.3
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 1500,
+          "setup_ms": {
+            "p50": 7.214,
+            "p95": 15.328,
+            "p99": 18.449
+          },
+          "echo_ms": {
+            "p50": 8.401,
+            "p95": 16.766,
+            "p99": 19.681
+          },
+          "completed_per_second_median": 2747.3
+        }
+      ]
+    },
+    "after": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "logical_cpus": 12,
+      "python": "3.9.6",
+      "binary_sha256": {
+        "astra-proxy": "472e0d7832707491775fa29ff8eb050e851af332766140880dbcd0e78605497e",
+        "astra-rule": "a7a13dee47b047ff607eff36fda08c39fb4284a9dad7fc0aa689982060327a7f"
+      },
+      "connections_per_round": 300,
+      "rounds": 5,
+      "scope": "Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.",
+      "results": [
+        {
+          "rules": 10000,
+          "cache": "disabled",
+          "concurrency": 32,
+          "samples": 1500,
+          "setup_ms": {
+            "p50": 6.426,
+            "p95": 15.518,
+            "p99": 19.829
+          },
+          "echo_ms": {
+            "p50": 7.6,
+            "p95": 17.15,
+            "p99": 21.461
+          },
+          "completed_per_second_median": 2949.4
+        },
+        {
+          "rules": 10000,
+          "cache": "warm",
+          "concurrency": 32,
+          "samples": 1500,
+          "setup_ms": {
+            "p50": 6.83,
+            "p95": 30.206,
+            "p99": 34.947
+          },
+          "echo_ms": {
+            "p50": 7.978,
+            "p95": 32.464,
+            "p99": 37.622
+          },
+          "completed_per_second_median": 2837.0
+        }
+      ]
+    },
+    "measurement_note": "Focused rules=10000, concurrency=32, connections=300, rounds=5; reverse order after then before; waited for ephemeral port recovery; no errors."
+  }
+}

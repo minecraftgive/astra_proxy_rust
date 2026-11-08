@@ -71,6 +71,15 @@ impl Ui {
         {
             return None;
         }
+        if self.page == OVERVIEW
+            && self.overview_input()
+            && self.editor.is_none()
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('b')
+        {
+            self.traffic_period = self.traffic_period.next();
+            return Some(Input::Idle);
+        }
         let regions: &[Region] = if self.editor.is_some() {
             &[Region::Main, Region::Controls, Region::Tasks]
         } else if matches!(self.page, PROXIES | CONNECTIONS | OVERVIEW) {

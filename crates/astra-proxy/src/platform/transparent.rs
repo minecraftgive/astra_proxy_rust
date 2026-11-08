@@ -1,4 +1,3 @@
-use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::{runtime::Current, App};
 #[cfg(not(target_os = "linux"))]
 use anyhow::bail;
@@ -52,13 +51,9 @@ pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Resu
     let mut remote = app
         .connect_tracked(&target, &action, inbound, stream.peer_addr().ok())
         .await?;
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut stream,
-        &mut remote,
-        COPY_BUFFER_SIZE,
-        COPY_BUFFER_SIZE,
-    )
-    .await?;
+    let _route_leases = app.route_leases.clone();
+    drop(app);
+    crate::proxy::relay::relay(&mut stream, &mut remote).await?;
     Ok(())
 }
 pub struct PreparedUdp {

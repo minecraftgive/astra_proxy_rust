@@ -9,7 +9,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(role: ReleaseRole) -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        // macOS exposes its temporary directory through /var -> /private/var;
+        // installation deliberately rejects symlink ancestors.
+        let temporary =
+            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let source = temporary.path().join("package");
         fs::create_dir(&source).unwrap();
         let components: &[&str] = match role {
@@ -355,4 +358,107 @@ fn verified_gui_components_select_native_frontends_and_tui_packages_stay_termina
             assert!(entry.contains(component));
         }
     }
+}
+
+// The subprocess executes from the installed path, so Windows holds an actual
+// executable image open (an ordinary open file is insufficient to test this).
+#[test]
+fn running_installed_frontend_child() {
+    let Some(marker) = std::env::var_os("ASTRA_INSTALL_TEST_READY") else {
+        return;
+    };
+    fs::write(marker, b"ready").unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn complete_package_updates_while_old_frontend_is_running() {
+    struct Process(std::process::Child);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn launch(binary: &Path, marker: &Path) -> Process {
+        let mut process = Process(
+            std::process::Command::new(binary)
+                .args([
+                    "--exact",
+                    "installation::tests::running_installed_frontend_child",
+                    "--nocapture",
+                ])
+                .env("ASTRA_INSTALL_TEST_READY", marker)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                process.0.try_wait().unwrap().is_none(),
+                "Installed frontend exited"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Installed frontend did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        process
+    }
+    let fixture = Fixture::new(ReleaseRole::Client);
+    let name = astra_platform::platform::executable("astra-tui");
+    let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+    fs::write(fixture.source.join(&name), &bytes).unwrap();
+    let mut manifest = source_manifest(&fixture.source);
+    let file = manifest.files.iter_mut().find(|f| f.path == name).unwrap();
+    file.size = bytes.len() as u64;
+    file.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    fs::write(
+        fixture.source.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let old = fixture.install().unwrap().directory.unwrap();
+    let mut running = launch(
+        &old.join(&name),
+        &fixture.temporary.path().join("old-ready"),
+    );
+    manifest.release_id = "fixture-2".into();
+    for file in &mut manifest.files {
+        if file.path != name {
+            let bytes = format!("new version of {}", file.path);
+            fs::write(fixture.source.join(&file.path), &bytes).unwrap();
+            file.size = bytes.len() as u64;
+            file.sha256 = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        }
+    }
+    fs::write(
+        fixture.source.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let new = fixture.install().unwrap().directory.unwrap();
+    assert_ne!(old, new);
+    assert!(running.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        verify_installation_directory(&new, &ImportOptions::default()).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        verify_installation_directory(&old, &ImportOptions::default())
+            .unwrap()
+            .release_id,
+        "fixture-1"
+    );
+    let mut replacement = launch(&new.join(name), &fixture.temporary.path().join("new-ready"));
+    assert!(replacement.0.try_wait().unwrap().is_none());
+}
+
+fn source_manifest(directory: &Path) -> ReleaseManifest {
+    serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE)).unwrap()).unwrap()
 }

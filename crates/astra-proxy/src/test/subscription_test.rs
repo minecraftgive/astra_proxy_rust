@@ -231,7 +231,9 @@ fn cache_survives_replacement_and_is_ignored_after_config_changes_or_corruption(
     save(&config, &cache).unwrap();
     save(&config, &cache).unwrap();
     assert_eq!(read(&config, base).unwrap().effective, effective);
-    let app = cached_app(&config, App::from_text(&config, base.into()).unwrap());
+    let mut original = App::from_text(&config, base.into()).unwrap();
+    original.effective_text = Some(base.into());
+    let app = cached_app(&config, original);
     assert!(app.outbounds.contains_key("cached-node"));
     assert_eq!(
         app.standalone_action,
@@ -245,7 +247,7 @@ fn cache_survives_replacement_and_is_ignored_after_config_changes_or_corruption(
     assert_eq!(app.source_text, base);
     // This is the immutable document handed to a worker, even if the
     // shared cache changes or disappears after candidate preparation.
-    let worker = App::from_text(&config, app.effective_text.clone()).unwrap();
+    let worker = App::from_text(&config, app.effective_text.clone().unwrap()).unwrap();
     assert!(worker.outbounds.contains_key("cached-node"));
     assert_eq!(
         worker.config.proxy_groups["subscription"].members,

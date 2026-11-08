@@ -397,6 +397,10 @@ fn install(owner: &str) -> io::Result<()> {
     let source = source
         .parent()
         .ok_or_else(|| io::Error::other("service helper has no directory"))?;
+    install_from(owner, source)
+}
+fn install_from(owner: &str, source: &Path) -> io::Result<()> {
+    security::validate_owner_sid(owner)?;
     let directory = installation_dir(owner)?;
     security::prepare_install_directory(&directory)?;
     for asset in ASSETS {
@@ -629,3 +633,87 @@ pub fn spawn(exe: &Path, args: &[OsString]) -> io::Result<ElevatedChild> {
 #[cfg(test)]
 #[path = "test/windows_service_test.rs"]
 mod tests;
+
+/// Called only by an already-authorized maintenance helper for the same account.
+/// Never registers a service that was previously disabled.
+pub fn maintenance_update(source: &Path, originally_installed: bool) -> io::Result<()> {
+    let owner = security::current_user_sid()?;
+    security::validate_owner_sid(&owner)?;
+    if !originally_installed {
+        return Err(io::Error::other(
+            "Maintenance cannot install a previously absent privilege service",
+        ));
+    }
+    for asset in ASSETS {
+        if !source.join(asset).is_file() {
+            return Err(io::Error::other(format!("Missing service asset: {asset}")));
+        }
+    }
+    maintenance_preflight(source, &[])?;
+    uninstall(&owner)?;
+    let deadline = Instant::now() + SERVICE_TIMEOUT;
+    while service(&owner, SERVICE_QUERY_STATUS)?.is_some() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("Service deletion timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    install_from(&owner, source)
+}
+
+/// Inspect the owner-scoped protected snapshot before stopping anything. Cores
+/// belonging to other manager directories are never stopped by maintenance.
+pub fn maintenance_preflight(
+    source: &Path,
+    allowed: &[crate::lifecycle::ProcessIdentity],
+) -> io::Result<()> {
+    for asset in ASSETS {
+        if !source.join(asset).is_file() {
+            return Err(io::Error::other(format!("Missing service asset: {asset}")));
+        }
+    }
+    let owner = security::current_user_sid()?;
+    security::validate_owner_sid(&owner)?;
+    let expected = std::fs::canonicalize(installation_dir(&owner)?.join("astra-proxy.exe"))?;
+    use windows_sys::Win32::System::{
+        ProcessStatus::K32EnumProcesses,
+        Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let mut ids = vec![0u32; 1024];
+    loop {
+        let mut bytes = 0;
+        if unsafe { K32EnumProcesses(ids.as_mut_ptr(), (ids.len() * 4) as u32, &mut bytes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (bytes as usize) < ids.len() * 4 {
+            ids.truncate(bytes as usize / 4);
+            break;
+        }
+        if ids.len() >= 1024 * 1024 {
+            return Err(io::Error::other(
+                "Process inventory exceeds maintenance limit",
+            ));
+        }
+        ids.resize(ids.len() * 2, 0);
+    }
+    for pid in ids {
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            continue;
+        }
+        let handle = Handle(raw);
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(handle.0, 0, path.as_mut_ptr(), &mut length) } == 0 {
+            continue;
+        }
+        let image = PathBuf::from(OsString::from_wide(&path[..length as usize]));
+        if std::fs::canonicalize(image).is_ok_and(|p| p == expected) {
+            let identity = crate::lifecycle::capture(pid)?;
+            if !allowed.contains(&identity) {
+                return Err(io::Error::other(format!("Protected TUN core PID {pid} belongs to another manager or is not fully stopped; maintain that directory separately")));
+            }
+        }
+    }
+    Ok(())
+}

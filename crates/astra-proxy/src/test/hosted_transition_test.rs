@@ -67,6 +67,7 @@ impl Fixture {
             transition: Default::default(),
             admissions: Default::default(),
             telemetry: Default::default(),
+            traffic_history: Default::default(),
             connection_ids: Default::default(),
             retired: Default::default(),
             tokens: Default::default(),
@@ -109,6 +110,17 @@ impl Fixture {
                     }
                     worker_enabled.store(value, Ordering::Release);
                     let _ = send(&mut stream, true).await;
+                } else if matches!(auth.command, WorkerRequest::Snapshot) {
+                    let _ = send(
+                        &mut stream,
+                        WorkerSample {
+                            snapshot: astra_model::runtime::Snapshot::default(),
+                            node_totals: Some([("node".into(), id * 100)].into()),
+                        },
+                    )
+                    .await;
+                } else if matches!(auth.command, WorkerRequest::Retire) {
+                    let _ = send(&mut stream, true).await;
                 } else {
                     panic!("unexpected worker request");
                 }
@@ -127,6 +139,31 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
+}
+
+#[tokio::test]
+async fn traffic_history_collects_workers_without_a_ui_and_survives_retirement() {
+    let mut fixture = Fixture::new(None).await;
+    fixture.worker(1, None).await;
+    fixture.worker(2, None).await;
+    fixture.host.refresh_telemetry().await;
+    fixture.host.refresh_telemetry().await;
+    let totals = || {
+        fixture
+            .host
+            .telemetry
+            .lock()
+            .unwrap()
+            .node_traffic
+            .clone()
+            .unwrap()["node"]
+    };
+    assert_eq!(totals().session, 300);
+    assert_eq!(totals().persist, 300);
+    fixture.host.state.lock().await.paused = false;
+    fixture.host.reap().await;
+    fixture.host.refresh_telemetry().await;
+    assert_eq!(totals().session, 300);
 }
 
 #[tokio::test]

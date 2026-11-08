@@ -32,6 +32,16 @@ pub(crate) fn plain_metadata(path: &Path) -> Result<Metadata> {
     Ok(metadata)
 }
 
+/// Finder/BSD tar metadata (`__MACOSX/`, `.DS_Store`, AppleDouble `._*`) is
+/// never release payload; dropping it lets a Finder-compressed folder import.
+/// Callers validate the path first, so skipping cannot hide a traversal.
+fn is_platform_metadata(name: &str) -> bool {
+    name.split('/').next() == Some("__MACOSX")
+        || name
+            .split('/')
+            .any(|c| c.eq_ignore_ascii_case(".DS_Store") || c.starts_with("._"))
+}
+
 struct Extractor<'a> {
     destination: &'a Path,
     options: &'a ImportOptions,
@@ -52,6 +62,9 @@ impl Extractor<'_> {
             name
         };
         validate_path(name)?;
+        if is_platform_metadata(name) {
+            return Ok(());
+        }
         ensure!(
             self.names.insert(name.to_ascii_lowercase()),
             "Duplicate package entry: {name}"

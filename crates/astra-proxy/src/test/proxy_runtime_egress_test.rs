@@ -117,8 +117,23 @@ async fn egress_change_closes_old_tcp_sessions_and_accepts_fresh_ones() {
     let mut old = client(address, echo_port).await;
     old.write_all(b"a").await.unwrap();
     assert_eq!(old.read_u8().await.unwrap(), b'a');
-    current.store(Arc::new(app()));
-    previous.egress_signal.send_replace(true);
+    let previous_weak = Arc::downgrade(&previous);
+    let signal = previous.egress_signal.clone();
+    let mut next = app();
+    {
+        let routing = &mut *next;
+        routing.groups.inherit(&previous, &routing.config);
+    }
+    current.store(Arc::new(next));
+    drop(previous);
+    tokio::task::yield_now().await;
+    assert!(
+        previous_weak.upgrade().is_none(),
+        "established TCP retained its old App"
+    );
+    old.write_all(b"c").await.unwrap();
+    assert_eq!(old.read_u8().await.unwrap(), b'c');
+    signal.send_replace(true);
     let mut byte = [0];
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), old.read(&mut byte))
@@ -132,10 +147,89 @@ async fn egress_change_closes_old_tcp_sessions_and_accepts_fresh_ones() {
     assert_eq!(fresh.read_u8().await.unwrap(), b'b');
     assert!(tokio::time::timeout(
         Duration::from_millis(20),
-        current.load_full().egress_cancelled()
+        current.load_full().egress_signal.cancelled()
     )
     .await
     .is_err());
     listener_task.abort();
     echo_task.abort();
+}
+
+#[tokio::test]
+async fn unchanged_subscription_keeps_generation_and_connections() {
+    let original = Arc::new(app());
+    let current = Arc::new(ArcSwap::from(original.clone()));
+    let mut state = State {
+        consistency: Default::default(),
+        hosted: None,
+        generation: 7,
+        path: std::env::temp_dir().join("unchanged-subscription.toml"),
+        text: original.source_text.clone(),
+        current,
+        listeners: HashMap::new(),
+        tunnel: None,
+        tproxy_udp: None,
+        dns: None,
+        system: Default::default(),
+        system_journal: PathBuf::new(),
+        group_worker: None,
+        outbound_interface: None,
+        elevated_tun: false,
+    };
+    let sessions = original.groups.sessions.clone();
+    let lease = sessions.lease(&["direct".into()]);
+    state
+        .apply_subscription(
+            state.path.clone(),
+            "same merged text",
+            "same merged text",
+            app(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.generation, 7);
+    assert!(Arc::ptr_eq(&state.current.load_full(), &original));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), lease.cancelled())
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn borrowed_route_key_matches_owned_hash_and_all_route_context() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let key = crate::CacheKey {
+        destination_ip: Some("203.0.113.1".parse().unwrap()),
+        target: astra_model::Target {
+            host: "example.org".into(),
+            port: 443,
+        },
+        revision: 9,
+        network: astra_model::Network::Tcp,
+        inbound: Inbound::Socks5,
+        process: None,
+    };
+    let borrowed = crate::CacheKeyRef {
+        destination_ip: key.destination_ip,
+        target: &key.target,
+        revision: key.revision,
+        network: key.network,
+        inbound: key.inbound,
+        process: key.process.as_ref(),
+    };
+    let mut owned_hash = DefaultHasher::new();
+    let mut borrowed_hash = DefaultHasher::new();
+    key.hash(&mut owned_hash);
+    borrowed.hash(&mut borrowed_hash);
+    assert_eq!(owned_hash.finish(), borrowed_hash.finish());
+    let cache = moka::sync::Cache::new(2);
+    cache.insert(key.clone(), astra_model::RouteAction::Direct);
+    assert_eq!(cache.get(&borrowed), Some(astra_model::RouteAction::Direct));
+    assert!(cache
+        .get(&crate::CacheKeyRef {
+            revision: 10,
+            ..borrowed
+        })
+        .is_none());
 }

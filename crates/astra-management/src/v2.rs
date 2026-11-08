@@ -43,6 +43,7 @@ pub enum RequestBody {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Query {
+    MaintenanceStatus,
     Hello,
     ProgramInfo,
     InstallationStatus,
@@ -372,6 +373,7 @@ pub struct ApiError {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
+    MaintenanceStatus(#[ts(type = "unknown")] Option<Box<crate::maintenance::Record>>),
     InstallationStatus(InstallationStatus),
     InstallationResult(InstallationResult),
     InstallationLaunch(InstallationLaunch),
@@ -482,6 +484,33 @@ pub struct Hello {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalCommand {
+    PrepareMaintenance {
+        target_directory: PathBuf,
+        expected_manifest_sha256: String,
+        expected_epoch: String,
+    },
+    CommitMaintenance {
+        operation_id: String,
+    },
+    RestoreMaintenance {
+        operation_id: String,
+        #[serde(default)]
+        dependencies_only: bool,
+    },
+    FinishMaintenance {
+        operation_id: String,
+    },
+    CancelMaintenance {
+        operation_id: String,
+    },
+    AbortMaintenance {
+        operation_id: String,
+    },
+    MaintenanceTun {
+        operation_id: String,
+        instance: String,
+        ticket: Option<String>,
+    },
     PrepareInstallation {
         package_id: String,
         expected_release_id: String,

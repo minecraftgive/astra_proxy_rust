@@ -29,8 +29,10 @@ fn main() -> anyhow::Result<()> {
     );
     for declaration in contracts.declarations.values() {
         output.push_str("export ");
-        output.push_str(declaration);
-        output.push('\n');
+        for line in declaration.lines() {
+            output.push_str(line.trim_end());
+            output.push('\n');
+        }
     }
     if std::env::args().any(|a| a == "--check") {
         anyhow::ensure!(

@@ -97,6 +97,7 @@ pub fn log_startup(home: &std::path::Path, message: &str) -> Result<()> {
 /// The same path is used by Windows sign-in, macOS launchd and Linux systemd;
 /// failures are logged instead of opening a terminal or requesting elevation.
 pub async fn run_silent(socket: PathBuf, context: crate::windows::Context) -> Result<()> {
+    anyhow::ensure!(!astra_management::maintenance::pending(&context.home)?, "Unfinished maintenance requires the recovery interface; business instances were not started");
     log_startup(&context.home, "Silent startup started")?;
     let result: Result<()> = async {
         let initial = call(&socket, Action::List)

@@ -83,13 +83,7 @@ impl Host {
         let result: std::result::Result<(), String> = receive(&mut stream).await?;
         result.map_err(anyhow::Error::msg)?;
         let mut stream = astra_ipc::host::HostStream::new(stream);
-        tokio::io::copy_bidirectional_with_sizes(
-            &mut client,
-            &mut stream,
-            COPY_BUFFER_SIZE,
-            COPY_BUFFER_SIZE,
-        )
-        .await?;
+        crate::proxy::relay::relay(&mut client, &mut stream).await?;
         Ok(())
     }
 }

@@ -217,3 +217,57 @@ async fn restart_can_retry_delivery_after_a_failed_session_checkpoint() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn launch_countdown_has_exact_boundary_and_refresh_does_not_extend_it() {
+    let mut launch = LaunchControl::default();
+    let now = Instant::now();
+    let key = ("operation".into(), "release".into());
+    launch.schedule(key.clone(), now);
+    assert!(!launch.due(now + Duration::from_secs(29)));
+    launch.schedule(key, now + Duration::from_secs(29));
+    assert!(launch.due(now + Duration::from_secs(30)));
+    launch.schedule(
+        ("new-operation".into(), "release".into()),
+        now + Duration::from_secs(31),
+    );
+    assert!(!launch.due(now + Duration::from_secs(60)));
+    assert!(launch.due(now + Duration::from_secs(61)));
+}
+
+#[test]
+fn manual_launch_and_cancellation_are_bound_to_the_pending_release() {
+    let mut client = Client::new(crate::protocol::Kind::Proxy);
+    Command::ToggleAutoLaunch.run(&mut client);
+    let now = Instant::now();
+    client
+        .update_launch
+        .schedule(("operation".into(), "release".into()), now);
+    assert!(!client.update_launch.due(now + Duration::from_secs(3600)));
+    Command::LaunchNow.run(&mut client);
+    assert!(client.update_launch.due(now));
+    // Toggling cancels a pending manual request too, including during checkpointing.
+    Command::ToggleAutoLaunch.run(&mut client);
+    assert!(!client.update_launch.due(now));
+    Command::ToggleAutoLaunch.run(&mut client);
+    assert!(!client.update_launch.due(now + Duration::from_secs(3600)));
+    client.update_launch.clear();
+    Command::LaunchNow.run(&mut client);
+    assert!(!client.update_launch.due(now));
+}
+
+#[test]
+fn cancel_countdown_keeps_target_manual_and_does_not_rearm_on_refresh() {
+    let mut client = Client::new(crate::protocol::Kind::Proxy);
+    let at = Instant::now();
+    let key = ("install".into(), "version".into());
+    client.update_launch.schedule(key.clone(), at);
+    Command::CancelMaintenance.run(&mut client);
+    client
+        .update_launch
+        .schedule(key, at + Duration::from_secs(31));
+    assert!(client.update_launch.pending());
+    assert!(!client.update_launch.due(at + Duration::from_secs(100)));
+    Command::LaunchNow.run(&mut client);
+    assert!(client.update_launch.due(at + Duration::from_secs(100)));
+}

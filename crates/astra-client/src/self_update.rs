@@ -123,6 +123,44 @@ pub fn resolve(context: &windows::Context, release_id: &str) -> Result<Option<wi
         release.manifest.release_id == release_id,
         "The selected release changed before the interface could restart"
     );
+    resolve_frontend(context, &release.directory, &release.manifest)
+}
+
+/// Resolve the installation through the local installation record and verify
+/// its entire payload. Never execute a launch command supplied over IPC.
+pub fn resolve_installation(
+    context: &windows::Context,
+    package: &crate::installation::Completed,
+) -> Result<Option<windows::Context>> {
+    let scope = match package.scope {
+        astra_management::v2::InstallationScope::User => {
+            astra_update::installation::InstallScope::User
+        }
+        astra_management::v2::InstallationScope::System => {
+            astra_update::installation::InstallScope::System
+        }
+    };
+    let installed = astra_update::installation::status(&package.source, scope)?;
+    anyhow::ensure!(
+        installed.installed && installed.release_id == package.release_id,
+        "The installed package changed; install it again before launching"
+    );
+    let directory = installed.directory.context("Missing installed package")?;
+    anyhow::ensure!(
+        directory == package.directory,
+        "The installation destination changed"
+    );
+    let manifest = astra_update::verify_installation_directory(&directory, &Default::default())?;
+    Ok(Some(
+        resolve_frontend(context, &directory, &manifest)?.unwrap_or_else(|| context.clone()),
+    ))
+}
+
+pub(crate) fn resolve_frontend(
+    context: &windows::Context,
+    directory: &Path,
+    manifest: &astra_update::ReleaseManifest,
+) -> Result<Option<windows::Context>> {
     let name = context
         .executable
         .file_name()
@@ -145,12 +183,10 @@ pub fn resolve(context: &windows::Context, release_id: &str) -> Result<Option<wi
     })
     .context("Only Astra interface executables can restart after an update")?;
     anyhow::ensure!(
-        release.manifest.components.contains_key(component),
+        manifest.components.contains_key(component),
         "The selected release does not contain {component}"
     );
-    let frontend = release
-        .directory
-        .join(astra_platform::platform::executable(component));
+    let frontend = directory.join(astra_platform::platform::executable(component));
     let frontend = std::fs::canonicalize(&frontend)
         .with_context(|| format!("Cannot open updated interface {}", frontend.display()))?;
     if frontend == std::fs::canonicalize(&context.executable)? {
@@ -158,7 +194,7 @@ pub fn resolve(context: &windows::Context, release_id: &str) -> Result<Option<wi
     }
     let mut next = context.clone();
     next.executable = frontend;
-    next.bin = std::fs::canonicalize(release.directory)?;
+    next.bin = std::fs::canonicalize(directory)?;
     Ok(Some(next))
 }
 
@@ -171,7 +207,26 @@ fn restart_command(context: &windows::Context, launch: &windows::Launch) -> Comm
 /// Called only after checkpointing drafts and restoring the terminal. No host
 /// command is sent: the replacement frontend reconnects to the existing host.
 pub fn restart(context: &windows::Context, launch: &windows::Launch) -> Result<()> {
+    let token = astra_management::maintenance::begin_switch(&context.home, &context.executable)?;
+    let result = restart_inner(context, launch, token.as_deref());
+    if let (Some(token), Err(error)) = (token, &result) {
+        let _ = astra_management::maintenance::fail_switch(
+            &context.home,
+            &token,
+            &format!("{error:#}"),
+        );
+    }
+    result
+}
+fn restart_inner(
+    context: &windows::Context,
+    launch: &windows::Launch,
+    token: Option<&str>,
+) -> Result<()> {
     let mut command = restart_command(context, launch);
+    if let Some(token) = token {
+        command.env("ASTRA_MAINTENANCE_FRONTEND", token);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

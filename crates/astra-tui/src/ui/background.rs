@@ -210,6 +210,14 @@ impl Ui {
         ) {
             return None;
         }
+        // NeedsRecovery/Uncertain need action and stay; a plain failure changed
+        // nothing, so an old or acknowledged one stays in F6 details only.
+        if operation.phase == UpdatePhase::Failed
+            && (operation.updated_at_ms < self.update_alert_since_ms
+                || self.acknowledged_update.as_ref() == Some(&operation.request.operation_id))
+        {
+            return None;
+        }
         Some(tr!(
             "Update {} · {} · {}",
             operation.request.operation_id,
@@ -236,6 +244,16 @@ impl Ui {
             self.client.tasks.details = if self.client.tasks.details.is_some() {
                 None
             } else {
+                // F6 shows the full update status, which acknowledges a failure.
+                self.acknowledged_update = self
+                    .update_status
+                    .as_ref()
+                    .and_then(|status| status.operation.as_ref())
+                    .filter(|operation| {
+                        operation.phase == crate::protocol::updates::UpdatePhase::Failed
+                    })
+                    .map(|operation| operation.request.operation_id.clone())
+                    .or(self.acknowledged_update.take());
                 Some(0)
             };
             return Some(Input::Idle);

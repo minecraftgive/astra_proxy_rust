@@ -135,6 +135,18 @@ impl State {
     async fn apply(&mut self, path: PathBuf, candidate: App) -> Result<()> {
         self.apply_overrides(path, candidate, None).await
     }
+    async fn apply_subscription(
+        &mut self,
+        path: PathBuf,
+        text: &str,
+        current_text: &str,
+        candidate: App,
+    ) -> Result<()> {
+        if text == current_text {
+            return Ok(());
+        }
+        self.apply(path, candidate).await
+    }
     async fn apply_overrides(
         &mut self,
         path: PathBuf,
@@ -163,7 +175,7 @@ impl State {
             old.overrides.clone()
         };
         {
-            let overrides = candidate.overrides.load();
+            let overrides = candidate.overrides.load_full();
             crate::mode_config::runtime_modes(&mut candidate.config, &overrides);
         }
         let legacy_journal = path.with_extension("system-proxy-state.toml");
@@ -349,7 +361,10 @@ impl State {
             "Resources ready; switching the active generation",
         );
         self.group_worker.take();
-        candidate.groups.inherit(&old, &candidate.config);
+        {
+            let routing = &mut *candidate;
+            routing.groups.inherit(&old, &routing.config);
+        }
         candidate.groups.committed(&old, &candidate.config);
         let egress_key = |tun: Option<&crate::mode_config::Tun>| {
             tun.map(|tun| (tun.interface.clone(), tun.gateway, tun.gateway6))
@@ -469,6 +484,7 @@ async fn run_inner(
     app: App,
     mut lifeline: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    crate::platform::file_limit::prepare();
     crate::platform::network_recovery::set_profile(&path);
     crate::platform::network_recovery::set_enabled(app.config.experimental.network_recovery);
     // Claim management ownership before preparing any OS takeover resources.
@@ -650,7 +666,10 @@ async fn run_inner(
                     continue;
                 }
                 match result {
-                    Ok(Ok((text, managed, app))) => match state.apply(path, app).await {
+                    Ok(Ok((text, managed, app))) => match state
+                        .apply_subscription(path, &text, &effective, app)
+                        .await
+                    {
                         Ok(()) => {
                             generation = state.generation;
                             effective = text;
@@ -848,7 +867,7 @@ async fn run_inner(
     state.dns.take();
     let restore = state.system.restore();
     let app = current.load_full();
-    // Existing sessions retain their own Arc; drain the current generation.
+    // Existing sessions retain their permits; drain the shared connection quota.
     let _ = tokio::time::timeout(
         Duration::from_secs(app.config.shutdown_timeout_secs),
         app.permits.idle(),
@@ -903,9 +922,10 @@ async fn accept(
         let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let _permit = permit;
-            let cancellation = app.clone();
-            let session = async {
-                if let Some(host) = &app.hosted {
+            let cancellation = app.egress_signal.clone();
+            let session = async move {
+                if let Some(host) = app.hosted.clone() {
+                    drop(app);
                     let local = stream.local_addr()?;
                     let destination = match inbound {
                         Inbound::Tproxy | Inbound::Redirect => {
@@ -945,7 +965,7 @@ async fn accept(
             };
             let result = tokio::select! {
                 biased;
-                _=cancellation.egress_cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect session")),
+                _=cancellation.cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect session")),
                 result=session=>result,
             };
             if let Err(error) = result {

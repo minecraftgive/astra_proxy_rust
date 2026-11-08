@@ -1,6 +1,40 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::prelude::*;
+
+#[test]
+fn node_totals_include_closed_tcp_and_udp_flows_but_exclude_direct_bytes() {
+    let metrics = Arc::new(Metrics::default());
+    for (network, action, up, down) in [
+        (Network::Tcp, RouteAction::Proxy("tokyo".into()), 100, 200),
+        (Network::Udp, RouteAction::Proxy("tokyo".into()), 30, 40),
+        (Network::Tcp, RouteAction::Proxy("osaka".into()), 7, 8),
+        (Network::Udp, RouteAction::Direct, 900, 1000),
+    ] {
+        let flow = Traffic::new(
+            &metrics,
+            None,
+            &Target {
+                host: "example.test".into(),
+                port: 443,
+            },
+            Inbound::Socks5,
+            network,
+            &action,
+        )
+        .unwrap();
+        flow.upload(up);
+        flow.download(down);
+    }
+    assert_eq!(metrics.snapshot().active, 0);
+    assert_eq!(
+        metrics.node_totals(),
+        [("osaka".into(), 15), ("tokyo".into(), 370)].into()
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.proxy_upload + snapshot.proxy_download, 385);
+    assert_eq!(snapshot.upload + snapshot.download, 2285);
+}
 #[tokio::test]
 async fn poisoned_flow_index_does_not_panic_again_during_traffic_drop() {
     let metrics = Arc::new(Metrics::default());

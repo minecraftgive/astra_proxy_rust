@@ -3,6 +3,7 @@ mod wire;
 pub use wire::*;
 pub mod client;
 pub mod config;
+pub mod maintenance;
 mod update_json;
 pub mod v2;
 pub use client::ManagerClient;

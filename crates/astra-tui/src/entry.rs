@@ -305,7 +305,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         manager_executable(&executable)
     };
     bin = std::fs::canonicalize(bin)?;
-    let socket = home.join("management.sock");
+    let socket = astra_client::maintenance::local_endpoint(&home)?;
     astra_platform::platform::validate_state_directory(&home)?;
     if !silent && !daemon && !shutdown && operation.is_none() {
         if let Some(frontend) =

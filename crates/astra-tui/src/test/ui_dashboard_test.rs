@@ -390,6 +390,141 @@ fn header_rates_keep_columns_and_actions_stay_in_controls() {
 }
 
 #[test]
+fn snapshot_second_row_shows_session_totals_and_cycles_node_windows() {
+    use astra_model::runtime::{Coverage, NodeTraffic, RuntimeTelemetry};
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = live_sample();
+        let snapshot = ui.runtime_snapshot.as_mut().unwrap();
+        snapshot.proxy_upload = 2048;
+        snapshot.proxy_download = 3072;
+        snapshot.upload = 6144;
+        snapshot.download = 8192;
+        ui.runtime_telemetry = Some(RuntimeTelemetry {
+            coverage: Coverage::Complete,
+            traffic: Some(Box::new(astra_model::runtime::TrafficTelemetry {
+                nodes: Some(
+                    [(
+                        "AJP-80-Direct-Vision".into(),
+                        NodeTraffic {
+                            session: 1024,
+                            hour: 2048,
+                            day: 3072,
+                            week: 4096,
+                            month: 5120,
+                            persist: 6144,
+                        },
+                    )]
+                    .into(),
+                ),
+                history_error: None,
+                selected_node: None,
+            })),
+            ..Default::default()
+        });
+        for (label, value) in [
+            ("this session", "1.0K"),
+            ("1h", "2.0K"),
+            ("24h", "3.0K"),
+            ("7d", "4.0K"),
+            ("1mon", "5.0K"),
+            ("persist", "6.0K"),
+            ("this session", "1.0K"),
+        ] {
+            for width in [120, 140, 190] {
+                let terminal = render(&ui, width, 30);
+                let buffer = terminal.backend().buffer();
+                let title_y = (0..30)
+                    .find(|&y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            .contains("SNAPSHOT")
+                    })
+                    .unwrap();
+                let line: String = (0..width)
+                    .map(|x| buffer[(x, title_y + 2)].symbol())
+                    .collect();
+                assert!(
+                    line.contains(&format!("S P5.0K D9.0K │ {label} {value}")),
+                    "{width}: {line}"
+                );
+            }
+            ui.focus.region = focus::Region::Secondary;
+            ui.key(event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        }
+        ui.runtime_snapshot.as_mut().unwrap().groups[0].selected = Some("unknown".into());
+        assert_eq!(
+            ui.node_traffic(),
+            None,
+            "never attribute profile totals to another node"
+        );
+        ui.runtime_telemetry = None;
+        assert_eq!(
+            ui.node_traffic(),
+            None,
+            "old cores have no per-node history"
+        );
+        assert_eq!(ui.session_traffic(), Some((5120, 9216)));
+    });
+}
+
+#[test]
+fn traffic_period_shortcut_does_not_capture_text_input_or_modified_keys() {
+    let mut ui = live_sample();
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        ui.key(event::KeyEvent::new(KeyCode::Char('b'), modifiers));
+        assert_eq!(ui.traffic_period, astra_client::traffic::Period::Session);
+    }
+    ui.connection_filtering = true;
+    ui.key(event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(ui.connection_filter, "b");
+    assert_eq!(ui.traffic_period, astra_client::traffic::Period::Session);
+}
+
+#[test]
+fn cumulative_traffic_fits_in_all_languages_and_keeps_missing_data_distinct_from_zero() {
+    use astra_model::runtime::{Coverage, NodeTraffic, RuntimeTelemetry};
+    for language in [
+        crate::i18n::Language::English,
+        crate::i18n::Language::Simplified,
+        crate::i18n::Language::Traditional,
+    ] {
+        crate::i18n::with_language(language, || {
+            let mut ui = live_sample();
+            let snapshot = ui.runtime_snapshot.as_mut().unwrap();
+            snapshot.upload = u64::MAX;
+            snapshot.download = u64::MAX;
+            snapshot.proxy_upload = u64::MAX / 2;
+            snapshot.proxy_download = u64::MAX / 2;
+            ui.runtime_telemetry = Some(RuntimeTelemetry {
+                coverage: Coverage::Complete,
+                traffic: Some(Box::new(astra_model::runtime::TrafficTelemetry {
+                    nodes: Some(
+                        [(
+                            "AJP-80-Direct-Vision".into(),
+                            NodeTraffic {
+                                session: u64::MAX,
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    ),
+                    history_error: None,
+                    selected_node: None,
+                })),
+                ..Default::default()
+            });
+            assert!(screen(&render(&ui, 120, 30)).contains("this session 16.0E"));
+            ui.runtime_disconnected("offline".into());
+            let text = screen(&render(&ui, 120, 30));
+            assert!(text.contains("16.0E ~"), "{language:?}: {text}");
+            ui.reset_runtime_identity();
+            assert!(screen(&render(&ui, 120, 30)).contains("this session —"));
+        });
+    }
+}
+
+#[test]
 fn overview_expands_traffic_and_stays_stable_in_small_windows() {
     crate::i18n::with_language(crate::i18n::Language::English, || {
         let mut ui = live_sample();

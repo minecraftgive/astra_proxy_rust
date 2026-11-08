@@ -105,9 +105,8 @@ async fn run_child(
         .stderr(log)
         .kill_on_drop(true);
     astra_platform::platform::background_command(command.as_std_mut(), false);
-    Ok(command
-        .spawn()
-        .context("start independent web gateway")?
-        .wait()
-        .await?)
+    let mut child = command.spawn().context("start independent web gateway")?;
+    let process = astra_platform::lifecycle::capture(child.id().context("web gateway PID")?)?;
+    crate::atomic_write(&state.join("process.json"), &serde_json::to_vec(&process)?)?;
+    Ok(child.wait().await?)
 }

@@ -166,6 +166,8 @@ async fn forward(
             return response(StatusCode::BAD_GATEWAY, "Upstream connection failed");
         }
     };
+    let route_leases = app.route_leases.clone();
+    drop(app);
     // Hyper validates HTTP framing and streams bodies with backpressure. A fresh
     // upstream and one request per client connection avoid cross-origin reuse.
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
@@ -177,6 +179,7 @@ async fn forward(
         Err(_) => return response(StatusCode::BAD_GATEWAY, "HTTP upstream handshake failed"),
     };
     let task = ConnectionTask(tokio::spawn(async move {
+        let _route_leases = route_leases;
         let _ = connection.await;
     }));
     *request.uri_mut() = uri
@@ -226,6 +229,9 @@ where
 {
     let source = Some(source);
     let destination = Some(local);
+    // This server accepts one request. Move its generation into that request
+    // so a slow response body cannot keep the entire App alive.
+    let app = std::sync::Mutex::new(Some(app));
     hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
         .half_close(true)
@@ -236,8 +242,13 @@ where
         .serve_connection(
             TokioIo::new(client),
             service_fn(move |request| {
-                let app = app.clone();
-                async move { Ok::<_, Infallible>(forward(request, app, source, destination).await) }
+                let app = app.lock().unwrap().take();
+                async move {
+                    Ok::<_, Infallible>(match app {
+                        Some(app) => forward(request, app, source, destination).await,
+                        None => response(StatusCode::BAD_REQUEST, "Only one request is allowed"),
+                    })
+                }
             }),
         )
         .await?;

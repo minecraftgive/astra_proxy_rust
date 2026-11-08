@@ -30,6 +30,8 @@ pub struct StackBuilder {
     // high-BDP hosts can raise it without recompiling.
     tcp_recv_buffer_size: u32,
     tcp_send_buffer_size: u32,
+    // None preserves historical staging sizes, matching each TCP window.
+    tcp_staging_buffer_size: Option<u32>,
     tcp_socket_limit: usize,
     mtu: usize,
     ip_filters: IpFilters<'static>,
@@ -52,6 +54,7 @@ impl Default for StackBuilder {
             // `tcp_{recv,send}_buffer_size` for a high-BDP path.
             tcp_recv_buffer_size: 0x3FFF * 20,
             tcp_send_buffer_size: 0x3FFF * 20,
+            tcp_staging_buffer_size: None,
             tcp_socket_limit: 256,
             mtu: 1504, // 1500 for Ethernet + 4 for VLAN
             ip_filters: IpFilters::with_non_broadcast(),
@@ -105,6 +108,15 @@ impl StackBuilder {
     /// `SocketBuffer` capacity). See [`Self::tcp_recv_buffer_size`].
     pub fn tcp_send_buffer_size(mut self, size: u32) -> Self {
         self.tcp_send_buffer_size = size;
+        self
+    }
+
+    /// Set each per-socket application staging buffer in bytes, independently
+    /// of the smoltcp send/receive windows. Smaller staging buffers reduce idle
+    /// connection memory without reducing the advertised TCP receive window.
+    /// Defaults to the corresponding window size; zero is clamped to one byte.
+    pub fn tcp_staging_buffer_size(mut self, size: u32) -> Self {
+        self.tcp_staging_buffer_size = Some(size.max(1));
         self
     }
 
@@ -183,6 +195,7 @@ impl StackBuilder {
                 self.mtu,
                 self.tcp_recv_buffer_size,
                 self.tcp_send_buffer_size,
+                self.tcp_staging_buffer_size,
                 self.tcp_socket_limit,
             )?;
             (Some(tcp_runner), Some(tcp_listener))

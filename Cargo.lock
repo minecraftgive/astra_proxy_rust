@@ -529,8 +529,11 @@ dependencies = [
  "astra-ipc",
  "astra-model",
  "astra-platform",
+ "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "ts-rs",
@@ -666,6 +669,7 @@ dependencies = [
  "ipnet",
  "libc",
  "meow-common",
+ "mimalloc",
  "moka",
  "netstack-smoltcp",
  "rcgen",
@@ -714,6 +718,7 @@ dependencies = [
  "criterion 0.5.1",
  "ipnet",
  "maxminddb",
+ "mimalloc",
  "prost",
  "regex",
  "serde",
@@ -5142,6 +5147,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libproc"
 version = "0.14.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5626,6 +5640,15 @@ name = "meow-trie"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424d0eaee3b866b33acf3633f3d0d100afeaa496cf584ba356aace1ddb1302f0"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"

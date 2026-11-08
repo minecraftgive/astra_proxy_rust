@@ -54,3 +54,105 @@ fn all_domain_types_and_invalid_database_are_handled() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn selected_groups_keep_attribute_semantics_and_report_missing_on_expansion() {
+    let bytes = include_bytes!("../../../astra-rule/src/test/data/geosite.dat");
+    let selected = Database::decode_selected(bytes, &["TeSt@cn@!missing".into()]).unwrap();
+    assert_eq!(selected.groups.len(), 1);
+    assert_eq!(
+        selected.expand("test@cn").unwrap(),
+        database().expand("test@cn").unwrap()
+    );
+    assert_eq!(
+        selected.expand("test@!cn").unwrap(),
+        database().expand("test@!cn").unwrap()
+    );
+    assert!(selected.expand("geolocation-!cn").is_err());
+    assert!(Database::decode_selected(bytes, &["missing".into()])
+        .unwrap()
+        .expand("missing")
+        .is_err());
+    assert!(Database::decode_selected(bytes, &["test@".into()]).is_err());
+    assert!(Database::decode_selected(bytes, &[])
+        .unwrap()
+        .groups
+        .is_empty());
+}
+
+#[test]
+fn unselected_groups_are_still_validated() {
+    let valid = GeoSite {
+        country_code: "selected".into(),
+        domain: vec![Domain {
+            kind: 3,
+            value: "example.test".into(),
+            attribute: vec![],
+        }],
+    };
+    for invalid in [
+        GeoSite {
+            country_code: "".into(),
+            domain: vec![],
+        },
+        GeoSite {
+            country_code: "bad@name".into(),
+            domain: vec![],
+        },
+        GeoSite {
+            country_code: "unused".into(),
+            domain: vec![Domain {
+                kind: 256,
+                value: "example.test".into(),
+                attribute: vec![],
+            }],
+        },
+        GeoSite {
+            country_code: "unused".into(),
+            domain: vec![Domain {
+                kind: 3,
+                value: "".into(),
+                attribute: vec![],
+            }],
+        },
+        GeoSite {
+            country_code: "unused".into(),
+            domain: vec![Domain {
+                kind: 0,
+                value: "a".repeat(254),
+                attribute: vec![],
+            }],
+        },
+    ] {
+        let bytes = GeoSiteList {
+            entry: vec![valid.clone(), invalid],
+        }
+        .encode_to_vec();
+        assert!(Database::decode_selected(&bytes, &["selected".into()]).is_err());
+    }
+    let duplicate = GeoSiteList {
+        entry: vec![
+            valid,
+            GeoSite {
+                country_code: "unused".into(),
+                domain: vec![],
+            },
+            GeoSite {
+                country_code: "UNUSED".into(),
+                domain: vec![],
+            },
+        ],
+    }
+    .encode_to_vec();
+    assert!(Database::decode_selected(&duplicate, &["selected".into()]).is_err());
+    // An unused group's malformed nested protobuf must not be skipped either.
+    let mut invalid = GeoSite {
+        country_code: "unused".into(),
+        domain: vec![],
+    }
+    .encode_to_vec();
+    invalid.extend_from_slice(&[0x12, 0x02, 0x12, 0xff]);
+    let mut bytes = vec![0x0a, invalid.len() as u8];
+    bytes.extend(invalid);
+    assert!(Database::decode_selected(&bytes, &[]).is_err());
+}

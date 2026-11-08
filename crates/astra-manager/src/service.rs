@@ -6,6 +6,29 @@ use astra_management::{
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub async fn run() -> Result<()> {
+    if let Some(
+        mode @ ("--maintenance-run"
+        | "--maintenance-retry"
+        | "--maintenance-previous"
+        | "--maintenance-privileged"),
+    ) = std::env::args().nth(1).as_deref()
+    {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        anyhow::ensure!(
+            args.len() == 2,
+            "Maintenance requires STATE_DIRECTORY OPERATION_ID"
+        );
+        let home = PathBuf::from(&args[0]);
+        let id = args[1]
+            .to_str()
+            .context("Invalid maintenance ID")?
+            .to_owned();
+        return if mode == "--maintenance-privileged" {
+            crate::maintenance_privilege::run(home, id).await
+        } else {
+            crate::maintenance::run(home, id, mode.trim_start_matches("--maintenance-")).await
+        };
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--install-system")) {
         return crate::install::run_helper(std::env::args_os().skip(2).collect());
     }
@@ -176,6 +199,26 @@ pub async fn run_config(mut config: ManagerConfig) -> Result<()> {
     );
     if let Some(runtime) = &config.runtime_dir {
         crate::private_dir(runtime)?;
+    }
+    if let Ok(id) = std::env::var("ASTRA_MAINTENANCE_OPERATION") {
+        use astra_management::maintenance as m;
+        let mut record =
+            m::read(&config.state_dir)?.context("Missing maintenance launch record")?;
+        let own = astra_platform::lifecycle::capture(std::process::id())?;
+        anyhow::ensure!(
+            record.operation_id == id
+                && record.phase == m::Phase::Starting
+                && record.target == config.bin_dir
+                && record.new_process.as_ref().is_none_or(|p| p == &own),
+            "Maintenance launch identity mismatch"
+        );
+        record.new_process = Some(own);
+        m::write(&record)?;
+    } else {
+        anyhow::ensure!(
+            !astra_management::maintenance::pending(&config.state_dir)?,
+            "Unfinished maintenance: open the local interface and explicitly retry or restore the previous version"
+        );
     }
     let endpoint = config.endpoint();
     if let Some(parent) = endpoint.parent() {

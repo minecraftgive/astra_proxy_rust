@@ -16,8 +16,18 @@ pub struct Request {
     pub elevate: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct Completed {
+    pub source: PathBuf,
+    pub release_id: String,
+    pub scope: v::InstallationScope,
+    pub directory: PathBuf,
+}
+
 #[derive(Default)]
 pub struct State {
+    pub completed: Option<Completed>,
+    pending_package: Option<(v::InstallationPackage, v::InstallationScope)>,
     pub open: bool,
     pub notice: bool,
     pub notice_accept: bool,
@@ -65,6 +75,12 @@ impl State {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallationAction {
+    RetryMaintenance,
+    RestorePrevious,
+    MaintenanceLog,
+    CancelMaintenance,
+    LaunchNow,
+    ToggleAutoLaunch,
     Open,
     Dismiss,
     Select(usize),
@@ -201,6 +217,18 @@ impl Client {
             self.installation.progress = None;
             match result {
                 Ok(result) => {
+                    if crate::protocol::target().is_none() {
+                        if let Some((package, scope)) = self.installation.pending_package.take() {
+                            if matches!(package.role.as_str(), "client" | "server") {
+                                self.installation.completed = Some(Completed {
+                                    source: package.source,
+                                    release_id: package.release_id,
+                                    scope,
+                                    directory: result.directory.clone(),
+                                });
+                            }
+                        }
+                    }
                     self.message = result.message.clone();
                     self.installation.result = Some(result);
                     self.installation.error = None;
@@ -292,6 +320,22 @@ impl Client {
 
     pub fn installation_action(&mut self, action: InstallationAction) -> Input {
         match action {
+            InstallationAction::RetryMaintenance => {
+                return crate::update::Command::RetryMaintenance.run(self)
+            }
+            InstallationAction::RestorePrevious => {
+                return crate::update::Command::RestorePrevious.run(self)
+            }
+            InstallationAction::MaintenanceLog => {
+                return crate::update::Command::MaintenanceLog.run(self)
+            }
+            InstallationAction::CancelMaintenance => {
+                return crate::update::Command::CancelMaintenance.run(self)
+            }
+            InstallationAction::LaunchNow => return crate::update::Command::LaunchNow.run(self),
+            InstallationAction::ToggleAutoLaunch => {
+                return crate::update::Command::ToggleAutoLaunch.run(self)
+            }
             InstallationAction::Open => {
                 self.dismiss_installation_notice(true);
                 return Input::Idle;
@@ -402,6 +446,20 @@ impl Client {
             return;
         }
         self.installation.error = None;
+        self.installation.completed = None;
+        self.update_launch.clear();
+        self.installation.pending_package = self
+            .installation
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status.packages.iter().find(|package| {
+                    package.id == request.package_id
+                        && package.release_id == request.expected_release_id
+                })
+            })
+            .cloned()
+            .map(|package| (package, request.scope));
         self.installation.result = None;
         self.installation.events.clear();
         let socket = socket.to_owned();
@@ -568,7 +626,7 @@ impl State {
             lines.push(Detail::plain(event.clone()));
         }
         if let Some(result) = &self.result {
-            lines.extend([Detail::plain(""), Detail { text: result.message.clone(), kind: DetailKind::Success }, Detail::plain(format!("{}: {}", t("Launch command"), result.launch_command)), Detail::plain(t("Running programs keep their current version. Use the launch command after a maintenance restart."))]);
+            lines.extend([Detail::plain(""), Detail { text: result.message.clone(), kind: DetailKind::Success }, Detail::plain(format!("{}: {}", t("Launch command"), result.launch_command)), Detail::plain(t("The complete package is installed in a new directory, including running components. The local interface can launch now or automatically after 30 seconds. Hosts and services use the new files after a maintenance restart."))]);
         }
         if let Some(error) = &self.error {
             lines.push(Detail {

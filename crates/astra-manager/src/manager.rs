@@ -1666,6 +1666,77 @@ impl Manager {
             Action::BindStart { name, targets } => self.action_bind_start(name, targets).await,
             Action::Remove(name) => self.action_remove(name).await,
             Action::Start(name) => self.action_start(name).await,
+            Action::MaintenanceRestore(names) => {
+                let allowed: HashSet<_> = names.iter().cloned().collect();
+                anyhow::ensure!(
+                    allowed.len() == names.len(),
+                    "Duplicate maintenance instance"
+                );
+                let mut ordered = Vec::new();
+                for name in &names {
+                    for dependency in self.start_plan(name)? {
+                        if allowed.contains(&dependency) && !ordered.contains(&dependency) {
+                            ordered.push(dependency);
+                        }
+                    }
+                }
+                for name in &ordered {
+                    let instance = self.instance(name)?;
+                    self.validate(instance.kind, &instance.config).await?;
+                }
+                for name in ordered {
+                    if self.running.contains_key(&name) {
+                        continue;
+                    }
+                    #[cfg(windows)]
+                    if let Some(process) = astra_management::maintenance::read(&self.home)?
+                        .and_then(|r| r.candidates.get(&name).cloned())
+                    {
+                        let socket = self.socket(&name);
+                        let identity = timeout(Duration::from_secs(30), async {
+                            loop {
+                                if let Ok(identity) = control::identity(&socket).await {
+                                    break Ok::<_, anyhow::Error>(identity);
+                                }
+                                anyhow::ensure!(
+                                    astra_platform::lifecycle::matches_live(&process)?,
+                                    "Authorized TUN candidate exited"
+                                );
+                                sleep(Duration::from_millis(50)).await;
+                            }
+                        })
+                        .await
+                        .context("Authorized TUN candidate did not become ready")??;
+                        anyhow::ensure!(
+                            identity.process == process,
+                            "Maintenance TUN process identity mismatch"
+                        );
+                        let instance = self.instance(&name)?;
+                        anyhow::ensure!(
+                            identity
+                                .applied
+                                .as_ref()
+                                .is_some_and(|a| fs::canonicalize(&a.path).ok()
+                                    == fs::canonicalize(&instance.config).ok()),
+                            "Maintenance TUN configuration mismatch"
+                        );
+                        self.start_with_options(
+                            &name,
+                            Some(ManagedChild::Reattached(recovery::Reattached {
+                                identity,
+                                endpoint: socket,
+                            })),
+                            false,
+                            false,
+                        )
+                        .await?;
+                    }
+                    if !self.running.contains_key(&name) {
+                        self.start_with_options(&name, None, false, false).await?;
+                    }
+                }
+                Ok(Reply::text("Maintenance instances restored"))
+            }
             Action::StartSilent(name) => {
                 self.start_with_policy(&name, false, false).await?;
                 Ok(Reply::text("Started"))

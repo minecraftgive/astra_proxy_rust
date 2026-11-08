@@ -16,6 +16,8 @@ async fn association_preserves_datagrams_across_receive_buffer_reuse() {
             )
             .unwrap(),
         );
+        let previous = Arc::downgrade(&app);
+        let routing = Arc::downgrade(&app.routing);
         let (mut control, server) = tokio::io::duplex(64);
         let worker = tokio::spawn(associate_stream(
             server,
@@ -30,6 +32,15 @@ async fn association_preserves_datagrams_across_receive_buffer_reuse() {
         let mut reply = [0; 10];
         control.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply[..8], &[5, 0, 0, 1, 127, 0, 0, 1]);
+        tokio::task::yield_now().await;
+        assert!(
+            previous.upgrade().is_none(),
+            "UDP association retained its App"
+        );
+        assert!(
+            routing.upgrade().is_some(),
+            "association lost its routing generation"
+        );
         let relay = SocketAddr::new(source.ip(), u16::from_be_bytes([reply[8], reply[9]]));
         let target = Target {
             host: destination.ip().to_string(),
@@ -53,8 +64,27 @@ async fn association_preserves_datagrams_across_receive_buffer_reuse() {
             assert_eq!(reply_target, target);
             assert_eq!(reply_body, body);
         }
+        // A later destination still uses the original routing snapshot after
+        // the App (and its source document/cache) has been reclaimed.
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_target = Target {
+            host: "127.0.0.1".into(),
+            port: second.local_addr().unwrap().port(),
+        };
+        let mut packet = vec![0, 0, 0];
+        crate::outbound::append_socks_address(&mut packet, &second_target).unwrap();
+        packet.extend_from_slice(b"second destination");
+        socket.send_to(&packet, relay).await.unwrap();
+        let (count, peer) = second.recv_from(&mut received).await.unwrap();
+        assert_eq!(&received[..count], b"second destination");
+        second.send_to(&received[..count], peer).await.unwrap();
+        let (count, _) = socket.recv_from(&mut received).await.unwrap();
+        let (reply_target, reply_body) = decode(&received[..count]).unwrap();
+        assert_eq!(reply_target, second_target);
+        assert_eq!(reply_body, b"second destination");
         drop(control);
         worker.await.unwrap().unwrap();
+        assert!(routing.upgrade().is_none());
     })
     .await
     .unwrap();
@@ -87,7 +117,10 @@ async fn configured_group_switch_cancels_idle_udp_receive_and_prevents_more_pack
     assert_eq!(&bytes[..size], b"before");
     let mut next =
         App::from_text(std::path::Path::new("udp-groups.toml"), settings("REJECT")).unwrap();
-    next.groups.inherit(&app, &next.config);
+    {
+        let routing = &mut *next;
+        routing.groups.inherit(&app, &routing.config);
+    }
     next.groups.committed(&app, &next.config);
     assert!(timeout(Duration::from_secs(1), connection.recv(&mut bytes))
         .await

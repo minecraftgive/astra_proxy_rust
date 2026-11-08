@@ -260,7 +260,10 @@ pub(crate) fn cached_app(config: &Path, original: App) -> App {
         // Older caches kept ownership separately from the effective document.
         // Restore it before generating per-subscription groups.
         let effective = effective_text(&cache).unwrap_or(cache.effective);
+        let retained = original.effective_text.as_ref().map(|_| effective.clone());
         if let Ok(mut app) = App::from_text(config, effective) {
+            // Preserve explicit hosted preparation without changing process-wide settings.
+            app.effective_text = retained;
             app.source_text = original.source_text;
             tracing::info!("validated subscription cache loaded");
             return app;

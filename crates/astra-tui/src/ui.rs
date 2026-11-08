@@ -97,6 +97,10 @@ struct Ui {
     /// Ctrl+Home held on the accent setting: (first press, latest press, done).
     /// Mouse capture change for the event loop, which owns the terminal.
     mouse_request: Option<bool>,
+    /// A "Not applied" update leaves the running version unchanged, so only a
+    /// failure recorded after this UI started alerts, until F6 acknowledges it.
+    update_alert_since_ms: u64,
+    acknowledged_update: Option<String>,
 }
 impl std::ops::Deref for Ui {
     type Target = Client;
@@ -178,6 +182,8 @@ impl Ui {
             settings_cursor: 0,
             settings_view: Default::default(),
             mouse_request: None,
+            update_alert_since_ms: astra_ipc::progress::now_ms(),
+            acknowledged_update: None,
         }
     }
     /// Switches the Profiles list between proxy instances and rule cores.

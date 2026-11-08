@@ -6,6 +6,75 @@ use crate::{
 use anyhow::Result;
 use futures_util::FutureExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// A fresh countdown belongs to one verified target, never to a status refresh.
+pub struct LaunchControl {
+    pub automatic: bool,
+    key: Option<(String, String)>,
+    deadline: Option<Instant>,
+    requested: bool,
+}
+impl Default for LaunchControl {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            key: None,
+            deadline: None,
+            requested: false,
+        }
+    }
+}
+impl LaunchControl {
+    pub fn pending(&self) -> bool {
+        self.key.is_some()
+    }
+    pub fn identity(&self) -> Option<(String, String)> {
+        self.key.clone()
+    }
+    pub fn clear(&mut self) {
+        self.key = None;
+        self.deadline = None;
+        self.requested = false;
+    }
+    fn schedule(&mut self, key: (String, String), now: Instant) {
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.requested = false;
+            self.deadline = self.automatic.then_some(now + Duration::from_secs(30));
+        }
+    }
+    pub fn due(&self, now: Instant) -> bool {
+        self.pending() && (self.requested || self.deadline.is_some_and(|deadline| now >= deadline))
+    }
+    pub fn toggle(&mut self) {
+        self.automatic = !self.automatic;
+        self.requested = false;
+        self.deadline =
+            (self.automatic && self.pending()).then(|| Instant::now() + Duration::from_secs(30));
+    }
+    pub fn label(&self) -> String {
+        use crate::i18n::t;
+        if self.pending() {
+            if self.due(Instant::now()) {
+                return t("Ready to launch; waiting for current work to finish").into();
+            }
+            if let Some(deadline) = self.deadline {
+                return crate::tr!(
+                    "Launching the new version in {} seconds",
+                    deadline.saturating_duration_since(Instant::now()).as_secs() + 1
+                );
+            }
+            return t("New version ready; launch manually").into();
+        }
+        t(if self.automatic {
+            "Auto launch after installation: 30 seconds"
+        } else {
+            "Launch after installation: manual"
+        })
+        .into()
+    }
+}
 pub struct View {
     pub status: UpdateStatus,
 }
@@ -35,6 +104,10 @@ pub struct Restart {
     attempted: Option<(String, String)>,
     checking: Option<tokio::task::JoinHandle<Result<Option<crate::windows::Context>>>>,
     ready: Option<crate::windows::Context>,
+    installation: Option<crate::installation::Completed>,
+    installation_key: Option<(String, String)>,
+    installation_update: Option<String>,
+    launch_checked: bool,
 }
 impl Restart {
     pub fn with_waker(mut self, waker: crate::waker::Waker) -> Self {
@@ -52,6 +125,123 @@ impl Restart {
 
     pub fn defer(&mut self, target: crate::windows::Context) {
         self.ready = Some(target);
+        self.launch_checked = false;
+    }
+
+    /// Shared by GUI and TUI. Validation is asynchronous; launch waits for the
+    /// user's choice/countdown and the existing session checkpoint safeguards.
+    pub fn poll_client(
+        &mut self,
+        client: &mut Client,
+        context: &crate::windows::Context,
+        idle: bool,
+    ) -> Result<Option<crate::windows::Context>> {
+        if crate::protocol::target().is_some() {
+            return Ok(None);
+        }
+        if let Some(release) =
+            (idle && !client.maintenance.active() && !client.maintenance.failed())
+                .then(|| client.maintenance.staged.take())
+                .flatten()
+        {
+            let directory = astra_update::ReleaseStore::new(&context.home).release_dir(&release)?;
+            let manifest =
+                astra_update::verify_installation_directory(&directory, &Default::default())?;
+            anyhow::ensure!(manifest.release_id == release, "Staged package changed");
+            {
+                let target = crate::self_update::resolve_frontend(context, &directory, &manifest)?
+                    .unwrap_or_else(|| context.clone());
+                // The maintenance command is explicit and bypasses only the
+                // online host ABI gate, never complete-package validation.
+                return Ok(Some(target));
+            }
+        }
+        if let Some(target) = client.maintenance.poll(context)? {
+            client.update_launch.clear();
+            return Ok(idle.then_some(target));
+        }
+        if client.maintenance.active() || client.maintenance.failed() {
+            client.update_launch.clear();
+            client.message = client.maintenance.label();
+            return Ok(None);
+        }
+        if client.installation.busy() {
+            self.ready = None;
+            if let Some(task) = self.checking.take() {
+                task.abort();
+            }
+            return Ok(None);
+        }
+        let operation = client
+            .update_status
+            .as_ref()
+            .and_then(|s| s.operation.as_ref())
+            .map(|o| o.request.operation_id.clone());
+        if let Some(package) = client.installation.completed.take() {
+            self.installation_update = operation.clone();
+            self.installation_key = Some((
+                format!("installation:{}", package.directory.display()),
+                package.release_id.clone(),
+            ));
+            self.installation = Some(package);
+            if let Some(task) = self.checking.take() {
+                task.abort();
+            }
+            self.ready = None;
+            self.attempted = None;
+            self.observed = true;
+            client.update_launch.clear();
+        } else if self.installation.is_some() && operation != self.installation_update {
+            self.installation = None;
+            self.installation_key = None;
+        }
+        let result = self.poll_ready(client.update_status.as_ref(), context, false);
+        if result.is_err() {
+            client.update_launch.clear();
+        }
+        result?;
+        let key = if self.installation.is_some() {
+            self.installation_key.clone()
+        } else {
+            client
+                .update_status
+                .as_ref()
+                .and_then(|s| self.candidate(s))
+        };
+        if client.update_launch.key != key {
+            client.update_launch.clear();
+        }
+        if self.ready.is_some() {
+            if let Some(key) = key {
+                client.update_launch.schedule(key, Instant::now());
+            }
+        }
+        if idle && client.update_launch.due(Instant::now()) && self.ready.is_some() {
+            // The payload/selection may have changed during the countdown.
+            // Revalidate off the UI thread immediately before checkpointing.
+            if !self.launch_checked {
+                self.ready = None;
+                self.launch_checked = true;
+                let context = context.clone();
+                let installation = self.installation.clone();
+                let release = self.attempted.as_ref().unwrap().1.clone();
+                let waker = self.waker.clone();
+                self.checking = Some(tokio::task::spawn_blocking(move || {
+                    let result = match installation {
+                        Some(package) => {
+                            crate::self_update::resolve_installation(&context, &package)
+                        }
+                        None => crate::self_update::resolve(&context, &release),
+                    };
+                    waker.wake();
+                    result
+                }));
+                return Ok(None);
+            }
+            self.launch_checked = false;
+            return Ok(self.ready.take());
+        }
+        Ok(None)
     }
     pub fn candidate(&mut self, status: &UpdateStatus) -> Option<(String, String)> {
         let key = crate::self_update::completed_release(status).map(|release| {
@@ -93,10 +283,13 @@ impl Restart {
         if crate::protocol::target().is_some() {
             return Ok(None);
         }
-        let Some(status) = status else {
-            return Ok(None);
+        let key = if self.installation.is_some() {
+            self.installation_key.clone()
+        } else if let Some(status) = status {
+            self.candidate(status)
+        } else {
+            None
         };
-        let key = self.candidate(status);
         if self
             .checking
             .as_ref()
@@ -116,9 +309,16 @@ impl Restart {
                     let context = context.clone();
                     let release = release.clone();
                     self.attempted = key.clone();
+                    self.launch_checked = false;
                     let waker = self.waker.clone();
+                    let installation = self.installation.clone();
                     self.checking = Some(tokio::task::spawn_blocking(move || {
-                        let result = crate::self_update::resolve(&context, &release);
+                        let result = match installation {
+                            Some(package) => {
+                                crate::self_update::resolve_installation(&context, &package)
+                            }
+                            None => crate::self_update::resolve(&context, &release),
+                        };
                         waker.wake();
                         result
                     }));
@@ -135,6 +335,13 @@ impl Restart {
 
 #[derive(Clone, Copy)]
 pub enum Command {
+    MaintenanceStaged,
+    CancelMaintenance,
+    RetryMaintenance,
+    RestorePrevious,
+    MaintenanceLog,
+    LaunchNow,
+    ToggleAutoLaunch,
     Import,
     Status,
     Rollback,
@@ -142,16 +349,30 @@ pub enum Command {
     Recover,
 }
 impl Command {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 12] = [
+        Self::MaintenanceStaged,
+        Self::CancelMaintenance,
+        Self::RetryMaintenance,
+        Self::RestorePrevious,
+        Self::MaintenanceLog,
         Self::Import,
         Self::Status,
         Self::Activate,
         Self::Rollback,
         Self::Recover,
+        Self::LaunchNow,
+        Self::ToggleAutoLaunch,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::MaintenanceStaged => "Maintenance restart into staged version",
+            Self::CancelMaintenance => "Cancel maintenance before shutdown",
+            Self::RetryMaintenance => "Retry maintenance with new version",
+            Self::RestorePrevious => "Restore previous version manually",
+            Self::MaintenanceLog => "Show maintenance log",
+            Self::LaunchNow => "Launch new version now",
+            Self::ToggleAutoLaunch => "Toggle automatic launch (30 seconds)",
             Self::Import => "Import local update package",
             Self::Status => "Update status",
             Self::Rollback => "Roll back release",
@@ -161,11 +382,97 @@ impl Command {
     }
 
     pub fn run(self, ui: &mut Client) -> Input {
+        match self {
+            Self::MaintenanceStaged => {
+                if let Some(status) = &ui.update_status {
+                    if !status.capabilities.operation_running
+                        && status.capabilities.recovery_operation_id.is_none()
+                    {
+                        ui.maintenance.staged = status.staged_release_id.clone();
+                    }
+                }
+                return Input::Idle;
+            }
+            Self::CancelMaintenance => {
+                if !ui.maintenance.active()
+                    && ui
+                        .maintenance
+                        .record
+                        .as_ref()
+                        .is_none_or(|r| r.phase.terminal())
+                {
+                    ui.maintenance.error = None;
+                }
+                ui.update_launch.automatic = false;
+                ui.update_launch.deadline = None;
+                ui.update_launch.requested = false;
+                if ui
+                    .maintenance
+                    .record
+                    .as_ref()
+                    .map_or(ui.maintenance.active(), |r| r.cancellable())
+                {
+                    ui.maintenance.cancel = true;
+                }
+                return Input::Idle;
+            }
+            Self::RetryMaintenance | Self::RestorePrevious => {
+                if ui.maintenance.failed() {
+                    ui.maintenance.recovery = Some(if matches!(self, Self::RestorePrevious) {
+                        "previous"
+                    } else {
+                        "retry"
+                    });
+                }
+                return Input::Idle;
+            }
+            Self::MaintenanceLog => {
+                if let Some(record) = &ui.maintenance.record {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let path = astra_management::maintenance::directory(&record.config.state_dir)
+                        .join("operation.log");
+                    let read = (|| -> std::io::Result<String> {
+                        let mut file = std::fs::File::open(&path)?;
+                        let length = file.metadata()?.len();
+                        file.seek(SeekFrom::Start(length.saturating_sub(64 * 1024)))?;
+                        let mut bytes = Vec::new();
+                        file.take(64 * 1024).read_to_end(&mut bytes)?;
+                        Ok(String::from_utf8_lossy(&bytes).into_owned())
+                    })();
+                    ui.maintenance.log = Some(match read {
+                        Ok(text) => format!("{}\n{text}", path.display()),
+                        Err(error) => format!("{}: {error}", path.display()),
+                    });
+                    ui.installation.open = true;
+                }
+                return Input::Idle;
+            }
+            Self::LaunchNow => {
+                if ui.update_launch.pending() {
+                    ui.update_launch.requested = true;
+                }
+                ui.message = ui.update_launch.label();
+                return Input::Idle;
+            }
+            Self::ToggleAutoLaunch => {
+                ui.update_launch.toggle();
+                ui.message = ui.update_launch.label();
+                return Input::Idle;
+            }
+            _ => {}
+        }
         if let Some(reason) = self.unavailable(ui.update_status.as_ref()) {
             ui.message = reason.into();
             return Input::Idle;
         }
         match self {
+            Self::LaunchNow
+            | Self::ToggleAutoLaunch
+            | Self::RetryMaintenance
+            | Self::RestorePrevious
+            | Self::MaintenanceLog
+            | Self::MaintenanceStaged
+            | Self::CancelMaintenance => unreachable!(),
             Self::Import => {
                 ui.prompt(Prompt::UpdatePackage);
                 Input::Idle
@@ -198,6 +505,13 @@ impl Command {
     }
     pub fn unavailable(self, status: Option<&UpdateStatus>) -> Option<&'static str> {
         match self {
+            Self::LaunchNow
+            | Self::ToggleAutoLaunch
+            | Self::RetryMaintenance
+            | Self::RestorePrevious
+            | Self::MaintenanceLog
+            | Self::MaintenanceStaged
+            | Self::CancelMaintenance => None,
             Self::Status => None,
             _ if status.is_none() => Some("Read update status first"),
             _ if status.is_some_and(|s| s.capabilities.operation_running) => {
@@ -417,7 +731,7 @@ impl View {
                 }
             }
         }
-        lines.push(t("After a successful local activation, this interface saves its session and restarts into the updated version.").to_owned());
+        lines.push(t("After a successful local activation, launch the new interface now or automatically after 30 seconds. Automatic launch can be switched to manual.").to_owned());
         lines.push(t("Closing this interface does not update hosts. Maintenance restarts end existing sessions. Draining has no completion estimate.").to_owned());
         lines
             .into_iter()

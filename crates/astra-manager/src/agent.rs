@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+pub(crate) mod maintenance;
 #[cfg(test)]
 #[path = "test/agent_test.rs"]
 mod tests;
@@ -217,7 +218,10 @@ impl AgentService {
                     .await
                     .expect("agent capacity never closed");
                 let _serial = self.mutation.lock().await;
-                self.execute(operation_id, command).await
+                match self.maintenance_gate() {
+                    Ok(()) => self.execute(operation_id, command).await,
+                    Err(error) => Err(error),
+                }
             }
             RequestBody::Drafts(command) => {
                 let _serial = if matches!(
@@ -228,19 +232,25 @@ impl AgentService {
                 } else {
                     Some(self.mutation.lock().await)
                 };
-                self.draft(command).await
+                match self.maintenance_gate() {
+                    Ok(()) => self.draft(command).await,
+                    Err(error) => Err(error),
+                }
             }
             RequestBody::Artifacts(command) => {
                 let _serial = self.mutation.lock().await;
                 let root = self.config.state_dir.join("artifacts");
                 let limit = self.config.limits.upload_bytes;
-                match tokio::task::spawn_blocking(move || {
-                    crate::artifacts::handle(&root, limit, command)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(error.into()),
+                match self.maintenance_gate() {
+                    Err(error) => Err(error),
+                    Ok(()) => match tokio::task::spawn_blocking(move || {
+                        crate::artifacts::handle(&root, limit, command)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(error.into()),
+                    },
                 }
             }
         };
@@ -283,7 +293,28 @@ impl AgentService {
         self.handle(request).await
     }
     async fn local(&self, command: LocalCommand) -> Result<ResponseBody> {
+        if matches!(
+            &command,
+            LocalCommand::PrepareMaintenance { .. }
+                | LocalCommand::CommitMaintenance { .. }
+                | LocalCommand::RestoreMaintenance { .. }
+                | LocalCommand::FinishMaintenance { .. }
+                | LocalCommand::CancelMaintenance { .. }
+                | LocalCommand::AbortMaintenance { .. }
+                | LocalCommand::MaintenanceTun { .. }
+        ) {
+            return self.maintenance(command).await;
+        }
+        let _serial = self.mutation.lock().await;
+        self.maintenance_gate()?;
         let action = match command {
+            LocalCommand::PrepareMaintenance { .. }
+            | LocalCommand::CommitMaintenance { .. }
+            | LocalCommand::RestoreMaintenance { .. }
+            | LocalCommand::FinishMaintenance { .. }
+            | LocalCommand::CancelMaintenance { .. }
+            | LocalCommand::AbortMaintenance { .. }
+            | LocalCommand::MaintenanceTun { .. } => unreachable!(),
             LocalCommand::PrepareInstallation {
                 package_id,
                 expected_release_id,
@@ -344,12 +375,16 @@ impl AgentService {
             _ => {}
         }
         Ok(match query {
+            Query::MaintenanceStatus => ResponseBody::MaintenanceStatus(
+                astra_management::maintenance::read(&self.config.state_dir)?.map(Box::new),
+            ),
             Query::Hello => ResponseBody::Hello(Hello {
                 version: VERSION,
                 role: "agent".into(),
                 epoch: self.identity.boot_id.clone(),
                 build_id: env!("CARGO_PKG_VERSION").into(),
                 capabilities: vec![
+                    astra_management::maintenance::CAPABILITY.into(),
                     "instances".into(),
                     "client".into(),
                     "server".into(),
@@ -1749,7 +1784,7 @@ fn model_kind(kind: InstanceKind) -> astra_model::CoreKind {
         InstanceKind::Server => astra_model::CoreKind::Server,
     }
 }
-fn bounded_text(path: &Path) -> Result<String> {
+pub(crate) fn bounded_text(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut text = String::new();
     std::fs::File::open(path)?

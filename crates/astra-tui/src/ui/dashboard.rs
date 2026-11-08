@@ -255,9 +255,9 @@ impl Ui {
     fn render_overview_main(&self, f: &mut Frame<'_>, area: Rect, row: &Row) {
         let connection_count = self.connection_rows().len();
         if area.width >= 120 {
+            let sidebar = ((u32::from(area.width) * 29 / 100) as u16).max(48);
             let columns =
-                Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
-                    .split(area);
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(sidebar)]).split(area);
             self.overview_item_count.set(connection_count);
             self.render_overview_connections(f, columns[0], false);
             self.render_snapshot(f, columns[1]);
@@ -291,7 +291,8 @@ impl Ui {
     }
 
     fn render_snapshot(&self, f: &mut Frame<'_>, area: Rect) {
-        let block = self.focused_card("SNAPSHOT", focus::Region::Secondary);
+        let title = format!("{} · {}", t("SNAPSHOT"), t("b period"));
+        let block = self.focused_card(&title, focus::Region::Secondary);
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
@@ -309,6 +310,10 @@ impl Ui {
             inner.bottom()
         };
         let mut y = inner.y + 1;
+        if y < bottom {
+            self.render_traffic_totals(f, Rect::new(inner.x, y, inner.width, 1));
+            y += 1;
+        }
         if bottom.saturating_sub(y) >= 4 {
             y += 1;
             let label = self
@@ -342,6 +347,45 @@ impl Ui {
                 Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
             );
         }
+    }
+
+    fn render_traffic_totals(&self, f: &mut Frame<'_>, area: Rect) {
+        let totals = self.session_traffic();
+        let value = |bytes| live::rate_value(bytes, true).trim().to_owned();
+        let muted = Style::default().fg(MUTED);
+        let stale = !self.runtime_error.is_empty()
+            || self
+                .runtime_received
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(3))
+            || self.runtime_telemetry.as_ref().is_some_and(|meta| {
+                meta.coverage != astra_model::runtime::Coverage::Complete
+                    || meta.sample_age_ms.saturating_add(
+                        self.runtime_received
+                            .map_or(0, |at| at.elapsed().as_millis() as u64),
+                    ) > 3000
+            });
+        let node = self.node_traffic();
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(t("Session P"), muted),
+                Span::styled(
+                    value(totals.map(|(proxy, _)| proxy)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(format!(" {}", t("Traffic D")), muted),
+                Span::styled(
+                    value(totals.map(|(_, direct)| direct)),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(format!(" │ {} ", self.traffic_period.label()), muted),
+                Span::styled(
+                    value(node),
+                    Style::default().fg(if stale { MUTED } else { BLUE }),
+                ),
+                Span::styled(if stale { " ~" } else { "" }, muted),
+            ])),
+            area,
+        );
     }
 
     fn render_groups_panel(

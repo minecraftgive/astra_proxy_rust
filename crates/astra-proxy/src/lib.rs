@@ -52,28 +52,89 @@ struct CacheKey {
     process: Option<ProcessInfo>,
 }
 
+#[derive(Hash)]
+struct CacheKeyRef<'a> {
+    destination_ip: Option<std::net::IpAddr>,
+    target: &'a Target,
+    revision: u64,
+    network: Network,
+    inbound: Inbound,
+    process: Option<&'a ProcessInfo>,
+}
+
+impl moka::Equivalent<CacheKey> for CacheKeyRef<'_> {
+    fn equivalent(&self, key: &CacheKey) -> bool {
+        self.destination_ip == key.destination_ip
+            && self.target == &key.target
+            && self.revision == key.revision
+            && self.network == key.network
+            && self.inbound == key.inbound
+            && self.process == key.process.as_ref()
+    }
+}
+
+/// Established flows retain only this signal, not the configuration generation.
+#[derive(Clone)]
+pub(crate) struct EgressSignal(Arc<tokio::sync::watch::Sender<bool>>);
+impl EgressSignal {
+    pub(crate) async fn cancelled(&self) {
+        let mut changed = self.0.subscribe();
+        let _ = changed.wait_for(|changed| *changed).await;
+    }
+    pub(crate) fn send_replace(&self, value: bool) {
+        self.0.send_replace(value);
+    }
+}
+impl Default for EgressSignal {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(false).0))
+    }
+}
+
 pub struct App {
+    // Documents and decision caches belong to the active App, not to an
+    // admitted UDP association which may need to route additional targets.
+    source_text: String,
+    effective_text: Option<String>,
+    cache: Option<Cache<CacheKey, RouteAction>>,
+    routing: Arc<RoutingContext>,
+}
+
+/// Routing resources shared by flows admitted under one configuration.
+/// Kept separate so a SOCKS UDP association can preserve its routing semantics
+/// without retaining old documents or the generation's decision cache.
+#[doc(hidden)]
+pub struct RoutingContext {
     hosted: Option<Arc<hosted::Host>>,
     worker_host: Option<hosted::WorkerHost>,
     metrics: Arc<proxy::traffic::Metrics>,
     overrides: Arc<arc_swap::ArcSwap<astra_model::runtime::Overrides>>,
-    egress_signal: Arc<tokio::sync::watch::Sender<bool>>,
+    egress_signal: EgressSignal,
     dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
-    source_text: String,
-    // Preserve the validated subscription expansion independently of the
-    // editable source. Immutable workers must not reread a mutable cache.
-    effective_text: String,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
     outbounds: HashMap<String, OutboundConfig>,
     groups: proxy::groups::Groups,
     rule_client: Option<rule_client::RuleClient>,
     standalone_action: Option<RouteAction>,
-    cache: Cache<CacheKey, RouteAction>,
     native: native::Registry,
     native_interfaces: HashMap<String, native::Registry>,
     udp_permits: Arc<limit::Limit>,
     permits: Arc<limit::Limit>,
+}
+
+impl std::ops::Deref for App {
+    type Target = RoutingContext;
+    fn deref(&self) -> &Self::Target {
+        &self.routing
+    }
+}
+impl std::ops::DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Routing resources are mutable only while preparing a candidate;
+        // once published, App itself is behind Arc and mutations use locks.
+        Arc::get_mut(&mut self.routing).expect("routing generation already published")
+    }
 }
 
 fn loopback_target(host: &str) -> bool {
@@ -91,6 +152,15 @@ fn loopback_target(host: &str) -> bool {
 }
 
 impl App {
+    fn routing_view(routing: Arc<RoutingContext>) -> Self {
+        Self {
+            source_text: String::new(),
+            effective_text: None,
+            cache: None,
+            routing,
+        }
+    }
+
     fn inbound_allowed(&self, ip: std::net::IpAddr) -> bool {
         let ip = ip.to_canonical();
         let allow_lan = self.overrides.load().allow_lan.unwrap_or(false);
@@ -133,10 +203,6 @@ impl App {
                         .parse::<std::net::SocketAddr>()
                         .is_ok_and(|a| !a.ip().is_loopback())
                 })
-    }
-    pub(crate) async fn egress_cancelled(&self) {
-        let mut changed = self.egress_signal.subscribe();
-        let _ = changed.wait_for(|changed| *changed).await;
     }
     pub async fn route(&self, target: &Target, inbound: Inbound) -> Result<RouteAction> {
         self.route_network(target, inbound, Network::Tcp).await
@@ -320,6 +386,23 @@ impl App {
         }
         let client = self.rule_client.as_ref().context("rule client missing")?;
         let revision = client.revision();
+        let key = CacheKeyRef {
+            destination_ip,
+            revision,
+            target,
+            network,
+            inbound,
+            process: process.as_ref(),
+        };
+        if revision != 0 && self.config.decision_cache_ttl_secs > 0 {
+            if let Some(action) = self.cache.as_ref().and_then(|cache| cache.get(&key)) {
+                astra_observe::counter!("routing.cache_hits", "路由缓存：命中").add(1);
+                return Ok(action);
+            }
+            astra_observe::counter!("routing.cache_misses", "路由缓存：未命中").add(1);
+        } else {
+            astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
+        }
         let key = CacheKey {
             destination_ip,
             revision,
@@ -328,15 +411,6 @@ impl App {
             inbound,
             process: process.clone(),
         };
-        if revision != 0 && self.config.decision_cache_ttl_secs > 0 {
-            if let Some(action) = self.cache.get(&key) {
-                astra_observe::counter!("routing.cache_hits", "路由缓存：命中").add(1);
-                return Ok(action);
-            }
-            astra_observe::counter!("routing.cache_misses", "路由缓存：未命中").add(1);
-        } else {
-            astra_observe::counter!("routing.cache_bypass", "路由缓存：绕过查询").add(1);
-        }
         let req = RouteRequest {
             destination_ip,
             api_version: API_VERSION,
@@ -350,8 +424,10 @@ impl App {
         // Do not cache a decision across a concurrent rule generation switch.
         if revision != 0 && response.revision == revision && self.config.decision_cache_ttl_secs > 0
         {
-            self.cache.insert(key, response.action.clone());
-            astra_observe::counter!("routing.cache_inserts", "路由缓存：写入").add(1);
+            if let Some(cache) = &self.cache {
+                cache.insert(key, response.action.clone());
+                astra_observe::counter!("routing.cache_inserts", "路由缓存：写入").add(1);
+            }
         }
         let decision = response.action;
         Ok(decision)
@@ -577,7 +653,7 @@ impl App {
                 );
             }
         }
-        let mut builder = Cache::builder().max_capacity(65_536);
+        let mut builder = Cache::builder().max_capacity(8_192);
         if config.decision_cache_ttl_secs > 0 {
             builder = builder.time_to_live(Duration::from_secs(config.decision_cache_ttl_secs));
         }
@@ -625,33 +701,38 @@ impl App {
             }
         }
         Ok(Self {
-            hosted: None,
-            worker_host: None,
-            metrics: Arc::default(),
-            overrides: Arc::default(),
-            egress_signal: Arc::new(tokio::sync::watch::channel(false).0),
-            dns,
-            groups: proxy::groups::Groups::new(&config)?,
-            standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),
-            rule_client: if config.standalone || config.dns_only() {
-                None
-            } else {
-                Some(rule_client::RuleClient::new(
-                    config.rule_socket.clone(),
-                    config.ipc_connections,
-                    config.decision_timeout_ms,
-                ))
-            },
-            udp_permits: Arc::new(limit::Limit::new(config.max_udp_flows)),
-            permits: Arc::new(limit::Limit::new(config.max_connections)),
-            cache: builder.build(),
-            route_leases: vec![],
-            effective_text: source_text.clone(),
+            // Hosted workers consume the validated expansion; ordinary cores
+            // only need the editable source text.
+            effective_text: std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL")
+                .map(|_| source_text.clone()),
             source_text,
-            config,
-            outbounds,
-            native,
-            native_interfaces,
+            cache: Some(builder.build()),
+            routing: Arc::new(RoutingContext {
+                hosted: None,
+                worker_host: None,
+                metrics: Arc::default(),
+                overrides: Arc::default(),
+                egress_signal: EgressSignal::default(),
+                dns,
+                groups: proxy::groups::Groups::new(&config)?,
+                standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),
+                rule_client: if config.standalone || config.dns_only() {
+                    None
+                } else {
+                    Some(rule_client::RuleClient::new(
+                        config.rule_socket.clone(),
+                        config.ipc_connections,
+                        config.decision_timeout_ms,
+                    ))
+                },
+                udp_permits: Arc::new(limit::Limit::new(config.max_udp_flows)),
+                permits: Arc::new(limit::Limit::new(config.max_connections)),
+                route_leases: vec![],
+                config,
+                outbounds,
+                native,
+                native_interfaces,
+            }),
         })
     }
 }

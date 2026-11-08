@@ -695,3 +695,92 @@ fn cidr_v4_and_v6() {
     assert_eq!(decision(spec, "2001:db8::1", 80), RouteAction::Block);
     assert_eq!(decision(spec, "11.0.0.1", 80), RouteAction::Direct);
 }
+
+#[test]
+fn compact_actions_preserve_provider_priority_and_matched_conditions() {
+    let engine = compile(
+        r#"
+        direct_local=false
+        [[rules]]
+        kind='rule_set'
+        value='outer'
+        action='proxy:shared'
+        [[rules]]
+        kind='domain_exact'
+        value='api.example.test'
+        action='block'
+        [[rules]]
+        kind='rule_set'
+        value='outer'
+        action='direct'
+        [[rules]]
+        kind='domain_exact'
+        value='second.test'
+        action='proxy:shared'
+        [rule_sets.outer]
+        payload=['DOMAIN-SUFFIX,example.test','DOMAIN,nested.test','DOMAIN-KEYWORD,needle']
+    "#,
+    );
+    assert_eq!(std::mem::size_of::<Entry>(), 8);
+    assert_eq!(engine.actions.len(), 3);
+    for (host, kind, value, compiled) in [
+        ("api.example.test", "domain_suffix", "example.test", 1),
+        ("nested.test", "domain_exact", "nested.test", 2),
+        ("hay-needle.test", "domain_keyword", "needle", 3),
+        ("second.test", "domain_exact", "second.test", 8),
+    ] {
+        let decision = engine.decision(&request(host, None));
+        assert_eq!(decision.action, RouteAction::Proxy("shared".into()));
+        assert_eq!(
+            engine.matched_condition(&decision.path),
+            Some((kind.into(), value.into()))
+        );
+        assert!(decision
+            .path
+            .to_string()
+            .ends_with(&format!("compiled[{compiled}]")));
+    }
+}
+
+#[test]
+fn malformed_geosite_selector_is_not_hidden_by_a_later_missing_group() {
+    use astra_rule_data::geosite::{Domain, GeoSite, GeoSiteList};
+    use prost::Message;
+    let dir = std::env::temp_dir().join(format!("astra-geosite-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = GeoSiteList {
+        entry: vec![GeoSite {
+            country_code: "invalid-regex".into(),
+            domain: vec![Domain {
+                kind: 1,
+                value: "[".into(),
+                attribute: vec![],
+            }],
+        }],
+    }
+    .encode_to_vec();
+    std::fs::write(dir.join("geosite.dat"), bytes).unwrap();
+    let mut config: RuleConfig = toml::from_str(
+        r#"
+        socket='/tmp/test.sock'
+        default_action='direct'
+        geosite_database='geosite.dat'
+        [[rules]]
+        kind='geosite'
+        value='invalid-regex'
+        action='block'
+        [[rules]]
+        kind='geosite'
+        value='missing'
+        action='block'
+    "#,
+    )
+    .unwrap();
+    let error = RuleEngine::compile_at(&config, &dir).unwrap_err();
+    assert!(format!("{error:#}").contains("invalid or unsupported domain regex"));
+    // Preserve the existing policy: an unavailable first selector skips this
+    // resource before later selector-specific validation occurs.
+    config.rules.swap(0, 1);
+    assert!(RuleEngine::compile_at(&config, &dir).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}

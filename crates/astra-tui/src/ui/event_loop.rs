@@ -14,7 +14,8 @@ pub(super) async fn run_local(
     ui.load_preferences(context.home.join(settings::FILE));
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     ui.load_startup_context(&context);
-    let mut startup = if resume_ui {
+    ui.client.maintenance.register(&context)?;
+    let mut startup = if resume_ui || astra_management::maintenance::pending(&context.home)? {
         startup::Instances::resumed()
     } else {
         startup::Instances::new(&launch)
@@ -35,6 +36,11 @@ pub(super) async fn run_local(
     let mut restarted = false;
     let mut opening: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     ui.mouse_request = None;
+    ui.client.maintenance.terminal = cfg!(unix);
+    if astra_management::maintenance::pending(&context.home)? {
+        ui.client.installation.notice = false;
+        ui.client.installation.open = true;
+    }
     let mut screen = TerminalSession::enter(TerminalOptions {
         mouse: ui.client.preferences.mouse,
         bracketed_paste: true,
@@ -115,14 +121,31 @@ pub(super) async fn run_local(
                 redraw |= view.poll(&socket).await;
             }
             let idle = !quit && initial.is_none() && opening.is_empty() && ui.restart_ready();
-            match restart
-                .poll(ui.client.update_status.as_ref(), &context, idle)
-                .await
-            {
+            let previous_message = ui.client.message.clone();
+            let launch_label = ui.client.update_launch.label();
+            match restart.poll_client(&mut ui.client, &context, idle) {
                 Ok(Some(mut target)) => {
                     // Do not relinquish the old UI until its complete draft is
                     // durable. The new process opens this exact window session.
                     if ui.checkpoint(&session_path) {
+                        match ui.client.maintenance.checkpointed(
+                            &context,
+                            &target,
+                            Default::default(),
+                            ui.client.preferences.silent_startup,
+                        ) {
+                            Ok(false) => {
+                                redraw = true;
+                                continue;
+                            }
+                            Err(error) => {
+                                ui.client.update_launch.clear();
+                                ui.client.message = format!("{error:#}");
+                                redraw = true;
+                                continue;
+                            }
+                            Ok(true) => {}
+                        }
                         let launch = ui.restart_launch(window_id.clone());
                         target.language = crate::i18n::language();
                         drop(events.take());
@@ -136,6 +159,7 @@ pub(super) async fn run_local(
                                 break Ok(());
                             }
                             Err(error) => {
+                                ui.client.update_launch.clear();
                                 if let Err(restore) = screen.resume() {
                                     break Err(
                                         error.context(format!("Restore terminal: {restore}"))
@@ -162,6 +186,35 @@ pub(super) async fn run_local(
                     redraw = true;
                 }
             }
+            if let Some(id) = ui.client.maintenance.needs_checkpoint() {
+                if ui.checkpoint(&session_path) {
+                    if let Err(error) = ui.client.maintenance.acknowledge(&id) {
+                        ui.client.message = format!("{error:#}");
+                    }
+                }
+            }
+            if let Some((record, action)) = ui.client.maintenance.authorization.take() {
+                drop(events.take());
+                screen.suspend()?;
+                eprintln!("{}", t("Maintenance will interrupt local connections. Authorize before stopping the old backend."));
+                let result = astra_client::maintenance::authorize_terminal(record, action).await;
+                screen.resume()?;
+                events = Some(event::EventStream::new());
+                terminal.backend_mut().writer_mut().invalidate();
+                ui.animations.resize();
+                if let Err(error) = result {
+                    ui.client.maintenance.error = Some(format!("{error:#}"));
+                }
+                redraw = true;
+            }
+            redraw |= previous_message != ui.client.message;
+            let next_label = ui.client.update_launch.label();
+            redraw |= launch_label != next_label;
+            if ui.client.update_launch.pending() && ui.recovery.is_none() && !ui.persistence_paused
+            {
+                redraw |= ui.client.message != next_label;
+                ui.client.message = next_label;
+            }
             for viewer in [&mut ui.client.viewer, &mut ui.client.tui_viewer]
                 .into_iter()
                 .flatten()
@@ -186,6 +239,9 @@ pub(super) async fn run_local(
         if redraw && last_frame.elapsed() >= ui.animations.draw_interval() {
             if let Err(error) = ui.draw(&mut terminal) {
                 break Err(error);
+            }
+            if let Err(error) = ui.client.maintenance.mark_ready(&context) {
+                ui.client.message = format!("{error:#}");
             }
             if let Some(path) = restart_ready.take() {
                 if let Err(error) = crate::self_update::signal_ready(&path) {
@@ -433,7 +489,7 @@ impl Ui {
     fn restart_ready(&self) -> bool {
         let ready = !self.client.tasks.running()
             && !self.client.installation.busy()
-            && !self.client.installation.visible()
+            && (!self.client.installation.visible() || self.client.update_launch.pending() || self.client.maintenance.record.as_ref().is_some_and(|r| matches!(r.phase, astra_management::maintenance::Phase::Ready | astra_management::maintenance::Phase::Complete)))
             && !self.persistence_paused
             && self.recovery.is_none()
             // Confirmation overlays are intentionally not persisted.

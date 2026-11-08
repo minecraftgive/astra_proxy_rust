@@ -16,9 +16,11 @@ async fn worker_channel_preserves_empty_udp_and_releases_flow_on_transport_close
         }
     });
     let (mut host, worker) = tokio::io::duplex(128);
+    let app = app();
+    let previous = Arc::downgrade(&app);
     let worker = tokio::spawn(serve(
         worker,
-        app(),
+        app,
         Metadata {
             flow_id: None,
             inbound: Inbound::Tun,
@@ -30,6 +32,11 @@ async fn worker_channel_preserves_empty_udp_and_releases_flow_on_transport_close
     ));
     let ready: std::result::Result<(), String> = receive(&mut host).await.unwrap();
     ready.unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        previous.upgrade().is_none(),
+        "established UDP retained its App"
+    );
     for body in [vec![], vec![7; 512]] {
         // Concurrent read keeps the deliberately tiny test channel bounded.
         let (mut read, mut write) = tokio::io::split(&mut host);
@@ -100,6 +107,7 @@ async fn generations_share_udp_quota_until_the_lease_connection_closes() {
         admissions: Default::default(),
         transition: Default::default(),
         telemetry: Default::default(),
+        traffic_history: Default::default(),
         connection_ids: Default::default(),
         retired: Default::default(),
         tokens: Arc::new(std::sync::Mutex::new(

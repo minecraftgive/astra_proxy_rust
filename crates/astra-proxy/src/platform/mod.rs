@@ -1,4 +1,5 @@
 pub mod egress;
+pub(crate) mod file_limit;
 pub mod mode_config;
 pub mod network_recovery;
 pub(crate) mod privilege;
@@ -48,6 +49,8 @@ pub fn entry() -> anyhow::Result<()> {
     }
     let result = {
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
+            .max_blocking_threads(32)
             .enable_all()
             .build()?;
         runtime.block_on(crate::run())

@@ -84,6 +84,8 @@ where
     let mut source = (requested.port != 0).then(|| SocketAddr::new(peer.ip(), requested.port));
     let (activity, _) = tokio::sync::watch::channel(Instant::now());
     let idle_time = Duration::from_secs(app.config.udp_idle_timeout_secs);
+    let routing = app.routing.clone();
+    drop(app);
     let expiry = idle(activity.clone(), idle_time);
     tokio::pin!(expiry);
     let mut workers = JoinSet::new();
@@ -108,11 +110,11 @@ where
                 if flows.get(&target).is_some_and(|s| s.is_closed()) { flows.remove(&target); }
                 if !flows.contains_key(&target) {
                     flows.retain(|_, s| !s.is_closed());
-                    if flows.len() >= app.config.udp_targets_per_association || workers.len() >= app.config.udp_targets_per_association { continue; }
-                    let Ok(permit) = app.udp_permits.clone().try_acquire_owned() else { continue; };
+                    if flows.len() >= routing.config.udp_targets_per_association || workers.len() >= routing.config.udp_targets_per_association { continue; }
+                    let Ok(permit) = routing.udp_permits.clone().try_acquire_owned() else { continue; };
                     let (send, receive) = mpsc::channel(QUEUE_PACKETS);
                     flows.insert(target.clone(), send);
-                    let (app, socket, activity, target) = (app.clone(), socket.clone(), activity.clone(), target.clone());
+                    let (app, socket, activity, target) = (Arc::new(App::routing_view(routing.clone())), socket.clone(), activity.clone(), target.clone());
                     let process = crate::hosted::INGRESS_PROCESS.try_with(Clone::clone).ok();
                     workers.spawn(async move {
                         let _permit = permit;
@@ -336,6 +338,9 @@ async fn flow(
     )
     .await
     .context("UDP open timeout")??;
+    let idle_time = Duration::from_secs(app.config.udp_idle_timeout_secs);
+    let _route_leases = app.route_leases.clone();
+    drop(app);
     // Domain-bound adapters carry the original name remotely. Never resolve it locally.
     let destination = SocketAddr::new(
         target
@@ -382,7 +387,7 @@ async fn flow(
     // have consumed part of a length prefix. Cancel only when destroying the flow.
     tokio::select! {
         result = async { tokio::try_join!(upload, download).map(|_| ()) } => result,
-        _ = idle(activity.clone(), Duration::from_secs(app.config.udp_idle_timeout_secs)) => Ok(()),
+        _ = idle(activity.clone(), idle_time) => Ok(()),
     }
 }
 

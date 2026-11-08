@@ -2,6 +2,8 @@
 pub use astra_management as protocol;
 mod install;
 mod log_stream;
+mod maintenance;
+mod maintenance_privilege;
 mod manager;
 mod monitor;
 use astra_management::subscription_view;

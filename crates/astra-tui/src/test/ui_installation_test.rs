@@ -126,3 +126,21 @@ fn installation_panel_renders_all_roles_target_and_result_on_small_terminals() {
         assert_eq!(ui.installation.scroll, 5);
     });
 }
+
+#[test]
+fn installation_launch_controls_support_keys_and_ignore_key_repeat() {
+    let mut ui = fixture();
+    assert!(ui.client.update_launch.automatic);
+    press(&mut ui, KeyCode::Char('a'));
+    assert!(!ui.client.update_launch.automatic);
+    ui.installation_key(event::KeyEvent::new_with_kind(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+        KeyEventKind::Repeat,
+    ));
+    assert!(!ui.client.update_launch.automatic);
+    press(&mut ui, KeyCode::Char('a'));
+    assert!(ui.client.update_launch.automatic);
+    assert!(matches!(press(&mut ui, KeyCode::Char('l')), Input::Idle));
+    assert!(!ui.client.update_launch.pending());
+}

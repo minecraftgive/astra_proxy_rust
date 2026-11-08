@@ -1,7 +1,6 @@
 //! Resident ingress and immutable worker generations. Public listeners never
 //! move during an update; each admitted flow owns a generation lease.
 use crate::platform::worker::WorkerChild;
-use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::{runtime::Current, App};
 use anyhow::{bail, ensure, Context, Result};
 use astra_model::Inbound;
@@ -25,6 +24,7 @@ use tokio::{
 mod connection_ids;
 mod dns;
 mod telemetry;
+mod traffic_history;
 #[cfg(test)]
 #[path = "test/hosted_transition_test.rs"]
 mod transition_tests;
@@ -76,6 +76,58 @@ enum WorkerRequest {
     Dns(Vec<u8>),
     DnsTcp,
     Monitor,
+}
+
+/// Additive JSON response: old hosts ignore node totals, new hosts accept old workers.
+#[derive(Serialize, Deserialize)]
+struct WorkerSample {
+    #[serde(flatten)]
+    snapshot: astra_model::runtime::Snapshot,
+    #[serde(default)]
+    node_totals: Option<BTreeMap<String, u64>>,
+}
+
+fn worker_sample(app: &App) -> WorkerSample {
+    let mut snapshot = app.metrics.snapshot();
+    snapshot.groups = app.groups.snapshot(app);
+    let mut nodes = app.metrics.node_totals();
+    for outbound in &app.config.outbounds {
+        nodes.entry(outbound.tag().to_owned()).or_default();
+    }
+    WorkerSample {
+        snapshot,
+        node_totals: Some(nodes),
+    }
+}
+
+fn selected_traffic_node(app: &App, snapshot: &astra_model::runtime::Snapshot) -> Option<String> {
+    use astra_model::runtime::Mode;
+    if snapshot.mode == Mode::Direct && !app.config.standalone {
+        return None;
+    }
+    let single =
+        || (app.config.outbounds.len() == 1).then(|| app.config.outbounds[0].tag().to_owned());
+    let mut name = if app.config.standalone {
+        app.config.standalone_outbound.clone().or_else(single)?
+    } else if snapshot.groups.iter().any(|group| group.name == "PROXY") {
+        "PROXY".to_owned()
+    } else {
+        single()?
+    };
+    for _ in 0..8 {
+        match snapshot.groups.iter().find(|group| group.name == name) {
+            Some(group) => name = group.selected.clone()?,
+            None => {
+                return app
+                    .config
+                    .outbounds
+                    .iter()
+                    .any(|outbound| outbound.tag() == name)
+                    .then_some(name)
+            }
+        }
+    }
+    None
 }
 #[derive(Serialize, Deserialize)]
 struct Auth<T> {
@@ -238,6 +290,7 @@ pub struct Host {
     transition: Arc<Mutex<()>>,
     admissions: tokio::sync::Notify,
     telemetry: std::sync::Mutex<telemetry::Store>,
+    traffic_history: Arc<std::sync::Mutex<traffic_history::History>>,
     connection_ids: std::sync::Mutex<connection_ids::ConnectionIds>,
     retired: std::sync::Mutex<astra_model::runtime::Snapshot>,
     tokens: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -254,6 +307,10 @@ impl Drop for Host {
         {
             task.abort();
         }
+        self.traffic_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .save();
         astra_platform::platform::remove_socket(&self.endpoint);
     }
 }
@@ -379,6 +436,9 @@ impl Host {
             boot: uuid::Uuid::new_v4().to_string(),
             next_flow: AtomicU64::new(1),
             endpoint,
+            traffic_history: Arc::new(std::sync::Mutex::new(traffic_history::History::open(
+                astra_platform::storage::runtime_path(&path, "traffic-history"),
+            ))),
             path,
             current: Arc::downgrade(current),
             state: Arc::new(Mutex::new(State {
@@ -500,7 +560,11 @@ impl Host {
         self.checked_lock("tokens", &self.tokens)?
             .insert(token.clone());
         preparation.token = Some(token.clone());
-        let mut table: toml::Table = toml::from_str(&app.effective_text)?;
+        let mut table: toml::Table = toml::from_str(
+            app.effective_text
+                .as_deref()
+                .context("hosted configuration snapshot missing")?,
+        )?;
         if let Some(socket) = &rule_socket {
             table.insert("rule_socket".into(), socket.clone().into());
         }
@@ -853,9 +917,7 @@ impl Host {
         };
         // A slow draining worker must not serialize every healthy worker's sample.
         let mut samples = stream::iter(generations.into_iter().map(|generation| async move {
-            let result =
-                Self::rpc::<astra_model::runtime::Snapshot>(&generation, WorkerRequest::Snapshot)
-                    .await;
+            let result = Self::rpc::<WorkerSample>(&generation, WorkerRequest::Snapshot).await;
             (generation, result, std::time::Instant::now())
         }))
         .buffer_unordered(4)
@@ -864,19 +926,46 @@ impl Host {
         samples.sort_by_key(|(generation, _, _)| generation.id);
         let mut snapshots = Vec::with_capacity(samples.len());
         let mut health = BTreeMap::new();
+        let now = traffic_history::minute();
+        let mut node_coverage = true;
         for (generation, result, sampled_at) in samples {
             health.insert(generation.id, result.is_ok().then_some(sampled_at));
             let mut stored = match self.checked_lock("generation telemetry", &generation.snapshot) {
                 Ok(stored) => stored,
                 Err(_) => return,
             };
-            if let Ok(snapshot) = result {
-                *stored = snapshot;
+            if let Ok(sample) = result {
+                if let Some(nodes) = sample.node_totals {
+                    self.traffic_history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe(generation.id, &nodes, now);
+                } else {
+                    node_coverage = false;
+                }
+                *stored = sample.snapshot;
+            } else {
+                node_coverage = false;
             }
             let mut snapshot = stored.clone();
             snapshot.truncated |= snapshot.connections.len() > 128;
             snapshot.connections.truncate(128);
             snapshots.push((generation.id, snapshot));
+        }
+        // Checkpoint on a blocking worker, outside the network/telemetry locks.
+        let history = self.traffic_history.clone();
+        if history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .checkpoint_due()
+        {
+            let _ = tokio::task::spawn_blocking(move || {
+                history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .save();
+            })
+            .await;
         }
         let Ok(mut ids) = self.checked_lock("connection identities", &self.connection_ids) else {
             return;
@@ -918,6 +1007,16 @@ impl Host {
         }
         if let Ok(mut telemetry) = self.checked_lock("telemetry", &self.telemetry) {
             telemetry.publish(combined, health, origins);
+            let mut history = self
+                .traffic_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Ok(app) = self.app() {
+                history.observe(0, &app.metrics.node_totals(), now);
+            }
+            let summary = history.summary(now);
+            telemetry.node_traffic = node_coverage.then_some(summary);
+            telemetry.traffic_history_error = history.error.clone();
         }
     }
     /// Diagnostics never hold admission/state locks while contacting workers.
@@ -1067,13 +1166,7 @@ impl Host {
         let ready: std::result::Result<(), String> = receive(&mut remote).await?;
         ready.map_err(anyhow::Error::msg)?;
         let mut remote = astra_ipc::host::HostStream::new(remote);
-        tokio::io::copy_bidirectional_with_sizes(
-            &mut client,
-            &mut remote,
-            COPY_BUFFER_SIZE,
-            COPY_BUFFER_SIZE,
-        )
-        .await?;
+        crate::proxy::relay::relay(&mut client, &mut remote).await?;
         Ok(())
     }
     async fn command(&self, command: Command) -> Result<serde_json::Value> {
@@ -1096,9 +1189,13 @@ impl Host {
                 snapshot.groups = app.groups.snapshot(&app);
                 let store = self.checked_lock("telemetry", &self.telemetry)?;
                 Self::merge_metrics(&mut snapshot, &store.snapshot);
+                let mut metadata = store.metadata(&self.boot, state.active, state.paused);
+                if let Some(traffic) = &mut metadata.traffic {
+                    traffic.selected_node = selected_traffic_node(&app, &snapshot);
+                }
                 Ok(serde_json::to_value(astra_model::runtime::RuntimeView {
                     snapshot,
-                    telemetry: Some(store.metadata(&self.boot, state.active, state.paused)),
+                    telemetry: Some(metadata),
                 })?)
             }
             Command::Mapping { token, operation } => self.mapping(&token, *operation).await,
@@ -1225,6 +1322,22 @@ impl Host {
         drop(state);
         drop(transition);
         for g in retired {
+            // Capture the final bytes of closed flows before retiring a worker.
+            if let Ok(sample) = Self::rpc::<WorkerSample>(&g, WorkerRequest::Snapshot).await {
+                if let Some(nodes) = sample.node_totals {
+                    self.traffic_history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe(g.id, &nodes, traffic_history::minute());
+                }
+                if let Ok(mut last) = self.checked_lock("generation telemetry", &g.snapshot) {
+                    *last = sample.snapshot;
+                }
+            }
+            self.traffic_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_generation(g.id);
             self.tokens
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1288,6 +1401,7 @@ fn append_worker_monitor(
 }
 
 pub async fn worker() -> Result<()> {
+    crate::platform::file_limit::prepare();
     let config: WorkerConfig = receive(&mut tokio::io::stdin()).await?;
     let mut app = App::from_text(&config.path, config.text)?;
     crate::platform::network_recovery::set_enabled(app.config.experimental.network_recovery);
@@ -1304,8 +1418,11 @@ pub async fn worker() -> Result<()> {
         endpoint: config.host.clone(),
         token: config.token.clone(),
     });
-    if let Some(dns) = &mut app.dns {
-        dns.set_mapping_store(Arc::new(app.worker_host.as_ref().unwrap().clone()))?;
+    {
+        let routing = &mut *app;
+        if let Some(dns) = &mut routing.dns {
+            dns.set_mapping_store(Arc::new(routing.worker_host.as_ref().unwrap().clone()))?;
+        }
     }
     if let Some(rule) = &mut app.rule_client {
         rule.start_observer();
@@ -1375,8 +1492,7 @@ pub async fn worker() -> Result<()> {
                                 crate::dns::tcp(astra_ipc::host::HostStream::new(stream),app).await
                             }
                             WorkerRequest::Snapshot => {
-                                let mut snapshot = app.metrics.snapshot(); snapshot.groups = app.groups.snapshot(&app);
-                                send(&mut stream,snapshot).await
+                                send(&mut stream,worker_sample(&app)).await
                             }
                             WorkerRequest::Monitor => {
                                 let snapshot = astra_observe::snapshot(format!("{boot}:{generation}"));
@@ -1449,14 +1565,11 @@ async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
     let mut remote = app
         .connect_tracked(&dial, &action, meta.inbound, Some(meta.source))
         .await?;
+    let _route_leases = app.route_leases.clone();
+    drop(app);
     remote.write_all(&prefix).await?;
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut stream,
-        &mut remote,
-        COPY_BUFFER_SIZE,
-        COPY_BUFFER_SIZE,
-    )
-    .await?;
+    drop(prefix);
+    crate::proxy::relay::relay(&mut stream, &mut remote).await?;
     Ok(())
 }
 

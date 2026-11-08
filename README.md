@@ -81,6 +81,8 @@ XHTTP packet-up 关闭上传时不能发送独立的上传 EOF，当前实现确
 
 ## 安装包
 
+本机客户端/服务端完整包安装后，TUI / GUI 支持立即维护重启、默认 30 秒自动维护以及取消后手动执行。维护会中断连接，更新管理器与运行中的核心并精确恢复原运行清单；失败等待手动处理，不自动回退。三平台权限与验收边界见 [维护重启说明](docs/SEAMLESS_UPDATES.md#安装后的维护重启windows--macos--linux)。
+
 分发包的解压和启动步骤见 [安装说明](docs/INSTALL.md)。按 `client`、`server`、`controller`、`web` 分别打包。客户端与服务端包包含各自 Core、终端入口及独立管理程序；Controller/Web 可单独部署，运行包内容见 [安装说明](docs/INSTALL.md)。客户端另包含离线转换工具及可选 Wintun 运行库。本机初始性能数据见 [性能基线](docs/PERFORMANCE.md)。
 
 VLESS Encryption、Vision 与 XHTTP 的配置字段见 [原生协议说明](docs/NATIVE_PROTOCOLS.md)。私人节点配置及验证记录保存在 Git 忽略的 `Local/` 目录，不随项目发布。
@@ -224,6 +226,8 @@ IPC 默认 8 个持久通道，每通道一条在途请求。一次决策的总�
 远程订阅、proxy-provider、规则集与 GeoIP/GeoSite 下载支持 HTTP(S)（URL 中不得包含账号密码）；明文 HTTP 内容可被链路篡改，建议优先使用 HTTPS。配置为 HTTPS 的地址，重定向不得降级为 HTTP。远程订阅不能引用本机 `type: file` provider；订阅更新不导入远端 DNS 设置，保留本地 DNS 配置。DNS 监听与代理入站使用同一套来源准入（LAN 开关、`lan_allowed_ips` / `lan_disallowed_ips`）。规则核心冷启动时直接使用已过期但有效的资源缓存，并在启动后立即于后台刷新。
 
 默认 `max_connections = 4096`；空闲监听器不占用会话额度。UDP 默认全局最多 512 个流、每个关联最多 32 个目标，每流发送队列 4 个包，空闲 120 秒回收。UDP 关联随 TCP 控制连接关闭，禁止 SOCKS 分片并固定客户端来源；超限丢包，不无限积压。
+
+Unix 代理核心与托管工作进程启动时尝试将文件描述符软上限提升至 65536，受继承的硬上限及 macOS `kern.maxfilesperproc` 限制；不降低已有上限，不修改系统全局设置。若无法达到目标，启动日志会给出警告。`Too many open files (os error 24)` 表示进程描述符耗尽：一个 TCP 转发通常占用两个描述符，另需预留 IPC、DNS、UDP 和日志开销；`max_connections` 并不是描述符数量。可提高启动服务的文件上限或降低并发配置；只在另一个终端执行 `ulimit` 不会改变已运行进程的上限。
 
 `connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 2 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
 

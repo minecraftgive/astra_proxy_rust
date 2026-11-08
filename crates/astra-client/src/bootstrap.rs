@@ -33,8 +33,17 @@ pub fn selected_startup_release(
     home: &Path,
     explicit_bin: bool,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
+    if astra_management::maintenance::pending(home)? {
+        return Ok(None);
+    }
     if explicit_bin {
         return Ok(None);
+    }
+    if let Some(directory) = crate::maintenance::selected(home)? {
+        return Ok(Some((
+            directory.clone(),
+            directory.join(astra_platform::platform::executable("astra-host")),
+        )));
     }
     let Some(release) = astra_update::ReleaseStore::new(home).resolve_current()? else {
         return Ok(None);
@@ -401,6 +410,9 @@ pub async fn ensure_manager(
     context: &windows::Context,
     silent: bool,
 ) -> Result<()> {
+    if astra_management::maintenance::pending(&context.home)? {
+        return Ok(());
+    }
     if protocol::call(socket, protocol::Action::List)
         .await
         .is_err()
@@ -420,14 +432,29 @@ pub async fn ensure_manager(
             .mode(0o600)
             .open(context.home.join("manager.log"))?;
         let mut command = Command::new(manager_binary);
+        let saved = astra_management::maintenance::directory(&context.home).join("manager.toml");
+        if saved.is_file() {
+            let config = astra_management::config::ManagerConfig::load(&saved)?;
+            anyhow::ensure!(
+                config.state_dir == context.home && config.config_dir == context.config,
+                "Saved maintenance configuration uses different storage directories"
+            );
+            command
+                .arg("--config")
+                .arg(saved)
+                .arg("--bin-dir")
+                .arg(&context.bin);
+        } else {
+            command
+                .arg("--manager")
+                .arg("--state-dir")
+                .arg(&context.home)
+                .arg("--config-dir")
+                .arg(&context.config)
+                .arg("--bin-dir")
+                .arg(&context.bin);
+        }
         command
-            .arg("--manager")
-            .arg("--state-dir")
-            .arg(&context.home)
-            .arg("--config-dir")
-            .arg(&context.config)
-            .arg("--bin-dir")
-            .arg(&context.bin)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
@@ -529,7 +556,7 @@ pub async fn prepare(options: &Options) -> Result<Prepared> {
             manager = supplied_host;
         }
         context.bin = std::fs::canonicalize(&context.bin)?;
-        let socket = context.home.join("management.sock");
+        let socket = crate::maintenance::local_endpoint(&context.home)?;
         astra_platform::platform::validate_state_directory(&context.home)?;
         if !options.shutdown {
             ensure_manager(&socket, &manager, &context, options.silent).await?;

@@ -15,6 +15,8 @@ pub(super) enum Click {
     Scope,
     Refresh,
     Install,
+    LaunchNow,
+    ToggleAutoLaunch,
 }
 
 impl Ui {
@@ -41,6 +43,12 @@ impl Ui {
             KeyCode::PageUp => InstallationAction::PageUp,
             KeyCode::PageDown => InstallationAction::PageDown,
             KeyCode::Char('r') => InstallationAction::Refresh,
+            KeyCode::Char('m') => InstallationAction::RetryMaintenance,
+            KeyCode::Char('b') => InstallationAction::RestorePrevious,
+            KeyCode::Char('v') => InstallationAction::MaintenanceLog,
+            KeyCode::Char('c') => InstallationAction::CancelMaintenance,
+            KeyCode::Char('l') => InstallationAction::LaunchNow,
+            KeyCode::Char('a') => InstallationAction::ToggleAutoLaunch,
             _ => return Input::Idle,
         };
         self.client.installation_action(action)
@@ -67,6 +75,12 @@ impl Ui {
                     }
                     Some(dashboard::Target::Installation(Click::Install)) => {
                         InstallationAction::Confirm
+                    }
+                    Some(dashboard::Target::Installation(Click::LaunchNow)) => {
+                        InstallationAction::LaunchNow
+                    }
+                    Some(dashboard::Target::Installation(Click::ToggleAutoLaunch)) => {
+                        InstallationAction::ToggleAutoLaunch
                     }
                     _ => return Input::Idle,
                 }
@@ -126,7 +140,7 @@ impl Ui {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(5),
                 Constraint::Min(1),
                 Constraint::Length(2),
             ])
@@ -135,11 +149,13 @@ impl Ui {
         let target = self.client.installation.target_label();
         frame.render_widget(
             Paragraph::new(format!(
-                "{}: {target}\n{}: {}  [Tab / ←→]\n{}",
+                "{}: {target}\n{}: {}  [Tab / ←→]\n{}\n{} [l / a]\n{}",
                 t("Management target"),
                 t("Installation scope"),
                 t(scope),
-                t("↑↓ package · Enter install · r refresh · PgUp/PgDn scroll · Esc close")
+                t("↑↓ package · Enter install · r refresh · PgUp/PgDn scroll · Esc close"),
+                self.client.update_launch.label(),
+                t("Maintenance: m retry · b previous · v log · c cancel")
             )),
             sections[0],
         );
@@ -147,7 +163,7 @@ impl Ui {
             Rect::new(sections[0].x, sections[0].y + 1, sections[0].width, 1),
             dashboard::Target::Installation(Click::Scope),
         );
-        let lines: Vec<Line> = self
+        let mut lines: Vec<Line> = self
             .client
             .installation
             .details()
@@ -171,6 +187,12 @@ impl Ui {
                 }
             })
             .collect();
+        if !self.client.maintenance.label().is_empty() {
+            lines.push(Line::from(self.client.maintenance.label()));
+        }
+        if let Some(log) = &self.client.maintenance.log {
+            lines.extend(log.lines().map(|line| Line::from(line.to_owned())));
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -198,9 +220,11 @@ impl Ui {
                 );
             }
         }
-        let width = sections[2].width / 3;
+        let width = sections[2].width / 5;
         for (i, (label, click)) in [
             ("Install", Click::Install),
+            ("Launch now", Click::LaunchNow),
+            ("Auto / manual", Click::ToggleAutoLaunch),
             ("Refresh", Click::Refresh),
             ("Close", Click::Close),
         ]

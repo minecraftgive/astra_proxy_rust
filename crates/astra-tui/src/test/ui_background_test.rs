@@ -30,6 +30,39 @@ fn remote_update_failure_is_visible_without_a_local_job() {
 }
 
 #[test]
+fn not_applied_update_failure_alerts_once_per_session_until_acknowledged() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = Ui::new(Session::default());
+        let failed = |id: &str, at: u64| {
+            serde_json::from_value(serde_json::json!({
+                "operation": {
+                    "request": {"operation_id":id, "intent":{"kind":"stage", "package":"client.zip"}},
+                    "phase":"failed", "before_directory":"old", "target_directory":null,
+                    "release_id":null, "runtime_committed":false, "next_launch_saved":false,
+                    "pending_record_saved":false, "participants":[],
+                    "error":"Missing root manifest.json", "updated_at_ms":at
+                }
+            }))
+            .unwrap()
+        };
+        // A failure journaled before this UI started does not nag on launch.
+        ui.update_status = Some(failed("old-op", ui.update_alert_since_ms - 1));
+        assert!(ui.update_alert().is_none());
+        // A fresh failure alerts until F6 shows its details.
+        ui.update_status = Some(failed("new-op", ui.update_alert_since_ms + 1));
+        assert!(ui.status_line(180).to_string().contains("new-op"));
+        let f6 = event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+        ui.background_key(f6);
+        assert!(ui.update_alert().is_none());
+        ui.background_key(f6);
+        assert!(ui.update_alert().is_none());
+        // A later failure is a new operation and alerts again.
+        ui.update_status = Some(failed("next-op", ui.update_alert_since_ms + 2));
+        assert!(ui.update_alert().is_some());
+    });
+}
+
+#[test]
 fn background_disk_observation_preserves_newer_foreground_draft_and_conflict_diff() {
     let mut ui = Ui::new(Session::default());
     ui.open_draft("proxy".into(), "standalone=true\n".into());

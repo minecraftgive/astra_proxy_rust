@@ -1,4 +1,3 @@
-use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::App;
 use anyhow::{Context, Result};
 use astra_model::Inbound;
@@ -89,19 +88,16 @@ where
             return Err(err);
         }
     };
+    let _route_leases = app.route_leases.clone();
+    drop(app);
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     if !tail.is_empty() {
         upstream.write_all(&tail).await?;
     }
-    let (up, down) = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut upstream,
-        COPY_BUFFER_SIZE,
-        COPY_BUFFER_SIZE,
-    )
-    .await?;
+    drop(tail);
+    let (up, down) = crate::proxy::relay::relay(&mut client, &mut upstream).await?;
     tracing::debug!(host = %target.host, port = target.port, up, down, "HTTP CONNECT stream complete");
     Ok(())
 }

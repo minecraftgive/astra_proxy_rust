@@ -28,6 +28,7 @@ struct PendingRestart {
     launch: astra_client::windows::Launch,
     snapshot: Vec<u8>,
     release: Option<String>,
+    launch_key: Option<(String, String)>,
 }
 
 pub struct AppModel {
@@ -56,6 +57,7 @@ pub struct AppModel {
     restart_plan: RestartPlan,
     restart_pending: Option<PendingRestart>,
     restart_sequence: u64,
+    maintenance_checkpoint: Option<(String, Vec<u8>)>,
     window_pages: BTreeMap<u64, usize>,
     restored_windows: Vec<usize>,
     cancelled_jobs: BTreeSet<u64>,
@@ -97,6 +99,7 @@ impl AppModel {
             restart_plan: Default::default(),
             restart_pending: None,
             restart_sequence: 0,
+            maintenance_checkpoint: None,
             window_pages: Default::default(),
             restored_windows: Vec::new(),
             cancelled_jobs: Default::default(),
@@ -134,6 +137,11 @@ impl AppModel {
         if !self.ready {
             return;
         }
+        if let Some(context) = &self.context {
+            if let Err(error) = self.client.maintenance.mark_ready(context) {
+                self.client.message = format!("{error:#}");
+            }
+        }
         if let Some(path) = self.restart_ready_path.take() {
             if let Err(error) = astra_client::self_update::signal_ready(&path) {
                 self.client.message = format!("{error:#}");
@@ -165,7 +173,15 @@ impl AppModel {
                 .load(std::sync::atomic::Ordering::Acquire)
             && !self.client.tasks.running()
             && !self.client.installation.busy()
-            && !self.client.installation.visible()
+            && (!self.client.installation.visible()
+                || self.client.update_launch.pending()
+                || self.client.maintenance.record.as_ref().is_some_and(|r| {
+                    matches!(
+                        r.phase,
+                        astra_management::maintenance::Phase::Ready
+                            | astra_management::maintenance::Phase::Complete
+                    )
+                }))
             && !self.client.persistence_paused
             && self.client.recovery.is_none()
             && !self
@@ -207,6 +223,7 @@ impl AppModel {
         }) {
             Ok(()) => {
                 self.restart_pending = Some(PendingRestart {
+                    launch_key: self.client.update_launch.identity(),
                     id,
                     target,
                     launch,
@@ -254,6 +271,9 @@ impl AppModel {
             return;
         }
         if !self.restart_idle()
+            || (pending.launch_key.is_some()
+                && (pending.launch_key != self.client.update_launch.identity()
+                    || !self.client.update_launch.due(std::time::Instant::now())))
             || self
                 .client
                 .update_status
@@ -269,6 +289,27 @@ impl AppModel {
         if serde_json::to_vec(&current).ok().as_deref() != Some(pending.snapshot.as_slice()) {
             self.checkpoint_restart(pending.target);
             return;
+        }
+        if let Some(context) = &self.context {
+            let _guard = self.handle.enter();
+            match self.client.maintenance.checkpointed(
+                context,
+                &pending.target,
+                self.waker.clone(),
+                self.client.preferences.silent_startup,
+            ) {
+                Ok(false) => {
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    self.client.update_launch.clear();
+                    self.client.message = format!("{error:#}");
+                    cx.notify();
+                    return;
+                }
+                Ok(true) => {}
+            }
         }
         *self
             .restart_plan
@@ -444,10 +485,9 @@ impl AppModel {
             if let Some(context) = &self.context {
                 let idle = self.restart_idle();
                 let _guard = self.handle.enter();
-                match self
-                    .restart
-                    .poll_ready(self.client.update_status.as_ref(), context, idle)
-                {
+                let previous_message = self.client.message.clone();
+                let launch_label = self.client.update_launch.label();
+                match self.restart.poll_client(&mut self.client, context, idle) {
                     Ok(Some(target)) => {
                         drop(_guard);
                         self.checkpoint_restart(target);
@@ -460,6 +500,33 @@ impl AppModel {
                             format!("{error:#}")
                         );
                         changed = true;
+                    }
+                }
+                changed |= self.client.message != previous_message;
+                let next_label = self.client.update_launch.label();
+                changed |= launch_label != next_label;
+                if self.client.update_launch.pending()
+                    && self.client.recovery.is_none()
+                    && !self.client.persistence_paused
+                {
+                    changed |= self.client.message != next_label;
+                    self.client.message = next_label;
+                }
+            }
+        }
+        if self.maintenance_checkpoint.is_none() {
+            if let Some(id) = self.client.maintenance.needs_checkpoint() {
+                let snapshot = self.session_snapshot();
+                if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+                    if self
+                        .commands
+                        .try_send(BackendCmd::CheckpointForMaintenance {
+                            id: id.clone(),
+                            session: Box::new(snapshot),
+                        })
+                        .is_ok()
+                    {
+                        self.maintenance_checkpoint = Some((id, bytes));
                     }
                 }
             }
@@ -658,6 +725,29 @@ impl AppModel {
         let _guard = handle.enter();
         match event {
             BackendEvent::Terminate => self.request_quit(cx),
+            BackendEvent::MaintenanceCheckpoint { id, result } => {
+                if self
+                    .maintenance_checkpoint
+                    .as_ref()
+                    .is_some_and(|(pending, _)| pending == &id)
+                {
+                    let (_, saved) = self.maintenance_checkpoint.take().unwrap();
+                    match result {
+                        Ok(())
+                            if serde_json::to_vec(&self.session_snapshot()).ok().as_ref()
+                                == Some(&saved) =>
+                        {
+                            if let Err(error) = self.client.maintenance.acknowledge(&id) {
+                                self.client.message = format!("{error:#}");
+                            }
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            self.client.message = error;
+                        }
+                    }
+                }
+            }
             BackendEvent::QuitCheckpoint(result) => self.complete_quit_checkpoint(result, cx),
             BackendEvent::RestartCheckpoint { id, result } => {
                 self.complete_restart_checkpoint(id, result, cx)
@@ -674,6 +764,9 @@ impl AppModel {
                 self.ready = true;
                 session.kind = prepared.launch.kind.unwrap_or(session.kind);
                 self.client = Client::from_session(session).with_waker(self.waker.clone());
+                if let Err(error) = self.client.maintenance.register(&prepared.context) {
+                    self.client.maintenance.error = Some(format!("{error:#}"));
+                }
                 let preferences_path = prepared.context.home.join(astra_client::preferences::FILE);
                 let (preferences, notice) =
                     astra_client::preferences::load(&preferences_path, &self.client.session);
@@ -722,6 +815,10 @@ impl AppModel {
                     &prepared.launch,
                     self.resume_ui,
                 );
+                if astra_management::maintenance::pending(&prepared.context.home).unwrap_or(true) {
+                    self.client.installation.notice = false;
+                    self.client.installation.open = true;
+                }
                 if !astra_client::i18n::command_line_language() {
                     astra_client::i18n::set_language(self.client.preferences.language.language());
                 }

@@ -35,11 +35,19 @@ pub enum BackendCmd {
         id: u64,
         session: Box<astra_client::state::Session>,
     },
+    CheckpointForMaintenance {
+        id: String,
+        session: Box<astra_client::state::Session>,
+    },
     RefreshProgramInfo,
 }
 
 pub enum BackendEvent {
     QuitCheckpoint(Result<(), String>),
+    MaintenanceCheckpoint {
+        id: String,
+        result: Result<(), String>,
+    },
     Terminate,
     Ready(Box<(Prepared, astra_client::state::Session)>),
     RestartCheckpoint {
@@ -219,6 +227,10 @@ async fn run(
                 Ok(BackendCmd::Checkpoint(session)) => { if let Err(error) = session.save(&session_path) { let _ = events.send(BackendEvent::Failed(format!("{error:#}"))).await; } },
                 Ok(BackendCmd::CheckpointForRestart { id, session }) => {
                     let _ = events.send(checkpoint_for_restart(&session_path, id, &session)).await;
+                },
+                Ok(BackendCmd::CheckpointForMaintenance { id, session }) => {
+                    let result = session.save(&session_path).map_err(|error| format!("{error:#}"));
+                    let _ = events.send(BackendEvent::MaintenanceCheckpoint { id, result }).await;
                 },
                 Ok(BackendCmd::RefreshProgramInfo) => info_timer.reset_immediately(),
                 Ok(BackendCmd::Cancel(id)) => jobs.cancel(id),

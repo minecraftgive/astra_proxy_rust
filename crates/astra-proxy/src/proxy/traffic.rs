@@ -28,8 +28,17 @@ pub(crate) struct Metrics {
     proxy_upload: AtomicU64,
     proxy_download: AtomicU64,
     flows: Mutex<BTreeMap<u64, Weak<Flow>>>,
+    nodes: Mutex<BTreeMap<String, Arc<AtomicU64>>>,
 }
 impl Metrics {
+    pub(crate) fn node_totals(&self) -> BTreeMap<String, u64> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(name, total)| (name.clone(), total.load(Ordering::Relaxed)))
+            .collect()
+    }
     fn flows(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Weak<Flow>>> {
         match self.flows.lock() {
             Ok(flows) => flows,
@@ -104,6 +113,7 @@ impl Metrics {
 pub(crate) struct Traffic {
     metrics: Arc<Metrics>,
     flow: Arc<Flow>,
+    node: Option<Arc<AtomicU64>>,
 }
 impl std::ops::Deref for Traffic {
     type Target = Flow;
@@ -155,9 +165,23 @@ impl Traffic {
         });
         metrics.total.fetch_add(1, Ordering::Relaxed);
         metrics.flows().insert(id, Arc::downgrade(&flow));
+        // Resolve once at flow creation; forwarding adds only an atomic increment.
+        let node = match action {
+            RouteAction::Proxy(name) => Some(
+                metrics
+                    .nodes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(name.clone())
+                    .or_default()
+                    .clone(),
+            ),
+            _ => None,
+        };
         Some(Self {
             metrics: metrics.clone(),
             flow,
+            node,
         })
     }
     pub(crate) fn cancellation(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -177,6 +201,9 @@ impl Traffic {
         tracing::debug!(target: "astra_route", flow = self.id, phase = "forward", source = ?self.source, host = ?self.target.host, port = self.target.port, inbound = ?self.inbound, network = ?self.network, action = ?self.action, "forwarding started");
     }
     pub(crate) fn upload(&self, bytes: usize) {
+        if let Some(node) = &self.node {
+            node.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         if matches!(self.action, RouteAction::Proxy(_)) {
             self.metrics
                 .proxy_upload
@@ -191,6 +218,9 @@ impl Traffic {
         }
     }
     pub(crate) fn download(&self, bytes: usize) {
+        if let Some(node) = &self.node {
+            node.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         if matches!(self.action, RouteAction::Proxy(_)) {
             self.metrics
                 .proxy_download

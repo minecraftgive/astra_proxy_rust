@@ -499,7 +499,10 @@ async fn reload_cancels_only_configured_reasons_and_preserves_unrelated_connecti
         .get_mut("speed")
         .unwrap()
         .disconnect_on_manual = true;
-    next.groups.inherit(&old, &next.config);
+    {
+        let routing = &mut *next;
+        routing.groups.inherit(&old, &routing.config);
+    }
     next.groups.committed(&old, &next.config);
     tokio::time::timeout(Duration::from_secs(1), lease.cancelled())
         .await
@@ -517,7 +520,10 @@ async fn reload_cancels_only_configured_reasons_and_preserves_unrelated_connecti
         .unwrap()
         .disconnect_on_config_change = true;
     last.config.proxy_groups.get_mut("speed").unwrap().members = vec!["b".into()];
-    last.groups.inherit(&next, &last.config);
+    {
+        let routing = &mut *last;
+        routing.groups.inherit(&next, &routing.config);
+    }
     last.groups.committed(&next, &last.config);
     tokio::time::timeout(Duration::from_secs(1), lease.cancelled())
         .await
@@ -542,7 +548,10 @@ async fn default_dynamic_group_reloads_members_and_never_falls_back_to_direct_wh
         .get_mut("PROXY")
         .unwrap()
         .disconnect_on_config_change = true;
-    next.groups.inherit(&old, &next.config);
+    {
+        let routing = &mut *next;
+        routing.groups.inherit(&old, &routing.config);
+    }
     next.groups.committed(&old, &next.config);
     assert_eq!(
         next.resolve_action(&action).await.unwrap(),

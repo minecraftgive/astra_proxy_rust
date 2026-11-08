@@ -38,6 +38,29 @@ pub fn run(kind: Kind) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("Backend thread stopped unexpectedly"))?;
     }
+    if options.endpoint.is_none() && !options.explicit_bin {
+        if let Some(directory) = astra_client::maintenance::selected(&options.home)? {
+            let frontend = directory.join(
+                options
+                    .executable
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Unknown GUI executable"))?,
+            );
+            anyhow::ensure!(
+                frontend.is_file(),
+                "Selected maintenance package has no GUI executable"
+            );
+            if std::fs::canonicalize(&frontend)? != std::fs::canonicalize(&options.executable)? {
+                let status = std::process::Command::new(frontend)
+                    .args(std::env::args_os().skip(1))
+                    .arg("--bin-dir")
+                    .arg(directory)
+                    .status()?;
+                anyhow::ensure!(status.success(), "Selected GUI exited with {status}");
+                return Ok(());
+            }
+        }
+    }
     let kind = options.launch.kind.unwrap_or(kind);
     let resume_ui = options.resume_ui;
     let restart_ready = options.restart_ready.clone();
@@ -101,7 +124,28 @@ pub fn run(kind: Kind) -> anyhow::Result<()> {
         .take();
     if let Some((context, launch)) = restart {
         // All native windows and the manager executor are closed before replacing this process.
-        astra_client::self_update::restart(&context, &launch)?;
+        if let Err(error) = astra_client::self_update::restart(&context, &launch) {
+            // Reopen only the diagnostic interface. The failed durable
+            // transaction prevents bootstrap from starting any old backend.
+            let mut diagnostic = context.clone();
+            diagnostic.executable = std::env::current_exe()?;
+            diagnostic.bin = diagnostic
+                .executable
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("GUI directory unavailable"))?
+                .into();
+            let mut command = std::process::Command::new(&diagnostic.executable);
+            command
+                .args(diagnostic.arguments(&launch))
+                .arg("--resume-ui");
+            astra_platform::platform::background_command(&mut command, false);
+            let mut child = command.spawn().map_err(|reopen| {
+                error.context(format!("Reopen diagnostic interface: {reopen}"))
+            })?;
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
     Ok(())
 }

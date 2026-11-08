@@ -74,13 +74,14 @@ impl TcpListenerRunner {
         sockets: HashMap<SocketHandle, SharedControl>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_staging_buffer_size: Option<u32>,
         tcp_socket_limit: usize,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size, tcp_socket_limit) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size, tcp_staging_buffer_size, tcp_socket_limit) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
             };
             res?;
@@ -99,6 +100,7 @@ impl TcpListenerRunner {
         socket_tx: UnboundedSender<TcpSocketCreation>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_staging_buffer_size: Option<u32>,
         tcp_socket_limit: usize,
     ) -> std::io::Result<()> {
         let mut connections: HashMap<(SocketAddr, SocketAddr), Weak<SpinMutex<TcpSocketControl>>> =
@@ -145,7 +147,7 @@ impl TcpListenerRunner {
                 connections.retain(|_, control| control.strong_count() > 0);
             }
             if packet.syn() && !packet.ack() && !connections.contains_key(&(src_addr, dst_addr)) {
-                // Reserve capacity before allocating four per-connection windows.
+                // Reserve capacity before allocating TCP windows and staging buffers.
                 // Retransmitted SYNs must reuse the original socket.
                 if connections.len() >= tcp_socket_limit {
                     continue;
@@ -169,9 +171,17 @@ impl TcpListenerRunner {
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
                     dropped: false,
-                    send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
+                    send_buffer: RingBuffer::new(vec![
+                        0u8;
+                        tcp_staging_buffer_size.unwrap_or(tcp_send_buffer_size)
+                            as usize
+                    ]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
+                    recv_buffer: RingBuffer::new(vec![
+                        0u8;
+                        tcp_staging_buffer_size.unwrap_or(tcp_recv_buffer_size)
+                            as usize
+                    ]),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -406,6 +416,7 @@ impl TcpListener {
         mtu: usize,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_staging_buffer_size: Option<u32>,
         tcp_socket_limit: usize,
     ) -> std::io::Result<(Runner, Self)> {
         let (mut device, iface_ingress_tx, iface_ingress_tx_avail) =
@@ -424,6 +435,7 @@ impl TcpListener {
             HashMap::new(),
             tcp_recv_buffer_size,
             tcp_send_buffer_size,
+            tcp_staging_buffer_size,
             tcp_socket_limit,
         );
 
@@ -609,3 +621,7 @@ impl AsyncWrite for TcpStream {
         Poll::Pending
     }
 }
+
+#[cfg(test)]
+#[path = "test/tcp_staging_test.rs"]
+mod staging_tests;

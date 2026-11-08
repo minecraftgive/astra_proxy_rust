@@ -1,4 +1,3 @@
-use crate::proxy::group_sessions::COPY_BUFFER_SIZE;
 use crate::{mode_config::Tun, runtime::Current};
 use anyhow::{ensure, Context, Result};
 use astra_model::Inbound;
@@ -464,11 +463,12 @@ async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Re
         .stack_buffer_size(256)
         .tcp_buffer_size(256)
         .udp_buffer_size(256)
-        // Four 256 KiB windows per socket: cap stack windows at 256 MiB,
-        // including SYNs awaiting dispatch (before application permits).
+        // Two 256 KiB windows plus two 64 KiB staging buffers per socket:
+        // cap TCP buffers at 160 MiB, including SYNs awaiting dispatch.
         .tcp_socket_limit(256)
         .tcp_recv_buffer_size(256 * 1024)
         .tcp_send_buffer_size(256 * 1024)
+        .tcp_staging_buffer_size(64 * 1024)
         .mtu(mtu as usize)
         .build()?;
     let (mut sink, mut packets) = stack.split();
@@ -553,11 +553,13 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                 streams.spawn(async move {
                     let _permit = permit;
                     let target = Target {host: destination.ip().to_string(), port: destination.port()};
-                    let session = async {
+                    let cancellation = app.egress_signal.clone();
+                    let session = async move {
                         if app.intercept_dns(destination) {
-                            return crate::dns::tcp(stream, app.clone()).await;
+                            return crate::dns::tcp(stream, app).await;
                         }
-                        if let Some(host) = &app.hosted {
+                        if let Some(host) = app.hosted.clone() {
+                            drop(app);
                             let process = super::process::lookup(astra_model::Network::Tcp,source,destination).await;
                             return host.relay(stream,crate::hosted::Metadata { flow_id:None,inbound: Inbound::Tun, source, local:destination, destination:Some(destination), process }).await;
                         }
@@ -567,12 +569,15 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                         let action = app.route_connection(&route, Inbound::Tun, astra_model::Network::Tcp, Some(source), Some(destination)).await?;
                         tracing::debug!(target:"astra_route",phase="destination",original=%target.host,host=%route.host,dial=%dial.host,%destination,"TUN routing name and dial address");
                         let mut remote = app.connect_tracked(&dial, &action, Inbound::Tun, Some(source)).await?;
+                        let _route_leases = app.route_leases.clone();
+                        drop(app);
                         tokio::io::AsyncWriteExt::write_all(&mut remote,&prefix).await?;
-                        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE).await?;
+                        drop(prefix);
+                        crate::proxy::relay::relay(&mut stream, &mut remote).await?;
                         Ok(())
                     };
                     let result:Result<()>=tokio::select! {
-                        _=app.egress_cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect TUN session")),
+                        _=cancellation.cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect TUN session")),
                         result=session=>result,
                     };
                     if let Err(error) = result { tracing::debug!(%error, %source, %destination, "TUN TCP ended"); }

@@ -130,6 +130,28 @@ pub struct RuntimeTelemetry {
     pub coverage: Coverage,
     pub generations: Vec<GenerationTelemetry>,
     pub connection_generations: std::collections::BTreeMap<u64, u64>,
+    /// Keep optional history off the stack of frontend event/operation futures.
+    pub traffic: Option<Box<TrafficTelemetry>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrafficTelemetry {
+    /// Per resolved outbound, including closed flows. JSON-only extension.
+    pub nodes: Option<BTreeMap<String, NodeTraffic>>,
+    pub history_error: Option<String>,
+    pub selected_node: Option<String>,
+}
+
+/// Upload + download bytes. Rolling windows use minute buckets; one month is 30 days.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeTraffic {
+    pub session: u64,
+    pub hour: u64,
+    pub day: u64,
+    pub week: u64,
+    pub month: u64,
+    pub persist: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
