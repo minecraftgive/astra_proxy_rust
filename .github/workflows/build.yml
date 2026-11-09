@@ -79,6 +79,7 @@ jobs:
           path: |
             ${{ env.RUN_DIR }}/artifacts.json
             ${{ env.RUN_DIR }}/release/*.tar.gz
+            ${{ env.RUN_DIR }}/release/symbols/*.tar.gz
 
   gui-release:
     name: desktop release (${{ matrix.name }})
@@ -122,17 +123,20 @@ jobs:
       - name: Build desktop and its client/server payloads with the existing fat-LTO release profile
         shell: python {0}
         run: |
-          import subprocess, sys
+          import shutil, subprocess, sys
           sys.path.insert(0, 'scripts')
           from astra_tools.artifacts import role_packages, role_binaries
-          from astra_tools.workspace import build_environment, host_target
+          from astra_tools.workspace import BuildLayout, build_environment, host_target
           env = build_environment()
           target = host_target(env)
           packages = sorted(set(role_packages(('client', 'server'), target=target)) | {'astra-gui'})
-          binaries = sorted(set(role_binaries(('client', 'server'), target=target)) | {'astra-gui', 'astra-server-gui'})
+          binaries = sorted((set(role_binaries(('client', 'server'), target=target)) | {'astra-gui', 'astra-server-gui'}) - {'astra-host'})
           subprocess.run(['cargo', 'build', '--locked', '--release', '--target', target,
                           *[arg for package in packages for arg in ('-p', package)],
                           *[arg for binary in binaries for arg in ('--bin', binary)]], env=env, check=True)
+          bin_dir = BuildLayout.discover(env)[0].binary_dir('release')
+          suffix = '.exe' if 'windows' in target else ''
+          shutil.copy2(bin_dir / ('astra-manager' + suffix), bin_dir / ('astra-host' + suffix))
       - run: python scripts/package_gui.py --profile release --output-dir dist/gui
       - uses: actions/upload-artifact@v5
         with:

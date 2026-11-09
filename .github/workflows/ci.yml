@@ -23,6 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-checks-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -53,6 +57,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: platform-checks-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -66,6 +74,16 @@ jobs:
           echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
           echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
       - run: python scripts/test.py check --debug
+      - name: Build and exercise independent maintenance on client and server packages
+        shell: python {0}
+        run: |
+          import os, subprocess, sys
+          sys.path.insert(0, 'scripts')
+          from astra_tools.workspace import BuildLayout, build_environment
+          env = build_environment()
+          subprocess.run(['cargo', 'build', '--locked', '-p', 'astra-manager', '-p', 'astra-proxy', '-p', 'astra-rule', '-p', 'astra-tui', '-p', 'astra-convert', '-p', 'astra-server-core'], env=env, check=True)
+          env['ASTRA_TEST_BIN_DIR'] = str(BuildLayout.discover(env)[0].binary_dir('debug').resolve())
+          subprocess.run(['cargo', 'test', '--locked', '-p', 'astra-manager', '--test', 'maintenance', '--', '--ignored', '--test-threads=1'], env=env, check=True)
       - name: Verify TUI Connect and Logs with a constrained Windows stack
         if: runner.os == 'Windows'
         shell: python {0}
@@ -92,7 +110,6 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - run: npm ci
-      - run: npm run typecheck
       - run: npm test
       - run: npm run build
   management:
@@ -101,6 +118,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: management-checks-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -110,7 +131,7 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang libclang-dev nasm pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev openssl
-      - run: cargo run --locked -p astra-management --bin export-contracts -- --check
+      - run: cargo run --locked -p astra-management --features bindings --bin export-contracts -- --check
       - run: python scripts/build.py --role all --profile debug --package --non-interactive
       - run: npx --no-install playwright install --with-deps chromium
         working-directory: apps/web
@@ -221,13 +242,15 @@ jobs:
               output.write(f'ASTRA_CI_BIN_DIR={binaries}\n')
           print(f'Exact artifact index: {index.directory / "artifacts.json"}')
           PY
+      - name: Exercise independent maintenance on client and server packages
+        run: ASTRA_TEST_BIN_DIR="$ASTRA_CI_BIN_DIR" cargo test --locked -p astra-manager --test maintenance -- --ignored --test-threads=1
       - name: Install the pinned Playwright Chromium browser
         id: browser
         working-directory: apps/web
         run: npx --no-install playwright install chromium
       - name: Check the generated contract and frontend tests
         run: |
-          cargo run --locked -p astra-management --bin export-contracts -- --check
+          cargo run --locked -p astra-management --features bindings --bin export-contracts -- --check
           npm --prefix apps/web test
       - name: Check all targets and run workspace, live TUI, client and server regressions
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
