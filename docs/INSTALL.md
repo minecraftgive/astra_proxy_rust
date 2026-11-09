@@ -112,7 +112,7 @@ python scripts/install_wintun.py --bin-dir target/x86_64-pc-windows-msvc/debug
 
 与 Windows 一致，`build.sh` 是 POSIX `sh` 脚本（不依赖 bash），优先使用 `PYTHON` 环境变量指定的解释器，否则依次查找 `python3`、`python3.14`…`python3.11`、`python` 中第一个 3.11+ 版本，并原样返回 `build.py` 的退出码。构建前检查 Cargo、rustc、CMake 及 C/C++ 编译器（`CC`/`CXX`，或 `cc`/`clang`/`gcc` 与 `c++`/`clang++`/`g++`），对应 Windows 的 MSVC/NASM 检查。未设置 `LIBCLANG_PATH` 时，与 Windows 相同地识别项目内 libclang：`python3 -m pip install --target .build-tools/unix/python libclang`，或安装在 `.build-tools` 虚拟环境中的 libclang；系统 LLVM/Xcode 的 libclang 由 bindgen 自行查找。
 
-`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖，以 `fast` 模式构建本机 `debug` 客户端程序，**不运行测试、不打包**。在终端运行时显示表单，输入字段编号修改 profile（debug/release/both）、模式（fast/runtime）、架构（native/64bits）、角色、打包及耗时报告；输入选项编号或值并回车。表单显示实际 Cargo profile，命令行参数作为初始值。输入 `B` 并回车开始编译，`Q` 取消；没有倒计时自动构建，输入结束或 Ctrl-C 也会取消。`--interactive` 强制显示表单，`--non-interactive` 跳过；非终端输入默认直接使用命令行参数。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
+`build.sh`、`build.ps1` 都只是转调 `scripts/build.py`，参数相同，从任何工作目录执行均可。默认使用锁定依赖，构建本机 `debug` 客户端程序，**不运行测试、不生成安装包**。在终端运行时显示表单，输入字段编号修改 profile（debug/release/both）、架构（native/64bits）、角色、打包及耗时报告；输入选项编号或值并回车。表单显示实际 Cargo profile，命令行参数作为初始值。输入 `B` 并回车开始编译，`Q` 取消；没有倒计时自动构建，输入结束或 Ctrl-C 也会取消。`--interactive` 强制显示表单，`--non-interactive` 跳过；非终端输入默认直接使用命令行参数。自动使用项目内已有的 `.build-tools/bin/cmake`（系统没有 CMake 时）。构建、打包和测试需要 Python 3.11+，分发程序无需 Python。
 
 架构默认 `native`，使用当前 Rust host target。选择 `64bits`（或传 `--arch 64bits`）时，会校验该目标的指针宽度为 64 位，支持本机 x86_64 和 ARM64；32 位 Rust 工具链会在构建前报错，需先切换为本机 64 位工具链。这个选项不启用交叉编译，实际 target 会打印到终端并记录在产物索引中。
 
@@ -151,6 +151,16 @@ Cargo 内置的 `test`、`bench` profile 分别继承 `dev`、`release`，不单
 仓库的 `.cargo/config.toml` 将默认目标设为 `host-tuple`，因此普通 `cargo build` / `cargo build --release` 与脚本使用完全相同的 profile 与 `target/<本机 Rust target>/{debug,release}/` 布局。
 
 输出支持 `CARGO_TARGET_DIR`；脚本仅针对当前机器平台，不进行交叉编译。`--package` 的默认标签来自所选程序共同的 Cargo 版本，`--label` 可覆盖；分发目录生成 `.tar.gz`，SHA-256 输出到控制台。每次构建使用独立时间戳目录并生成 `artifacts.json`，记录角色、debug/release 和 Cargo profile；有多次产物时，通过 `--artifact-dir` 明确选择待验证的目录。四个角色分别打包，Web 与 Controller 不被嵌入 Core。
+
+`astra-manager` 与兼容入口 `astra-host` 使用相同入口实现。脚本只链接管理器一次，再以普通文件复制生成 `astra-host`；安装包仍包含两个名称，直接 Cargo 构建也仍支持两个目标。此项减少重复链接，不减少两份文件的安装体积。
+
+release 分发会在生成 manifest 前处理发布副本：Linux 使用本机 `strip --strip-unneeded`，macOS 使用本机 `strip` 并检查签名，必要时修复 ad-hoc 签名；具有正式签名身份的输入会报错，必须在签名之前完成剥离，不能静默替换身份。Windows MSVC PE 保持原样，不使用 GNU strip；输出目录有同名 PDB 时另存，并记录其摘要，不保证当前配置生成 PDB 或缩减 Windows 程序。
+
+原始 `target/` 文件始终保留。每个 release 角色另存 `dist/<本次构建目录>/release/symbols/astra-<角色>-<标签>-<target>-symbols.tar.gz`，内含 `unstripped/` 原件及 `symbols.json` 的构建身份、目标、处理方式、原件和发布文件 SHA-256。符号包的路径和校验值同时写入 `artifacts.json`；它独立于可安装的角色包，也不会被普通更新包枚举选中。即使未指定 `--package`，release 分发副本仍会处理并保留符号归档。debug 不剥离。由于当前 profile 的 `debug=false`，这些原件保留现有符号能力，不包含本来未生成的源码行号信息。
+
+GUI 使用 `python3 scripts/package_gui.py --profile release --output-dir dist/gui` 打包时也先处理临时发布副本，再计算原生包和更新包的 manifest，另存 `astra-gui-<target>-symbols.tar.gz`、`astra-server-gui-<target>-symbols.tar.gz`。排错时先用发布文件 SHA-256 找到映射记录，再选择相应原件；不要将符号包导入更新面板。
+
+构建元数据按各包的本地依赖范围监听源码。调整 Cargo 本地依赖或补丁后运行 `python3 scripts/build_metadata_inputs.py`，并通过 `python3 scripts/build_metadata_inputs.py --check` 校验生成表；不需要新增 Cargo profile。Web 类型合同生成依赖只在 `bindings` 功能下启用：运行 `cargo run --locked -p astra-management --features bindings --bin export-contracts` 更新，或追加 `-- --check` 只校验。
 
 新安装包的 `manifest.json` 也记录 Cargo profile。本次更新后的导入器仍接受旧安装包；更新前的导入器会拒绝这些新增字段，因此首次升级到此版本须正常退出程序后手动解压、替换程序，不能通过旧程序的包导入功能升级。
 

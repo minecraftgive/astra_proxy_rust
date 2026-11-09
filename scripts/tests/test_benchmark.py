@@ -14,7 +14,42 @@ benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
 
+class BenchmarkConfigTests(unittest.TestCase):
+    def test_rule_trial_uses_explicit_fallback_and_requested_rule_count(self):
+        config = benchmark.rules_text(1000, Path('/tmp/rules.sock'))
+        self.assertIn('direct_local=false\n', config)
+        self.assertIn('default_action="direct"\n', config)
+        self.assertEqual(config.count('[[rules]]'), 1000)
+
+
 class BenchmarkFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_echo_closes_after_one_complete_payload_without_waiting_for_client_eof(self):
+        payload = bytes(range(256)) * 4
+        reader = Mock(readexactly=AsyncMock(return_value=payload))
+        writer = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+        await benchmark.echo(reader, writer)
+        reader.readexactly.assert_awaited_once_with(1024)
+        writer.write.assert_called_once_with(payload)
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+
+    async def test_client_waits_for_server_eof_before_closing_its_socket(self):
+        writer = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+
+        async def eof(size):
+            self.assertEqual(size, 1)
+            writer.close.assert_not_called()
+            return b''
+
+        reader = Mock(readexactly=AsyncMock(side_effect=[
+            b'\x05\x00', b'\x05\x00\x00\x01' + b'\x00' * 6, bytes(range(256)) * 4,
+        ]), read=AsyncMock(side_effect=eof))
+        with patch.object(benchmark.asyncio, 'open_connection', new=AsyncMock(return_value=(reader, writer))):
+            setup, echo = await benchmark.query(1080, 8080)
+        self.assertLessEqual(setup, echo)
+        reader.read.assert_awaited_once()
+        writer.close.assert_called_once()
+
     async def test_socks_connect_error_reports_status_and_closes_writer(self):
         reader = Mock(readexactly=AsyncMock(side_effect=[
             b'\x05\x00', b'\x05\x05\x00\x01' + b'\x00' * 6,

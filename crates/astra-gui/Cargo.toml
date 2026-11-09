@@ -23,7 +23,7 @@ astra-model = { path = "../astra-model" }
 astra-management = { path = "../astra-management" }
 astra-ipc = { path = "../astra-ipc" }
 astra-platform = { path = "../astra-platform" }
-gpui-component = "=0.9.0"
+gpui-component = { version = "=0.9.0", default-features = false }
 # Component 0.9.0 does not re-export GPUI; use its exact underlying package,
 # so there is a single GPUI version and no crates.io gpui 0.2 dependency.
 gpui = { package = "gpui-pre", version = "=0.3.11" }

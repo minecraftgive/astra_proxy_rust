@@ -15,6 +15,7 @@ pub struct StableWrite<S> {
     inner: S,
     /// Bytes already reported as written but not yet accepted by `inner`.
     pending: Vec<u8>,
+    consumed: usize,
 }
 
 impl<S> StableWrite<S> {
@@ -22,22 +23,25 @@ impl<S> StableWrite<S> {
         Self {
             inner,
             pending: Vec::new(),
+            consumed: 0,
         }
     }
 }
 
 impl<S: AsyncWrite + Unpin> StableWrite<S> {
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.pending.is_empty() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending))?;
+        while self.consumed < self.pending.len() {
+            let n =
+                ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.consumed..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
-            self.pending.drain(..n);
+            self.consumed += n;
         }
         // Pending writes are exceptional; do not retain their allocation for
         // the rest of a potentially long-lived connection once drained.
         self.pending = Vec::new();
+        self.consumed = 0;
         Poll::Ready(Ok(()))
     }
 }

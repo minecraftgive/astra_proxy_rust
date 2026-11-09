@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 
 from astra_tools.artifacts import ROLES, COMPONENT_PACKAGES, role_binaries
+from astra_tools.symbols import separate_symbols
 from astra_tools.workspace import ROOT, BuildLayout, build_environment
 
 # Match the deployment target used by the desktop CI build and GPUI's shaders.
@@ -26,7 +27,9 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def package_frontend(source, output_dir, target, role, binary, title, version, versions=None):
+def package_frontend(source, output_dir, target, role, binary, title, version, versions=None, *, profile='debug'):
+    if profile not in ('debug', 'release'):
+        raise ValueError(f'Unsupported desktop packaging profile: {profile}')
     source, output_dir = Path(source), Path(output_dir)
     windows = 'windows' in target
     macos = 'apple-darwin' in target
@@ -85,6 +88,11 @@ def package_frontend(source, output_dir, target, role, binary, title, version, v
         for component in [binary, *role_binaries((role,), target=target)]:
             package = 'astra-gui' if component in ('astra-gui', 'astra-server-gui') else COMPONENT_PACKAGES.get(component, component)
             components[component] = (versions or {}).get(package, version)
+        if profile == 'release':
+            separate_symbols(source, destination, names, target=target,
+                             archive_path=output_dir / f'{name}-symbols.tar.gz',
+                             build_identity={'frontend': binary, 'version': version,
+                                             'role': role, 'components': components})
         files = [{'path': file.name, 'size': file.stat().st_size,
                   'sha256': sha256_file(file)}
                  for file in sorted(destination.iterdir()) if file.is_file()]
@@ -112,7 +120,10 @@ def main():
     version = next(package['version'] for package in metadata['packages'] if package['name'] == 'astra-gui')
     versions = {package['name']: package['version'] for package in metadata['packages']}
     for role, binary, title in FRONTENDS:
-        print(package_frontend(source, args.output_dir, layout.target, role, binary, title, version, versions))
+        print(package_frontend(source, args.output_dir, layout.target, role, binary, title, version, versions,
+                               profile=args.profile))
+        if args.profile == 'release':
+            print(args.output_dir / f'{binary}-{layout.target}-symbols.tar.gz')
     print(args.output_dir / f'astra-gui-update-{layout.target}.tar.gz')
 
 

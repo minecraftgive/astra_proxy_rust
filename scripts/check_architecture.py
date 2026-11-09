@@ -7,6 +7,10 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 errors = []
+from astra_tools.build_inputs import render_inputs
+metadata_inputs = ROOT / 'crates/astra-platform/build_metadata_inputs.rs'
+if not metadata_inputs.exists() or metadata_inputs.read_text() != render_inputs(ROOT):
+    errors.append('Metadata dependency watches are stale: run python scripts/build_metadata_inputs.py')
 workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))
 packages = {}
 for member in workspace['workspace']['members']:

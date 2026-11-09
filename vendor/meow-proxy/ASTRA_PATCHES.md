@@ -2,6 +2,40 @@
 
 Source: crates.io meow-proxy 0.23.1; upstream https://github.com/meow-rs/meow-rs (MIT, see LICENSE).
 
+## Optional Shadowsocks plugins
+
+The additive `ss-core` feature builds the same TCP/UDP adapter and keeps the
+existing AEAD, AEAD-2022 and stream-cipher dependencies. `ss-plugins` adds the
+SIP003 subprocess, simple-obfs, v2ray, gost, shadow-tls, restls and jls paths and
+their transport feature requests. The existing `ss` feature enables both;
+upstream defaults, kcptun and ECH therefore retain their former behavior.
+Astra selects `ss-core` because its configuration has never exposed plugins.
+Passing any plugin selection to a pluginless build fails explicitly,
+rather than silently dialing an unprotected/plain SS endpoint.
+
+The adapter is not duplicated. Plugin-only imports, enum variants, parser
+helpers, match arms and metadata fields are conditionally compiled. Existing
+crypto/UDP/stream tests remain available in both variants; only plugin-specific
+tests require `ss-plugins`. New tests cover explicit plugin refusal and retention
+of AEAD, AEAD-2022 and legacy stream ciphers.
+
+Validation commands (this package is excluded from the workspace):
+
+```sh
+cargo test --locked --manifest-path vendor/meow-proxy/Cargo.toml --no-default-features --features ss-core,mux --lib shadowsocks_adapter::
+cargo test --locked --manifest-path vendor/meow-proxy/Cargo.toml --no-default-features --features ss,mux --lib shadowsocks_adapter::
+```
+
+Verified on macOS arm64 on 2026-11-09 using `--locked`: the `ss-core,mux`
+selection passed all 23 adapter tests and the original `ss,mux` selection
+passed all 39 adapter tests. The full selection preserves plugin dispatch,
+option parsing, relay restrictions and UDP ownership behavior. No new unused
+code/import warnings appeared; upstream AEAD deprecation warnings remain.
+The workspace also passed its all-target check with Astra's pluginless
+selection. The full vendor default feature set was not rebuilt separately.
+
+The following pre-existing patches are preserved.
+
 - Add `vmess::server` for the independent native Astra server. It validates AEAD AuthID time/CRC, rejects replay, decrypts bounded request headers, emits AEAD response headers, and reuses the existing AES-GCM/ChaCha body codec. UDP record boundaries are carried through the internal duplex as length-prefixed records; these internal lengths are not added to VMess wire packets. Standard chunk options are supported; masked-size/global-padding and mux extensions are rejected. Local interoperability: `python scripts/server_regression.py --case vmess --case vmess-chacha`.
 
 - Shadowsocks raw UDP and Hysteria2: accept a reply carrying the same domain and port as the association's bound target. Return an unspecified IP to the caller, which retains the original domain. Unknown/unbound domain sources remain rejected. No local DNS resolution is introduced. Required for real sing-box domain-target UDP interoperability.

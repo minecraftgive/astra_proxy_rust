@@ -61,12 +61,22 @@ impl AppState {
             event_streams: Arc::new(tokio::sync::Semaphore::new(64)),
         })
     }
-    fn audit(&self, event: &str, id: Option<&str>) {
-        // Deliberately never serialize commands, document text, passwords or tokens.
-        if let Ok(mut audit) = self.audit.lock() {
-            if let Err(error) = audit.record(event, id) {
-                eprintln!("Audit metadata write failed: {error}");
+    async fn audit(&self, event: &str, id: Option<&str>) {
+        // Await completion before dispatching the operation, as before; disk I/O
+        // and rotation must not block an async runtime worker.
+        let audit = Arc::clone(&self.audit);
+        let event = event.to_owned();
+        let id = id.map(str::to_owned);
+        let result = tokio::task::spawn_blocking(move || {
+            if let Ok(mut audit) = audit.lock() {
+                if let Err(error) = audit.record(&event, id.as_deref()) {
+                    eprintln!("Audit metadata write failed: {error}");
+                }
             }
+        })
+        .await;
+        if let Err(error) = result {
+            eprintln!("Audit metadata task failed: {error}");
         }
     }
 }
@@ -162,7 +172,7 @@ async fn login(
     Json(input): Json<Login>,
 ) -> Response {
     if !state.auth.permit_attempt(peer.ip()) {
-        state.audit("login_rate_limited", None);
+        state.audit("login_rate_limited", None).await;
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -171,7 +181,7 @@ async fn login(
     }
     match state.auth.login(input.password).await {
         Ok(token) => {
-            state.audit("login", None);
+            state.audit("login", None).await;
             (
                 StatusCode::OK,
                 [(header::CACHE_CONTROL, "no-store")],
@@ -180,7 +190,7 @@ async fn login(
                 .into_response()
         }
         Err(_) => {
-            state.audit("login_failed", None);
+            state.audit("login_failed", None).await;
             error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
@@ -198,7 +208,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         );
     }
     state.auth.logout(token(&headers).unwrap());
-    state.audit("logout", None);
+    state.audit("logout", None).await;
     StatusCode::NO_CONTENT.into_response()
 }
 async fn request(
@@ -235,11 +245,11 @@ async fn request(
         v2::RequestBody::Artifacts(_) => "artifact",
         v2::RequestBody::Local(_) => unreachable!(),
     };
-    state.audit(kind, Some(&id));
+    state.audit(kind, Some(&id)).await;
     match state.backend.request(input).await {
         Ok(response) => ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response(),
         Err(_) => {
-            state.audit("manager_unavailable", Some(&id));
+            state.audit("manager_unavailable", Some(&id)).await;
             error(StatusCode::BAD_GATEWAY,"outcome_unknown","Manager reply unavailable. Query the original operation ID before retrying a change.")
         }
     }

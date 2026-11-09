@@ -3,6 +3,7 @@ use meow_common::atomic::Uint;
 use std::sync::Mutex;
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn sip003u_mode_extraction() {
     // Mode has no PartialEq; compare via its tcp/udp semantics.
     let sem = |m: Mode| (m.enable_tcp(), m.enable_udp());
@@ -686,6 +687,7 @@ async fn front_udp_domain_target_encrypts_domain_inner() {
 /// `ss`-without-`mux` build (the upstream mux default is a parse
 /// error there).
 #[tokio::test]
+#[cfg(feature = "ss-plugins")]
 async fn builtin_tcp_plugins_refuse_udp() {
     for (plugin, opts, tag) in [
         ("v2ray-plugin", "host=cdn.example.com", "v2ray-plugin"),
@@ -739,6 +741,7 @@ async fn builtin_tcp_plugins_refuse_udp() {
 /// loudly on `connect_over` rather than send unwrapped SS traffic
 /// through the front hop.
 #[tokio::test]
+#[cfg(feature = "ss-plugins")]
 async fn shadow_tls_refuses_relay_supplied_stream() {
     let adapter = ShadowsocksAdapter::new(
         "ss-test",
@@ -907,6 +910,7 @@ fn plain_udp_still_advertised_under_direct_dialer() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_is_builtin_obfs_plugin_accepts_aliases() {
     assert!(is_builtin_obfs_plugin("obfs"));
     assert!(is_builtin_obfs_plugin("simple-obfs"));
@@ -917,6 +921,7 @@ fn test_is_builtin_obfs_plugin_accepts_aliases() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_http_yaml_keys() {
     // YAML map form serializes to `mode=http;host=foo`.
     let got = parse_obfs_opts(Some("mode=http;host=bing.com"), "1.2.3.4").unwrap();
@@ -927,6 +932,7 @@ fn test_parse_obfs_opts_http_yaml_keys() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_tls_yaml_keys() {
     let got = parse_obfs_opts(Some("mode=tls;host=gateway.icloud.com"), "1.2.3.4").unwrap();
     match got {
@@ -936,6 +942,7 @@ fn test_parse_obfs_opts_tls_yaml_keys() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_sip003_alias_keys() {
     // Native SIP003 keys (`obfs`/`obfs-host`).
     let got = parse_obfs_opts(Some("obfs=http;obfs-host=cloudflare.com"), "1.2.3.4").unwrap();
@@ -946,6 +953,7 @@ fn test_parse_obfs_opts_sip003_alias_keys() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_rejects_ctl_host() {
     // `host` lands verbatim in the emitted `Host:` header (http) or SNI
     // (tls) — provider-supplied CTLs and oversized names must not parse
@@ -968,6 +976,7 @@ fn test_parse_obfs_opts_rejects_ctl_host() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_mode_is_case_insensitive() {
     let http = parse_obfs_opts(Some("mode=HTTP;host=foo"), "1.2.3.4").unwrap();
     assert!(matches!(http, BuiltinObfs::Http { .. }));
@@ -978,6 +987,7 @@ fn test_parse_obfs_opts_mode_is_case_insensitive() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_extra_whitespace() {
     // Tolerate whitespace around `;` and `=`, similar to the Go reference.
     let got = parse_obfs_opts(Some("  mode = http ;  host = bing.com  "), "1.2.3.4").unwrap();
@@ -988,6 +998,7 @@ fn test_parse_obfs_opts_extra_whitespace() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_unknown_keys_ignored() {
     // Forward-compat: unknown keys must be silently dropped.
     let got = parse_obfs_opts(
@@ -1002,6 +1013,7 @@ fn test_parse_obfs_opts_unknown_keys_ignored() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_missing_host_falls_back_to_server() {
     let got = parse_obfs_opts(Some("mode=http"), "ss.example.org").unwrap();
     match got {
@@ -1011,6 +1023,7 @@ fn test_parse_obfs_opts_missing_host_falls_back_to_server() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_empty_host_falls_back_to_server() {
     let got = parse_obfs_opts(Some("mode=tls;host="), "ss.example.org").unwrap();
     match got {
@@ -1020,6 +1033,7 @@ fn test_parse_obfs_opts_empty_host_falls_back_to_server() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_missing_mode_errors() {
     let err = parse_obfs_opts(Some("host=bing.com"), "1.2.3.4").unwrap_err();
     match err {
@@ -1032,6 +1046,7 @@ fn test_parse_obfs_opts_missing_mode_errors() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_empty_opts_errors() {
     // Empty / missing opts is also "no mode" — must error.
     assert!(parse_obfs_opts(None, "1.2.3.4").is_err());
@@ -1040,6 +1055,7 @@ fn test_parse_obfs_opts_empty_opts_errors() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_invalid_mode_errors() {
     let err = parse_obfs_opts(Some("mode=quic;host=foo"), "1.2.3.4").unwrap_err();
     match err {
@@ -1055,6 +1071,7 @@ fn test_parse_obfs_opts_invalid_mode_errors() {
 }
 
 #[test]
+#[cfg(feature = "ss-plugins")]
 fn test_parse_obfs_opts_yaml_overrides_sip003_when_both_present() {
     // If both `mode=` and `obfs=` are passed (unusual but legal), the last
     // one wins after iteration order. Document the behavior so future
@@ -1110,4 +1127,60 @@ async fn front_udp_refuses_oversized_domain_target() {
         panic!("oversized domain target must error");
     };
     assert!(matches!(e, MeowError::NotSupported(_)), "{e:?}");
+}
+
+#[cfg(not(feature = "ss-plugins"))]
+#[test]
+fn pluginless_build_rejects_plugins_without_starting_them() {
+    for plugin in [
+        "obfs",
+        "v2ray-plugin",
+        "gost-plugin",
+        "shadow-tls",
+        "restls",
+        "jls",
+        "external-plugin",
+    ] {
+        let result = ShadowsocksAdapter::new(
+            "node",
+            "127.0.0.1",
+            8388,
+            "secret",
+            "aes-128-gcm",
+            true,
+            Some(plugin),
+            None,
+            None,
+            Arc::new(crate::dialer::DirectDialer),
+        );
+        assert!(
+            matches!(result, Err(MeowError::Config(message)) if message.contains("plugins were not enabled"))
+        );
+    }
+}
+
+#[test]
+fn core_retains_aead_2022_and_stream_ciphers() {
+    for (cipher, password) in [
+        ("aes-128-gcm", "secret"),
+        ("2022-blake3-aes-128-gcm", "MTIzNDU2Nzg5MDEyMzQ1Ng=="),
+        ("aes-128-cfb", "secret"),
+    ] {
+        assert!(
+            ShadowsocksAdapter::new(
+                "node",
+                "127.0.0.1",
+                8388,
+                password,
+                cipher,
+                true,
+                None,
+                None,
+                None,
+                Arc::new(crate::dialer::DirectDialer),
+            )
+            .is_ok(),
+            "cipher removed: {cipher}"
+        );
+    }
 }

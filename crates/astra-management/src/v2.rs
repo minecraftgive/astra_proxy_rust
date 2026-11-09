@@ -3,6 +3,7 @@ use crate::update_json;
 pub use astra_platform::program_info::ProgramInfo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(feature = "bindings")]
 use ts_rs::TS;
 
 mod installation;
@@ -11,7 +12,8 @@ pub use installation::*;
 pub const VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub version: u16,
     pub id: String,
@@ -28,7 +30,8 @@ impl Request {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RequestBody {
     Local(LocalCommand),
@@ -40,7 +43,8 @@ pub enum RequestBody {
     Drafts(DraftCommand),
     Artifacts(ArtifactCommand),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Query {
     MaintenanceStatus,
@@ -109,14 +113,16 @@ pub enum Query {
         limit: Option<u16>,
     },
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstanceKind {
     Proxy,
     Rule,
     Server,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Command {
     InstallCurrentPackage {
@@ -183,7 +189,10 @@ pub enum Command {
     },
     SetLogLevel {
         instance: String,
-        #[ts(type = r#""error" | "warn" | "info" | "debug" | "trace" | "route""#)]
+        #[cfg_attr(
+            feature = "bindings",
+            ts(type = r#""error" | "warn" | "info" | "debug" | "trace" | "route""#)
+        )]
         level: crate::LogLevel,
     },
     BindStart {
@@ -203,7 +212,7 @@ pub enum Command {
         request: NetToolRequest,
     },
     Update {
-        #[ts(type = "unknown")]
+        #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
         request: crate::updates::UpdateRequest,
     },
     RecoverUpdate {
@@ -214,11 +223,18 @@ pub enum Command {
     },
     Shutdown,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuntimeCommand {
     Snapshot,
-    SetMode(#[ts(type = r#""rule" | "global" | "direct""#)] astra_model::runtime::Mode),
-    Select { group: String, member: String },
+    SetMode(
+        #[cfg_attr(feature = "bindings", ts(type = r#""rule" | "global" | "direct""#))]
+        astra_model::runtime::Mode,
+    ),
+    Select {
+        group: String,
+        member: String,
+    },
     TestGroup(String),
     Disconnect(Option<String>),
     SystemProxy(bool),
@@ -226,11 +242,12 @@ pub enum RuntimeCommand {
     Reset,
     AllowLan(bool),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetToolRequest {
-    #[ts(type = "unknown")]
+    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub egress: astra_model::nettool::Egress,
-    #[ts(type = "unknown")]
+    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub probe: astra_model::nettool::Probe,
     pub count: u32,
     pub interval_ms: String,
@@ -275,19 +292,27 @@ impl RuntimeCommand {
         })
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteQuery {
     pub host: String,
     pub port: u16,
-    #[ts(type = r#""Tcp" | "Udp""#)]
+    #[cfg_attr(feature = "bindings", ts(type = r#""Tcp" | "Udp""#))]
     pub network: astra_model::Network,
-    #[ts(type = r#""Socks5" | "HttpConnect" | "Tun" | "Tproxy" | "Redirect" | "Mixed""#)]
+    #[cfg_attr(
+        feature = "bindings",
+        ts(type = r#""Socks5" | "HttpConnect" | "Tun" | "Tproxy" | "Redirect" | "Mixed""#)
+    )]
     pub inbound: astra_model::Inbound,
     pub destination_ip: Option<std::net::IpAddr>,
-    #[ts(type = "{ pid: number; name: string; path: string } | null")]
+    #[cfg_attr(
+        feature = "bindings",
+        ts(type = "{ pid: number; name: string; path: string } | null")
+    )]
     pub process: Option<astra_model::ProcessInfo>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DraftCommand {
     Apply {
@@ -322,7 +347,8 @@ pub enum DraftCommand {
         expected_revision: String,
     },
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub version: u16,
     pub id: String,
@@ -348,7 +374,8 @@ impl Response {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     VersionMismatch,
@@ -362,18 +389,23 @@ pub enum ErrorCode {
     Unauthorized,
     Internal,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[cfg_attr(feature = "bindings", ts(optional))]
     pub details: Option<SaveOutcome>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
-    MaintenanceStatus(#[ts(type = "unknown")] Option<Box<crate::maintenance::Record>>),
+    MaintenanceStatus(
+        #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
+        Option<Box<crate::maintenance::Record>>,
+    ),
     InstallationStatus(InstallationStatus),
     InstallationResult(InstallationResult),
     InstallationLaunch(InstallationLaunch),
@@ -390,7 +422,7 @@ pub enum ResponseBody {
     Capabilities(Vec<String>),
     NodeTags(Vec<String>),
     SubscriptionNodes(
-        #[ts(type = "Record<string, unknown>")]
+        #[cfg_attr(feature = "bindings", ts(type = "Record<string, unknown>"))]
         std::collections::BTreeMap<String, crate::SubscriptionNodes>,
     ),
     DiagnosticTargets(serde_json::Value),
@@ -399,9 +431,16 @@ pub enum ResponseBody {
     RouteExplanation(serde_json::Value),
     NetTool(Vec<serde_json::Value>),
     LogLevel(
-        #[ts(type = r#""error" | "warn" | "info" | "debug" | "trace" | "route""#)] crate::LogLevel,
+        #[cfg_attr(
+            feature = "bindings",
+            ts(type = r#""error" | "warn" | "info" | "debug" | "trace" | "route""#)
+        )]
+        crate::LogLevel,
     ),
-    StoragePaths(#[ts(type = "{ config: string; state: string }")] crate::StoragePaths),
+    StoragePaths(
+        #[cfg_attr(feature = "bindings", ts(type = "{ config: string; state: string }"))]
+        crate::StoragePaths,
+    ),
     Draft(Draft),
     Artifact(Artifact),
     ArtifactChunk(ArtifactChunk),
@@ -413,7 +452,7 @@ pub enum ResponseBody {
     },
     LogChunk(LogChunk),
     UpdateStatus(
-        #[ts(type = "unknown")]
+        #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
         #[serde(with = "update_json")]
         Box<crate::updates::UpdateStatus>,
     ),
@@ -421,7 +460,8 @@ pub enum ResponseBody {
         message: String,
     },
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ArtifactCommand {
     Begin {
@@ -448,7 +488,8 @@ pub enum ArtifactCommand {
         id: String,
     },
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: String,
     pub name: String,
@@ -457,7 +498,8 @@ pub struct Artifact {
     pub sha256: String,
     pub complete: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactChunk {
     pub id: String,
     pub offset: String,
@@ -465,7 +507,8 @@ pub struct ArtifactChunk {
     pub base64: String,
     pub eof: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub name: String,
@@ -473,7 +516,8 @@ pub struct Agent {
     pub online: bool,
     pub last_seen_ms: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u16,
     pub role: String,
@@ -481,7 +525,8 @@ pub struct Hello {
     pub build_id: String,
     pub capabilities: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalCommand {
     PrepareMaintenance {
@@ -533,13 +578,15 @@ pub enum LocalCommand {
         expected_pid: Option<u32>,
     },
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", content = "message", rename_all = "snake_case")]
 pub enum Cancellation {
     AlreadyFinished(String),
     UnsafeToCancel(String),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
     pub name: String,
@@ -552,16 +599,18 @@ pub struct Instance {
     #[serde(default)]
     pub changed: bool,
     #[serde(default)]
-    #[ts(type = "unknown")]
+    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub details: Option<crate::InstanceDetails>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogCursor {
     pub device: String,
     pub inode: String,
     pub offset: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LogChunk {
     Data {
@@ -573,13 +622,15 @@ pub enum LogChunk {
     Waiting,
     Error(String),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "snapshot", rename_all = "snake_case")]
 pub enum RuntimeSnapshot {
     Client(serde_json::Value),
     Server(ServerSnapshot),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSnapshot {
     pub pid: u32,
     pub uptime_secs: String,
@@ -592,7 +643,8 @@ pub struct ServerSnapshot {
 }
 /// Process metrics cover only the managed PID, not child workers or the host OS.
 /// Network counters cover instance relay traffic, not physical network adapters.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     #[serde(default)]
     pub internal: Option<astra_model::monitor::InternalSnapshot>,
@@ -610,7 +662,8 @@ pub struct MonitorSnapshot {
     pub total_connections: Option<String>,
     pub error: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub instance: String,
     pub path: PathBuf,
@@ -618,7 +671,8 @@ pub struct Document {
     pub revision: String,
     pub kind: InstanceKind,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Draft {
     pub id: String,
@@ -630,10 +684,11 @@ pub struct Draft {
     pub source_revision: String,
     pub kind: InstanceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[cfg_attr(feature = "bindings", ts(optional))]
     pub last_save: Option<SaveOutcome>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SaveState {
     Applied,
@@ -643,7 +698,8 @@ pub enum SaveState {
     RecoveryFailed,
     OutcomeUnknown,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveOutcome {
     pub state: SaveState,
     pub disk_saved: Option<bool>,
@@ -652,7 +708,8 @@ pub struct SaveOutcome {
     pub operation_id: String,
     pub message: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Running,
@@ -661,7 +718,8 @@ pub enum TaskState {
     OutcomeUnknown,
     NeedsRecovery,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
@@ -670,24 +728,27 @@ pub struct Task {
     pub started_ms: String,
     pub finished_ms: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub sequence: String,
     pub operation_id: Option<String>,
     pub kind: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[cfg_attr(feature = "bindings", ts(optional))]
     pub payload: Option<EventPayload>,
     pub timestamp_ms: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventPayload {
     Diagnostics(serde_json::Value),
     NetTool(serde_json::Value),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventBatch {
     pub events: Vec<Event>,
     pub cursor: String,

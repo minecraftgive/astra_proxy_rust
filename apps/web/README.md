@@ -19,6 +19,6 @@ npm run dev
 
 Vite 监听 `127.0.0.1:5173` 并将 `/api` 转发到 `http://127.0.0.1:8787`（可通过 `ASTRA_WEB_DEV_UPSTREAM` 指定）。开发用 gateway 配置应设置 `listen = "127.0.0.1:8787"`、`public_origin = "http://127.0.0.1:5173"`、`dev_http = true`，保持原始 Host/Origin 供同源检查；该 HTTP 模式只允许回环地址。
 
-契约由仓库根目录的 `cargo run -p astra-management --bin export-contracts` 显式生成。追加 `-- --check` 检查是否过期，不会改写源码；普通测试不会生成契约。
+契约由仓库根目录的 `cargo run -p astra-management --features bindings --bin export-contracts` 显式生成。追加 `-- --check` 检查是否过期，不会改写源码；普通测试不会生成契约。
 
 组件测试覆盖保存期间的新编辑、草稿冲突基线、切换节点后的迟到回复，以及请求身份和禁止自动重试变更。真实浏览器端到端测试由 `python scripts/test.py management --debug --browser` 启动 TLS Controller、两个 Agent、独立网页和真实核心后运行。也可使用 `--artifact-dir` 对指定安装包索引进行验证。

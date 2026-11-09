@@ -88,8 +88,11 @@ def write_release_manifest(directory, label, target, versions, *, role='client',
     return manifest
 
 
-def stage(role, bin_dir, destination, *, target, versions, label, profile=None):
+def stage(role, bin_dir, destination, *, target, versions, label, profile=None, symbols_archive=None,
+          build_identity=None):
     _build_metadata(profile)
+    if symbols_archive is not None and profile != 'release':
+        raise ValueError('Symbol separation is only supported for release distributions')
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     for binary in role_binaries((role,), target=target):
@@ -98,6 +101,11 @@ def stage(role, bin_dir, destination, *, target, versions, label, profile=None):
         shutil.copy2(ROOT / 'configs' / ROLES[role].example, destination / ROLES[role].example)
     if role == 'client' and os.name == 'nt' and (Path(bin_dir) / 'wintun.dll').is_file():
         shutil.copy2(Path(bin_dir) / 'wintun.dll', destination / 'wintun.dll')
+    if symbols_archive is not None:
+        from .symbols import separate_symbols
+        separate_symbols(bin_dir, destination,
+                         [executable(name) for name in role_binaries((role,), target=target)],
+                         target=target, archive_path=symbols_archive, build_identity=build_identity)
     write_release_manifest(destination, label, target, versions, role=role, profile=profile)
     return destination
 
@@ -119,17 +127,21 @@ class ArtifactIndex:
     entries: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-    def add(self, *, role, profile, binary_dir, staged, archive=None):
+    def add(self, *, role, profile, binary_dir, staged, archive=None, symbols_archive=None):
         if role not in ROLES or profile not in ('debug', 'release'):
             raise ValueError('Unknown artifact role or profile')
+        if symbols_archive is not None and profile != 'release':
+            raise ValueError('Symbol archives are only supported for release distributions')
         build = _build_metadata(profile)
         if any(e['role'] == role and e['profile'] == profile for e in self.entries):
             raise ValueError(f'Duplicate artifact entry: {role}/{profile}')
+        symbols = ({'symbols_archive': Path(symbols_archive).resolve().relative_to(self.directory.resolve()).as_posix(),
+                    'symbols_archive_sha256': sha256(symbols_archive)} if symbols_archive else {})
         self.entries.append({'role': role, 'profile': profile, 'binary_dir': str(Path(binary_dir).resolve()),
                              'staged': Path(staged).resolve().relative_to(self.directory.resolve()).as_posix(),
                              'archive': Path(archive).resolve().relative_to(self.directory.resolve()).as_posix() if archive else None,
                              'archive_sha256': sha256(archive) if archive else None,
-                             'binaries': role_binaries((role,), target=self.target), **build})
+                             'binaries': role_binaries((role,), target=self.target), **build, **symbols})
 
     def save(self):
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -161,7 +173,16 @@ class ArtifactIndex:
                 raise ValueError(f'Artifact {pair[0]}/{pair[1]} was built with a removed Cargo profile '
                                  f'({entry.get("cargo_profile")}); rebuild with scripts/build.py')
             seen.add(pair)
-            for name in ('staged', 'archive'):
+            symbols = entry.get('symbols_archive')
+            checksum = entry.get('symbols_archive_sha256')
+            if (symbols is None) != (checksum is None):
+                raise ValueError('Symbol archive metadata requires both path and checksum')
+            if symbols is not None:
+                if (pair[1] != 'release' or not isinstance(symbols, str) or not symbols
+                        or Path(symbols).is_absolute() or not isinstance(checksum, str)
+                        or len(checksum) != 64 or any(c not in '0123456789abcdef' for c in checksum)):
+                    raise ValueError('Invalid symbol archive metadata')
+            for name in ('staged', 'archive', 'symbols_archive'):
                 if entry.get(name) is not None:
                     resolved = (index.directory / entry[name]).resolve()
                     if not resolved.is_relative_to(index.directory):
@@ -185,6 +206,21 @@ class ArtifactIndex:
                 result.append((entry['role'], path))
         if not result:
             raise ValueError('Selected build has no archives; build with --package')
+        return result
+
+    def symbol_archives(self, *, profile=None, role=None):
+        """Resolve optional debugging artifacts without treating them as updates."""
+        result = []
+        for entry in self.select(profile=profile, role=role):
+            if entry.get('symbols_archive'):
+                path = (self.directory / entry['symbols_archive']).resolve()
+                if not path.is_relative_to(self.directory.resolve()):
+                    raise ValueError('Artifact symbols_archive escapes build directory')
+                if sha256(path) != entry['symbols_archive_sha256']:
+                    raise ValueError(f'Symbol archive checksum changed since build: {path}')
+                result.append((entry['role'], path))
+        if not result:
+            raise ValueError('Selected build has no symbol archives')
         return result
 
 

@@ -19,7 +19,7 @@
 
 ```sh
 python scripts/build.py --role all --profile debug --package --non-interactive
-cargo run --locked -p astra-management --bin export-contracts -- --check
+cargo run --locked -p astra-management --features bindings --bin export-contracts -- --check
 npm --prefix apps/web test
 python scripts/test.py check unit live client server --debug \
   --bin-dir "$ASTRA_CI_BIN_DIR" --keep-going --report .test-tools/macos-core.json

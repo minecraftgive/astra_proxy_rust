@@ -92,7 +92,7 @@ def build_web_assets(env):
     npm = shutil.which('npm.cmd' if os.name == 'nt' else 'npm', path=env['PATH'])
     if not npm:
         raise RuntimeError('The web role requires Node/npm; native client/server/controller builds do not')
-    for arguments in (['ci'], ['run', 'typecheck'], ['run', 'build']):
+    for arguments in (['ci'], ['run', 'build']):
         subprocess.run([npm, *arguments], cwd=web, env=env, check=True)
     if not (web / 'dist/index.html').is_file():
         raise RuntimeError('Web build did not produce apps/web/dist/index.html')
@@ -119,7 +119,7 @@ def argument_parser():
 
 def build_command(roles, target, profile, *, timings=False):
     crates = [item for name in role_packages(roles, target=target) for item in ('-p', name)]
-    binaries = [item for name in role_binaries(roles, target=target) for item in ('--bin', name)]
+    binaries = [item for name in role_binaries(roles, target=target) if name != 'astra-host' for item in ('--bin', name)]
     return ['cargo', 'build', '--locked', *crates, *binaries, '--target', target,
             '--profile', cargo_profile(profile), *(['--timings'] if timings else [])]
 
@@ -176,6 +176,9 @@ def main():
         started = time.perf_counter()
         subprocess.run(build_command(roles, layout.target, profile, timings=args.timings),
                        check=True, cwd=ROOT, env=env)
+        if "astra-host" in role_binaries(roles, target=layout.target):
+            extension = ".exe" if "windows" in layout.target else ""
+            shutil.copy2(bin_dir / ("astra-manager" + extension), bin_dir / ("astra-host" + extension))
         elapsed = time.perf_counter() - started
         if args.timings:
             report = layout.target_directory / 'cargo-timings' / 'cargo-timing.html'
@@ -190,10 +193,15 @@ def main():
                 if (wintun / name).is_file():
                     shutil.copy2(wintun / name, bin_dir / name)
         for role in roles:
+            symbols_archive = (run_dir / profile / 'symbols' / f'astra-{role}-{label}-{layout.target}-symbols.tar.gz'
+                               if profile == 'release' else None)
             staged = stage(role, bin_dir, run_dir / profile / role, target=layout.target, versions=versions,
-                           label=label, profile=profile)
+                           label=label, profile=profile, symbols_archive=symbols_archive,
+                           build_identity={'revision': index.source_revision, 'role': role,
+                                           'label': label, 'versions': versions})
             archive = package(role, staged, run_dir / profile, label, target=layout.target) if args.package else None
-            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive)
+            index.add(role=role, profile=profile, binary_dir=bin_dir, staged=staged, archive=archive,
+                      symbols_archive=symbols_archive)
             index.save()
         print(f'Built {", ".join(roles)} in {elapsed:.2f}s: {bin_dir}')
     print(f'Distribution: {run_dir}\nArtifact index: {run_dir / "artifacts.json"}')

@@ -68,8 +68,10 @@ snell = [
     "dep:blake2",
     "meow-transport/simple-obfs",
 ]
-ss = [
-    "dep:shadowsocks",
+ss = ["ss-core", "ss-plugins"]
+ss-core = ["dep:shadowsocks"]
+ss-plugins = [
+    "ss-core",
     "meow-transport/simple-obfs",
     "meow-transport/shadow-tls",
     "meow-transport/restls",

@@ -30,9 +30,12 @@ def percentile(values, percent):
 
 async def echo(reader, writer):
     try:
-        while data := await reader.read(65536):
-            writer.write(data)
-            await writer.drain()
+        # Each benchmark connection carries one 1 KiB message. Let the server
+        # close first so high sample counts do not consume every ephemeral port
+        # in client-side TIME_WAIT on macOS.
+        data = await reader.readexactly(1024)
+        writer.write(data)
+        await writer.drain()
     finally:
         writer.close()
         await writer.wait_closed()
@@ -56,6 +59,8 @@ async def query(proxy_port, target_port):
         await writer.drain()
         assert await reader.readexactly(len(data)) == data
         ended = time.perf_counter()
+        if await reader.read(1) != b'':
+            raise RuntimeError('echo server sent unexpected data after the payload')
         return (connected - start) * 1000, (ended - start) * 1000
     finally:
         writer.close()
@@ -80,7 +85,9 @@ async def samples(port, target, count, concurrency):
 
 
 def rules_text(count, sock):
-    rows = [f'socket={json.dumps(str(sock), ensure_ascii=False)}\ndefault_action="direct"\n']
+    # Make the fallback explicit for loopback targets, matching hosted trials.
+    # Local fallback is evaluated inside Rule Core; cache misses still use IPC.
+    rows = [f'socket={json.dumps(str(sock), ensure_ascii=False)}\ndefault_action="direct"\ndirect_local=false\n']
     for index in range(count):
         kind, value = [
             ('domain_exact', f'host{index}.example.invalid'),
@@ -99,7 +106,8 @@ async def run(args):
         'logical_cpus': os.cpu_count(), 'python': platform.python_version(),
         'binary_sha256': {name: digest(binaries / executable(name)) for name in ('astra-proxy', 'astra-rule')},
         'connections_per_round': args.connections, 'rounds': args.rounds,
-        'scope': 'Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency.',
+        'route_path': 'direct_local=false; loopback requests enter the rule engine unless the proxy decision cache hits',
+        'scope': 'Local IPv4 direct SOCKS5 setup plus 1024-byte echo; includes Python client/server overhead. Not encrypted throughput or production capacity. Queue wait before admission to the client concurrency gate is excluded from latency. The destination closes after its single echo; latency stops at received payload, while completed connections/second also includes waiting for remote EOF before client close to avoid ephemeral-port exhaustion.',
         'results': [],
     }
     server = await asyncio.start_server(echo, '127.0.0.1', 0, backlog=256)

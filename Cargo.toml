@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/astra-gui", "crates/astra-client", "crates/astra-observe", "crates/astra-model", "crates/astra-platform", "crates/astra-resource", "crates/astra-management", "crates/astra-manager", "crates/astra-web", "crates/astra-tui-kit", "crates/astra-app", "crates/astra-update", "crates/astra-dns", "crates/astra-rule-data", "crates/astra-protocols", "crates/astra-ipc", "crates/astra-rule", "crates/astra-proxy", "crates/astra-tui", "crates/astra-convert", "crates/astra-server-core"]
 resolver = "2"
-exclude = ["vendor/meow-proxy", "vendor/netstack-smoltcp", "vendor/meow-common"]
+exclude = ["vendor/meow-proxy", "vendor/netstack-smoltcp", "vendor/meow-common", "vendor/gpui-component"]
 
 [workspace.package]
 edition = "2021"
@@ -20,6 +20,7 @@ anyhow = "1"
 meow-common = { path = "vendor/meow-common" }
 meow-proxy = { path = "vendor/meow-proxy" }
 netstack-smoltcp = { path = "vendor/netstack-smoltcp" }
+gpui-component = { path = "vendor/gpui-component" }
 
 # Exactly two build profiles are supported: `dev` and `release`.
 # Do not add custom [profile.*] sections; the built-in `test` and `bench`

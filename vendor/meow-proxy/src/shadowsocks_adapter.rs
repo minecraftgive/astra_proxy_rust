@@ -1,23 +1,33 @@
 use crate::dialer::UdpTarget;
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
+#[cfg(feature = "ss-plugins")]
 use crate::gost_plugin;
+#[cfg(feature = "ss-plugins")]
 use crate::jls_plugin;
 #[cfg(feature = "kcptun")]
 use crate::kcptun_plugin;
+#[cfg(feature = "ss-plugins")]
 use crate::restls_plugin;
+#[cfg(feature = "ss-plugins")]
 use crate::shadow_tls_plugin;
+#[cfg(feature = "ss-plugins")]
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
+#[cfg(feature = "ss-plugins")]
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
+#[cfg(feature = "ss-plugins")]
 use meow_transport::tls::TlsLayer;
-use shadowsocks::config::{Mode, ServerAddr, ServerConfig, ServerType};
+#[cfg(feature = "ss-plugins")]
+use shadowsocks::config::Mode;
+use shadowsocks::config::{ServerAddr, ServerConfig, ServerType};
 use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
+#[cfg(feature = "ss-plugins")]
 use shadowsocks::plugin::{Plugin, PluginConfig, PluginMode};
 use shadowsocks::relay::udprelay::crypto_io::{decrypt_server_payload, encrypt_client_payload};
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
@@ -34,9 +44,12 @@ use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(feature = "ss-plugins")]
+use tracing::warn;
 
 /// Built-in (native, no external process) simple-obfs configuration.
+#[cfg(feature = "ss-plugins")]
 #[derive(Debug, Clone)]
 pub enum BuiltinObfs {
     /// HTTP simple-obfs with the configured fake `Host` header.
@@ -70,14 +83,18 @@ enum PluginKind {
     None,
     /// External SIP003 plugin subprocess. The `Plugin` handle keeps the
     /// subprocess alive for the adapter's lifetime.
+    #[cfg(feature = "ss-plugins")]
     External(#[allow(dead_code)] Plugin),
+    #[cfg(feature = "ss-plugins")]
     Obfs(BuiltinObfs),
+    #[cfg(feature = "ss-plugins")]
     V2ray(V2rayPluginConfig, Option<TlsLayer>),
     /// Native gost-plugin websocket (+ optional TLS and smux) transport.
     /// `WsLayer` is built at construction so a malformed headers/path
     /// config fails once at startup, not per dial. The TLS layer is a
     /// `ReloadableTlsLayer` — file-sourced mTLS cert/key PEMs are re-stat
     /// per dial and hot-reloaded on change (issue #621).
+    #[cfg(feature = "ss-plugins")]
     Gost(
         gost_plugin::GostPluginConfig,
         Option<gost_plugin::ReloadableTlsLayer>,
@@ -85,12 +102,15 @@ enum PluginKind {
     ),
     /// Native shadow-tls transport (v1/v2/v3). `TlsLayer` is built at
     /// construction so a malformed TLS config fails once at startup.
+    #[cfg(feature = "ss-plugins")]
     ShadowTls(shadow_tls_plugin::ShadowTlsConfig, TlsLayer),
     /// Native restls transport — the record-level TLS client needs no
     /// `TlsLayer`; `RestlsPluginConfig` is validated at construction.
+    #[cfg(feature = "ss-plugins")]
     Restls(restls_plugin::RestlsPluginConfig),
     /// Native jls transport — record-level TLS 1.3 with hello-random
     /// authentication; `JlsConfig` is validated at construction.
+    #[cfg(feature = "ss-plugins")]
     Jls(jls_plugin::JlsPluginConfig),
     /// Native kcptun transport — KCP-over-UDP + smux session pool.
     /// `Arc` because the pooled client outlives a single dial.
@@ -105,10 +125,15 @@ impl PluginKind {
     /// `dial_udp` gate can't drift as variants accrete.
     fn udp_block_reason(&self) -> Option<&'static str> {
         match self {
+            #[cfg(feature = "ss-plugins")]
             PluginKind::V2ray(..) => Some("v2ray-plugin does not support UDP relay"),
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Gost(..) => Some("gost-plugin does not support UDP relay"),
+            #[cfg(feature = "ss-plugins")]
             PluginKind::ShadowTls(..) => Some("shadow-tls does not support UDP relay"),
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Restls(..) => Some("restls does not support UDP relay"),
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Jls(..) => Some("jls does not support UDP relay"),
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(..) => Some("ech-tls-tunnel does not support UDP relay"),
@@ -120,7 +145,9 @@ impl PluginKind {
 /// Dial-relevant SS state, shared (Arc) between the adapter and any mux
 /// session so the SIP003 plugin handle stays alive for both.
 struct SsCore {
+    #[cfg(feature = "ss-plugins")]
     server: SmolStr,
+    #[cfg(feature = "ss-plugins")]
     port: u16,
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
@@ -158,20 +185,25 @@ impl ShadowsocksAdapter {
         client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "ss-plugins"))]
+        let _ = (plugin_opts, client_fingerprint);
         let cipher_kind = cipher
             .parse::<CipherKind>()
             .map_err(|_| MeowError::Config(format!("unknown cipher: {cipher}")))?;
+        #[allow(unused_mut)] // Plugin builds replace the remote endpoint with the plugin endpoint.
         let mut server_config = ServerConfig::new((server, port), password, cipher_kind)
             .map_err(|e| MeowError::Config(format!("invalid ss config: {e}")))?;
         let context = Context::new_shared(ServerType::Local);
         let addr_str = SmolStr::from(format!("{server}:{port}"));
 
         let plugin = match plugin_name {
+            #[cfg(feature = "ss-plugins")]
             Some(p) if is_builtin_obfs_plugin(p) => {
                 let cfg = parse_obfs_opts(plugin_opts, server)?;
                 debug!("SS '{}' using built-in simple-obfs ({:?})", name, cfg);
                 PluginKind::Obfs(cfg)
             }
+            #[cfg(feature = "ss-plugins")]
             Some("v2ray-plugin") => {
                 let mut cfg = v2ray_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 if cfg.host.is_empty() {
@@ -184,6 +216,7 @@ impl ShadowsocksAdapter {
                 let tls = v2ray_plugin::build_tls_layer(&cfg)?;
                 PluginKind::V2ray(cfg, tls)
             }
+            #[cfg(feature = "ss-plugins")]
             Some("gost-plugin") => {
                 let cfg = gost_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -194,6 +227,7 @@ impl ShadowsocksAdapter {
                 let ws = gost_plugin::build_ws_layer(&cfg)?;
                 PluginKind::Gost(cfg, tls, ws)
             }
+            #[cfg(feature = "ss-plugins")]
             Some("shadow-tls") => {
                 let cfg = shadow_tls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -203,6 +237,7 @@ impl ShadowsocksAdapter {
                 let tls = shadow_tls_plugin::build_tls_layer(&cfg, client_fingerprint)?;
                 PluginKind::ShadowTls(cfg, tls)
             }
+            #[cfg(feature = "ss-plugins")]
             Some("restls") => {
                 let cfg = restls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -216,6 +251,7 @@ impl ShadowsocksAdapter {
                 }
                 PluginKind::Restls(cfg)
             }
+            #[cfg(feature = "ss-plugins")]
             Some("jls") => {
                 let cfg = jls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -256,6 +292,7 @@ impl ShadowsocksAdapter {
                 let tls = ech_tls_tunnel::build_tls_layer(&cfg)?;
                 PluginKind::EchTlsTunnel(cfg, tls)
             }
+            #[cfg(feature = "ss-plugins")]
             Some(pname) => {
                 // SIP003u: a `mode=tcp_and_udp` / `udp_only` token in plugin-opts
                 // selects whether UDP relay is tunneled through the plugin. The
@@ -280,11 +317,19 @@ impl ShadowsocksAdapter {
                 debug!("SS plugin '{}' started on {}", pname, started.local_addr());
                 PluginKind::External(started)
             }
+            #[cfg(not(feature = "ss-plugins"))]
+            Some(_) => {
+                return Err(MeowError::Config(
+                    "Shadowsocks plugins were not enabled in this build".into(),
+                ));
+            }
             None => PluginKind::None,
         };
 
         let core = Arc::new(SsCore {
+            #[cfg(feature = "ss-plugins")]
             server: SmolStr::from(server),
+            #[cfg(feature = "ss-plugins")]
             port,
             server_config,
             context,
@@ -334,12 +379,17 @@ impl ShadowsocksAdapter {
     /// still listens locally. Same contract as the TCP path, which dials the
     /// plugin listener directly under `dialer-proxy`.
     fn plugin_owns_udp(&self) -> bool {
-        matches!(self.core.plugin, PluginKind::External(_))
-            && self
-                .core
-                .server_config
-                .plugin()
-                .is_some_and(|p| p.plugin_mode.enable_udp())
+        #[cfg(feature = "ss-plugins")]
+        {
+            matches!(self.core.plugin, PluginKind::External(_))
+                && self
+                    .core
+                    .server_config
+                    .plugin()
+                    .is_some_and(|p| p.plugin_mode.enable_udp())
+        }
+        #[cfg(not(feature = "ss-plugins"))]
+        false
     }
 
     /// Whether the plain SS UDP association must ride the `dialer-proxy`
@@ -451,6 +501,7 @@ impl SsCore {
     /// user streams regardless of which dial triggered its establishment.
     async fn dial_tcp_stream(&self, addr: Address, internal: bool) -> Result<Box<dyn ProxyConn>> {
         match &self.plugin {
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Obfs(obfs) => {
                 // Open a raw TCP connection to the SS server, wrap it in the
                 // simple-obfs codec, then layer the SS crypto stream on top.
@@ -473,6 +524,7 @@ impl SsCore {
                     }
                 }
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::V2ray(cfg, tls) => {
                 let transport = v2ray_plugin::dial(
                     cfg,
@@ -485,6 +537,7 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Gost(cfg, tls, ws) => {
                 let transport = gost_plugin::dial(
                     cfg,
@@ -498,6 +551,7 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::ShadowTls(cfg, tls) => {
                 let transport = shadow_tls_plugin::dial(
                     cfg,
@@ -510,12 +564,14 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Restls(cfg) => {
                 let transport =
                     restls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal)
                         .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Jls(cfg) => {
                 let transport =
                     jls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal).await?;
@@ -556,6 +612,7 @@ impl SsCore {
                 .map_err(|e| MeowError::io_with("ss tcp connect", e))?;
                 Ok(self.ss_conn(tcp, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::External(_) => {
                 // SIP003 plugin subprocess: ``tcp_external_addr`` returns the
                 // plugin's local listener (typically 127.0.0.1:<port>).
@@ -583,6 +640,7 @@ impl SsCore {
     ) -> Result<Box<dyn ProxyConn>> {
         match &self.plugin {
             PluginKind::None => Ok(self.ss_conn(stream, addr)),
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Obfs(obfs) => {
                 let stream = match obfs.clone() {
                     BuiltinObfs::Http { host } => Box::new(
@@ -598,6 +656,7 @@ impl SsCore {
                 };
                 Ok(self.ss_conn(stream, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::V2ray(cfg, tls) => {
                 let transport = v2ray_plugin::handshake_over(
                     cfg,
@@ -616,6 +675,7 @@ impl SsCore {
                         .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Gost(..) => {
                 // gost (ws+tls+smux) could terminate on a relay-supplied
                 // stream once it grows a `handshake_over` split — its `dial`
@@ -627,6 +687,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::ShadowTls(..) => {
                 // shadow-tls could terminate on a relay-supplied stream once
                 // it grows a `handshake_over` split — its `dial` currently
@@ -638,6 +699,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Restls(..) => {
                 // restls could terminate on a relay-supplied stream once it
                 // grows a `handshake_over` split — its `dial` currently owns
@@ -649,6 +711,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::Jls(..) => {
                 // jls could terminate on a relay-supplied stream once it
                 // grows a `handshake_over` split — its `dial` currently owns
@@ -669,6 +732,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "ss-plugins")]
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
                 // real server itself and we only reach its local listener).
@@ -694,6 +758,7 @@ impl SsCore {
 /// [`Mode`] (default [`Mode::TcpOnly`], preserving the pre-SIP003u behaviour
 /// where UDP bypasses the plugin) and the opts string with a recognised
 /// transport-mode token removed so it is not forwarded to the plugin process.
+#[cfg(feature = "ss-plugins")]
 fn extract_sip003_plugin_mode(opts: Option<&str>) -> (Mode, Option<String>) {
     let Some(opts) = opts else {
         return (Mode::TcpOnly, None);
@@ -734,6 +799,7 @@ fn extract_sip003_plugin_mode(opts: Option<&str>) -> (Mode, Option<String>) {
 /// Returns true if the given plugin name selects the built-in simple-obfs.
 /// Accepts both `obfs` (Go mihomo's short name) and `simple-obfs` (the
 /// original SIP003 binary name some users still write).
+#[cfg(feature = "ss-plugins")]
 pub fn is_builtin_obfs_plugin(name: &str) -> bool {
     matches!(name, "obfs" | "simple-obfs")
 }
@@ -743,6 +809,7 @@ pub fn is_builtin_obfs_plugin(name: &str) -> bool {
 /// dispatch match in `ShadowsocksAdapter::new` (single source of truth
 /// for `meow-config`'s dialer-injection gate, which cannot see the
 /// feature-gated `ech-tls-tunnel`/`kcptun` arms directly).
+#[cfg(feature = "ss-plugins")]
 pub fn is_builtin_sip003_plugin(name: &str) -> bool {
     is_builtin_obfs_plugin(name)
         || matches!(
@@ -765,6 +832,7 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
 ///
 /// Unknown keys are silently ignored to stay forward-compatible with the
 /// upstream Go reference.
+#[cfg(feature = "ss-plugins")]
 pub(crate) fn parse_obfs_opts(plugin_opts: Option<&str>, server: &str) -> Result<BuiltinObfs> {
     let opts = plugin_opts.unwrap_or("").trim();
     let mut mode: Option<String> = None;

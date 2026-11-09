@@ -39,13 +39,11 @@ pub async fn send<W: AsyncWrite + Unpin, T: serde::Serialize>(
     stream: &mut W,
     value: &T,
 ) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_FRAME_BYTES,
-        "management frame exceeds limit"
-    );
-    stream.write_all(b"AMV2").await?;
-    stream.write_u32(bytes.len() as u32).await?;
+    let mut bytes = b"AMV2\0\0\0\0".to_vec();
+    serde_json::to_writer(&mut bytes, value)?;
+    let length = bytes.len() - 8;
+    anyhow::ensure!(length <= MAX_FRAME_BYTES, "management frame exceeds limit");
+    bytes[4..8].copy_from_slice(&(length as u32).to_be_bytes());
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(())
@@ -65,3 +63,7 @@ pub async fn receive<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+
+#[cfg(test)]
+#[path = "test/client_framing_test.rs"]
+mod tests;

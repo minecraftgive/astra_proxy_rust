@@ -109,6 +109,10 @@ async fn receive_frame(
 #[path = "test/version_test.rs"]
 mod version_tests;
 
+#[cfg(test)]
+#[path = "test/framing_test.rs"]
+mod framing_tests;
+
 pub use astra_platform::platform::shutdown_signal;
 
 /// Extensible metadata carried inside the existing v4 route envelope.

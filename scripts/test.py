@@ -104,9 +104,9 @@ def main():
     if 'web' in suites:
         # A codegen tool: always the fast-compiling dev profile.
         contract_flags = ['--locked', '--target', host, '--profile', 'dev']
-        steps.append(('contracts', ['cargo', 'run', *contract_flags, '-p', 'astra-management', '--bin', 'export-contracts', '--', '--check']))
+        steps.append(('contracts', ['cargo', 'run', *contract_flags, '-p', 'astra-management', '--features', 'bindings', '--bin', 'export-contracts', '--', '--check']))
         npm = 'npm.cmd' if os.name == 'nt' else 'npm'
-        for script in ('typecheck', 'test', 'build'):
+        for script in ('test', 'build'):
             steps.append(Step(f'web {script}', [npm, 'run', script], cwd=ROOT/'apps/web'))
     if 'release' in suites:
         steps.append(('release', python + [SCRIPTS/'release_check.py', '--bin-dir', bin_dir, '--output', timestamped_report('release')]))

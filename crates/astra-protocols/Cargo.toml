@@ -18,7 +18,7 @@ sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
-meow-proxy = { version = "=0.23.1", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "hysteria2", "mux", "vless-server"] }
+meow-proxy = { version = "=0.23.1", default-features = false, features = ["ss-core", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "hysteria2", "mux", "vless-server"] }
 meow-common = "=0.23.1"
 meow-transport = { version = "=0.23.1", features = ["reality", "xhttp", "grpc", "httpupgrade", "h2"] }
 rustls-pemfile = "2"

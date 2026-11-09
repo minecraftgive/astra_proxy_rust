@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open a real GUI against an isolated manager, then verify graceful SIGTERM."""
+"""Open a client/server GUI against an isolated manager and verify graceful exit."""
 from __future__ import annotations
 import argparse
 import json
@@ -25,9 +25,9 @@ def wait_for(predicate, process, timeout, description):
     raise TimeoutError(description)
 
 
-def smoke(binary_dir, duration=5, termination="signal"):
+def smoke(binary_dir, duration=5, termination="signal", frontend="astra-gui"):
     binary_dir = Path(binary_dir).resolve()
-    host, gui = binary_dir / 'astra-host', binary_dir / 'astra-gui'
+    host, gui = binary_dir / 'astra-host', binary_dir / frontend
     for executable in (host, gui):
         if not executable.is_file():
             raise FileNotFoundError(executable)
@@ -45,12 +45,12 @@ def smoke(binary_dir, duration=5, termination="signal"):
                 raise RuntimeError('Native application quit smoke is macOS-only')
             bundle = root / 'Astra Quit Smoke.app'
             contents = bundle / 'Contents'
-            program = contents / 'MacOS' / 'astra-gui'
+            program = contents / 'MacOS' / frontend
             program.parent.mkdir(parents=True)
             shutil.copy2(gui, program)
             with (contents / 'Info.plist').open('wb') as info:
                 plistlib.dump({'CFBundleIdentifier': 'org.astra.quit-smoke.' + root.name,
-                              'CFBundleExecutable': 'astra-gui', 'CFBundleName': 'Astra Quit Smoke',
+                              'CFBundleExecutable': frontend, 'CFBundleName': 'Astra Quit Smoke',
                               'CFBundlePackageType': 'APPL'}, info)
             gui = program
         host_args = [str(host), '--state-dir', str(state), '--config-dir', str(config), '--bin-dir', str(binary_dir)]
@@ -113,8 +113,9 @@ def main():
     parser.add_argument('--bin-dir', required=True, type=Path)
     parser.add_argument('--duration', type=float, default=5)
     parser.add_argument('--termination', choices=('signal', 'native'), default='signal')
+    parser.add_argument('--frontend', choices=('astra-gui', 'astra-server-gui'), default='astra-gui')
     args = parser.parse_args()
-    smoke(args.bin_dir, args.duration, args.termination)
+    smoke(args.bin_dir, args.duration, args.termination, args.frontend)
 
 if __name__ == '__main__':
     main()

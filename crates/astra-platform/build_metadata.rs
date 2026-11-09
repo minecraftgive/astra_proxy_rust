@@ -2,6 +2,8 @@
 // rather than the independently cached astra-platform dependency.
 use std::{env, path::Path, process::Command, time::SystemTime};
 
+include!("build_metadata_inputs.rs");
+
 fn output(command: &mut Command) -> Option<String> {
     #[cfg(windows)]
     {
@@ -18,8 +20,15 @@ fn output(command: &mut Command) -> Option<String> {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../astra-platform/build_metadata.rs");
-    // Rebuild metadata when workspace sources change, including dependencies.
-    println!("cargo:rerun-if-changed=../../crates");
+    println!("cargo:rerun-if-changed=../astra-platform/build_metadata_inputs.rs");
+    let package = env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME");
+    let (_, inputs) = LOCAL_METADATA_INPUTS
+        .iter()
+        .find(|(name, _)| *name == package)
+        .expect("Run python scripts/build_metadata_inputs.py for this package");
+    for input in *inputs {
+        println!("cargo:rerun-if-changed=../../{input}");
+    }
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");

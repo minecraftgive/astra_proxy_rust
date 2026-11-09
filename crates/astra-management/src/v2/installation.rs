@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
+#[cfg(feature = "bindings")]
 use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallationScope {
     #[default]
@@ -10,7 +12,8 @@ pub enum InstallationScope {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationDestination {
     pub directory: Option<PathBuf>,
     pub entry: Option<PathBuf>,
@@ -19,7 +22,8 @@ pub struct InstallationDestination {
     pub unavailable_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationPackage {
     pub id: String,
     pub role: String,
@@ -29,7 +33,8 @@ pub struct InstallationPackage {
     pub system: InstallationDestination,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationStatus {
     pub target: String,
     pub account: String,
@@ -38,7 +43,8 @@ pub struct InstallationStatus {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationResult {
     pub role: String,
     pub directory: PathBuf,
@@ -50,7 +56,8 @@ pub struct InstallationResult {
 
 /// Only returned through the target machine's private local IPC. No browser
 /// or remote controller may request a local interactive elevation launch.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationLaunch {
     pub program: PathBuf,
     pub arguments: Vec<String>,

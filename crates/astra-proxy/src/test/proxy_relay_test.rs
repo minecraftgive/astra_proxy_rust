@@ -94,6 +94,27 @@ async fn idle_open_relay_is_not_closed() {
 }
 
 #[tokio::test]
+async fn late_half_close_starts_a_fresh_linger() {
+    let (mut client, mut client_side) = duplex(1024);
+    let (mut server_side, mut server) = duplex(1024);
+    let mut relay =
+        tokio::spawn(async move { relay_with(&mut client_side, &mut server_side, LINGER).await });
+    tokio::time::sleep(LINGER * 2).await;
+    client.write_all(b"request").await.unwrap();
+    let mut request = [0; 7];
+    server.read_exact(&mut request).await.unwrap();
+    assert_eq!(&request, b"request");
+    client.shutdown().await.unwrap();
+    assert!(tokio::time::timeout(LINGER / 4, &mut relay).await.is_err());
+    server.write_all(b"reply").await.unwrap();
+    server.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"reply");
+    assert_eq!(relay.await.unwrap().unwrap(), (7, 5));
+}
+
+#[tokio::test]
 async fn closes_half_closed_tcp_relay_whose_client_reset() {
     use tokio::net::{TcpListener, TcpStream};
     let front = TcpListener::bind("127.0.0.1:0").await.unwrap();

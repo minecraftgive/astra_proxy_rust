@@ -26,21 +26,21 @@ pub mod unavailable;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 pub mod gost_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 mod plugin_util;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 pub mod restls_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 pub mod shadow_tls_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-core")]
 pub mod shadowsocks_adapter;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-plugins")]
 pub mod v2ray_plugin;
 
 /// `uot.AddrParser` per-packet address headers — shared by the anytls and
@@ -86,7 +86,7 @@ pub use group::selector_store::SelectorStore;
 pub use group::urltest::UrlTestGroup;
 pub use http_adapter::HttpAdapter;
 pub use reject::RejectAdapter;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-core")]
 pub use shadowsocks_adapter::ShadowsocksAdapter;
 pub use socks5_adapter::Socks5Adapter;
 pub use stream_conn::StreamConn;

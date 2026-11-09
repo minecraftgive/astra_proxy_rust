@@ -132,6 +132,10 @@ Windows PowerShell 使用 `./scripts/build.ps1`，参数与上面的脚本相同
 
 加 `--package` 时安装包输出到 `dist/`，包含客户端程序与完整示例配置，并输出 SHA-256。支持 `--role client|server|controller|web|all`、`--label`、`--output-dir` 和 `--timings`；完整参数、输出路径及测量方法见 [构建与打包说明](docs/INSTALL.md)。
 
+构建脚本复用管理器的一次链接结果，复制为兼容入口 `astra-host`，两者仍是独立普通文件。release 的 Linux/macOS 分发副本会剥离符号，并在独立的 `symbols/` 目录保存匹配的原始二进制与前后 SHA-256 映射；`target/` 原件不变。Windows MSVC 可执行文件保持原样，同名 PDB 仅在已有时另存，不据此承诺 Windows 体积下降。符号包用于排错，不能导入更新面板。
+
+修改本地 Cargo 依赖后运行 `python3 scripts/build_metadata_inputs.py` 更新构建元数据监听表；`--check` 可校验表是否同步。Web 类型合同按需生成：`cargo run --locked -p astra-management --features bindings --bin export-contracts`，追加 `-- --check` 只校验；普通构建不启用类型生成依赖。
+
 ```sh
 ./scripts/build.sh --profile both --timings
 ./scripts/build.sh --profile release --package
@@ -191,6 +195,8 @@ cargo run --locked -p astra-gui --bin astra-server-gui
 Linux 除上文的构建工具外，需要 `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev`；GUI 同时启用 Wayland 与 X11。Windows 使用 MSVC 与 Windows SDK，两个入口均不创建控制台窗口。macOS 应用包声明最低版本为 12.0。
 
 `python3 scripts/package_gui.py --profile debug --output-dir dist/gui` 将两种桌面入口分别与对应运行核心打包；macOS 产物包含带图标的 `.app`，Windows 可执行文件嵌入图标并带入构建目录中已有的可选 `wintun.dll`，Linux 包含 `.desktop` 文件和 PNG/SVG 图标。发布包使用 `release`，需先用同一 profile 构建两个角色及 GUI。CI 的桌面任务独立覆盖 Linux、Windows、macOS ARM64 和 x86_64，并在 Linux Xvfb 中验证窗口绘制、会话保存和 SIGTERM 正常退出。`astra-gui-update-<target>.tar.gz` 是供更新面板导入的客户端更新包；带 `.app` 的原生发布包用于解压启动，不直接作为更新包导入。
+
+GUI 的 release 打包同样保留独立的 `astra-gui-<target>-symbols.tar.gz` 和 `astra-server-gui-<target>-symbols.tar.gz`；符号与原件不进入原生安装包或客户端更新包。当前 profile 不生成完整源码调试信息，保留未剥离原件不能恢复本来不存在的源码行号。
 
 可在有桌面的 Unix 环境运行 `python3 scripts/gui_smoke.py --bin-dir target/<本机 Rust target>/debug`；该检查使用临时管理节点和数据目录，不修改真实配置或安装位置；macOS 加 `--termination native` 可验证系统“退出”同样先保存会话并完成后台清理。
 

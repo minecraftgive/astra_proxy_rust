@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -76,6 +77,65 @@ class ProfileResolutionTests(unittest.TestCase):
                 explicit = root / 'explicit'
                 self.assertEqual(resolve_binary_dir(explicit, artifact_dir=index.directory), explicit.resolve())
             self.assertEqual(index.entries[0]['cargo_profile'], 'release')
+            self.assertNotIn('symbols_archive', index.entries[0])
+            with self.assertRaisesRegex(ValueError, 'no symbol archives'):
+                index.symbol_archives()
+
+    def test_symbol_archive_index_checks_paths_and_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            index, bins = artifact_fixture(root)
+            archive = index.directory / 'release/symbols/controller.tar.gz'
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b'symbol archive')
+            index.add(role='controller', profile='release', binary_dir=bins,
+                      staged=index.directory / 'release/controller', symbols_archive=archive)
+            index.save()
+            loaded = ArtifactIndex.load(index.directory)
+            self.assertEqual(loaded.symbol_archives(role='controller'), [('controller', archive.resolve())])
+            self.assertEqual(loaded.entries[-1]['symbols_archive_sha256'], hashlib.sha256(archive.read_bytes()).hexdigest())
+            # Debugging archives never become install/update archives.
+            self.assertEqual(len(loaded.archives()), 1)
+            archive.write_bytes(b'changed archive')
+            with self.assertRaisesRegex(ValueError, 'Symbol archive checksum changed'):
+                loaded.symbol_archives(role='controller')
+
+    def test_symbol_archive_metadata_rejects_escape_and_incomplete_pairs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            index, _ = artifact_fixture(Path(temporary))
+            path = index.directory / 'artifacts.json'
+            original = json.loads(path.read_text())
+            bad_entries = [
+                {'symbols_archive': '../outside.tar.gz', 'symbols_archive_sha256': 'a' * 64},
+                {'symbols_archive': str(index.directory / 'inside.tar.gz'), 'symbols_archive_sha256': 'a' * 64},
+                {'symbols_archive': 'symbols.tar.gz'},
+                {'symbols_archive_sha256': 'a' * 64},
+                {'symbols_archive': '', 'symbols_archive_sha256': 'a' * 64},
+                {'symbols_archive': 'symbols.tar.gz', 'symbols_archive_sha256': 'not a hash'},
+                {'symbols_archive': 'symbols.tar.gz', 'symbols_archive_sha256': 'a' * 64,
+                 'profile': 'debug', 'cargo_profile': 'dev'},
+            ]
+            for fields in bad_entries:
+                with self.subTest(fields=fields):
+                    data = json.loads(json.dumps(original))
+                    data['entries'][0].update(fields)
+                    path.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(ValueError, '[Ss]ymbol'):
+                        ArtifactIndex.load(index.directory)
+
+    def test_debug_symbol_request_is_rejected_before_staging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, 'only supported for release'):
+                stage('controller', root / 'bins', root / 'staged', target='host',
+                      versions={'astra-manager': '0.1.0'}, label='0.1.0', profile='debug',
+                      symbols_archive=root / 'symbols.tar.gz')
+            self.assertFalse((root / 'staged').exists())
+            index = ArtifactIndex(root, 'host')
+            with self.assertRaisesRegex(ValueError, 'only supported for release'):
+                index.add(role='controller', profile='debug', binary_dir=root,
+                          staged=root / 'staged', symbols_archive=root / 'symbols.tar.gz')
+            self.assertFalse(index.entries)
 
     def test_artifacts_from_removed_profiles_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -159,7 +219,7 @@ class BuildCommandTests(unittest.TestCase):
             with self.subTest(roles=roles):
                 command = build.build_command(roles, 'host', 'release', timings=True)
                 binaries = [command[i + 1] for i, item in enumerate(command) if item == '--bin']
-                self.assertEqual(set(binaries), {binary for role in roles for binary in ROLES[role].binaries})
+                self.assertEqual(set(binaries), {binary for role in roles for binary in ROLES[role].binaries if binary != 'astra-host'})
                 self.assertEqual(len(binaries), len(set(binaries)))
                 self.assertNotIn('--bins', command)
                 self.assertIn('--timings', command)
@@ -199,6 +259,7 @@ class BuildCommandTests(unittest.TestCase):
              patch.object(build.subprocess, 'run', side_effect=run), \
              patch.object(build.subprocess, 'check_output', return_value=cfg), \
              patch.object(build, 'build_web_assets', side_effect=lambda env: web_built.append(True)), \
+             patch('astra_tools.symbols._strip', return_value='test-fixture'), \
              contextlib.redirect_stdout(io.StringIO()):
             build.main()
         runs = list((root / 'dist').glob('*/artifacts.json'))
@@ -216,6 +277,30 @@ class BuildCommandTests(unittest.TestCase):
             manifest = json.loads((index.directory / entry['staged'] / 'manifest.json').read_text())
             self.assertEqual(manifest['cargo_profile'], 'dev')
             self.assertNotIn('mode', manifest)
+
+    def test_host_alias_is_copied_without_linking_twice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calls, index = self.run_build(Path(temporary), ['--role', 'all', '--profile', 'both'])
+            for command in calls:
+                binaries = [command[i + 1] for i, value in enumerate(command) if value == '--bin']
+                self.assertIn('astra-manager', binaries)
+                self.assertNotIn('astra-host', binaries)
+            for entry in index.entries:
+                if entry['role'] not in ('client', 'server'):
+                    continue
+                bins = Path(entry['binary_dir'])
+                manager, host = bins / executable('astra-manager'), bins / executable('astra-host')
+                self.assertEqual(manager.read_bytes(), host.read_bytes())
+                self.assertFalse(os.path.samefile(manager, host), 'host must be a normal copy, not a hard link')
+                staged = index.directory / entry['staged']
+                self.assertEqual((staged / host.name).read_bytes(), (staged / manager.name).read_bytes())
+                manifest = json.loads((staged / 'manifest.json').read_text())
+                self.assertIn('astra-host', manifest['components'])
+                if entry['profile'] == 'release':
+                    self.assertIn('symbols_archive', entry)
+                    self.assertEqual(len(index.symbol_archives(role=entry['role'], profile='release')), 1)
+                else:
+                    self.assertNotIn('symbols_archive', entry)
 
     def test_both_profiles_preserve_web_guard_and_copy_each_timing_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -292,6 +377,8 @@ class ConsumerCommandTests(unittest.TestCase):
             test_cli.main()
         command = runner.call_args.args[0][0].command
         self.assertEqual(command[command.index('--profile') + 1], 'dev')
+        self.assertEqual(command[command.index('--features') + 1], 'bindings')
+        self.assertEqual([step.command[-1] for step in runner.call_args.args[0][1:]], ['test', 'build'])
 
     def test_launcher_uses_index_path(self):
         with tempfile.TemporaryDirectory() as temporary:
