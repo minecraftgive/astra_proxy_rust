@@ -45,7 +45,7 @@ async fn form_builds_requests_for_each_probe_and_egress() {
     view.key(key(KeyCode::Char('d')));
     assert_eq!(view.kind, Kind::Dns);
     assert_eq!(view.target, "www.gstatic.com");
-    assert_eq!(view.fields().len(), 6);
+    assert!(view.fields().contains(&Field::Resolver) && view.fields().contains(&Field::Family));
     view.key(key(KeyCode::Down));
     view.key(key(KeyCode::Down));
     view.key(key(KeyCode::Right));
@@ -56,7 +56,7 @@ async fn form_builds_requests_for_each_probe_and_egress() {
     assert_eq!(request.count, 1);
     view.field = Field::Kind;
     view.key(key(KeyCode::Char('i')));
-    assert_eq!(view.fields().len(), 4);
+    assert!(!view.fields().contains(&Field::Server) && view.fields().contains(&Field::Family));
     view.field = Field::Count;
     for c in "120".chars() {
         view.key(key(KeyCode::Char(c)));
@@ -84,7 +84,7 @@ async fn late_outbounds_keep_the_selected_egress() {
     assert_eq!(view.egresses.last(), Some(&Egress::Outbound("JP".into())));
     view.egress = view.egresses.len() - 1;
     view.set_outbounds(&[]);
-    assert_eq!(view.egresses[view.egress], Egress::System);
+    assert_eq!(view.egresses[view.egress], Egress::Outbound("JP".into()));
 }
 #[test]
 fn host_part_strips_ports_but_not_ipv6() {

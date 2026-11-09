@@ -476,7 +476,7 @@ fn reply(r: v::ResponseBody) -> Result<Reply> {
         other => Reply::text(serde_json::to_string(&other)?),
     })
 }
-fn native_numbers(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
+pub(crate) fn native_numbers(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
     match value {
         serde_json::Value::String(s)
             if key.is_some_and(|k| {

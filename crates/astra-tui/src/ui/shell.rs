@@ -7,8 +7,25 @@ use astra_model::runtime::Mode;
 use ratatui::{layout::Rect, style::Modifier};
 
 pub use astra_client::navigation::{
-    CONNECTIONS, LOGS, OVERVIEW, PAGES, PROFILES, PROXIES, RULES, SETTINGS,
+    CONNECTIONS, DNS, LOGS, OVERVIEW, PROFILES, PROXIES, RULES, SETTINGS,
 };
+// Display order is independent of the shared page IDs used by the native GUI.
+pub const PAGES: [(usize, &str); 8] = [
+    (OVERVIEW, "Overview"),
+    (PROXIES, "Proxies"),
+    (CONNECTIONS, "Connections"),
+    (DNS, "DNS queries"),
+    (RULES, "Rules"),
+    (LOGS, "Logs"),
+    (PROFILES, "Profiles"),
+    (SETTINGS, "Settings"),
+];
+pub(super) fn page_at(index: usize) -> usize {
+    PAGES[index.min(PAGES.len() - 1)].0
+}
+pub(super) fn page_position(page: usize) -> usize {
+    PAGES.iter().position(|&(id, _)| id == page).unwrap_or(0)
+}
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(super) enum PaletteFocus {
     #[default]
@@ -76,16 +93,78 @@ impl Ui {
                 PaletteMode::Profiles(p.profile_kind)
             })
     }
+    fn palette_entries_in(&self, language: crate::i18n::Language, mode: PaletteMode) -> Vec<Entry> {
+        use astra_client::{i18n::translate, palette::Intent};
+        let mut entries = self.client.palette_entries_in(language, mode);
+        if matches!(mode, PaletteMode::Commands) {
+            let at = entries
+                .iter()
+                .position(|entry| matches!(entry.run, Intent::Page(_)))
+                .unwrap_or(entries.len());
+            entries.retain(|entry| !matches!(entry.run, Intent::Page(_)));
+            entries.splice(
+                at..at,
+                PAGES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(page, title))| Entry {
+                        scope: "Go to",
+                        label: translate(title, language).into(),
+                        key: ["1", "2", "3", "4", "5", "6", "7", "8"][index],
+                        run: Intent::Page(page),
+                        unavailable: None,
+                    }),
+            );
+        }
+        entries
+    }
     fn palette_matches(&self) -> Vec<Entry> {
-        self.client.palette_matches(
-            self.palette_mode(),
-            self.palette.as_ref().map_or("", |p| p.query.as_str()),
-        )
+        use astra_client::i18n::{language, translate, Language};
+        let query = self
+            .palette
+            .as_ref()
+            .map_or("", |p| p.query.as_str())
+            .to_lowercase();
+        let current = language();
+        let matches = |entry: &Entry, language| {
+            format!(
+                "{} {} {}",
+                translate(entry.scope, language),
+                entry.label,
+                entry.key
+            )
+            .to_lowercase()
+            .contains(&query)
+        };
+        self.palette_entries_in(current, self.palette_mode())
+            .into_iter()
+            .zip(self.palette_entries_in(Language::English, self.palette_mode()))
+            .filter_map(|(entry, english)| {
+                (matches(&entry, current) || matches(&english, Language::English)).then_some(entry)
+            })
+            .collect()
     }
     pub(super) fn command_help(&self) -> String {
-        self.help_override
-            .clone()
-            .unwrap_or_else(|| self.client.command_help())
+        self.help_override.clone().unwrap_or_else(|| {
+            let mut text = commands::help().replace("1–7", "1–8");
+            text.push_str("\nPage and profile actions · F2 opens these commands\n");
+            for entry in self
+                .palette_entries_in(crate::i18n::language(), PaletteMode::Commands)
+                .into_iter()
+                .filter(|entry| entry.scope != "General")
+            {
+                text.push_str(&format!(
+                    "{}  {}{}\n",
+                    entry.key,
+                    entry.label,
+                    entry
+                        .unavailable
+                        .map(|reason| format!(" ({})", t(reason)))
+                        .unwrap_or_default()
+                ));
+            }
+            text
+        })
     }
     pub(super) fn palette_run(&mut self, index: usize) -> Input {
         let Some(entry) = self.palette_matches().into_iter().nth(index) else {
@@ -147,7 +226,9 @@ impl Ui {
             return None;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='7') => return Some(self.navigate(c as usize - '1' as usize)),
+            KeyCode::Char(c @ '1'..='8') => {
+                return Some(self.navigate(page_at(c as usize - '1' as usize)))
+            }
             KeyCode::Char('p') => {
                 self.palette = Some(Palette::profiles(self.kind));
                 return Some(Input::Idle);
@@ -210,7 +291,7 @@ impl Ui {
                 let name = self.log_source(key.code == KeyCode::Char('['))?;
                 Some(self.open_logs(name))
             }
-            KeyCode::Char(c @ '1'..='7') => Some(self.navigate(c as usize - '1' as usize)),
+            KeyCode::Char(c @ '1'..='8') => Some(self.navigate(page_at(c as usize - '1' as usize))),
             KeyCode::Char(':') => {
                 self.palette = Some(Palette::default());
                 Some(Input::Idle)
@@ -363,7 +444,7 @@ impl Ui {
         let Some(row) = self.active_proxy() else {
             let mut spans = brand;
             spans.push(Span::styled(
-                t("No profile yet · 6 then n to create one"),
+                t("No profile yet · 7 then n to create one"),
                 muted,
             ));
             f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -571,12 +652,17 @@ impl Ui {
     }
     fn render_page_bar(&self, f: &mut Frame<'_>, area: Rect) {
         let mut x = area.x + 1;
-        let compact = area.width < 72;
-        for (index, page) in PAGES.iter().enumerate() {
-            let label = if compact && index != self.page {
+        let full_width: usize = PAGES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, title))| Line::from(format!(" {} {} ", i + 1, t(title))).width() + 1)
+            .sum();
+        let compact = full_width + 1 > area.width as usize;
+        for (index, &(page, title)) in PAGES.iter().enumerate() {
+            let label = if compact && page != self.page {
                 format!(" {} ", index + 1)
             } else {
-                format!(" {} {} ", index + 1, t(page))
+                format!(" {} {} ", index + 1, t(title))
             };
             let width = Line::from(label.as_str()).width() as u16;
             let rect = Rect::new(x, area.y, width, 1).intersection(area);
@@ -587,7 +673,7 @@ impl Ui {
                             .bg(Color::Cyan)
                             .fg(Color::Black)
                             .add_modifier(Modifier::BOLD)
-                    } else if index == self.page {
+                    } else if page == self.page {
                         Style::default()
                             .bg(BLUE)
                             .fg(Color::White)
@@ -598,7 +684,7 @@ impl Ui {
                 ),
                 rect,
             );
-            self.hit(rect, Target::Page(index));
+            self.hit(rect, Target::Page(page));
             x = x.saturating_add(width + 1);
         }
     }
@@ -622,6 +708,7 @@ impl Ui {
                 OVERVIEW => "e edit · L logs · ? help",
                 PROXIES => "↑↓ group · Enter members · / find · t test · D node tests · U update subscriptions",
                 CONNECTIONS => "↑↓ select · / filter · x close · X close all · Esc clear filter",
+                DNS => "↑↓ select · Enter details · / filter · Space pause · Esc back",
                 RULES => "t test a route · / search rules · e edit rules",
                 LOGS => "Enter open · [ proxy log · ] rule core log · F7 TUI log",
                 SETTINGS => "↑↓ select · ←→ change · PgUp/PgDn scroll · Home top · r refresh",

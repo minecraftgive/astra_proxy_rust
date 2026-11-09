@@ -94,7 +94,10 @@ pub fn handle(root: &Path, max: u64, command: ArtifactCommand) -> Result<Respons
                 let existing = load(&meta)?;
                 anyhow::ensure!(
                     existing.size == size && existing.sha256.eq_ignore_ascii_case(&sha256),
-                    "Conflict: artifact ID identifies different content"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: artifact ID identifies different content"
+                    )
                 );
                 return Ok(ResponseBody::Artifact(existing));
             }
@@ -163,17 +166,29 @@ pub fn handle(root: &Path, max: u64, command: ArtifactCommand) -> Result<Respons
             if offset < received {
                 anyhow::ensure!(
                     end <= received,
-                    "Conflict: overlapping chunk extends past persisted cursor"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: overlapping chunk extends past persisted cursor"
+                    )
                 );
                 file.seek(SeekFrom::Start(offset))?;
                 let mut previous = vec![0; bytes.len()];
                 file.read_exact(&mut previous)?;
                 anyhow::ensure!(
                     previous == bytes,
-                    "Conflict: retried chunk contains different data"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: retried chunk contains different data"
+                    )
                 );
             } else {
-                anyhow::ensure!(offset == received, "Conflict: artifact cursor changed");
+                anyhow::ensure!(
+                    offset == received,
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: artifact cursor changed"
+                    )
+                );
                 // A crash after bytes but before metadata is safe: replay rewrites the same offset.
                 file.seek(SeekFrom::Start(offset))?;
                 file.write_all(&bytes)?;

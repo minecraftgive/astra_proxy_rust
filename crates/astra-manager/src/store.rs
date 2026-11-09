@@ -1,11 +1,59 @@
 //! Durable operation identities and revision-checked drafts, owned by the executing agent.
 use anyhow::{Context, Result};
+mod network;
 use astra_management::v2::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{path::Path, time::Duration};
 
 // Pin rusqlite's current default rather than depend on a changeable library policy.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The caller's confirmed completion disposition, independent of display text.
+#[derive(Debug, Clone)]
+pub enum FinishOutcome {
+    Complete,
+    Failed(String),
+    OutcomeUnknown(String),
+}
+
+impl FinishOutcome {
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        let message = format!("{error:#}");
+        if matches!(crate::error::code(error), ErrorCode::OutcomeUnknown) {
+            Self::OutcomeUnknown(message)
+        } else {
+            Self::Failed(message)
+        }
+    }
+}
+
+fn missing_row(error: rusqlite::Error, message: &'static str) -> anyhow::Error {
+    if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+        crate::error::classified(ErrorCode::NotFound, error.into()).context(message)
+    } else {
+        error.into()
+    }
+}
+
+fn operation_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 160,
+        crate::error::message(ErrorCode::InvalidRequest, "invalid operation ID")
+    );
+    Ok(())
+}
+
+fn draft_revision(revision: &str) -> Result<i64> {
+    let revision = revision
+        .parse::<i64>()
+        .map_err(|error| crate::error::classified(ErrorCode::InvalidRequest, error.into()))
+        .context("invalid draft revision")?;
+    anyhow::ensure!(
+        revision >= 0,
+        crate::error::message(ErrorCode::InvalidRequest, "invalid draft revision")
+    );
+    Ok(revision)
+}
 
 // A clearly invalid nonempty header can be rejected without letting SQLite
 // reconstruct an existing WAL index. Empty/new databases and active WALs are
@@ -98,6 +146,7 @@ impl Store {
                 params![id, serde_json::to_string(&task)?],
             )?;
         }
+        store.initialize_network()?;
         store.db.set_db_config(
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             false,
@@ -105,7 +154,7 @@ impl Store {
         Ok(store)
     }
     pub fn begin(&self, id: &str, fingerprint: &str) -> Result<Option<ResponseBody>> {
-        anyhow::ensure!(!id.is_empty() && id.len() <= 160, "invalid operation ID");
+        operation_id(id)?;
         let previous: Option<(String, String, Option<String>)> = self
             .db
             .query_row(
@@ -117,7 +166,10 @@ impl Store {
         if let Some((previous, task, response)) = previous {
             anyhow::ensure!(
                 previous == fingerprint,
-                "Conflict: operation ID already identifies different input"
+                crate::error::message(
+                    ErrorCode::Conflict,
+                    "operation ID already identifies different input"
+                )
             );
             return Ok(Some(match response {
                 Some(text) => serde_json::from_str(&text)?,
@@ -142,18 +194,24 @@ impl Store {
         &self,
         id: &str,
         result: Option<&ResponseBody>,
-        error: Option<&str>,
+        outcome: FinishOutcome,
     ) -> Result<()> {
         let mut task = self.task(id)?;
-        task.state =
-            if error.is_some_and(|e| e.contains("outcome unknown") || e.contains("not replayed")) {
-                TaskState::OutcomeUnknown
-            } else if error.is_some() {
-                TaskState::Failed
-            } else {
-                TaskState::Complete
-            };
-        task.message = error.map(str::to_owned).unwrap_or_else(|| match result {
+        let error = match outcome {
+            FinishOutcome::Complete => {
+                task.state = TaskState::Complete;
+                None
+            }
+            FinishOutcome::Failed(message) => {
+                task.state = TaskState::Failed;
+                Some(message)
+            }
+            FinishOutcome::OutcomeUnknown(message) => {
+                task.state = TaskState::OutcomeUnknown;
+                Some(message)
+            }
+        };
+        task.message = error.clone().unwrap_or_else(|| match result {
             Some(ResponseBody::Draft(draft)) => draft
                 .last_save
                 .as_ref()
@@ -211,7 +269,7 @@ impl Store {
             .query_row("SELECT task FROM operations WHERE id=?1", [id], |r| {
                 r.get(0)
             })
-            .context("operation not found")?;
+            .map_err(|error| missing_row(error, "operation not found"))?;
         Ok(serde_json::from_str(&value)?)
     }
     pub fn identity(&self, name: &str) -> Result<String> {
@@ -267,7 +325,17 @@ impl Store {
         let after = after
             .unwrap_or("0")
             .parse::<i64>()
+            .map_err(|error| crate::error::classified(ErrorCode::InvalidRequest, error.into()))
             .context("invalid event cursor")?;
+        anyhow::ensure!(
+            after >= 0,
+            crate::error::message(ErrorCode::InvalidRequest, "invalid event cursor")
+        );
+        let floor: i64 =
+            self.db
+                .query_row("SELECT floor FROM event_retention WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
         let first: i64 =
             self.db
                 .query_row("SELECT COALESCE(MIN(sequence),0) FROM events", [], |r| {
@@ -313,18 +381,21 @@ impl Store {
         Ok(EventBatch {
             events,
             cursor,
-            resync_required: after > 0 && first > after + 1,
+            resync_required: after > 0 && (first > after.saturating_add(1) || after < floor),
         })
     }
     pub fn draft(&self, id: &str) -> Result<Draft> {
         let text: String = self
             .db
             .query_row("SELECT body FROM drafts WHERE id=?1", [id], |r| r.get(0))
-            .context("draft not found")?;
+            .map_err(|error| missing_row(error, "draft not found"))?;
         Ok(serde_json::from_str(&text)?)
     }
     pub fn open_draft(&self, id: String, doc: Document) -> Result<Draft> {
-        anyhow::ensure!(!id.is_empty() && id.len() <= 160, "invalid draft ID");
+        anyhow::ensure!(
+            !id.is_empty() && id.len() <= 160,
+            crate::error::message(ErrorCode::InvalidRequest, "invalid draft ID")
+        );
         let previous: Option<String> = self
             .db
             .query_row("SELECT body FROM drafts WHERE id=?1", [&id], |row| {
@@ -336,7 +407,7 @@ impl Store {
                 .context("Saved draft cannot be read; original record is retained")?;
             anyhow::ensure!(
                 existing.instance == doc.instance && existing.path == doc.path,
-                "Conflict: draft belongs to another document"
+                crate::error::message(ErrorCode::Conflict, "draft belongs to another document")
             );
             return Ok(existing);
         }
@@ -358,10 +429,12 @@ impl Store {
         Ok(draft)
     }
     pub fn replace_draft(&self, mut draft: Draft, expected: &str) -> Result<Draft> {
-        let previous = expected.parse::<i64>().context("invalid draft revision")?;
+        let previous = draft_revision(expected)?;
         draft.revision = previous
             .checked_add(1)
-            .context("draft revision overflow")?
+            .ok_or_else(|| {
+                crate::error::message(ErrorCode::InvalidRequest, "draft revision overflow")
+            })?
             .to_string();
         let changed = self.db.execute(
             "UPDATE drafts SET revision=?2,body=?3 WHERE id=?1 AND revision=?4",
@@ -372,15 +445,21 @@ impl Store {
                 previous
             ],
         )?;
-        anyhow::ensure!(changed == 1, "Conflict: draft changed in another frontend");
+        anyhow::ensure!(
+            changed == 1,
+            crate::error::message(ErrorCode::Conflict, "draft changed in another frontend")
+        );
         Ok(draft)
     }
     pub fn discard(&self, id: &str, revision: &str) -> Result<()> {
         let count = self.db.execute(
             "DELETE FROM drafts WHERE id=?1 AND revision=?2",
-            params![id, revision.parse::<i64>()?],
+            params![id, draft_revision(revision)?],
         )?;
-        anyhow::ensure!(count == 1, "Conflict: draft changed or was already removed");
+        anyhow::ensure!(
+            count == 1,
+            crate::error::message(ErrorCode::Conflict, "draft changed or was already removed")
+        );
         Ok(())
     }
     pub fn servers(&self) -> Result<Vec<(String, std::path::PathBuf)>> {
@@ -412,7 +491,7 @@ impl Store {
                 "UPDATE servers SET config=?2 WHERE name=?1",
                 params![name, path.to_string_lossy()]
             )? == 1,
-            "server not found"
+            crate::error::message(ErrorCode::NotFound, "server not found")
         );
         Ok(())
     }
@@ -437,6 +516,7 @@ impl Store {
             .collect()
     }
     pub fn route(&self, operation: &str, agent: &str, request: &str, state: &str) -> Result<()> {
+        operation_id(operation)?;
         let prior: Option<String> = self
             .db
             .query_row(
@@ -447,7 +527,10 @@ impl Store {
             .optional()?;
         anyhow::ensure!(
             prior.as_deref().is_none_or(|owner| owner == agent),
-            "Conflict: operation ID already belongs to another agent"
+            crate::error::message(
+                ErrorCode::Conflict,
+                "operation ID already belongs to another agent"
+            )
         );
         self.db.execute("INSERT INTO controller_routes(operation_id,agent_id,request_id,state,updated_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(operation_id) DO UPDATE SET request_id=excluded.request_id,state=excluded.state,updated_ms=excluded.updated_ms",params![operation,agent,request,state,now()])?;
         Ok(())
@@ -464,3 +547,11 @@ pub fn revision(text: &str) -> String {
 #[cfg(test)]
 #[path = "test/store_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "test/network_store_test.rs"]
+mod network_tests;
+
+#[cfg(test)]
+#[path = "test/storage_error_test.rs"]
+mod error_tests;

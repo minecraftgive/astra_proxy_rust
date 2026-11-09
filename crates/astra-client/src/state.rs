@@ -380,6 +380,7 @@ pub struct Client {
     pub binding_picker: Option<BindingPicker>,
     pub last_find: String,
     pub live_state: crate::live::State,
+    pub dns_state: crate::dns::State,
     pub notice_since: std::cell::RefCell<HashMap<String, Instant>>,
     pub notice_expiry: std::cell::Cell<Option<Instant>>,
     pub installation: crate::installation::State,
@@ -466,6 +467,7 @@ impl Client {
             binding_picker: None,
             last_find: String::new(),
             live_state: Default::default(),
+            dns_state: Default::default(),
             notice_since: Default::default(),
             notice_expiry: Default::default(),
 
@@ -702,6 +704,7 @@ impl Client {
     pub fn reset_runtime_identity(&mut self) {
         self.pending_proxy_selection = None;
         self.live_state = Default::default();
+        self.dns_state = Default::default();
         self.connection_selection = 0;
         self.runtime_instance.clear();
         self.runtime_snapshot = None;
@@ -930,7 +933,7 @@ impl Client {
         if scope == Scope::Editor && self.editor.is_none() {
             return Some("Open a configuration first");
         }
-        if scope == Scope::Live && !matches!(self.page, 0 | 2 | 4) {
+        if scope == Scope::Live && !matches!(self.page, 0 | 2 | 4 | crate::navigation::DNS) {
             return Some("Open connections or logs first");
         }
         match id {
@@ -1210,6 +1213,10 @@ impl Client {
             Id::NextMatch | Id::PreviousMatch => self.find_next(id == Id::PreviousMatch),
             Id::Window => self.detach_current(),
             Id::Pause => {
+                if self.page == crate::navigation::DNS && self.viewer.is_none() {
+                    self.toggle_dns_pause();
+                    return Input::Idle;
+                }
                 if let Some(viewer) = &mut self.viewer {
                     viewer.toggle_pause();
                     Input::Idle

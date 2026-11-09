@@ -144,7 +144,7 @@ fn failed_or_uncertain_updates_never_become_successful_tasks() {
             .finish(
                 "update",
                 Some(&ResponseBody::UpdateStatus(Box::new(status))),
-                None,
+                FinishOutcome::Complete,
             )
             .unwrap();
         let task = serde_json::to_value(store.task("update").unwrap()).unwrap();
@@ -179,11 +179,14 @@ fn progress_events_expose_objects_instead_of_nested_json_strings() {
 fn operation_route_cannot_change_agents() {
     let store = memory();
     store.route("op", "a", "request1", "forwarding").unwrap();
-    assert!(store
-        .route("op", "b", "request2", "forwarding")
-        .unwrap_err()
-        .to_string()
-        .starts_with("Conflict:"));
+    assert!(matches!(
+        crate::error::code(
+            &store
+                .route("op", "b", "request2", "forwarding")
+                .unwrap_err()
+        ),
+        ErrorCode::Conflict
+    ));
     let agent: String = store
         .db
         .query_row(
@@ -209,7 +212,7 @@ fn operations_never_reexecute_and_reject_changed_identity() {
         Some(&ResponseBody::Done {
             message: "done".into(),
         }),
-        None,
+        FinishOutcome::Complete,
     )
     .unwrap();
     assert!(matches!(

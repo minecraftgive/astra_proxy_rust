@@ -39,6 +39,7 @@ pub struct Resolver {
     cache: Mutex<HashMap<Vec<u8>, Cached>>,
     permits: Arc<Semaphore>,
     requests: Arc<Semaphore>,
+    query_log: Arc<super::query_log::Store>,
 }
 impl Resolver {
     pub fn new(config: Config) -> Result<Self> {
@@ -66,6 +67,7 @@ impl Resolver {
             config,
             mappings,
             cache: Mutex::new(HashMap::new()),
+            query_log: Default::default(),
         })
     }
     /// A reload keeps address ownership; changing fake ranges requires restart.
@@ -83,6 +85,7 @@ impl Resolver {
         reserved.extend(&self.reserved);
         previous.mappings.configure(&self.config, &reserved)?;
         self.reserved = reserved;
+        self.query_log = previous.query_log.clone();
         self.set_mapping_store(previous.mappings.clone())
     }
     /// Install a host-backed store before this resolver is shared with request
@@ -99,6 +102,12 @@ impl Resolver {
     }
     pub fn mapping_store(&self) -> Arc<dyn MappingStore> {
         self.mappings.clone()
+    }
+    pub fn lookup_fake(&self, ip: IpAddr) -> Result<Option<String>> {
+        if !self.config.enable || !self.config.fake_ip {
+            return Ok(None);
+        }
+        self.mappings.lookup_fake(ip)
     }
     pub fn restore(&self, ip: IpAddr) -> Result<Option<String>> {
         self.mappings.restore(&self.config, ip)
@@ -122,13 +131,29 @@ impl Resolver {
     pub fn is_fake(&self, ip: IpAddr) -> bool {
         self.config.fake_ip && Mappings::contains_fake(&self.config, ip)
     }
+    pub fn query_log(&self) -> astra_model::runtime::DnsQueryLog {
+        self.query_log.snapshot()
+    }
     pub async fn answer(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
         let operation = astra_observe::operation!("dns.answer", "DNS 应答");
-        let result = self.answer_inner(raw, transport).await;
+        let mut trace =
+            super::query_log::Query::new(&self.query_log, Message::from_vec(raw).ok().as_ref());
+        let result = self.answer_inner(raw, transport, &mut trace).await;
+        trace.finish(
+            result
+                .as_ref()
+                .map(|raw| Message::from_vec(raw).ok())
+                .map_err(|e| e.to_string()),
+        );
         operation.finish(result.is_ok());
         result
     }
-    async fn answer_inner(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
+    async fn answer_inner(
+        &self,
+        raw: &[u8],
+        transport: &dyn Transport,
+        trace: &mut super::query_log::Query,
+    ) -> Result<Vec<u8>> {
         let _request = self
             .requests
             .clone()
@@ -147,11 +172,13 @@ impl Resolver {
             .trim_end_matches('.')
             .to_ascii_lowercase();
         if q.query_type() == RecordType::AAAA && !self.config.ipv6 {
+            trace.source("ipv6_disabled");
             return Ok(wire::response(&query, ResponseCode::NoError).to_vec()?);
         }
         if self.config.use_fake(&domain) && !self.excluded.contains(&domain) {
             // Prevent HTTPS/SVCB address hints bypassing Fake IP domain routing.
             if matches!(q.query_type(), RecordType::HTTPS | RecordType::SVCB) {
+                trace.source("fake_ip");
                 astra_observe::counter!(
                     "dns.fake_ip.suppressed_hints",
                     "Fake-IP 屏蔽 HTTPS/SVCB 地址提示"
@@ -160,6 +187,7 @@ impl Resolver {
                 return Ok(wire::response(&query, ResponseCode::NoError).to_vec()?);
             }
             if matches!(q.query_type(), RecordType::A | RecordType::AAAA) {
+                trace.source("fake_ip");
                 let mut reply = wire::response(&query, ResponseCode::NoError);
                 if let Some(ip) = self.mappings.allocate(
                     &self.config,
@@ -182,7 +210,7 @@ impl Resolver {
                 return Ok(bytes);
             }
         }
-        Ok(self.real(&query, transport).await?.to_vec()?)
+        Ok(self.real(&query, transport, trace).await?.to_vec()?)
     }
     pub async fn lookup(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = name.parse() {
@@ -194,7 +222,16 @@ impl Resolver {
             if kind == RecordType::AAAA && !self.config.ipv6 {
                 continue;
             }
-            match self.real(&wire::query(name, kind)?, transport).await {
+            let query = wire::query(name, kind)?;
+            let mut trace = super::query_log::Query::new(&self.query_log, Some(&query));
+            let result = self.real(&query, transport, &mut trace).await;
+            trace.finish(
+                result
+                    .as_ref()
+                    .map(|reply| Some(reply.clone()))
+                    .map_err(|e| e.to_string()),
+            );
+            match result {
                 Ok(reply) => {
                     for record in reply.answers {
                         let ip = match record.data {
@@ -218,13 +255,23 @@ impl Resolver {
         }
         Ok(addresses)
     }
-    async fn real(&self, query: &Message, transport: &dyn Transport) -> Result<Message> {
+    async fn real(
+        &self,
+        query: &Message,
+        transport: &dyn Transport,
+        trace: &mut super::query_log::Query,
+    ) -> Result<Message> {
         let operation = astra_observe::operation!("dns.resolve", "DNS 真实解析（含缓存）");
-        let result = self.real_inner(query, transport).await;
+        let result = self.real_inner(query, transport, trace).await;
         operation.finish(result.is_ok());
         result
     }
-    async fn real_inner(&self, query: &Message, transport: &dyn Transport) -> Result<Message> {
+    async fn real_inner(
+        &self,
+        query: &Message,
+        transport: &dyn Transport,
+        trace: &mut super::query_log::Query,
+    ) -> Result<Message> {
         let mut normalized = query.clone();
         normalized.metadata.id = 0;
         let key = normalized.to_vec()?;
@@ -234,6 +281,7 @@ impl Resolver {
                 let age = entry.inserted.elapsed().as_secs();
                 if age < entry.ttl as u64 {
                     astra_observe::counter!("dns.cache.hits", "DNS 缓存命中").add(1);
+                    trace.source("cache");
                     let mut message = entry.message.clone();
                     message.metadata.id = query.metadata.id;
                     for record in message
@@ -277,6 +325,7 @@ impl Resolver {
                 .chain(&self.config.fallback)
             {
                 let upstream = Upstream::parse(raw)?;
+                trace.upstream(raw);
                 let packet = query.to_vec()?;
                 let attempt = astra_observe::operation!("dns.upstream", "DNS 上游交换");
                 let result = match tokio::time::timeout(

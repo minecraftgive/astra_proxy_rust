@@ -40,7 +40,10 @@ impl AgentService {
     pub(super) fn maintenance_gate(&self) -> Result<()> {
         anyhow::ensure!(
             !m::pending(&self.config.state_dir)?,
-            "Conflict: maintenance is pending; use its local recovery controls"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: maintenance is pending; use its local recovery controls"
+            )
         );
         Ok(())
     }
@@ -56,7 +59,10 @@ impl AgentService {
                 self.maintenance_gate()?;
                 anyhow::ensure!(
                     expected_epoch == self.identity.boot_id,
-                    "Conflict: manager changed before maintenance"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: manager changed before maintenance"
+                    )
                 );
                 let target = std::fs::canonicalize(target_directory)?;
                 let manifest = verify_target(&target, &expected_manifest_sha256)?;
@@ -167,6 +173,7 @@ impl AgentService {
                     candidates: Default::default(),
                 };
                 m::write(&record)?;
+                let _diagnostic_pause = self.diagnostics.pause().await?;
                 Ok(ResponseBody::MaintenanceStatus(Some(Box::new(record))))
             }
             LocalCommand::CancelMaintenance { operation_id } => {
@@ -369,7 +376,10 @@ impl AgentService {
         let record = m::read(&self.config.state_dir)?.context("No maintenance operation")?;
         anyhow::ensure!(
             record.operation_id == id,
-            "Conflict: maintenance operation changed"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: maintenance operation changed"
+            )
         );
         Ok(record)
     }

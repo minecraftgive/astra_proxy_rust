@@ -785,6 +785,31 @@ async fn run_inner(
             }
         })
     };
+    let lookup_current = current.clone();
+    let control = control
+        .with_capabilities(vec![
+            astra_model::control::NETWORK_DIAGNOSTICS_STREAM_CAPABILITY.into(),
+            astra_model::control::NETWORK_DIAGNOSTICS_PINNED_CAPABILITY.into(),
+            astra_model::control::NETWORK_DIAGNOSTICS_RESOLUTION_CAPABILITY.into(),
+        ])
+        .with_fake_ip_lookup(move |addresses| {
+            let app = lookup_current.load_full();
+            async move {
+                addresses
+                    .into_iter()
+                    .map(|address| {
+                        let domain = app
+                            .dns
+                            .as_ref()
+                            .map(|dns| dns.lookup_fake(address))
+                            .transpose()
+                            .map_err(|error| format!("{error:#}"))?
+                            .flatten();
+                        Ok(astra_model::control::FakeIpMapping { address, domain })
+                    })
+                    .collect()
+            }
+        });
     let service = control.run_with_runtime(
         |path| {
             let state = state.clone();

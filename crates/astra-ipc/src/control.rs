@@ -1,6 +1,9 @@
 //! Separate, owner-only management socket. Routing IPC remains unchanged.
+mod fake_ip;
+mod identity_wire;
 mod server;
 use astra_platform::platform::LocalListener as UnixListener;
+pub use fake_ip::{fake_ip_lookup, FakeIpLookupError, FakeIpLookupErrorKind};
 use serde::Serialize;
 use std::{io, path::PathBuf, time::Instant};
 use tokio::time::{timeout, Duration};
@@ -31,13 +34,40 @@ fn publish_applied(state: &arc_swap::ArcSwapOption<Applied>, path: &std::path::P
     })));
 }
 
+type FakeLookup = std::sync::Arc<
+    dyn Fn(
+            Vec<std::net::IpAddr>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<FakeIpMapping>, String>> + Send>,
+        > + Send
+        + Sync,
+>;
 pub struct Control {
     candidate: astra_platform::lifecycle::Candidate,
     listener: Option<UnixListener>,
     started: Instant,
+    capabilities: Vec<String>,
+    fake_lookup: Option<FakeLookup>,
 }
 
 impl Control {
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.capabilities.extend(capabilities);
+        self.capabilities.sort();
+        self.capabilities.dedup();
+        self
+    }
+    pub fn with_fake_ip_lookup<F, Fut>(mut self, lookup: F) -> Self
+    where
+        F: Fn(Vec<std::net::IpAddr>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<FakeIpMapping>, String>> + Send + 'static,
+    {
+        self.fake_lookup = Some(std::sync::Arc::new(move |addresses| {
+            Box::pin(lookup(addresses))
+        }));
+        self.capabilities.push(FAKE_IP_LOOKUP_CAPABILITY.into());
+        self
+    }
     /// Opt-in so existing standalone commands retain their behavior.
     pub fn from_env() -> io::Result<Self> {
         Self::bind(std::env::var_os("ASTRA_CONTROL_SOCKET").map(PathBuf::from))
@@ -60,6 +90,8 @@ impl Control {
             candidate,
             listener,
             started: Instant::now(),
+            capabilities: Vec::new(),
+            fake_lookup: None,
         })
     }
 
@@ -193,7 +225,8 @@ fn peer_pool(pool: &std::sync::Mutex<ControlPeers>) -> std::sync::MutexGuard<'_,
 }
 async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Result<Response> {
     let lane = match &command {
-        Command::Monitor
+        Command::FakeIpLookup { .. }
+        | Command::Monitor
         | Command::Status
         | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
         Command::GetConfig | Command::ExplainRoute(_) => 2,
@@ -247,22 +280,25 @@ pub async fn identity(path: &std::path::Path) -> io::Result<Identity> {
             },
         )
         .await?;
-        let identity: Identity = crate::receive_management(&mut stream).await.map_err(|error|io::Error::new(error.kind(),format!("Invalid lifecycle response; incompatible core protocol (expected {}): {error}",crate::API_VERSION)))?;
+        let frame = crate::receive_frame(&mut stream, 16 * 1024).await?;
+        let identity = identity_wire::decode(&frame)?;
         if identity.version != 1 || identity.process.pid != peer {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 "lifecycle identity does not match IPC peer",
             ));
         }
         Ok(identity)
     })
     .await
-    .map_err(io::Error::other)?
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "core identity timed out"))?
 }
 
 pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Status> {
     if matches!(
         command,
-        Command::Identity
+        Command::FakeIpLookup { .. }
+            | Command::Identity
             | Command::GetConfig
             | Command::ExplainRoute(_)
             | Command::Runtime(_)

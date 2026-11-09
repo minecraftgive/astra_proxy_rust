@@ -10,6 +10,7 @@ import Installation from "./components/Installation";
 import ProgramInfo from "./components/ProgramInfo";
 import NetworkRecovery from "./components/NetworkRecovery";
 import Monitor from "./components/Monitor";
+import NetworkTools from "./components/NetworkTools";
 import { Details, Empty, Table } from "./components/common";
 import {
   EXIT_INTERVAL,
@@ -31,6 +32,7 @@ const pages = [
   ["rules", "规则"],
   ["logs", "日志"],
   ["monitor", "监视器"],
+  ["network", "网络工具"],
   ["tasks", "任务"],
   ["settings", "设置"],
 ] as const;
@@ -406,9 +408,7 @@ export default function App() {
   const chain = current?.kind === "proxy" ? exitChain(runtime) : [];
   const exitNode = chain[chain.length - 1];
   const details = current?.details as
-    | { diagnostics_supported?: boolean }
-    | null
-    | undefined;
+    { diagnostics_supported?: boolean } | null | undefined;
   const probe = useExitProbe(
     authenticated &&
       online &&
@@ -586,6 +586,14 @@ export default function App() {
                 />
               )}
               {current && <NetworkRecovery details={current.details} />}
+              {page === "network" && (
+                <NetworkTools
+                  key={`${agent}/${selected}`}
+                  agent={agent}
+                  instance={selected}
+                  online={online}
+                />
+              )}
               {page === "monitor" && (
                 <Monitor
                   agent={agent}
@@ -1144,8 +1152,7 @@ export default function App() {
                       <span>
                         <strong>出口 TCP 延迟</strong>
                         <span className="muted">
-                          每次连接或切换节点都会测量一次经出口节点的
-                          TCP
+                          每次连接或切换节点都会测量一次经出口节点的 TCP
                           握手耗时。开启时按下方间隔重复测量，并在顶栏保留其位置。
                         </span>
                       </span>

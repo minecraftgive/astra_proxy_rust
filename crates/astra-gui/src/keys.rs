@@ -32,13 +32,20 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     let live = context("AstraLive && !Input && !AstraDialog");
     let editor = context("AstraEditor && !Input && !AstraDialog");
     let application = context("(Astra || AstraEditor) && !AstraDialog");
+    let outside_nettools = context("(Astra || AstraEditor) && !AstraDialog && !AstraNetTools");
     let non_input = context("(Astra || AstraEditor) && !Input && !AstraDialog");
     let mut bindings = Vec::new();
     let mut command_chords = std::collections::HashSet::new();
     for spec in SPECS {
         for chord in spec.key.split(" / ").filter(|key| !key.is_empty()) {
             let chord = chord.to_ascii_lowercase();
+            let nettools_reserved = chord.split('-').next_back().is_some_and(|key| {
+                key.strip_prefix('f')
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .is_some_and(|n| (1..=12).contains(&n))
+            }) || chord == "ctrl-p";
             let context = match spec.scope {
+                Scope::Global if nettools_reserved => &outside_nettools,
                 Scope::Editor => &editor,
                 Scope::Live => &live,
                 Scope::Global if chord.chars().count() == 1 || chord == "space" => &shell,

@@ -1,5 +1,9 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod elevation;
+mod legacy_network;
+mod nettool_environment;
+mod network;
+use legacy_network::pipe_events;
 mod probes;
 mod recovery;
 mod server;
@@ -190,7 +194,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
             && !name.eq_ignore_ascii_case("management")
             && !name.to_ascii_lowercase().starts_with("server-")
             && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
-        "instance name must contain 1..24 ASCII letters, digits, dash or underscore; manager, management and server-* are reserved"
+        crate::error::message(astra_management::v2::ErrorCode::InvalidRequest, "instance name must contain 1..24 ASCII letters, digits, dash or underscore; manager, management and server-* are reserved")
     );
     Ok(())
 }
@@ -311,25 +315,45 @@ impl DiagnosticPlan {
         output: &mut (impl tokio::io::AsyncWrite + Unpin),
     ) -> Result<()> {
         use astra_model::nettool::Event;
-        self.refresh().await?;
-        request.config = self.text;
+        let outbound = matches!(request.egress, astra_model::nettool::Egress::Outbound(_));
+        if outbound {
+            self.refresh().await?;
+            request.config = self.text;
+        } else {
+            // System/interface measurements do not need a profile or its
+            // cached nodes, relative assets, or group initialization.
+            request.config.clear();
+        }
         let payload = serde_json::to_vec(&request)?;
-        let running = self.running;
-        pipe_events(
-            (self.executable, self.runtime_dir),
-            "--nettool-stream",
-            self.config_path,
-            payload,
-            output,
-            "Update proxy core to use network tools",
-            |event: &mut Event| {
-                if let Event::Started { running_config, .. } = event {
-                    *running_config = running;
-                }
-                matches!(event, Event::Done)
-            },
-        )
-        .await
+        let running = self.running && outbound;
+        let mut environment = nettool_environment::Environment::new(&self.runtime_dir, !outbound)?;
+        let config_path = environment.absolute(&self.config_path)?;
+        let mut command = environment.command(&self.executable)?;
+        command
+            .arg("--nettool-stream")
+            .arg(config_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let result = async {
+            let mut child = environment.spawn(&mut command)?;
+            legacy_network::pipe_child_events(
+                &mut child,
+                payload,
+                output,
+                "Update proxy core to use network tools",
+                |event: &mut Event| {
+                    if let Event::Started { running_config, .. } = event {
+                        *running_config = running;
+                    }
+                    matches!(event, Event::Done)
+                },
+            )
+            .await
+        }
+        .await;
+        environment.finish(result)
     }
     async fn run(self) -> Result<Reply> {
         self.run_selection(None, false).await
@@ -346,124 +370,95 @@ impl DiagnosticPlan {
         list: bool,
         refresh: bool,
     ) -> Result<Reply> {
-        use tokio::io::AsyncWriteExt;
-        timeout(Duration::from_secs(70), async {
+        {
             if let Some((socket, pid)) = &self.control {
-                let snapshot = control::config_snapshot(socket).await
+                let snapshot = timeout(Duration::from_secs(5), control::config_snapshot(socket)).await.context("Active configuration timed out")?
                     .context("Read active configuration; update/restart the proxy core if snapshots are unavailable")?;
-                anyhow::ensure!(Some(snapshot.pid) == *pid, "Core PID changed; retry diagnostics");
-                anyhow::ensure!(snapshot.text.len() <= CONFIG_LIMIT, "Configuration exceeds 480 KiB");
+                anyhow::ensure!(
+                    Some(snapshot.pid) == *pid,
+                    "Core PID changed; retry diagnostics"
+                );
+                anyhow::ensure!(
+                    snapshot.text.len() <= CONFIG_LIMIT,
+                    "Configuration exceeds 480 KiB"
+                );
                 self.config_path = snapshot.path;
                 self.text = snapshot.text;
             }
             let selected = targets.is_some() || list;
             let payload = if selected {
-                serde_json::to_vec(&astra_model::diagnostics::Request { config: self.text, targets, list_targets: list })?
-            } else { self.text.into_bytes() };
+                serde_json::to_vec(&astra_model::diagnostics::Request {
+                    config: self.text,
+                    targets,
+                    list_targets: list,
+                })?
+            } else {
+                self.text.into_bytes()
+            };
             // A stopped core has no inherited instance log. Redirect stderr
             // directly so progress remains visible even if the job times out.
             let refresh_log = if refresh {
-                match OpenOptions::new().create(true).append(true).mode(0o600).open(&self.log_path) {
+                match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(&self.log_path)
+                {
                     Ok(log) => Some(log),
                     Err(error) => {
                         eprintln!("Subscription refresh log could not be opened: {error}");
                         None
                     }
                 }
-            } else { None };
+            } else {
+                None
+            };
             let redirected = refresh_log.is_some();
             let mut child = core_process(self.executable, &self.runtime_dir)
-                .arg(if refresh { "--refresh-subscriptions-stdin" } else if selected { "--diagnose-request" } else { "--diagnose-stdin" }).arg(self.config_path)
-                .stdin(Stdio::piped()).stdout(Stdio::piped())
+                .arg(if refresh {
+                    "--refresh-subscriptions-stdin"
+                } else if selected {
+                    "--diagnose-request"
+                } else {
+                    "--diagnose-stdin"
+                })
+                .arg(self.config_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .stderr(refresh_log.map(Stdio::from).unwrap_or_else(Stdio::piped))
-                .kill_on_drop(true).spawn()?;
-            let mut input = child.stdin.take().context("Missing diagnostic input")?;
-            input.write_all(&payload).await?;
-            drop(input);
-            let output = child.wait_with_output().await?;
+                .kill_on_drop(true)
+                .spawn()?;
+            let output = legacy_network::collect(&mut child, payload).await?;
             anyhow::ensure!(
                 output.status.success(),
                 "Diagnostic core failed: {}",
-                if redirected { log_tail(&self.log_path, 4096) } else {
-                    String::from_utf8_lossy(&output.stderr[output.stderr.len().saturating_sub(4096)..]).into_owned()
+                if redirected {
+                    log_tail(&self.log_path, 4096)
+                } else {
+                    String::from_utf8_lossy(
+                        &output.stderr[output.stderr.len().saturating_sub(4096)..],
+                    )
+                    .into_owned()
                 }
             );
             anyhow::ensure!(
                 output.stdout.len() < 900 * 1024,
                 "Diagnostic report exceeds limit"
             );
-            if refresh { return Ok(Reply::text(String::from_utf8(output.stdout)?)); }
+            if refresh {
+                return Ok(Reply::text(String::from_utf8(output.stdout)?));
+            }
             if list {
                 let targets: Vec<String> = serde_json::from_slice(&output.stdout)?;
                 return Ok(Reply::text(serde_json::to_string(&targets)?));
             }
-            let mut report: astra_model::diagnostics::Report = serde_json::from_slice(&output.stdout)
-                .context("Update the proxy core to use diagnostics")?;
+            let mut report: astra_model::diagnostics::Report =
+                serde_json::from_slice(&output.stdout)
+                    .context("Update the proxy core to use diagnostics")?;
             report.running_config = self.running;
             Ok(Reply::text(serde_json::to_string(&report)?))
-        })
-        .await
-        .context("Diagnostic core timed out")?
-    }
-}
-
-/// Relay one JSON event per line from a short-lived core; `done` marks the final event.
-async fn pipe_events<E: serde::de::DeserializeOwned + Serialize>(
-    (executable, runtime_dir): (PathBuf, PathBuf),
-    flag: &str,
-    config_path: PathBuf,
-    payload: Vec<u8>,
-    output: &mut (impl tokio::io::AsyncWrite + Unpin),
-    outdated: &'static str,
-    mut done: impl FnMut(&mut E) -> bool,
-) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    let mut child = core_process(executable, &runtime_dir)
-        .arg(flag)
-        .arg(config_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut input = child.stdin.take().context("Missing diagnostic input")?;
-    input.write_all(&payload).await?;
-    drop(input);
-    let stderr = child.stderr.take().context("Missing diagnostic errors")?;
-    let errors = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let _ = stderr.take(4096).read_to_end(&mut bytes).await;
-        bytes
-    });
-    let mut reader = BufReader::new(child.stdout.take().context("Missing diagnostic output")?);
-    let mut last = None;
-    for _ in 0..20000 {
-        let mut line = String::new();
-        if (&mut reader).take(1024 * 1024).read_line(&mut line).await? == 0 {
-            break;
         }
-        anyhow::ensure!(line.ends_with('\n'), "Diagnostic event exceeds limit");
-        let mut event: E = serde_json::from_str(&line).context(outdated)?;
-        if done(&mut event) {
-            last = Some(event);
-            break;
-        }
-        timeout(
-            Duration::from_secs(2),
-            astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&event)?)),
-        )
-        .await??;
     }
-    let status = child.wait().await?;
-    let errors = String::from_utf8_lossy(&errors.await?).into_owned();
-    anyhow::ensure!(
-        status.success(),
-        "Diagnostic core failed: {}",
-        errors.trim()
-    );
-    let last = last.context("Diagnostic stream ended before completion")?;
-    astra_ipc::send_management(output, &Reply::text(serde_json::to_string(&last)?)).await?;
-    Ok(())
 }
 
 fn core_process(path: PathBuf, runtime_dir: &Path) -> Process {
@@ -711,7 +706,12 @@ impl Manager {
             .iter()
             .find(|i| i.name == name)
             .cloned()
-            .context("Unknown instance")
+            .ok_or_else(|| {
+                crate::error::message(
+                    astra_management::v2::ErrorCode::NotFound,
+                    "Unknown instance",
+                )
+            })
     }
     fn socket(&self, name: &str) -> PathBuf {
         self.home.join(format!("{name}.sock"))
@@ -1557,13 +1557,19 @@ impl Manager {
         let instance = self.instance(&name)?;
         anyhow::ensure!(
             read_config(&instance.config)? == original,
-            "Conflict: file changed on disk; reopen before editing"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: file changed on disk; reopen before editing"
+            )
         );
         self.validate_text(instance.kind, &instance.config, &text)
             .await?;
         anyhow::ensure!(
             read_config(&instance.config)? == original,
-            "Conflict: file changed during validation; reopen before editing"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: file changed during validation; reopen before editing"
+            )
         );
         astra_ipc::progress::report(
             "Save configuration",
@@ -1587,7 +1593,11 @@ impl Manager {
                 }
                 let mut failure=outcome(SaveState::Restored,Some(false),Some(false),format!("Reload failed: {error:#}; original file and runtime restored; draft retained"));
                 failure.recovery = Some("Previous source and runtime confirmed".into());
-                return Err(crate::save::SaveFailure { outcome: failure }.into());
+                return Err(crate::save::SaveFailure {
+                    outcome: failure,
+                    source: None,
+                }
+                .into());
             }
         }
         let message = if !running {

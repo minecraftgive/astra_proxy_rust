@@ -8,6 +8,10 @@ use ts_rs::TS;
 
 mod installation;
 pub use installation::*;
+mod network;
+pub use network::*;
+mod core_network;
+pub use core_network::*;
 
 pub const VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -47,9 +51,19 @@ pub enum RequestBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Query {
+    NetworkCore {
+        instance: String,
+    },
+    FakeIpLookup {
+        instance: String,
+        #[cfg_attr(feature = "bindings", ts(type = "string[]"))]
+        addresses: Vec<std::net::IpAddr>,
+    },
     MaintenanceStatus,
     Hello,
     ProgramInfo,
+    /// Read-only OS snapshot from the target Agent, never the frontend host.
+    NetworkState,
     InstallationStatus,
     Agents,
     Instances,
@@ -107,6 +121,10 @@ pub enum Query {
     },
     Task {
         operation_id: String,
+    },
+    NetworkReport {
+        operation_id: String,
+        cursor: Option<String>,
     },
     Events {
         after: Option<String>,
@@ -211,6 +229,15 @@ pub enum Command {
         instance: String,
         request: NetToolRequest,
     },
+    /// Accepted asynchronously; query NetworkReport for progress and the outcome.
+    NetworkDiagnostics {
+        instance: String,
+        request: NetworkDiagnosticsRequest,
+    },
+    NetworkDiagnosticsBatch {
+        instance: String,
+        request: NetworkBatchRequest,
+    },
     Update {
         #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
         request: crate::updates::UpdateRequest,
@@ -245,9 +272,7 @@ pub enum RuntimeCommand {
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetToolRequest {
-    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub egress: astra_model::nettool::Egress,
-    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub probe: astra_model::nettool::Probe,
     pub count: u32,
     pub interval_ms: String,
@@ -274,6 +299,50 @@ impl From<astra_model::nettool::Request> for NetToolRequest {
             interval_ms: value.interval_ms.to_string(),
             timeout_ms: value.timeout_ms.to_string(),
         }
+    }
+}
+/// Versioned diagnostic envelope; legacy NetToolRequest stays wire-compatible.
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkDiagnosticsRequest {
+    #[serde(flatten)]
+    pub request: NetToolRequest,
+    #[serde(default)]
+    pub resolver: Option<String>,
+    #[serde(default)]
+    pub family: Option<astra_model::nettool::AddressFamily>,
+}
+impl NetworkDiagnosticsRequest {
+    pub fn into_core(self) -> anyhow::Result<astra_model::nettool::DetailedRequest> {
+        let mut detailed: astra_model::nettool::DetailedRequest = self.request.into_core()?.into();
+        detailed.resolver = self.resolver;
+        detailed.family = self.family;
+        Ok(detailed)
+    }
+}
+impl From<NetToolRequest> for NetworkDiagnosticsRequest {
+    fn from(request: NetToolRequest) -> Self {
+        Self {
+            request,
+            resolver: None,
+            family: None,
+        }
+    }
+}
+impl From<astra_model::nettool::Request> for NetworkDiagnosticsRequest {
+    fn from(request: astra_model::nettool::Request) -> Self {
+        NetToolRequest::from(request).into()
+    }
+}
+impl std::ops::Deref for NetworkDiagnosticsRequest {
+    type Target = NetToolRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+impl std::ops::DerefMut for NetworkDiagnosticsRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
     }
 }
 impl RuntimeCommand {
@@ -402,6 +471,8 @@ pub struct ApiError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
+    NetworkCore(NetworkCoreReply),
+    FakeIpLookup(FakeIpLookupReply),
     MaintenanceStatus(
         #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
         Option<Box<crate::maintenance::Record>>,
@@ -430,6 +501,8 @@ pub enum ResponseBody {
     ExitProbe(serde_json::Value),
     RouteExplanation(serde_json::Value),
     NetTool(Vec<serde_json::Value>),
+    NetworkReport(NetworkReport),
+    NetworkState(astra_model::network_state::Snapshot),
     LogLevel(
         #[cfg_attr(
             feature = "bindings",
@@ -769,3 +842,7 @@ pub fn browser_numbers(value: serde_json::Value) -> serde_json::Value {
         other => other,
     }
 }
+
+#[cfg(test)]
+#[path = "test/network_request_test.rs"]
+mod network_request_tests;

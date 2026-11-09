@@ -257,11 +257,14 @@ pub async fn run_config(mut config: ManagerConfig) -> Result<()> {
                 result=local=>result,
                 result=uplink=>result,
                 error=agent.database_closed()=>Err(error),
+                result=agent.retain_network()=>result,
             };
+            let diagnostic_cleanup = agent.stop_network().await;
             if !completed {
                 native.abort();
                 let _ = native.await;
             }
+            let _diagnostic_pause = diagnostic_cleanup?;
             if result.is_ok() {
                 agent.shutdown_servers().await?;
             }

@@ -29,18 +29,18 @@ impl Ui {
                     shell::duration(r.uptime)
                 )
             })
-            .unwrap_or_else(|| "Astra · Server · 6 Profiles → n Create".into());
+            .unwrap_or_else(|| "Astra · Server · 7 Profiles → n Create".into());
         let mut lines = vec![Line::styled(summary, Style::default().fg(Color::Cyan))];
         if area.height > 1 {
             lines.push(Line::raw(
-                "1 Overview · 2 Proxies · 3 Connections · 4 Rules · 5 Logs · 6 Profiles",
+                "1 Overview · 2 Proxies · 3 Connections · 4 DNS · 5 Rules · 6 Logs · 7 Profiles · 8 Settings",
             ));
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
     pub(super) fn render_server(&self, f: &mut Frame<'_>, area: Rect) {
         let Some(row) = self.selected() else {
-            f.render_widget(Paragraph::new("No server selected. Open Profiles (6), select Servers and press n to initialize a configuration.").wrap(Wrap{trim:false}).block(self.focused_card("Server",focus::Region::Main)),area);
+            f.render_widget(Paragraph::new("No server selected. Open Profiles (7), select Servers and press n to initialize a configuration.").wrap(Wrap{trim:false}).block(self.focused_card("Server",focus::Region::Main)),area);
             return;
         };
         let mut lines = vec![

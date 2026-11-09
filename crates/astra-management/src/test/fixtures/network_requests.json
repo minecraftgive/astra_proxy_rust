@@ -1,0 +1,182 @@
+[
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "dns",
+      "name": "example.test",
+      "record": "A",
+      "server": "tcp://192.0.2.53:53"
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "tcp",
+      "host": "example.test",
+      "port": 443
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "icmp",
+      "host": "192.0.2.1"
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "tcp_ports",
+      "host": "example.test",
+      "ports": [
+        80,
+        443
+      ]
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "tls",
+      "host": "192.0.2.1",
+      "port": 443,
+      "server_name": "example.test",
+      "compare_bundled": true
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "http",
+      "url": "https://example.test/",
+      "method": "HEAD",
+      "compare_bundled": false
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "https_ip",
+      "url": "https://example.test/ip",
+      "compare_bundled": false
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "stun",
+      "server": "stun:192.0.2.1:3478"
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "interface",
+      "name": "eth0"
+    },
+    "probe": {
+      "kind": "nat",
+      "request": {
+        "agent_id": "agent-test",
+        "interface_id": "eth0",
+        "family": "ipv4",
+        "servers": [
+          "192.0.2.1:3478"
+        ],
+        "advanced": false
+      }
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": null,
+    "egress": {
+      "kind": "interface",
+      "name": "eth0"
+    },
+    "probe": {
+      "kind": "trace",
+      "host": "192.0.2.1",
+      "max_hops": 30,
+      "probes_per_hop": 3
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  },
+  {
+    "resolver": null,
+    "family": "ipv6",
+    "egress": {
+      "kind": "system"
+    },
+    "probe": {
+      "kind": "ipv6",
+      "host": "2001:db8::1",
+      "port": 443
+    },
+    "count": 1,
+    "interval_ms": "0",
+    "timeout_ms": "1000"
+  }
+]

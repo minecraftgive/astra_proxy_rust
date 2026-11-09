@@ -11,6 +11,8 @@ pub const RULES: usize = 3;
 pub const LOGS: usize = 4;
 pub const PROFILES: usize = 5;
 pub const SETTINGS: usize = 6;
+/// Additional terminal page; the native GUI retains its existing page catalog.
+pub const DNS: usize = 7;
 pub const PAGES: [&str; 7] = [
     "Overview",
     "Proxies",
@@ -40,7 +42,7 @@ impl Client {
     }
     pub fn navigate(&mut self, page: usize) -> Input {
         self.suspend_editor();
-        let page = page.min(PAGES.len() - 1);
+        let page = page.min(DNS);
         if self.page == LOGS && page != LOGS {
             self.close_viewer();
         }
@@ -52,6 +54,10 @@ impl Client {
             self.reveal_selected_connection();
         }
         self.connection_filtering = false;
+        self.dns_state.filtering = false;
+        self.dns_state.query_open = false;
+        self.dns_state.status_open = false;
+        self.dns_state.detail = false;
         self.runtime_picker = None;
         if page == LOGS && self.viewer.is_none() {
             if let Some(name) = self.log_source(true) {

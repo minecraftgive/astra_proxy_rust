@@ -85,6 +85,10 @@ struct WorkerSample {
     snapshot: astra_model::runtime::Snapshot,
     #[serde(default)]
     node_totals: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    dns: Option<astra_model::runtime::DnsQueryLog>,
+    #[serde(default)]
+    dns_resolver: Option<astra_model::runtime::DnsResolverStatus>,
 }
 
 fn worker_sample(app: &App) -> WorkerSample {
@@ -97,6 +101,15 @@ fn worker_sample(app: &App) -> WorkerSample {
     WorkerSample {
         snapshot,
         node_totals: Some(nodes),
+        dns_resolver: Some(astra_model::runtime::DnsResolverStatus::from_config(
+            app.dns.as_ref().map(|dns| &dns.config),
+        )),
+        dns: Some(
+            app.dns
+                .as_ref()
+                .map(|dns| dns.query_log())
+                .unwrap_or_default(),
+        ),
     }
 }
 
@@ -928,6 +941,9 @@ impl Host {
         let mut health = BTreeMap::new();
         let now = traffic_history::minute();
         let mut node_coverage = true;
+        let mut dns_logs = Vec::new();
+        let mut dns_supported = None;
+        let mut dns_resolver = None;
         for (generation, result, sampled_at) in samples {
             health.insert(generation.id, result.is_ok().then_some(sampled_at));
             let mut stored = match self.checked_lock("generation telemetry", &generation.snapshot) {
@@ -935,6 +951,13 @@ impl Host {
                 Err(_) => return,
             };
             if let Ok(sample) = result {
+                if generation.id == active {
+                    dns_supported = Some(sample.dns.is_some());
+                    dns_resolver = Some(sample.dns_resolver);
+                }
+                if let Some(log) = sample.dns {
+                    dns_logs.push(log);
+                }
                 if let Some(nodes) = sample.node_totals {
                     self.traffic_history
                         .lock()
@@ -1007,6 +1030,10 @@ impl Host {
         }
         if let Ok(mut telemetry) = self.checked_lock("telemetry", &self.telemetry) {
             telemetry.publish(combined, health, origins);
+            telemetry.merge_dns(dns_logs, dns_supported);
+            if let Some(resolver) = dns_resolver {
+                telemetry.dns_resolver = resolver.map(Box::new);
+            }
             let mut history = self
                 .traffic_history
                 .lock()

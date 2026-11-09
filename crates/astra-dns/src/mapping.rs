@@ -24,6 +24,10 @@ pub trait MappingStore: Send + Sync {
         reserved: &HashSet<IpAddr>,
     ) -> Result<Option<IpAddr>>;
     fn restore(&self, config: &Config, ip: IpAddr) -> Result<Option<String>>;
+    /// Non-mutating diagnostic observation. Unknown and expired addresses return None.
+    fn lookup_fake(&self, _ip: IpAddr) -> Result<Option<String>> {
+        anyhow::bail!("This mapping backend does not support diagnostic observation")
+    }
     fn observe(&self, config: &Config, domain: &str, ip: IpAddr, ttl: u32) -> Result<()>;
 }
 
@@ -109,6 +113,18 @@ impl MappingStore for LocalMappingStore {
             .map_err(|_| anyhow::anyhow!("DNS mapping store is unavailable"))?;
         state.configure(config, &HashSet::new())?;
         state.mappings.reverse(config, ip)
+    }
+    fn lookup_fake(&self, ip: IpAddr) -> Result<Option<String>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DNS mapping store is unavailable"))?;
+        Ok(state
+            .mappings
+            .fake
+            .get(&ip)
+            .filter(|entry| entry.expires > Instant::now())
+            .map(|entry| entry.domain.clone()))
     }
     fn observe(&self, config: &Config, domain: &str, ip: IpAddr, ttl: u32) -> Result<()> {
         let mut state = self
@@ -263,5 +279,47 @@ impl Mappings {
                 domain: Some(domain.to_owned()),
                 expires,
             });
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn fake_lookup_requires_a_live_mapping_and_does_not_allocate_or_refresh() {
+        let store = LocalMappingStore::default();
+        let config = Config {
+            fake_ip: true,
+            ..Default::default()
+        };
+        let unknown = "198.18.0.2".parse().unwrap();
+        assert_eq!(store.lookup_fake(unknown).unwrap(), None);
+        let ip = store
+            .allocate(&config, "mapped.test", false, &HashSet::new())
+            .unwrap()
+            .unwrap();
+        let before = store.state.lock().unwrap().mappings.fake[&ip].expires;
+        assert_eq!(
+            store.lookup_fake(ip).unwrap().as_deref(),
+            Some("mapped.test")
+        );
+        assert_eq!(
+            store.state.lock().unwrap().mappings.fake[&ip].expires,
+            before
+        );
+        store
+            .state
+            .lock()
+            .unwrap()
+            .mappings
+            .fake
+            .get_mut(&ip)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        assert_eq!(store.lookup_fake(ip).unwrap(), None);
+        let real = "203.0.113.1".parse().unwrap();
+        store.observe(&config, "real.test", real, 60).unwrap();
+        assert_eq!(store.lookup_fake(real).unwrap(), None);
+        assert_eq!(store.state.lock().unwrap().mappings.fake.len(), 1);
     }
 }

@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+mod core_network;
 pub(crate) mod maintenance;
+mod network_admission;
+mod network_batch;
 #[cfg(test)]
 #[path = "test/agent_test.rs"]
 mod tests;
@@ -72,6 +75,8 @@ pub struct AgentService {
     pub identity: Agent,
     store: crate::database::Database,
     mutation: AsyncMutex<()>,
+    diagnostics: Arc<crate::network::Scheduler>,
+    network_state: astra_platform::network_snapshot::Sampler,
     capacity: tokio::sync::Semaphore,
     native: std::sync::OnceLock<crate::manager::NativeClient>,
     uncertain: std::sync::Mutex<std::collections::HashMap<String, Task>>,
@@ -102,6 +107,15 @@ impl Drop for ServerCandidate {
 }
 
 impl AgentService {
+    pub(crate) async fn retain_network(&self) -> Result<()> {
+        loop {
+            self.store.prune_network().await?;
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    }
+    pub(crate) async fn stop_network(&self) -> Result<crate::network::Pause> {
+        self.diagnostics.pause().await
+    }
     pub(crate) async fn database_closed(&self) -> anyhow::Error {
         self.store.closed().await
     }
@@ -130,11 +144,14 @@ impl AgentService {
             crate::atomic_write(&marker, b"2\n")?;
         }
         let capacity = tokio::sync::Semaphore::new(config.limits.concurrent_tasks.max(1));
+        let diagnostics = crate::network::Scheduler::new(store.clone(), config.state_dir.clone());
         Ok(Arc::new(Self {
             config,
             identity,
             store,
             mutation: AsyncMutex::new(()),
+            diagnostics,
+            network_state: Default::default(),
             capacity,
             native: std::sync::OnceLock::new(),
             uncertain: Default::default(),
@@ -154,6 +171,7 @@ impl AgentService {
             self.config.runtime_dir.clone(),
         )
         .await?;
+        client.attach_network_scheduler(self.diagnostics.clone())?;
         self.native
             .set(client)
             .map_err(|_| anyhow::anyhow!("Native actor already started"))?;
@@ -186,6 +204,11 @@ impl AgentService {
             .join(astra_platform::platform::executable("astra-server-core"))
     }
     pub async fn handle(&self, request: Request) -> Response {
+        // Keep the dispatch state out of callers such as the reconnect handshake.
+        // Windows' 1 MiB main stack otherwise overflows when nested futures poll.
+        Box::pin(self.handle_inner(request)).await
+    }
+    async fn handle_inner(&self, request: Request) -> Response {
         let id = request.id.clone();
         if request.version != VERSION {
             return Response::error(id, ErrorCode::VersionMismatch, "Management v2 is required");
@@ -204,19 +227,25 @@ impl AgentService {
                 operation_id,
                 command,
             } => {
+                if matches!(
+                    command,
+                    Command::NetworkDiagnostics { .. } | Command::NetworkDiagnosticsBatch { .. }
+                ) {
+                    return match self.submit_network(operation_id, command).await {
+                        Ok(task) => Response::success(id, ResponseBody::Task(task)),
+                        Err(error) => crate::error::response(id, error),
+                    };
+                }
                 if matches!(command, Command::CancelTask { .. }) {
                     return match self.execute(operation_id, command).await {
                         Ok(value) => Response::success(id, value),
-                        Err(error) => {
-                            Response::error(id, ErrorCode::InvalidRequest, error.to_string())
-                        }
+                        Err(error) => crate::error::response(id, error),
                     };
                 }
-                let _capacity = self
-                    .capacity
-                    .acquire()
-                    .await
-                    .expect("agent capacity never closed");
+                let _capacity = match self.capacity.acquire().await {
+                    Ok(permit) => permit,
+                    Err(error) => return crate::error::response(id, error.into()),
+                };
                 let _serial = self.mutation.lock().await;
                 match self.maintenance_gate() {
                     Ok(()) => self.execute(operation_id, command).await,
@@ -256,30 +285,7 @@ impl AgentService {
         };
         match result {
             Ok(value) => Response::success(id, value),
-            Err(error) => {
-                let message = format!("{error:#}");
-                let code = if message.starts_with("Conflict:") {
-                    ErrorCode::Conflict
-                } else if message.starts_with("RequiresLocalAction:") {
-                    ErrorCode::RequiresLocalAction
-                } else if message.starts_with("Unsupported:") {
-                    ErrorCode::Unsupported
-                } else if message.contains("outcome unknown") || message.contains("not replayed") {
-                    ErrorCode::OutcomeUnknown
-                } else if message.contains("not found") {
-                    ErrorCode::NotFound
-                } else {
-                    ErrorCode::Internal
-                };
-                let details = error
-                    .downcast_ref::<crate::save::SaveFailure>()
-                    .map(|failure| failure.outcome.clone());
-                let mut response = Response::error(id, code, message);
-                if let Err(error) = &mut response.result {
-                    error.details = details;
-                }
-                response
-            }
+            Err(error) => crate::error::response(id, error),
         }
     }
     pub async fn handle_remote(&self, request: Request) -> Response {
@@ -359,7 +365,9 @@ impl AgentService {
     }
     async fn query(&self, mut query: Query) -> Result<ResponseBody> {
         match &mut query {
-            Query::Runtime { instance }
+            Query::NetworkCore { instance }
+            | Query::FakeIpLookup { instance, .. }
+            | Query::Runtime { instance }
             | Query::Monitor { instance }
             | Query::Document { instance }
             | Query::Capabilities { instance }
@@ -375,6 +383,34 @@ impl AgentService {
             _ => {}
         }
         Ok(match query {
+            Query::NetworkCore { instance } => {
+                ResponseBody::NetworkCore(self.network_core(instance).await?)
+            }
+            Query::FakeIpLookup {
+                instance,
+                addresses,
+            } => ResponseBody::FakeIpLookup(self.fake_ip_lookup(instance, addresses).await?),
+            Query::NetworkState => {
+                ResponseBody::NetworkState(self.network_state.sample(&self.identity.id).await)
+            }
+            Query::NetworkReport {
+                operation_id,
+                cursor,
+            } => {
+                if let Some(error) = self.diagnostics.outcome_failure(&operation_id) {
+                    anyhow::bail!(crate::error::message(
+                        astra_management::v2::ErrorCode::OutcomeUnknown,
+                        format!(
+                            "outcome unknown: diagnostic outcome could not be persisted: {error}"
+                        )
+                    ));
+                }
+                ResponseBody::NetworkReport(
+                    self.store
+                        .network_report(&operation_id, cursor.as_deref())
+                        .await?,
+                )
+            }
             Query::MaintenanceStatus => ResponseBody::MaintenanceStatus(
                 astra_management::maintenance::read(&self.config.state_dir)?.map(Box::new),
             ),
@@ -391,6 +427,18 @@ impl AgentService {
                     "documents".into(),
                     "artifacts".into(),
                     "tasks".into(),
+                    NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+                    "network_state_v1".into(),
+                    "core_network_v1".into(),
+                    "network_diagnostics_system_tcp_dns_v1".into(),
+                    "network_diagnostics_dns_detail_v1".into(),
+                    "network_diagnostics_interface_ip_v1".into(),
+                    "network_diagnostics_resolution_v1".into(),
+                    "network_diagnostics_pinned_v1".into(),
+                    "network_diagnostics_tools_v1".into(),
+                    "network_diagnostics_nat_v1".into(),
+                    "network_diagnostics_path_v1".into(),
+                    NETWORK_BATCH_CAPABILITY.into(),
                     "monitor".into(),
                     "program_info".into(),
                     "installation".into(),
@@ -443,7 +491,9 @@ impl AgentService {
                     .await?
                     .into_iter()
                     .find(|i| i.name == instance || i.id == instance)
-                    .context("instance not found")?
+                    .ok_or_else(|| {
+                        crate::error::message(ErrorCode::NotFound, "instance not found")
+                    })?
                     .capabilities,
             ),
             Query::NodeTags { instance } => ResponseBody::NodeTags(serde_json::from_str(
@@ -486,7 +536,10 @@ impl AgentService {
             Query::LogLevel { instance } => {
                 anyhow::ensure!(
                     self.server_path(&instance).await?.is_none(),
-                    "Unsupported: server cores do not expose a configurable log capture level"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Unsupported,
+                        "Unsupported: server cores do not expose a configurable log capture level"
+                    )
                 );
                 ResponseBody::LogLevel(
                     self.call(old::Action::GetLogLevel(instance))
@@ -523,10 +576,15 @@ impl AgentService {
                         .rows
                         .into_iter()
                         .find(|r| r.instance.name == instance)
-                        .context("instance not found")?;
+                        .ok_or_else(|| {
+                            crate::error::message(ErrorCode::NotFound, "instance not found")
+                        })?;
                     anyhow::ensure!(
                         row.instance.kind == old::Kind::Proxy,
-                        "Unsupported: rule instances do not expose a proxy runtime snapshot"
+                        crate::error::message(
+                            astra_management::v2::ErrorCode::Unsupported,
+                            "Unsupported: rule instances do not expose a proxy runtime snapshot"
+                        )
                     );
                     ResponseBody::Runtime(RuntimeSnapshot::Client(browser_numbers(
                         self.native
@@ -577,7 +635,7 @@ impl AgentService {
                                 .rows
                                 .iter()
                                 .any(|r| r.instance.name == instance),
-                        "instance not found"
+                        crate::error::message(ErrorCode::NotFound, "instance not found")
                     );
                     let (reader, writer) = astra_platform::platform::stream_pair().await?;
                     tokio::spawn(crate::log_stream::serve(
@@ -624,6 +682,13 @@ impl AgentService {
             }
             Query::Tasks { limit } => {
                 let mut tasks = self.store.tasks(limit.unwrap_or(32)).await?;
+                for task in &mut tasks {
+                    if let Some(error) = self.diagnostics.outcome_failure(&task.id) {
+                        task.state = TaskState::OutcomeUnknown;
+                        task.message =
+                            format!("Diagnostic outcome could not be persisted: {error}");
+                    }
+                }
                 for task in self.uncertain.lock().unwrap().values() {
                     tasks.retain(|existing| existing.id != task.id);
                     tasks.push(task.clone());
@@ -642,6 +707,14 @@ impl AgentService {
                 )?)
             }
             Query::Task { operation_id } => {
+                if let Some(error) = self.diagnostics.outcome_failure(&operation_id) {
+                    anyhow::bail!(crate::error::message(
+                        astra_management::v2::ErrorCode::OutcomeUnknown,
+                        format!(
+                            "outcome unknown: diagnostic outcome could not be persisted: {error}"
+                        )
+                    ));
+                }
                 let uncertain = self.uncertain.lock().unwrap().get(&operation_id).cloned();
                 ResponseBody::Task(match uncertain {
                     Some(task) => task,
@@ -795,7 +868,7 @@ impl AgentService {
                 .rows
                 .into_iter()
                 .find(|r| r.instance.name == name)
-                .context("instance not found")?;
+                .ok_or_else(|| crate::error::message(ErrorCode::NotFound, "instance not found"))?;
             (
                 row.instance.config,
                 if row.instance.kind == old::Kind::Proxy {
@@ -814,6 +887,77 @@ impl AgentService {
             text,
             kind,
         })
+    }
+    async fn submit_network(&self, id: String, command: Command) -> Result<Task> {
+        if let Some(error) = self.diagnostics.outcome_failure(&id) {
+            anyhow::bail!(crate::error::message(
+                astra_management::v2::ErrorCode::OutcomeUnknown,
+                format!("outcome unknown: {error}")
+            ));
+        }
+        let fingerprint = store::revision(&serde_json::to_string(&command)?);
+        if let Some(task) = self.store.network_existing(&id, &fingerprint).await? {
+            return Ok(task);
+        }
+        if let Command::NetworkDiagnosticsBatch { instance, request } = command {
+            return self
+                .submit_network_batch(id, instance, request, fingerprint)
+                .await;
+        }
+        let Command::NetworkDiagnostics { instance, request } = command else {
+            unreachable!()
+        };
+        crate::network::validate(&request)?;
+        let selected = if let astra_model::nettool::Probe::Nat { request: nat } = &request.probe {
+            Some(self.validate_nat_interface(nat).await?)
+        } else {
+            None
+        };
+        let exclusive = selected.is_some();
+        let native = self.native.get().cloned();
+        let store = self.store.clone();
+        let scheduler = self.diagnostics.clone();
+        let agent_id = self.identity.id.clone();
+        self.diagnostics
+            .submit_mode(
+                id,
+                fingerprint,
+                exclusive,
+                move |output, cancel| async move {
+                    if let (Some(before), astra_model::nettool::Probe::Nat { request: nat }) =
+                        (&selected, &request.probe)
+                    {
+                        let snapshot = astra_platform::network_snapshot::Sampler::default()
+                            .sample(&agent_id)
+                            .await;
+                        let after =
+                            network_admission::physical_interface(nat, &snapshot, &agent_id)?;
+                        anyhow::ensure!(
+                            network_admission::same_interface(before, &after),
+                            "NAT physical interface changed while queued; choose it again"
+                        );
+                    }
+                    if *cancel.borrow() {
+                        return Ok(());
+                    }
+                    let _project = scheduler.project_permit().await?;
+                    let instance = store.resolve(&instance).await?;
+                    native
+                        .context("Native actor not initialized")?
+                        .network_diagnostic(&instance, request.into_core()?, output, cancel)
+                        .await
+                },
+            )
+            .await
+    }
+    async fn validate_nat_interface(
+        &self,
+        request: &astra_model::network_nat::Request,
+    ) -> Result<astra_model::network_state::Interface> {
+        let snapshot = astra_platform::network_snapshot::Sampler::default()
+            .sample(&self.identity.id)
+            .await;
+        network_admission::physical_interface(request, &snapshot, &self.identity.id)
     }
     async fn execute(&self, id: String, command: Command) -> Result<ResponseBody> {
         let fingerprint = store::revision(&serde_json::to_string(&command)?);
@@ -845,12 +989,19 @@ impl AgentService {
         result
     }
     async fn finish_operation(&self, id: &str, result: &Result<ResponseBody>) -> Result<()> {
-        let error = result.as_ref().err().map(|e| format!("{e:#}"));
-        if let Err(error) = self
-            .store
-            .finish(id, result.as_ref().ok(), error.as_deref())
-            .await
-        {
+        let outcome = result
+            .as_ref()
+            .err()
+            .map(store::FinishOutcome::from_error)
+            .unwrap_or(store::FinishOutcome::Complete);
+        // Cancellation receipts must not retain a second, unbudgeted copy of evidence.
+        let durable = result.as_ref().ok().map(|response| match response {
+            ResponseBody::NetworkReport(report) => {
+                ResponseBody::Cancellation(Cancellation::AlreadyFinished(report.message.clone()))
+            }
+            response => response.clone(),
+        });
+        if let Err(error) = self.store.finish(id, durable.as_ref(), outcome).await {
             let message = format!("outcome unknown for operation {id}: final result could not be persisted ({error:#}); query this operation before retrying");
             self.uncertain.lock().unwrap().insert(
                 id.into(),
@@ -862,11 +1013,23 @@ impl AgentService {
                     finished_ms: None,
                 },
             );
-            anyhow::bail!(message);
+            return Err(crate::error::message(ErrorCode::OutcomeUnknown, message));
         }
         Ok(())
     }
     async fn command(&self, mut command: Command, operation_id: &str) -> Result<ResponseBody> {
+        let _diagnostic_pause = if matches!(
+            &command,
+            Command::Update { .. }
+                | Command::UpdateArtifact { .. }
+                | Command::RecoverUpdate { .. }
+                | Command::InstallCurrentPackage { .. }
+                | Command::Shutdown
+        ) {
+            Some(self.diagnostics.pause().await?)
+        } else {
+            None
+        };
         match &mut command {
             Command::Remove { instance }
             | Command::Start { instance }
@@ -937,10 +1100,18 @@ impl AgentService {
                 .await??;
                 return Ok(ResponseBody::InstallationResult(result));
             }
+            Command::NetworkDiagnostics { .. } | Command::NetworkDiagnosticsBatch { .. } => {
+                anyhow::bail!("Network diagnostics must use the background scheduler")
+            }
             Command::CancelTask { operation_id } => {
+                if let Some(report) = self.diagnostics.cancel(&operation_id).await? {
+                    return Ok(ResponseBody::NetworkReport(report));
+                }
                 let task = self.store.task(&operation_id).await?;
                 return Ok(ResponseBody::Cancellation(
-                    if matches!(task.state, TaskState::Complete | TaskState::Failed) {
+                    if matches!(task.state, TaskState::Complete | TaskState::Failed)
+                        || self.store.network_terminal(&operation_id).await?
+                    {
                         Cancellation::AlreadyFinished(task.message)
                     } else {
                         Cancellation::UnsafeToCancel("This operation may already have external effects. Observe its durable task outcome; stopping observation does not stop any core.".into())
@@ -1025,7 +1196,7 @@ impl AgentService {
                         .context("Native actor not initialized")?
                         .enable_tun_without_uac(instance, expected_pid)
                         .await
-                        .map_err(|error| anyhow::anyhow!("RequiresLocalAction: target service could not enable TUN without interactive elevation: {error:#}"))?;
+                        .map_err(|error| crate::error::classified(ErrorCode::RequiresLocalAction, error.context("Target service could not enable TUN without interactive elevation")))?;
                     // A successful service handover returns a new PID. The
                     // actor verified expected_pid before replacing the core.
                     return Ok(ResponseBody::Runtime(RuntimeSnapshot::Client(
@@ -1126,6 +1297,15 @@ impl AgentService {
             Command::NetTool { instance, request } => {
                 let request = request.into_core()?;
                 anyhow::ensure!(
+                    matches!(
+                        request.probe,
+                        astra_model::nettool::Probe::Tcp { .. }
+                            | astra_model::nettool::Probe::Dns { .. }
+                            | astra_model::nettool::Probe::Icmp { .. }
+                    ),
+                    "Extended tools require NetworkDiagnostics"
+                );
+                anyhow::ensure!(
                     request.count <= 100
                         && request.timeout_ms <= 30000
                         && request.interval_ms <= 30000,
@@ -1180,17 +1360,28 @@ impl AgentService {
             Command::Shutdown => {
                 let mut failures = Vec::new();
                 if let Err(error) = self.shutdown_servers().await {
-                    failures.push(format!("servers: {error:#}"));
+                    failures.push(error.context("servers"));
                 }
                 let native = self.call(old::Action::Shutdown).await;
                 if let Err(error) = native {
-                    failures.push(format!("native instances: {error:#}"));
+                    failures.push(error.context("native instances"));
                 }
-                anyhow::ensure!(
-                    failures.is_empty(),
-                    "Shutdown incomplete: {}",
-                    failures.join("; ")
-                );
+                if let Some(position) = failures
+                    .iter()
+                    .position(|error| {
+                        matches!(crate::error::code(error), ErrorCode::OutcomeUnknown)
+                    })
+                    .or_else(|| (!failures.is_empty()).then_some(0))
+                {
+                    let message = failures
+                        .iter()
+                        .map(|error| format!("{error:#}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(failures
+                        .swap_remove(position)
+                        .context(format!("Shutdown incomplete: {message}")));
+                }
                 return Ok(ResponseBody::Done {
                     message: "All instances stopped".into(),
                 });
@@ -1228,7 +1419,10 @@ impl AgentService {
                 .await?
                 .iter()
                 .any(|i| i.name.eq_ignore_ascii_case(name)),
-            "Conflict: instance name already exists"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: instance name already exists"
+            )
         );
         Ok(())
     }
@@ -1268,9 +1462,10 @@ impl AgentService {
                 });
             }
             Command::SetLogLevel { .. } => {
-                anyhow::bail!(
+                anyhow::bail!(crate::error::message(
+                    astra_management::v2::ErrorCode::Unsupported,
                     "Unsupported: server cores do not expose a configurable log capture level"
-                );
+                ));
             }
             Command::SetConfig { path: new_path, .. } => {
                 let new_path = std::fs::canonicalize(new_path)?;
@@ -1305,7 +1500,10 @@ impl AgentService {
                 self.store.remove_server(name).await?;
                 self.store.forget_identity(name).await?;
             }
-            _ => anyhow::bail!("Unsupported server operation"),
+            _ => anyhow::bail!(crate::error::message(
+                ErrorCode::Unsupported,
+                "Unsupported server operation"
+            )),
         }
         Ok(ResponseBody::Done {
             message: "Server operation completed".into(),
@@ -1430,15 +1628,28 @@ impl AgentService {
             astra_management::server::Action::Reload { path: None },
         )
         .await?;
-        let identity = reply
-            .identity
-            .context("Reload response has no lifecycle identity")?;
+        let identity = reply.identity.ok_or_else(|| {
+            crate::error::message(
+                ErrorCode::OutcomeUnknown,
+                "Reload response has no lifecycle identity",
+            )
+        })?;
         anyhow::ensure!(
             identity.boot_id == previous.boot_id && identity.process == previous.process,
-            "Outcome unknown: server identity changed during reload"
+            crate::error::message(
+                ErrorCode::OutcomeUnknown,
+                "Outcome unknown: server identity changed during reload"
+            )
         );
-        astra_platform::storage::write_json(&self.server_record(name), &identity)
-            .context("Outcome unknown: reload completed but process record checkpoint failed")?;
+        astra_platform::storage::write_json(&self.server_record(name), &identity).map_err(
+            |error| {
+                crate::error::classified(
+                    ErrorCode::OutcomeUnknown,
+                    anyhow::Error::new(error)
+                        .context("Reload completed but process record checkpoint failed"),
+                )
+            },
+        )?;
         Ok(())
     }
     async fn verify_server(&self, name: &str) -> Result<astra_model::control::Identity> {
@@ -1600,7 +1811,10 @@ impl AgentService {
                 let mut draft = self.store.draft(&draft_id).await?;
                 anyhow::ensure!(
                     draft.revision == expected_revision,
-                    "Conflict: draft changed in another frontend"
+                    crate::error::message(
+                        astra_management::v2::ErrorCode::Conflict,
+                        "Conflict: draft changed in another frontend"
+                    )
                 );
                 let mut document = astra_app::Document::parse(model_kind(draft.kind), &draft.text)?;
                 document.apply(command)?;
@@ -1624,7 +1838,13 @@ impl AgentService {
                 expected_revision,
                 text,
             } => {
-                anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+                anyhow::ensure!(
+                    text.len() <= 480 * 1024,
+                    crate::error::message(
+                        ErrorCode::InvalidRequest,
+                        "Configuration exceeds 480 KiB"
+                    )
+                );
                 let mut draft = self.store.draft(&draft_id).await?;
                 draft.text = text;
                 draft.last_save = None;
@@ -1655,32 +1875,15 @@ impl AgentService {
                 if let Some(previous) = self.store.begin(&operation_id, &fingerprint).await? {
                     return Ok(previous);
                 }
-                let mut result = self
+                let result = self
                     .save_draft(
                         &draft_id,
                         &expected_revision,
                         &expected_source_revision,
                         &operation_id,
                     )
-                    .await;
-                if let Err(error) = &mut result {
-                    if let Some(failure) = error.downcast_mut::<crate::save::SaveFailure>() {
-                        failure.outcome.operation_id = operation_id.clone();
-                        if matches!(failure.outcome.state, SaveState::OutcomeUnknown) {
-                            failure.outcome.message =
-                                format!("Save outcome unknown: {}", failure.outcome.message);
-                        }
-                    } else {
-                        let mut outcome = crate::save::outcome(
-                            SaveState::Rejected,
-                            Some(false),
-                            Some(false),
-                            format!("{error:#}"),
-                        );
-                        outcome.operation_id = operation_id.clone();
-                        *error = crate::save::SaveFailure { outcome }.into();
-                    }
-                }
+                    .await
+                    .map_err(|error| crate::save::for_operation(error, &operation_id));
                 self.finish_operation(&operation_id, &result).await?;
                 result
             }
@@ -1697,23 +1900,35 @@ impl AgentService {
         let instance_name = self.store.resolve(&draft.instance).await?;
         anyhow::ensure!(
             draft.revision == expected && draft.source_revision == source,
-            "Conflict: draft revision changed"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: draft revision changed"
+            )
         );
         let current = self.document(&draft.instance).await?;
         astra_app::Document::parse(model_kind(draft.kind), &draft.text)?.validate_structure()?;
         anyhow::ensure!(
             current.path == draft.path && current.kind == draft.kind,
-            "Conflict: instance configuration binding changed"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: instance configuration binding changed"
+            )
         );
         anyhow::ensure!(
             current.revision == source,
-            "Conflict: source configuration changed; draft retained"
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: source configuration changed; draft retained"
+            )
         );
         let mut outcome = if draft.kind == InstanceKind::Server {
             self.validate_server(&draft.path, &draft.text).await?;
             anyhow::ensure!(
                 store::revision(&bounded_text(&draft.path)?) == source,
-                "Conflict: source changed during validation"
+                crate::error::message(
+                    astra_management::v2::ErrorCode::Conflict,
+                    "Conflict: source changed during validation"
+                )
             );
             if self.server_endpoint(&instance_name).exists() {
                 self.verify_server(&instance_name).await?;
@@ -1766,7 +1981,7 @@ impl AgentService {
         draft.original = draft.text.clone();
         draft.source_revision = store::revision(&draft.text);
         Ok(ResponseBody::Draft(
-            self.store.replace_draft(draft, expected).await.map_err(|error|{outcome.state=SaveState::OutcomeUnknown;outcome.message=format!("Configuration save completed but draft checkpoint failed: {error:#}. Read source and task before retrying");crate::save::SaveFailure{outcome}})?,
+            self.store.replace_draft(draft, expected).await.map_err(|error|{outcome.state=SaveState::OutcomeUnknown;outcome.message=format!("Configuration save completed but draft checkpoint failed: {error:#}. Read source and task before retrying");crate::save::SaveFailure{outcome, source:Some(error)}})?,
         ))
     }
 }
@@ -1790,7 +2005,10 @@ pub(crate) fn bounded_text(path: &Path) -> Result<String> {
     std::fs::File::open(path)?
         .take(480 * 1024 + 1)
         .read_to_string(&mut text)?;
-    anyhow::ensure!(text.len() <= 480 * 1024, "Configuration exceeds 480 KiB");
+    anyhow::ensure!(
+        text.len() <= 480 * 1024,
+        crate::error::message(ErrorCode::InvalidRequest, "Configuration exceeds 480 KiB")
+    );
     Ok(text)
 }
 fn check_output(output: std::process::Output) -> Result<()> {
@@ -1801,3 +2019,15 @@ fn check_output(output: std::process::Output) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "test/network_agent_test.rs"]
+mod network_tests;
+
+#[cfg(test)]
+#[path = "test/network_storage_failure_test.rs"]
+mod network_storage_failure_tests;
+
+#[cfg(test)]
+#[path = "test/network_state_test.rs"]
+mod network_state_tests;

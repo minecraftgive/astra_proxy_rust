@@ -782,7 +782,7 @@ impl Ui {
 
     fn render_not_live(&self, f: &mut Frame<'_>, area: Rect, title: &str) {
         let text = match self.active_proxy() {
-            None => t("No profile yet · 6 then n to create one").to_owned(),
+            None => t("No profile yet · 7 then n to create one").to_owned(),
             Some(row) if row.pid.is_none() => {
                 tr!("{} is not connected · c connect", row.instance.name)
             }

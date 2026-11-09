@@ -616,6 +616,11 @@ impl Client {
         } else if matches!(self.page, OVERVIEW | CONNECTIONS) {
             self.page = CONNECTIONS;
             self.connection_filtering = true;
+        } else if self.page == crate::navigation::DNS {
+            self.dns_state.filtering = true;
+            self.dns_state.query_open = false;
+            self.dns_state.status_open = false;
+            self.dns_state.detail = false;
         } else if self.page == RULES {
             return self.rule_search();
         } else {

@@ -132,6 +132,95 @@ pub struct RuntimeTelemetry {
     pub connection_generations: std::collections::BTreeMap<u64, u64>,
     /// Keep optional history off the stack of frontend event/operation futures.
     pub traffic: Option<Box<TrafficTelemetry>>,
+    /// Bounded, JSON-only query history; absent on older cores.
+    pub dns: Option<Box<DnsQueryLog>>,
+    /// Effective resolver configuration of the active worker, not a saved draft.
+    pub dns_resolver: Option<Box<DnsResolverStatus>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsResolverStatus {
+    pub enabled: bool,
+    pub fake_ip: bool,
+    pub ipv6: bool,
+    pub respect_rules: bool,
+    pub listen: Vec<std::net::SocketAddr>,
+    pub nameservers: Vec<DnsServer>,
+    pub fallback: Vec<DnsServer>,
+    pub policy_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsServer {
+    pub address: String,
+    pub transport: String,
+}
+
+impl DnsResolverStatus {
+    pub fn from_config(config: Option<&crate::config::dns::Config>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+        let servers = |values: &[String]| {
+            values
+                .iter()
+                .map(|address| {
+                    let transport = crate::config::dns::Upstream::parse(address)
+                        .map(|server| match server.scheme.as_str() {
+                            "udp" => "UDP",
+                            "tcp" => "TCP",
+                            "tls" => "DoT",
+                            "https" => "DoH",
+                            _ => "Unknown",
+                        })
+                        .unwrap_or("Unknown");
+                    DnsServer {
+                        address: address.clone(),
+                        transport: transport.into(),
+                    }
+                })
+                .collect()
+        };
+        Self {
+            enabled: config.enable,
+            fake_ip: config.fake_ip,
+            ipv6: config.ipv6,
+            respect_rules: config.respect_rules,
+            listen: config.listen.clone(),
+            nameservers: servers(&config.nameserver),
+            fallback: servers(&config.fallback),
+            policy_count: config.nameserver_policy.len(),
+        }
+    }
+}
+
+pub const DNS_QUERY_LIMIT: usize = 128;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsQueryLog {
+    /// Most recently completed queries first.
+    pub records: Vec<DnsQuery>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsQuery {
+    /// Resolver lifetime plus sequence: remains unambiguous across reloads.
+    pub resolver: String,
+    pub id: u64,
+    pub timestamp_ms: u64,
+    pub domain: String,
+    pub query_type: String,
+    pub source: String,
+    pub upstream: Option<String>,
+    pub status: String,
+    pub answers: Vec<String>,
+    pub answers_truncated: bool,
+    pub duration_us: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -14,7 +14,9 @@ pub mod unix_handoff;
 pub mod windows_service;
 
 pub mod command;
+pub mod diagnostic_path;
 pub mod monitor;
+pub mod network_snapshot;
 pub mod recovery;
 pub mod runtime;
 pub mod supervision;

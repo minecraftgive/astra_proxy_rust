@@ -1,5 +1,5 @@
 //! A bounded dedicated SQLite executor. Filesystem/database waits never occupy a Tokio worker.
-use crate::store::Store;
+use crate::store::{FinishOutcome, Store};
 use anyhow::Result;
 use astra_management::v2::*;
 use std::{
@@ -7,6 +7,11 @@ use std::{
     sync::{Arc, OnceLock},
 };
 type Job = Box<dyn FnOnce(&mut Store) + Send>;
+#[derive(Clone, Copy)]
+enum CallKind {
+    Read,
+    Write,
+}
 #[derive(Clone)]
 pub struct Database {
     sender: tokio::sync::mpsc::Sender<Job>,
@@ -61,33 +66,66 @@ impl Database {
         &self,
         work: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.dispatch(CallKind::Read, work).await
+    }
+    async fn write<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.dispatch(CallKind::Write, work).await
+    }
+    async fn dispatch<T: Send + 'static>(
+        &self,
+        kind: CallKind,
+        work: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.sender
             .send(Box::new(move |store| {
                 let _ = sender.send(work(store));
             }))
             .await
-            .map_err(|_| self.worker_error())?;
+            // A rejected send never handed this operation to the worker.
+            .map_err(|_| crate::error::classified(ErrorCode::Internal, self.worker_error()))?;
         match receiver.await {
-            Ok(result) => result,
-            Err(_) => Err(self.closed().await),
+            Ok(result) => result.map_err(|error| {
+                // Keep local storage failures explicitly classified so a
+                // caller cannot mistake an untyped SQL/JSON error for remote
+                // transport failure. Preserve existing markers and causes.
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::error::AgentError>())
+                {
+                    error
+                } else {
+                    crate::error::classified(crate::error::code(&error), error)
+                }
+            }),
+            // Once queued, a write may have committed before its receipt was
+            // lost. Never claim rejection or replay it based on error text.
+            Err(_) => Err(crate::error::classified(
+                match kind {
+                    CallKind::Read => ErrorCode::Internal,
+                    CallKind::Write => ErrorCode::OutcomeUnknown,
+                },
+                self.closed().await,
+            )),
         }
     }
     pub async fn begin(&self, id: &str, fingerprint: &str) -> Result<Option<ResponseBody>> {
         let id = id.to_owned();
         let fingerprint = fingerprint.to_owned();
-        self.call(move |s| s.begin(&id, &fingerprint)).await
+        self.write(move |s| s.begin(&id, &fingerprint)).await
     }
     pub async fn finish(
         &self,
         id: &str,
         result: Option<&ResponseBody>,
-        error: Option<&str>,
+        outcome: FinishOutcome,
     ) -> Result<()> {
         let id = id.to_owned();
         let result = result.cloned();
-        let error = error.map(str::to_owned);
-        self.call(move |s| s.finish(&id, result.as_ref(), error.as_deref()))
+        self.write(move |s| s.finish(&id, result.as_ref(), outcome))
             .await
     }
     pub async fn task(&self, id: &str) -> Result<Task> {
@@ -105,7 +143,43 @@ impl Database {
         let id = id.map(str::to_owned);
         let kind = kind.to_owned();
         let message = message.to_owned();
-        self.call(move |s| s.event(id.as_deref(), &kind, &message))
+        self.write(move |s| s.event(id.as_deref(), &kind, &message))
+            .await
+    }
+    pub async fn network_terminal(&self, id: &str) -> Result<bool> {
+        let id = id.to_owned();
+        self.call(move |s| s.network_terminal(&id)).await
+    }
+    pub async fn prune_network(&self) -> Result<()> {
+        self.write(|s| s.prune_network()).await
+    }
+    pub async fn network_existing(&self, id: &str, fingerprint: &str) -> Result<Option<Task>> {
+        let (id, fingerprint) = (id.to_owned(), fingerprint.to_owned());
+        self.call(move |s| s.network_existing(&id, &fingerprint))
+            .await
+    }
+    pub async fn begin_network(&self, id: &str, fingerprint: &str) -> Result<Task> {
+        let (id, fingerprint) = (id.to_owned(), fingerprint.to_owned());
+        self.write(move |s| s.begin_network(&id, &fingerprint))
+            .await
+    }
+    pub async fn append_network(&self, id: &str, data: serde_json::Value) -> Result<()> {
+        let id = id.to_owned();
+        self.write(move |s| s.append_network(&id, data)).await
+    }
+    pub async fn network_truncated(&self, id: &str) -> Result<()> {
+        let id = id.to_owned();
+        self.write(move |s| s.network_truncated(&id)).await
+    }
+    pub async fn network_state(&self, id: &str, state: NetworkState, message: &str) -> Result<()> {
+        let (id, message) = (id.to_owned(), message.to_owned());
+        self.write(move |s| s.network_state(&id, state, &message))
+            .await
+    }
+    pub async fn network_report(&self, id: &str, cursor: Option<&str>) -> Result<NetworkReport> {
+        let (id, cursor) = (id.to_owned(), cursor.map(str::to_owned));
+        // Reading a report also commits evidence-retention pruning.
+        self.write(move |s| s.network_report(&id, cursor.as_deref()))
             .await
     }
     pub async fn draft(&self, id: &str) -> Result<Draft> {
@@ -113,16 +187,16 @@ impl Database {
         self.call(move |s| s.draft(&id)).await
     }
     pub async fn open_draft(&self, id: String, doc: Document) -> Result<Draft> {
-        self.call(move |s| s.open_draft(id, doc)).await
+        self.write(move |s| s.open_draft(id, doc)).await
     }
     pub async fn replace_draft(&self, draft: Draft, expected: &str) -> Result<Draft> {
         let expected = expected.to_owned();
-        self.call(move |s| s.replace_draft(draft, &expected)).await
+        self.write(move |s| s.replace_draft(draft, &expected)).await
     }
     pub async fn discard(&self, id: &str, revision: &str) -> Result<()> {
         let id = id.to_owned();
         let revision = revision.to_owned();
-        self.call(move |s| s.discard(&id, &revision)).await
+        self.write(move |s| s.discard(&id, &revision)).await
     }
     pub async fn servers(&self) -> Result<Vec<(String, PathBuf)>> {
         self.call(|s| s.servers()).await
@@ -130,11 +204,11 @@ impl Database {
     pub async fn add_server(&self, name: &str, path: &Path) -> Result<()> {
         let name = name.to_owned();
         let path = path.to_owned();
-        self.call(move |s| s.add_server(&name, &path)).await
+        self.write(move |s| s.add_server(&name, &path)).await
     }
     pub async fn identity(&self, name: &str) -> Result<String> {
         let name = name.to_owned();
-        self.call(move |s| s.identity(&name)).await
+        self.write(move |s| s.identity(&name)).await
     }
     pub async fn resolve(&self, reference: &str) -> Result<String> {
         let reference = reference.to_owned();
@@ -142,24 +216,24 @@ impl Database {
     }
     pub async fn forget_identity(&self, name: &str) -> Result<()> {
         let name = name.to_owned();
-        self.call(move |s| s.forget_identity(&name)).await
+        self.write(move |s| s.forget_identity(&name)).await
     }
     pub async fn remove_server(&self, name: &str) -> Result<()> {
         let name = name.to_owned();
-        self.call(move |s| s.remove_server(&name)).await
+        self.write(move |s| s.remove_server(&name)).await
     }
     pub async fn set_server_config(&self, name: &str, path: &Path) -> Result<()> {
         let name = name.to_owned();
         let path = path.to_owned();
-        self.call(move |s| s.set_server_config(&name, &path)).await
+        self.write(move |s| s.set_server_config(&name, &path)).await
     }
     pub async fn remember_agent(&self, agent: Agent) -> Result<()> {
-        self.call(move |s| s.remember_agent(agent)).await
+        self.write(move |s| s.remember_agent(agent)).await
     }
     pub async fn snapshot(&self, id: &str, body: &str) -> Result<()> {
         let id = id.to_owned();
         let body = body.to_owned();
-        self.call(move |s| s.snapshot(&id, &body)).await
+        self.write(move |s| s.snapshot(&id, &body)).await
     }
     pub async fn remembered_agents(&self) -> Result<Vec<Agent>> {
         self.call(|s| s.remembered_agents()).await
@@ -175,7 +249,7 @@ impl Database {
         let agent = agent.to_owned();
         let request = request.to_owned();
         let state = state.to_owned();
-        self.call(move |s| s.route(&operation, &agent, &request, &state))
+        self.write(move |s| s.route(&operation, &agent, &request, &state))
             .await
     }
 }

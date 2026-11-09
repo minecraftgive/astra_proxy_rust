@@ -35,6 +35,43 @@ pub(crate) mod icmp;
 mod unix_elevated;
 /// Perform privileged hand-offs before starting worker threads.
 pub fn entry() -> anyhow::Result<()> {
+    // Metadata must not initialize routing, privileges, profiles or workers.
+    if std::env::args().nth(1).as_deref() == Some("--program-info") {
+        use astra_platform::program_info::{FeatureSupport, ProgramInfo};
+        let info = ProgramInfo::collect(
+            astra_platform::build_info!(),
+            vec![FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_STREAM_CAPABILITY,
+                "Network diagnostic stream",
+                true,
+                "Isolated system/interface TCP and DNS diagnostics; no profile initialization.",
+            ), FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_PINNED_CAPABILITY,
+                "Pinned network diagnostics",
+                true,
+                "One verified node or DIRECT path; constrained resolution and no group refresh.",
+            ), FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_RESOLUTION_CAPABILITY,
+                "Constrained diagnostic resolution",
+                true,
+                "Explicit resolvers and verified interface-scoped resolvers; no implicit system fallback.",
+            ), FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_TOOLS_CAPABILITY,
+                "HTTP, native-root TLS and transport evidence", true,
+                "Bounded HTTP/TLS, multi-port TCP, address-family and STUN diagnostics.",
+            ), FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_NAT_CAPABILITY,
+                "Physical-interface NAT diagnostics", true,
+                "Requires a manually selected physical interface verified at runtime; RFC 5780 depends on server evidence.",
+            ), FeatureSupport::new(
+                astra_model::control::NETWORK_DIAGNOSTICS_PATH_CAPABILITY,
+                "ICMP and per-hop path evidence", true,
+                "Runtime permissions and physical-path verification are checked before probing; never elevates privileges.",
+            )],
+        );
+        println!("{}", serde_json::to_string(&info)?);
+        return Ok(());
+    }
     if let Some(result) = network_recovery::entry() {
         return result;
     }

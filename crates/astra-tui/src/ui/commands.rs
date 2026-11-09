@@ -14,6 +14,7 @@ impl Ui {
             .as_ref()
             .is_some_and(|p| !p.confirmation() && !p.picker())
             || self.connection_filtering
+            || (self.page == shell::DNS && (self.dns_state.filtering || self.dns_state.query_open))
             || self.editor.as_ref().is_some_and(|e| !e.browsing())
             || self.viewer.as_ref().is_some_and(|v| !v.browsing())
             || self.palette.is_some()
@@ -41,6 +42,7 @@ impl Ui {
             return false;
         }
         self.connection_filtering
+            || (self.page == shell::DNS && (self.dns_state.filtering || self.dns_state.query_open))
             || self.editor.as_ref().is_some_and(Editor::accepts_text_input)
             || self
                 .viewer
@@ -159,19 +161,19 @@ impl Ui {
         }
         if ctrl && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let next = if key.code == KeyCode::PageUp {
-                (self.page + shell::PAGES.len() - 1) % shell::PAGES.len()
+                (shell::page_position(self.page) + shell::PAGES.len() - 1) % shell::PAGES.len()
             } else {
-                (self.page + 1) % shell::PAGES.len()
+                (shell::page_position(self.page) + 1) % shell::PAGES.len()
             };
             self.suspend_editor();
-            return Some(self.navigate(next));
+            return Some(self.navigate(shell::page_at(next)));
         }
         if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
-                KeyCode::Char(c @ '1'..='7') => {
+                KeyCode::Char(c @ '1'..='8') => {
                     self.suspend_editor();
                     self.focus = Default::default();
-                    return Some(self.navigate((c as u8 - b'1') as usize));
+                    return Some(self.navigate(shell::page_at((c as u8 - b'1') as usize)));
                 }
                 KeyCode::Char('p') => return Some(self.run_command(Id::Profiles)),
                 KeyCode::Char(':') => return Some(self.run_command(Id::Palette)),

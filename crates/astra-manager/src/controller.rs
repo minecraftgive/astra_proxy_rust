@@ -187,20 +187,18 @@ impl Controller {
             }
             _ => None,
         };
+        let observed = match &request.body {
+            RequestBody::Query(
+                Query::Task { operation_id } | Query::NetworkReport { operation_id, .. },
+            ) => Some(operation_id.clone()),
+            _ => None,
+        };
         if let (Some(index), Some(operation)) = (&self.index, &operation) {
             if let Err(error) = index
                 .route(operation, &agent, &original, "forwarding")
                 .await
             {
-                return Response::error(
-                    original,
-                    if error.to_string().starts_with("Conflict:") {
-                        ErrorCode::Conflict
-                    } else {
-                        ErrorCode::Internal
-                    },
-                    format!("Persist routing identity: {error}"),
-                );
+                return crate::error::response(original, error.context("Persist routing identity"));
             }
         }
         let route_id = format!("route-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
@@ -225,19 +223,26 @@ impl Controller {
                 Response::error(original,ErrorCode::OutcomeUnknown,"Agent disconnected or reply timed out; query the operation ID after reconnecting")
             }
         };
-        if let (Some(index), Some(operation)) = (&self.index, &operation) {
-            let state = if matches!(
-                response.result,
+        if let (Some(index), Some(operation_id)) =
+            (&self.index, operation.as_ref().or(observed.as_ref()))
+        {
+            let state = match &response.result {
                 Err(ApiError {
                     code: ErrorCode::OutcomeUnknown,
                     ..
-                })
-            ) {
-                "outcome_unknown"
-            } else {
-                "responded"
+                }) => "outcome_unknown",
+                Ok(ResponseBody::Task(task)) if matches!(task.state, TaskState::Running) => {
+                    "accepted"
+                }
+                Ok(ResponseBody::Task(task)) if task.finished_ms.is_some() => "completed",
+                Ok(ResponseBody::NetworkReport(report)) if report.state.terminal() => "completed",
+                Ok(ResponseBody::NetworkReport(_)) => "accepted",
+                _ => "responded",
             };
-            let _ = index.route(operation, &agent, &response.id, state).await;
+            // A failed observation must not replace the last known execution state.
+            if operation.is_some() || response.result.is_ok() {
+                let _ = index.route(operation_id, &agent, &response.id, state).await;
+            }
         }
         response
     }
@@ -586,3 +591,7 @@ async fn connect_once(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "test/network_controller_test.rs"]
+mod network_tests;

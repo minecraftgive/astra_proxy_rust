@@ -698,7 +698,7 @@ fn overview_resizes_follows_active_profile_and_palette_runs_commands() {
         let text = screen(&render(&ui, 140, 40));
         for value in [
             "1 Overview",
-            "6 Profiles",
+            "7 Profiles",
             "Connected",
             "proxy-00",
             "SOCKS5 127.0.0.1:7890",
@@ -859,5 +859,305 @@ fn overview_group_column_folds_out_nodes_without_leaving_overview() {
         ui.mouse(click(rect));
         assert_eq!(ui.page, OVERVIEW);
         assert_eq!(ui.overview_unfolded.as_deref(), Some("PROXY"));
+    });
+}
+
+fn dns_sample() -> Ui {
+    use astra_model::runtime::{Coverage, DnsQuery, DnsQueryLog, RuntimeTelemetry};
+    let mut ui = live_sample();
+    ui.runtime_telemetry = Some(RuntimeTelemetry {
+        host_boot_id: "dns-test".into(),
+        coverage: Coverage::Complete,
+        dns_resolver: Some(Box::new(astra_model::runtime::DnsResolverStatus {
+            enabled: true,
+            fake_ip: true,
+            listen: vec!["127.0.0.1:1053".parse().unwrap()],
+            nameservers: vec![astra_model::runtime::DnsServer {
+                address: "https://resolver.example/dns-query".into(),
+                transport: "DoH".into(),
+            }],
+            fallback: vec![astra_model::runtime::DnsServer {
+                address: "tls://1.1.1.1:853".into(),
+                transport: "DoT".into(),
+            }],
+            ..Default::default()
+        })),
+        dns: Some(Box::new(DnsQueryLog {
+            records: (1..=40)
+                .rev()
+                .map(|id| DnsQuery {
+                    resolver: "resolver".into(),
+                    id,
+                    timestamp_ms: 1_800_000_000_000 + id,
+                    domain: format!("query-{id}.example"),
+                    query_type: "A".into(),
+                    source: "cache".into(),
+                    status: "NoError".into(),
+                    answers: vec!["query.example. A TTL=60 203.0.113.1".into()],
+                    duration_us: 250,
+                    ..Default::default()
+                })
+                .collect(),
+            truncated: false,
+        })),
+        ..Default::default()
+    });
+    ui
+}
+
+#[test]
+fn dns_query_form_keeps_input_local_and_displays_settings_errors_and_answers() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = dns_sample();
+        let key = |code| event::KeyEvent::new(code, KeyModifiers::NONE);
+        ui.navigate(shell::DNS);
+        let text = screen(&render(&ui, 160, 45));
+        for label in [
+            "Current DNS",
+            "DoH",
+            "resolver.example/dns-query",
+            "Fake IP",
+        ] {
+            assert!(text.contains(label), "{label}");
+        }
+        ui.key(key(KeyCode::Char('s')));
+        let text = screen(&render(&ui, 100, 30));
+        assert!(text.contains("DoT tls://1.1.1.1:853"));
+        assert!(text.contains("127.0.0.1:1053"));
+        ui.key(key(KeyCode::Esc));
+        assert!(!ui.dns_state.status_open);
+        ui.key(key(KeyCode::Char('n')));
+        assert!(ui.dns_state.query_open);
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ));
+        for c in "query-1234.example".chars() {
+            ui.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(ui.page, shell::DNS);
+        assert_eq!(ui.dns_state.target, "query-1234.example");
+        ui.key(key(KeyCode::Tab));
+        ui.key(key(KeyCode::Right));
+        assert_eq!(astra_client::nettools::RECORDS[ui.dns_state.record], "AAAA");
+        ui.key(key(KeyCode::Enter));
+        assert!(ui.dns_query_running(), "{:?}", ui.dns_state.query_error);
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!ui.dns_query_running());
+        ui.dns_state.target = "bad name".into();
+        ui.key(key(KeyCode::Enter));
+        assert!(screen(&render(&ui, 100, 30)).contains("Enter a valid DNS name"));
+        ui.dns_state.query_error = None;
+        let mut view = astra_client::nettools::View::new(
+            std::path::Path::new("unused.sock"),
+            "proxy-00".into(),
+            &[],
+        );
+        view.kind = astra_client::nettools::Kind::Dns;
+        view.target = "example.com".into();
+        view.attempts.push(astra_model::nettool::Attempt {
+            seq: 1,
+            rtt_ms: Some(1.0),
+            detail: "example.com. A 198.18.0.1".into(),
+            error: None,
+        });
+        ui.dns_state.query = Some(Box::new(view));
+        assert!(screen(&render(&ui, 160, 45)).contains("198.18.0.1"));
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(ui.dns_state.query.as_ref().unwrap().show_advanced);
+        for (width, height) in [(100, 30), (80, 24), (60, 20), (35, 12), (12, 5)] {
+            render(&ui, width, height);
+        }
+        ui.key(key(KeyCode::Esc));
+        assert!(!ui.dns_state.query_open);
+        assert_eq!(ui.page, shell::DNS);
+    });
+}
+
+#[test]
+fn dns_preview_opens_details_and_does_not_displace_connections_or_snapshot() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = dns_sample();
+        let terminal = render(&ui, 160, 45);
+        let text = screen(&terminal);
+        assert!(text.contains("LIVE CONNECTIONS"));
+        assert!(text.contains("SNAPSHOT"));
+        assert!(text.contains("DNS queries"));
+        assert!(text.contains("query-40.example"));
+        // Click the preview row using the rendered cell coordinates.
+        let buffer = terminal.backend().buffer();
+        let mut target = None;
+        for y in 0..45 {
+            for x in 95..145 {
+                let row: String = (x..160).map(|c| buffer[(c, y)].symbol()).collect();
+                if row.starts_with("query-40.example") {
+                    target = Some(Rect::new(x, y, 1, 1));
+                    break;
+                }
+            }
+        }
+        ui.mouse(click(target.expect("DNS preview in the lower right")));
+        assert_eq!(ui.page, shell::DNS);
+        assert!(ui.dns_state.detail);
+        assert_eq!(ui.dns_state.selected.as_ref().unwrap().1, 40);
+        assert!(screen(&render(&ui, 160, 45)).contains("203.0.113.1"));
+    });
+}
+
+#[test]
+fn dns_filter_pause_navigation_and_identity_reset() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = dns_sample();
+        let key = |code| event::KeyEvent::new(code, KeyModifiers::NONE);
+        ui.key(key(KeyCode::Char('4')));
+        assert_eq!(ui.page, shell::DNS);
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(ui.dns_state.filtering);
+        for c in "query-3".chars() {
+            ui.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            ui.page,
+            shell::DNS,
+            "digits in the filter must not navigate"
+        );
+        assert!(ui
+            .dns_rows()
+            .iter()
+            .all(|row| row.domain.contains("query-3")));
+        ui.key(key(KeyCode::Enter));
+        ui.key(key(KeyCode::Char(' ')));
+        assert!(ui.dns_state.frozen.is_some());
+        assert!(!ui.connections_paused());
+        ui.runtime_telemetry
+            .as_mut()
+            .unwrap()
+            .dns
+            .as_mut()
+            .unwrap()
+            .records
+            .clear();
+        assert!(!ui.dns_rows().is_empty());
+        ui.key(key(KeyCode::End));
+        assert_eq!(ui.dns_selected_index(), ui.dns_rows().len() - 1);
+        ui.key(key(KeyCode::Enter));
+        assert!(ui.dns_state.detail);
+        let domain = ui.dns_state.detail_record.as_ref().unwrap().domain.clone();
+        ui.dns_state.frozen.as_mut().unwrap().records.clear();
+        assert!(
+            screen(&render(&ui, 100, 30)).contains(&domain),
+            "open details survive history eviction"
+        );
+        ui.key(key(KeyCode::Esc));
+        assert!(!ui.dns_state.detail);
+        ui.key(key(KeyCode::Esc));
+        assert!(ui.dns_state.filter.is_empty());
+        ui.key(key(KeyCode::Char(' ')));
+        assert!(ui.dns_rows().is_empty());
+        ui.reset_runtime_identity();
+        assert!(ui.dns_state.frozen.is_none());
+        assert!(ui.dns_state.selected.is_none());
+    });
+}
+
+#[test]
+fn dns_page_handles_small_sizes_empty_and_older_cores() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = dns_sample();
+        ui.navigate(shell::DNS);
+        for (width, height) in [(160, 45), (100, 30), (80, 24), (60, 20), (35, 12), (12, 5)] {
+            render(&ui, width, height);
+            ui.dns_state.detail = true;
+            render(&ui, width, height);
+            ui.dns_state.detail = false;
+        }
+        ui.runtime_telemetry
+            .as_mut()
+            .unwrap()
+            .dns
+            .as_mut()
+            .unwrap()
+            .records
+            .clear();
+        assert!(screen(&render(&ui, 100, 30)).contains("No DNS queries yet"));
+        ui.runtime_telemetry.as_mut().unwrap().dns = None;
+        assert!(screen(&render(&ui, 100, 30)).contains("DNS history unavailable"));
+        ui.runtime_error = "offline".into();
+        assert!(screen(&render(&ui, 100, 30)).contains("Reconnecting"));
+    });
+}
+
+#[test]
+fn reordered_dns_page_keeps_shortcuts_tabs_palette_and_history_consistent() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        use super::super::shell::{CONNECTIONS, DNS, LOGS, RULES, SETTINGS};
+        let mut ui = dns_sample();
+        for (key, page) in [
+            ('4', DNS),
+            ('5', RULES),
+            ('6', LOGS),
+            ('7', PROFILES),
+            ('8', SETTINGS),
+        ] {
+            ui.key(event::KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert_eq!(ui.page, page);
+        }
+        ui.navigate(CONNECTIONS);
+        ui.key(event::KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(ui.page, DNS);
+        ui.key(event::KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(ui.page, RULES);
+        ui.key(event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL));
+        assert_eq!(ui.page, DNS);
+        ui.navigate(CONNECTIONS);
+        ui.focus.region = focus::Region::Tabs;
+        ui.focus.cursor = 2;
+        ui.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        ui.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.page, DNS);
+        ui.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(ui.page, CONNECTIONS);
+        ui.palette = Some(super::super::shell::Palette::default());
+        ui.palette.as_mut().unwrap().query = "DNS queries 4".into();
+        ui.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.page, DNS);
+        ui.navigate(CONNECTIONS);
+        ui.palette = None;
+        let help = ui.command_help();
+        for label in [
+            "4  DNS queries",
+            "5  Rules",
+            "6  Logs",
+            "7  Profiles",
+            "8  Settings",
+        ] {
+            assert!(help.contains(label), "{label}");
+        }
+        let screen = screen(&render(&ui, 160, 35));
+        assert!(screen.find("3 Connections").unwrap() < screen.find("4 DNS queries").unwrap());
+        assert!(screen.find("4 DNS queries").unwrap() < screen.find("5 Rules").unwrap());
+        let tab = ui
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(rect, target)| matches!(target, Target::Page(DNS)).then_some(*rect))
+            .unwrap();
+        ui.mouse(click(tab));
+        assert_eq!(ui.page, DNS);
     });
 }

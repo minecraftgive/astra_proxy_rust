@@ -70,6 +70,7 @@ pub(super) async fn run_local(
             redraw |= ui.poll_terminal_scan().await;
             redraw |= ui.poll_installation(&socket).await;
             redraw |= feeds.poll(&mut ui).await;
+            redraw |= ui.client.poll_dns_query(&socket);
             if feeds.ready {
                 if let Some(launch) = initial.take() {
                     if let Some(action) = ui.apply_launch(&launch) {

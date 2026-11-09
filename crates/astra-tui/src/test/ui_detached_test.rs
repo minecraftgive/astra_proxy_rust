@@ -47,9 +47,11 @@ fn shortcuts_open_pages_and_selected_logs_without_editing_or_navigation() {
         ('1', View::Dashboard),
         ('2', View::Proxies),
         ('3', View::Connections),
-        ('4', View::Rules),
-        ('5', View::Logs),
-        ('6', View::Profiles),
+        ('4', View::Dns),
+        ('5', View::Rules),
+        ('6', View::Logs),
+        ('7', View::Profiles),
+        ('8', View::Settings),
     ] {
         assert!(
             matches!(ui.key(event::KeyEvent::new(KeyCode::Char(c),KeyModifiers::ALT)),Input::OpenWindow(launch) if launch.view==Some(view))

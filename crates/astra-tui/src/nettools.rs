@@ -4,75 +4,107 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 pub trait Render {
     fn render(&self, frame: &mut Frame<'_>, area: Rect);
 }
+fn result_style(tone: OutputTone) -> Style {
+    Style::default().fg(match tone {
+        OutputTone::Success => Color::Green,
+        OutputTone::Warning => Color::Yellow,
+        OutputTone::Error => Color::Red,
+        OutputTone::Info => Color::Cyan,
+        OutputTone::Muted => crate::theme::MUTED,
+    })
+}
+fn render_column(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    rows: Vec<OutputLine>,
+    scroll: usize,
+) {
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    // Wrap and clamp each column separately: a long report cannot push a
+    // conclusion out of its column or change its scrollable row count.
+    let lines = rows
+        .into_iter()
+        .flat_map(|row| {
+            wrap_lines(vec![row.text], inner.width.max(1) as usize)
+                .into_iter()
+                .map(move |text| Line::styled(text, result_style(row.tone)))
+        })
+        .collect::<Vec<_>>();
+    let height = inner.height as usize;
+    let skip = lines.len().saturating_sub(height).saturating_sub(scroll);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(skip)
+                .take(height)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
 impl Render for View {
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let fields = self.fields();
+        let mut fields = self.fields();
+        // Preserve result space in short terminals. Field navigation still uses
+        // the full shared form, showing the newly focused field on each key.
+        if !fields.is_empty() && area.height < fields.len() as u16 + 9 {
+            fields = vec![fields
+                .iter()
+                .copied()
+                .find(|field| *field == self.field)
+                .unwrap_or(fields[0])];
+        }
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(3),
                 Constraint::Length(fields.len() as u16 + 1),
                 Constraint::Min(1),
                 Constraint::Length(2),
             ])
             .split(area);
         frame.render_widget(
-            Paragraph::new(tr!("Network tools · {}", clean(&self.name)))
-                .block(Block::default().borders(Borders::BOTTOM)),
+            Paragraph::new(format!(
+                "{}\n{}",
+                tr!("Network tools · {}", clean(&self.name)),
+                Section::ALL
+                    .into_iter()
+                    .map(|section| format!(
+                        "{}{}",
+                        if section == self.section { "●" } else { " " },
+                        section.label()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            ))
+            .block(Block::default().borders(Borders::BOTTOM)),
             parts[0],
         );
         let lines: Vec<Line> = fields
             .iter()
             .map(|field| {
-                let (label, value) = match field {
-                    Field::Egress => (
-                        t("Egress"),
-                        format!(
-                            "‹ {} ›  {}/{}{}",
-                            egress_label(&self.egresses[self.egress]),
-                            self.egress + 1,
-                            self.egresses.len(),
-                            if self.egress_query.is_empty() {
-                                String::new()
-                            } else {
-                                format!("  /{}", self.egress_query)
-                            }
-                        ),
-                    ),
-                    Field::Kind => (t("Test"), format!("‹ {} ›", t(self.kind.label()))),
-                    Field::Target => (
-                        t("Target"),
-                        format!(
-                            "{}{}",
-                            self.target,
-                            if self.target.is_empty() {
-                                match self.kind {
-                                    Kind::Tcp => "host:port",
-                                    Kind::Dns => "example.com",
-                                    Kind::Icmp => "host / IP",
-                                }
-                            } else {
-                                ""
-                            }
-                        ),
-                    ),
-                    Field::Record => (t("Record"), format!("‹ {} ›", self.record)),
-                    Field::Server => (
-                        t("DNS server"),
-                        if self.server.is_empty() {
-                            "1.1.1.1 · udp:// tcp:// tls://".into()
-                        } else {
-                            self.server.clone()
-                        },
-                    ),
-                    Field::Count => (t("Count"), format!("‹ {} ›", self.count)),
-                };
+                let label = t(field.label());
+                let mut value = self.field_value(*field);
+                if value.is_empty() {
+                    value = self.field_hint(*field).into();
+                }
+                if *field == Field::Egress && !self.egress_query.is_empty() {
+                    value.push_str(&format!("  /{}", self.egress_query));
+                }
+                if !field.editable() {
+                    value = format!("‹ {value} ›");
+                }
                 let selected = *field == self.field;
                 Line::styled(
                     format!(
@@ -91,77 +123,36 @@ impl Render for View {
             .collect();
         frame.render_widget(Paragraph::new(lines), parts[1]);
 
-        let mut output: Vec<Line> = Vec::new();
-        if let Some(note) = &self.note {
-            output.push(Line::styled(
-                clean(note),
-                Style::default().fg(Color::DarkGray),
-            ));
+        if self.show_advanced {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(parts[2]);
+            render_column(
+                frame,
+                columns[0],
+                "结论",
+                self.conclusion_rows(),
+                self.scroll,
+            );
+            render_column(
+                frame,
+                columns[1],
+                "原始报告 · Ctrl+D 收起",
+                self.report_rows(),
+                self.scroll,
+            );
+        } else {
+            render_column(
+                frame,
+                parts[2],
+                "结论 · Ctrl+D 原始报告",
+                self.conclusion_rows(),
+                self.scroll,
+            );
         }
-        for attempt in &self.attempts {
-            output.push(match (&attempt.error, attempt.rtt_ms) {
-                (None, Some(ms)) => Line::styled(
-                    format!(
-                        "#{:<3} {:>9.2} ms  {}",
-                        attempt.seq,
-                        ms,
-                        clean(&attempt.detail)
-                    ),
-                    Style::default().fg(Color::Green),
-                ),
-                (error, _) => Line::styled(
-                    format!(
-                        "#{:<3} {:>12}  {}",
-                        attempt.seq,
-                        t("failed"),
-                        clean(error.as_deref().unwrap_or_default())
-                    ),
-                    Style::default().fg(Color::Red),
-                ),
-            });
-        }
-        if self.running() {
-            output.push(Line::raw(t("Testing…")));
-        }
-        if let Some(summary) = &self.summary {
-            let stats = match (summary.min_ms, summary.avg_ms, summary.max_ms) {
-                (Some(min), Some(avg), Some(max)) => {
-                    format!(" · min/avg/max {min:.2}/{avg:.2}/{max:.2} ms")
-                }
-                _ => String::new(),
-            };
-            output.push(Line::styled(
-                format!(
-                    "{}{stats}",
-                    tr!(
-                        "{} sent · {} received · {}% loss",
-                        summary.sent,
-                        summary.received,
-                        summary.loss_percent()
-                    )
-                ),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        if let Some(error) = &self.error {
-            output.push(Line::styled(clean(error), Style::default().fg(Color::Red)));
-        }
-        if output.is_empty() {
-            output.push(Line::raw(t(
-                "Pick an egress (system route, adapter or outbound), then press Enter",
-            )));
-        }
-        // Follow the newest lines.
-        let height = parts[2].height.saturating_sub(1) as usize;
-        let skip = output.len().saturating_sub(height);
-        frame.render_widget(
-            Paragraph::new(output.into_iter().skip(skip).collect::<Vec<_>>())
-                .block(Block::default().borders(Borders::TOP).title(t("Results"))),
-            parts[2],
-        );
         frame.render_widget(
             Paragraph::new(t(
-                "↑↓ field · ←→ choose · type to edit / find egress · Ctrl-U clear\nEnter run / stop · Esc back to node tests",
+                "Ctrl+L 分区 · Ctrl+D 详情 · Ctrl+P 加入计划 · Ctrl+R 预设 · Ctrl+Y 复制 · Ctrl+E JSON\nEnter 运行/取消 · Ctrl+O 停止观察 · Ctrl+↑/↓ 滚动 · Esc 返回 · Ctrl+U 清空",
             )),
             parts[3],
         );

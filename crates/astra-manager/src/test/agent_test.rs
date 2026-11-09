@@ -511,16 +511,15 @@ async fn draft_schema_uses_current_document_and_stale_apply_is_rejected() {
         .await
         .unwrap();
     assert!(matches!(updated, ResponseBody::Draft(_)));
-    assert!(agent
+    let error = agent
         .draft(DraftCommand::Edit {
             draft_id: draft.id.clone(),
             expected_revision: draft.revision,
-            text: "bad".into()
+            text: "bad".into(),
         })
         .await
-        .unwrap_err()
-        .to_string()
-        .starts_with("Conflict:"));
+        .unwrap_err();
+    assert!(matches!(crate::error::code(&error), ErrorCode::Conflict));
     assert!(matches!(
         agent
             .draft(DraftCommand::Schema {
@@ -715,4 +714,76 @@ async fn live_server_prepare_starts_existing_profile_and_streams_logs() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn dispatch_future_does_not_embed_the_command_state_machine() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().into(),
+        runtime_dir: Some(root.path().join("runtime")),
+        ..Default::default()
+    })
+    .unwrap();
+    let request = || Request::new("stack-budget", RequestBody::Query(Query::Hello));
+    let dispatch = agent.handle(request());
+    let internal = agent.handle_inner(request());
+    let service = crate::run_config(agent.config.clone());
+    let run = crate::run();
+    eprintln!(
+        "future bytes: run={} run_config={} handle={} dispatch={}",
+        std::mem::size_of_val(&run),
+        std::mem::size_of_val(&service),
+        std::mem::size_of_val(&dispatch),
+        std::mem::size_of_val(&internal)
+    );
+    assert!(
+        std::mem::size_of_val(&dispatch) < 4096,
+        "public dispatch must not inline the full command state machine"
+    );
+    assert!(matches!(dispatch.await.result, Ok(ResponseBody::Hello(_))));
+}
+
+#[tokio::test]
+async fn shutdown_preserves_uncertainty_from_native_receipt_loss() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        bin_dir: root.path().join("bin"),
+        ..Default::default()
+    })
+    .unwrap();
+    let (client, actor) =
+        crate::manager::NativeClient::with_test_runtime_actor(root.path().join("actor"), |_, _| {
+            Err(crate::error::message(
+                ErrorCode::OutcomeUnknown,
+                "关闭确认丢失",
+            ))
+        })
+        .unwrap();
+    assert!(agent.native.set(client).is_ok());
+    let response = agent
+        .handle(Request::new(
+            "shutdown",
+            RequestBody::Execute {
+                operation_id: "shutdown-once".into(),
+                command: Command::Shutdown,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        response.result,
+        Err(ApiError {
+            code: ErrorCode::OutcomeUnknown,
+            ..
+        })
+    ));
+    assert!(matches!(
+        agent.store.task("shutdown-once").await.unwrap().state,
+        TaskState::OutcomeUnknown
+    ));
+    actor.abort();
 }

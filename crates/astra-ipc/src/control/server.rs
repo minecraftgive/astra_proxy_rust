@@ -152,15 +152,31 @@ where
             Some(work) = commands.recv() => {
                 if work.reply.is_closed() { continue; }
                 let status = || Status { api_version: crate::API_VERSION, pid: std::process::id(), uptime_secs: control.started.elapsed().as_secs(), error: None, applied: applied_snapshot() };
-                let kind = match &work.command { Command::GetConfig => 1, Command::ExplainRoute(_) => 2, Command::Runtime(_) => 3, Command::Monitor => 4, _ => 0 };
+                let kind = match &work.command { Command::GetConfig => 1, Command::ExplainRoute(_) => 2, Command::Runtime(_) => 3, Command::Monitor => 4, Command::FakeIpLookup { .. } => 5, _ => 0 };
                 let mutation = matches!(&work.command, Command::Reload { .. } | Command::UpdateSubscriptions)
                     || matches!(&work.command, Command::Runtime(command) if !matches!(command, astra_model::runtime::Command::Snapshot));
-                let fast = matches!(&work.command, Command::Monitor | Command::Status | Command::Stop | Command::SetLogLevel(_) | Command::Runtime(astra_model::runtime::Command::Snapshot));
+                let fast = matches!(&work.command, Command::FakeIpLookup { .. } | Command::Monitor | Command::Status | Command::Stop | Command::SetLogLevel(_) | Command::Runtime(astra_model::runtime::Command::Snapshot));
                 if jobs.len() >= if fast {64} else {16} { let _ = work.reply.send(failure(kind, "Core is busy; retry shortly".into(), status())); continue; }
                 let baseline = status();
                 let future: Pin<Box<dyn Future<Output=Response> + Send + '_>> = match work.command {
                     Command::CommitService { boot_id } => { let mut reply = status(); reply.error = if boot_id != astra_platform::lifecycle::boot_id() {Some("Core boot changed; readiness commit rejected".into())} else {control.candidate.commit().err().map(|e|e.to_string())}; Box::pin(async move {Response::Status(reply)}) }
-                    Command::Identity => { let identity = astra_platform::lifecycle::identity(applied_snapshot())?; Box::pin(async move { Response::Identity(identity) }) }
+                    Command::Identity => { let mut identity = astra_platform::lifecycle::identity(applied_snapshot())?; identity.capabilities = Some(control.capabilities.clone()); Box::pin(async move { Response::Identity(identity) }) }
+                    Command::FakeIpLookup { expected_boot_id, addresses } => {
+                        let lookup = control.fake_lookup.clone();
+                        let boot_id = astra_platform::lifecycle::boot_id().to_owned();
+                        Box::pin(async move {
+                            let outcome = if expected_boot_id != boot_id { FakeIpLookupOutcome::CoreChanged }
+                            else if addresses.len() > MAX_FAKE_IP_LOOKUP { FakeIpLookupOutcome::InvalidRequest("At most 64 addresses are accepted".into()) }
+                            else if let Some(lookup) = lookup {
+                                match lookup(addresses.clone()).await {
+                                    Ok(mappings) if mappings.len() == addresses.len() && mappings.iter().zip(&addresses).all(|(mapping, address)| mapping.address == *address && mapping.domain.as_ref().is_none_or(|name| !name.is_empty() && name.len() <= 253 && !name.chars().any(char::is_control))) => FakeIpLookupOutcome::Mappings(mappings),
+                                    Ok(_) => FakeIpLookupOutcome::Failed("Invalid mapping provider result".into()),
+                                    Err(error) => FakeIpLookupOutcome::Failed(error.chars().take(512).collect()),
+                                }
+                            } else { FakeIpLookupOutcome::Unsupported };
+                            Response::FakeIpLookup(FakeIpLookupResponse { version: 1, boot_id, outcome })
+                        })
+                    }
                     Command::Monitor => {
                         astra_observe::gauge!("runtime.control_jobs", "控制接口正在处理的任务", "count").set(jobs.len() as u64);
                         astra_observe::gauge!("runtime.control_connections", "控制接口连接数", "count").set(connections.len() as u64);
@@ -195,6 +211,11 @@ fn failure(kind: u8, error: String, mut status: Status) -> Response {
         2 => Response::Explanation(Err(error)),
         3 => Response::Runtime(Err(error)),
         4 => Response::Monitor(Err(error)),
+        5 => Response::FakeIpLookup(FakeIpLookupResponse {
+            version: 1,
+            boot_id: astra_platform::lifecycle::boot_id().into(),
+            outcome: FakeIpLookupOutcome::Failed(error),
+        }),
         _ => {
             status.error = Some(error);
             Response::Status(status)
@@ -318,7 +339,12 @@ async fn write_response(
         return send(stream, &Event::Reply(response)).await;
     }
     match response {
-        Response::Identity(value) => send(stream, &value).await,
+        Response::Identity(value) => {
+            timeout(Duration::from_secs(3), identity_wire::send(stream, &value))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "slow identity subscriber"))?
+        }
+        Response::FakeIpLookup(value) => send(stream, &value).await,
         Response::Status(value) => send(stream, &value).await,
         Response::Config(value) => send(stream, &value).await,
         Response::Explanation(value) => send(stream, &value).await,

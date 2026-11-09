@@ -2,6 +2,72 @@ use super::*;
 fn key(c: char) -> event::KeyEvent {
     event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
+
+#[tokio::test]
+async fn nettools_shortcuts_precede_global_navigation_but_not_overlays() {
+    let mut ui = sample_ui(false);
+    let mut diagnostics = astra_client::diagnostics::View::start(
+        std::path::Path::new("unused-nettools-dispatch.sock"),
+        "proxy".into(),
+    );
+    if let Some(task) = diagnostics.task.take() {
+        task.abort();
+    }
+    diagnostics.receiver = None;
+    diagnostics.open_tools();
+    ui.diagnostics = Some(diagnostics);
+    let page = ui.page;
+    let ctrl = |code| event::KeyEvent::new(code, KeyModifiers::CONTROL);
+    assert!(matches!(ui.key(ctrl(KeyCode::Char('p'))), Input::Idle));
+    assert_eq!(
+        ui.diagnostics
+            .as_ref()
+            .unwrap()
+            .tools
+            .as_ref()
+            .unwrap()
+            .plan
+            .projects
+            .len(),
+        1
+    );
+    assert_eq!(ui.page, page);
+    assert!(ui.palette.is_none());
+    ui.key(ctrl(KeyCode::Char('d')));
+    assert!(
+        ui.diagnostics
+            .as_ref()
+            .unwrap()
+            .tools
+            .as_ref()
+            .unwrap()
+            .show_advanced
+    );
+    for n in 1..=12 {
+        assert!(matches!(press(&mut ui, KeyCode::F(n)), Input::Idle));
+    }
+    assert!(ui.palette.is_none());
+    assert!(ui.help_scroll.is_none());
+    assert!(ui.monitor.is_none());
+    assert!(!ui.client.tasks.showing_details());
+    assert!(ui.tui_viewer.is_none());
+    // The palette is above NetTool, so its global F1 keeps its original meaning.
+    ui.key(ctrl(KeyCode::Char('k')));
+    assert!(ui.palette.is_some());
+    ui.key(key('x'));
+    press(&mut ui, KeyCode::F(1));
+    assert!(ui.help_scroll.is_some());
+    assert!(
+        ui.diagnostics
+            .as_ref()
+            .unwrap()
+            .tools
+            .as_ref()
+            .unwrap()
+            .show_advanced
+    );
+}
+
 fn sample_ui(running: bool) -> Ui {
     let mut ui = Ui::new(Session::default());
     // Instance-level shortcuts live on the Profiles page.

@@ -13,6 +13,7 @@ pub enum View {
     Dashboard,
     Proxies,
     Connections,
+    Dns,
     Rules,
     Logs,
     Profiles,
@@ -26,6 +27,7 @@ impl View {
             "overview" | "dashboard" => Self::Dashboard,
             "proxies" => Self::Proxies,
             "connections" => Self::Connections,
+            "dns" => Self::Dns,
             // Tools were split into Rules (route queries) and Proxies (diagnostics).
             "rules" | "tools" => Self::Rules,
             "logs" => Self::Logs,
@@ -41,6 +43,7 @@ impl View {
             Self::Dashboard => "overview",
             Self::Proxies => "proxies",
             Self::Connections => "connections",
+            Self::Dns => "dns",
             Self::Rules => "rules",
             Self::Logs => "logs",
             Self::Profiles => "profiles",
@@ -59,6 +62,7 @@ impl View {
             Self::Logs => Some(4),
             Self::Profiles => Some(5),
             Self::Settings => Some(6),
+            Self::Dns => Some(crate::navigation::DNS),
             _ => None,
         }
     }
@@ -71,7 +75,8 @@ impl View {
             Self::Logs,
             Self::Profiles,
             Self::Settings,
-        ][index.min(6)]
+            Self::Dns,
+        ][index.min(7)]
     }
 }
 #[derive(Debug, Clone, Default)]

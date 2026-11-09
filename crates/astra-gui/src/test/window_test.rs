@@ -3,6 +3,68 @@ use astra_client::editor::{Editor, Mode};
 use gpui::{AppContext, Focusable, TestAppContext};
 
 #[gpui::test]
+fn nettools_chords_bypass_global_bindings_and_keep_overlay_shortcuts(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, _) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        model.tokio(|client| {
+            let mut diagnostics = astra_client::diagnostics::View::start(
+                std::path::Path::new("unused-native-nettools-dispatch.sock"),
+                "proxy".into(),
+            );
+            if let Some(task) = diagnostics.task.take() {
+                task.abort();
+            }
+            diagnostics.receiver = None;
+            diagnostics.open_tools();
+            client.diagnostics = Some(diagnostics);
+        })
+    });
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| {
+            let mut app = AppWindow::new(model.clone(), Some(0), window, cx);
+            app.panel = Some(Panel::NetTools);
+            app
+        });
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(
+        handle.into(),
+        "ctrl-p ctrl-d f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12",
+    );
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.panel, Some(Panel::NetTools));
+        assert!(!app.palette);
+    });
+    model.read_with(cx, |model, _| {
+        let tools = model
+            .client
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .tools
+            .as_ref()
+            .unwrap();
+        assert_eq!(tools.plan.projects.len(), 1);
+        assert!(tools.show_advanced);
+        assert!(!tools.running());
+    });
+    assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+    cx.simulate_keystrokes(handle.into(), "ctrl-k");
+    app.read_with(cx, |app, _| assert!(app.palette));
+    cx.simulate_keystrokes(handle.into(), "f1");
+    app.read_with(cx, |app, _| assert_eq!(app.panel, Some(Panel::Help)));
+}
+
+#[gpui::test]
 fn dialog_focus_blocks_application_shortcuts_and_enter_submits(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

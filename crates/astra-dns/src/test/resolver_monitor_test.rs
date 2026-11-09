@@ -145,3 +145,77 @@ async fn monitor_records_cache_failure_timeout_cancellation_fake_ip_and_saturati
         .any(|metric| metric.name == "dns.answer.in_flight"
             && metric.kind == astra_observe::Kind::Gauge));
 }
+
+#[tokio::test]
+async fn dns_query_history_records_real_cache_fake_failure_and_cancellation() {
+    let resolver = Resolver::new(Config::default()).unwrap();
+    let query = wire::query("history.example", RecordType::A)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let good = Mock::new(Behavior::Answer);
+    resolver.answer(&query, &good).await.unwrap();
+    resolver.answer(&query, &good).await.unwrap();
+    let log = resolver.query_log();
+    assert_eq!(log.records.len(), 2);
+    assert_eq!(log.records[0].source, "cache");
+    assert_eq!(log.records[1].source, "upstream");
+    assert!(log.records[1].upstream.is_some());
+    assert_eq!(log.records[0].domain, "history.example");
+    assert_eq!(log.records[0].query_type, "A");
+    assert_eq!(log.records[0].status, "NoError");
+    assert!(log.records[0].answers[0].contains("203.0.113.1"));
+    assert!(log.records[0].id > log.records[1].id);
+
+    let failed_query = wire::query("failure.example", RecordType::A)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    assert!(resolver
+        .answer(&failed_query, &Mock::new(Behavior::Failure))
+        .await
+        .is_err());
+    assert_eq!(resolver.query_log().records[0].status, "ERROR");
+    assert!(resolver.query_log().records[0].error.is_some());
+    let hanging = Mock::new(Behavior::Pending);
+    let mut cancelled = Box::pin(resolver.answer(&failed_query, &hanging));
+    std::future::poll_fn(|cx| {
+        assert!(cancelled.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(cancelled);
+    assert_eq!(resolver.query_log().records[0].status, "CANCELLED");
+    let fake = Resolver::new(Config {
+        fake_ip: true,
+        ..Default::default()
+    })
+    .unwrap();
+    fake.answer(&query, &good).await.unwrap();
+    assert_eq!(fake.query_log().records[0].source, "fake_ip");
+    assert!(fake.query_log().records[0].upstream.is_none());
+    assert_ne!(
+        fake.query_log().records[0].resolver,
+        log.records[0].resolver
+    );
+}
+
+#[tokio::test]
+async fn dns_query_history_is_bounded_and_internal_lookups_are_not_duplicated() {
+    let resolver = Resolver::new(Config::default()).unwrap();
+    let good = Mock::new(Behavior::Answer);
+    for _ in 0..140 {
+        resolver.lookup("lookup.example", &good).await.unwrap();
+    }
+    let log = resolver.query_log();
+    assert_eq!(log.records.len(), astra_model::runtime::DNS_QUERY_LIMIT);
+    assert!(log.truncated);
+    assert_eq!(log.records[0].id, 140);
+    assert_eq!(good.calls.load(Ordering::Relaxed), 1);
+    let mut replacement = Resolver::new(Config::default()).unwrap();
+    replacement.inherit(&resolver).unwrap();
+    assert_eq!(
+        replacement.query_log().records[0].resolver,
+        log.records[0].resolver
+    );
+}

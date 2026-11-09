@@ -2,8 +2,24 @@ use super::*;
 use astra_management::config::{AgentConfig, ManagerConfig, Mode};
 use sha2::Digest;
 
-#[tokio::test]
-async fn authenticated_agent_routes_requests_and_offline_mutations_are_not_queued() {
+#[test]
+fn authenticated_agent_routes_requests_and_offline_mutations_are_not_queued() {
+    std::thread::Builder::new()
+        .name("controller-small-stack".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Box::pin(authenticated_agent_routes_on_small_stack()));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn authenticated_agent_routes_on_small_stack() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

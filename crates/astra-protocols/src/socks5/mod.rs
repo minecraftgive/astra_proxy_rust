@@ -8,8 +8,25 @@ pub async fn socks5(
     password: Option<&str>,
     target: &Target,
 ) -> Result<Stream> {
-    let mut tcp = crate::egress::connect(server).await?;
+    let tcp = crate::egress::connect(server).await?;
     tcp.set_nodelay(true)?;
+    socks5_on(tcp, username, password, target).await
+}
+/// Handshake on an already connected stream; no resolver or socket is opened here.
+pub async fn socks5_on(
+    mut tcp: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    username: Option<&str>,
+    password: Option<&str>,
+    target: &Target,
+) -> Result<Stream> {
+    ensure!(
+        username.is_some() == password.is_some(),
+        "SOCKS credentials must include both username and password"
+    );
+    ensure!(
+        username.is_none_or(|v| v.len() <= 255) && password.is_none_or(|v| v.len() <= 255),
+        "SOCKS credentials exceed wire limit"
+    );
     let method = if username.is_some() { 2 } else { 0 };
     tcp.write_all(&[5, 1, method]).await?;
     let mut greeting = [0; 2];
@@ -33,8 +50,23 @@ pub async fn socks5(
     tcp.write_all(&request).await?;
     let mut reply = [0; 4];
     tcp.read_exact(&mut reply).await?;
-    if reply[0] != 5 || reply[1] != 0 || reply[2] != 0 {
-        bail!("upstream SOCKS5 CONNECT failed ({:?})", reply);
+    if reply[0] != 5 || reply[2] != 0 {
+        bail!("invalid upstream SOCKS5 CONNECT response");
+    }
+    if reply[1] != 0 {
+        use std::io::{Error, ErrorKind};
+        let kind = match reply[1] {
+            3 => ErrorKind::NetworkUnreachable,
+            4 => ErrorKind::HostUnreachable,
+            5 => ErrorKind::ConnectionRefused,
+            6 => ErrorKind::TimedOut,
+            2 => ErrorKind::PermissionDenied,
+            7 | 8 => ErrorKind::Unsupported,
+            _ => ErrorKind::Other,
+        };
+        return Err(
+            Error::new(kind, format!("upstream SOCKS5 CONNECT status {}", reply[1])).into(),
+        );
     }
     let size = match reply[3] {
         1 => 4,

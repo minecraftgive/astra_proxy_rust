@@ -18,6 +18,9 @@ pub(super) struct Store {
     pub origins: BTreeMap<u64, u64>,
     pub node_traffic: Option<BTreeMap<String, astra_model::runtime::NodeTraffic>>,
     pub traffic_history_error: Option<String>,
+    dns: astra_model::runtime::DnsQueryLog,
+    dns_supported: bool,
+    pub dns_resolver: Option<Box<astra_model::runtime::DnsResolverStatus>>,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -31,10 +34,46 @@ impl Default for Store {
             origins: BTreeMap::new(),
             node_traffic: None,
             traffic_history_error: None,
+            dns: Default::default(),
+            dns_supported: false,
+            dns_resolver: None,
         }
     }
 }
 impl Store {
+    pub fn merge_dns(
+        &mut self,
+        logs: Vec<astra_model::runtime::DnsQueryLog>,
+        supported: Option<bool>,
+    ) {
+        if let Some(supported) = supported {
+            self.dns_supported = supported;
+        }
+        for log in logs {
+            self.dns.truncated |= log.truncated;
+            for record in log.records {
+                if !self
+                    .dns
+                    .records
+                    .iter()
+                    .any(|old| old.resolver == record.resolver && old.id == record.id)
+                {
+                    self.dns.records.push(record);
+                }
+            }
+        }
+        self.dns.records.sort_by(|a, b| {
+            b.timestamp_ms
+                .cmp(&a.timestamp_ms)
+                .then(b.id.cmp(&a.id))
+                .then(b.resolver.cmp(&a.resolver))
+        });
+        self.dns.truncated |= self.dns.records.len() > astra_model::runtime::DNS_QUERY_LIMIT;
+        self.dns
+            .records
+            .truncate(astra_model::runtime::DNS_QUERY_LIMIT);
+    }
+
     pub fn publish(
         &mut self,
         snapshot: Snapshot,
@@ -111,6 +150,8 @@ impl Store {
                 })
                 .collect(),
             connection_generations: self.origins.clone(),
+            dns: self.dns_supported.then(|| Box::new(self.dns.clone())),
+            dns_resolver: self.dns_resolver.clone(),
             traffic: Some(Box::new(astra_model::runtime::TrafficTelemetry {
                 nodes: self.node_traffic.clone(),
                 history_error: self.traffic_history_error.clone(),

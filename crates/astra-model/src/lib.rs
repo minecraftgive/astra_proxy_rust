@@ -2,6 +2,11 @@
 use serde::{Deserialize, Serialize};
 pub mod config;
 pub mod groups;
+pub mod network_analysis;
+pub mod network_nat;
+pub mod network_path;
+pub mod network_state;
+pub mod network_tls;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum Network {
     Tcp,

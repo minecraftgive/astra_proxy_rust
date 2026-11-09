@@ -47,19 +47,25 @@ impl Worker {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
-        let mut input = child.stdin.take().context("Missing probe input")?;
+        let input = child.stdin.take().context("Missing probe input")?;
         let output = BufReader::new(child.stdout.take().context("Missing probe output")?);
-        let mut first = serde_json::to_vec(&ProbeServe {
-            config: key.text.clone(),
-        })?;
-        first.push(b'\n');
-        input.write_all(&first).await?;
         Ok(Self {
             key,
             _child: child,
             input,
             output,
         })
+    }
+    async fn initialize(&mut self) -> Result<()> {
+        let mut first = serde_json::to_vec(&ProbeServe {
+            config: self.key.text.clone(),
+        })?;
+        first.push(b'\n');
+        self.input.write_all(&first).await?;
+        Ok(())
+    }
+    async fn close(mut self) -> Result<()> {
+        super::network::terminate(&mut self._child).await
     }
     async fn ask(&mut self, request: &ProbeRequest) -> Result<Probe> {
         let mut line = serde_json::to_vec(request)?;
@@ -130,11 +136,16 @@ impl Probes {
         let mut guard = slot.lock().await;
         // A changed configuration or core build needs a freshly loaded worker.
         if guard.worker.as_ref().is_some_and(|w| w.key != key) {
-            guard.worker = None;
+            if let Some(worker) = guard.worker.take() {
+                worker.close().await?;
+            }
         }
         let result = tokio::time::timeout(ROUND_LIMIT, async {
             if guard.worker.is_none() {
                 guard.worker = Some(Worker::spawn(&plan, key).await?);
+                // Store ownership before the first await that writes to the
+                // process. A timeout still leaves a child available to reap.
+                guard.worker.as_mut().expect("worker").initialize().await?;
             }
             guard.worker.as_mut().expect("worker").ask(&request).await
         })
@@ -151,11 +162,17 @@ impl Probes {
                     let mut slot = slot.lock().await;
                     // A later request extended the lease.
                     if slot.used == Some(used) {
-                        slot.worker = None;
+                        if let Some(worker) = slot.worker.take() {
+                            let _ = worker.close().await;
+                        }
                     }
                 });
             }
-            _ => guard.worker = None,
+            _ => {
+                if let Some(worker) = guard.worker.take() {
+                    worker.close().await?;
+                }
+            }
         }
         result
     }

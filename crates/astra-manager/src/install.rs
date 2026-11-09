@@ -54,7 +54,10 @@ fn inspect(path: &Path) -> Result<Source> {
     // package replaced without changing release_id still invalidates the ID.
     anyhow::ensure!(
         serde_json::from_slice::<ReleaseManifest>(&bytes)? == manifest,
-        "Conflict: package manifest changed while inspecting; refresh installation status"
+        crate::error::message(
+            astra_management::v2::ErrorCode::Conflict,
+            "Conflict: package manifest changed while inspecting; refresh installation status"
+        )
     );
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let mut hash = Sha256::new();
@@ -183,9 +186,12 @@ fn selected(config: &ManagerConfig, id: &str, release: &str) -> Result<Source> {
     sources
         .into_iter()
         .find(|source| source.id == id && source.manifest.release_id == release)
-        .context(
-            "Conflict: the selected package is missing or changed; refresh installation status",
-        )
+        .ok_or_else(|| {
+            crate::error::message(
+                astra_management::v2::ErrorCode::Conflict,
+                "Conflict: the selected package is missing or changed; refresh installation status",
+            )
+        })
 }
 
 pub(crate) fn execute(
@@ -206,7 +212,7 @@ pub(crate) fn execute(
     )?;
     let installed = match outcome {
         engine::InstallOutcome::Installed(status) => status,
-        engine::InstallOutcome::RequiresLocalAction(_) => anyhow::bail!("RequiresLocalAction: system installation requires administrator approval on the target machine; open its local TUI and choose Settings > Installation"),
+        engine::InstallOutcome::RequiresLocalAction(_) => anyhow::bail!(crate::error::message(astra_management::v2::ErrorCode::RequiresLocalAction, "RequiresLocalAction: system installation requires administrator approval on the target machine; open its local TUI and choose Settings > Installation")),
     };
     let directory = installed
         .directory

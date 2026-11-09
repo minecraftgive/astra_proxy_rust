@@ -12,6 +12,7 @@ pub fn identity(applied: Option<astra_model::control::Applied>) -> io::Result<Id
         boot_id: boot_id().into(),
         process: capture(std::process::id())?,
         applied,
+        capabilities: Some(Vec::new()),
     })
 }
 pub fn matches_live(identity: &ProcessIdentity) -> io::Result<bool> {

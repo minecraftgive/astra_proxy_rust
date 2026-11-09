@@ -96,6 +96,8 @@ fn worker_node_counters_preserve_legacy_json_snapshot_compatibility() {
     let enhanced = WorkerSample {
         snapshot: legacy,
         node_totals: Some(nodes(42)),
+        dns: None,
+        dns_resolver: None,
     };
     let old_reader: Snapshot =
         serde_json::from_value(serde_json::to_value(enhanced).unwrap()).unwrap();

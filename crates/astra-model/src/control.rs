@@ -5,18 +5,31 @@ use std::path::PathBuf;
 pub enum Command {
     Status,
     Stop,
-    Reload { path: Option<PathBuf> },
+    Reload {
+        path: Option<PathBuf>,
+    },
     SetLogLevel(crate::logging::LogLevel),
     GetConfig,
     ExplainRoute(crate::RouteRequest),
     UpdateSubscriptions,
     Runtime(crate::runtime::Command),
     Session,
-    WatchRuntime { interval_ms: u64 },
+    WatchRuntime {
+        interval_ms: u64,
+    },
     Identity,
-    CommitService { boot_id: String },
-    StopIdentified { boot_id: String, force: bool },
+    CommitService {
+        boot_id: String,
+    },
+    StopIdentified {
+        boot_id: String,
+        force: bool,
+    },
     Monitor,
+    FakeIpLookup {
+        expected_boot_id: String,
+        addresses: Vec<std::net::IpAddr>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +40,7 @@ pub enum Response {
     Runtime(Result<crate::runtime::Snapshot, String>),
     Identity(Identity),
     Monitor(Result<crate::monitor::InternalSnapshot, String>),
+    FakeIpLookup(FakeIpLookupResponse),
 }
 
 /// A process number alone is never a durable process identity.
@@ -35,13 +49,18 @@ pub struct ProcessIdentity {
     pub pid: u32,
     pub started: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub version: u16,
     pub boot_id: String,
     pub process: ProcessIdentity,
     pub applied: Option<Applied>,
+    pub capabilities: Option<Vec<String>>,
 }
+
+mod fake_ip;
+mod identity;
+pub use fake_ip::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteExplanation {

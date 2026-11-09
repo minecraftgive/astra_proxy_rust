@@ -2,6 +2,15 @@
 //! any outbound / proxy group of the profile. ICMP and UDP cannot travel
 //! through a proxy, so those paths are refused instead of silently leaking DIRECT.
 use crate::platform::icmp;
+mod basic;
+mod detailed;
+#[path = "http.rs"]
+mod http_probe;
+mod nat;
+mod path_probe;
+mod stun;
+mod tls;
+pub use detailed::run_context as run_detailed_context;
 
 use crate::{egress, App};
 use anyhow::{bail, ensure, Context, Result};
@@ -73,6 +82,7 @@ pub fn validate(request: &Request) -> Result<()> {
             ensure!(*port != 0, "TCP port must be nonzero");
         }
         Probe::Icmp { host } => ensure!(!host.trim().is_empty(), "ICMP host is empty"),
+        _ => {} // New jobs perform their tool-specific validation before I/O.
     }
     if let Egress::Interface(name) = &request.egress {
         ensure!(
@@ -89,6 +99,13 @@ pub async fn run(
     running_config: bool,
     emit: impl Fn(Event) -> Result<()>,
 ) -> Result<Summary> {
+    ensure!(
+        matches!(
+            request.probe,
+            Probe::Dns { .. } | Probe::Tcp { .. } | Probe::Icmp { .. }
+        ),
+        "New tools require the versioned diagnostic job interface"
+    );
     validate(request)?;
     let path = match &request.egress {
         Egress::System => Path::System,
@@ -281,6 +298,7 @@ async fn prepare<'a>(path: &Path<'a>, probe: &Probe) -> Result<Prepared<'a>> {
                 record: record_type(record)?,
             }
         }
+        _ => bail!("New tools require the versioned diagnostic job interface"),
     };
     Ok(Prepared {
         note: notes.join(" · "),
@@ -564,12 +582,12 @@ pub async fn cli(mut args: impl Iterator<Item = String>) -> Result<()> {
         interval_ms: interval,
         timeout_ms: wait,
     };
-    let app = match config {
-        Some(path) => {
+    let app = match (&request.egress, config) {
+        (Egress::Outbound(_), Some(path)) => {
             let path = std::path::absolute(path)?;
             Some(crate::subscription::cached_app(&path, App::load(&path)?))
         }
-        None => None,
+        _ => None,
     };
     let summary = run(app.as_ref(), &request, false, |event| {
         match event {
@@ -599,7 +617,13 @@ pub async fn cli(mut args: impl Iterator<Item = String>) -> Result<()> {
                     _ => String::new(),
                 }
             ),
+            Event::Dns { .. } => unreachable!("legacy network tools do not emit DNS detail"),
+            Event::Context(_) => unreachable!("context is emitted only by manager jobs"),
+            Event::Resolution { .. } => {
+                unreachable!("legacy tools do not emit resolution evidence")
+            }
             Event::Done => {}
+            _ => unreachable!("legacy tools do not emit versioned tool evidence"),
         }
         Ok(())
     })
@@ -611,3 +635,7 @@ pub async fn cli(mut args: impl Iterator<Item = String>) -> Result<()> {
 #[cfg(test)]
 #[path = "../test/nettool_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../test/network_nat_fixture.rs"]
+mod nat_fixture;

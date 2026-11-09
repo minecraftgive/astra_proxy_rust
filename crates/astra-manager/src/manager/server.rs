@@ -1,5 +1,6 @@
 //! A serialized mutation actor with independent read, push and log connections.
 use super::*;
+mod group_diagnostic;
 use astra_ipc::progress;
 use astra_ipc::session::Event;
 use futures_util::{stream, StreamExt};
@@ -34,6 +35,7 @@ struct Base {
 }
 pub(super) struct Hub {
     runtime_dir: PathBuf,
+    network_scheduler: std::sync::OnceLock<Arc<crate::network::Scheduler>>,
     home: PathBuf,
     config: PathBuf,
     bin: PathBuf,
@@ -63,6 +65,7 @@ impl Hub {
         };
         let hub = Arc::new(Self {
             runtime_dir: manager.runtime_dir.clone(),
+            network_scheduler: Default::default(),
             home: manager.home.clone(),
             config: manager.config_home.clone(),
             bin: manager.bin.clone(),
@@ -76,6 +79,25 @@ impl Hub {
         });
         hub.publish(manager);
         Ok(hub)
+    }
+    fn spawn_legacy<T, F>(self: &Arc<Self>, work: F) -> tokio::task::JoinHandle<Result<T>>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let owner = hub.network_scheduler.get();
+            let _permit = match owner {
+                Some(owner) => Some(owner.legacy_permit().await?),
+                None => None,
+            };
+            let result = work.await;
+            if let Some(owner) = owner {
+                owner.record_legacy_cleanup(&result);
+            }
+            result
+        })
     }
     pub(super) fn publish(&self, manager: &Manager) {
         let previous = self.list.borrow().clone();
@@ -232,12 +254,12 @@ impl Hub {
         Ok(slot.updates.subscribe())
     }
     fn route(&self, name: &str) -> Result<Route> {
-        self.base
-            .borrow()
-            .routes
-            .get(name)
-            .cloned()
-            .context("Unknown instance")
+        self.base.borrow().routes.get(name).cloned().ok_or_else(|| {
+            crate::error::message(
+                astra_management::v2::ErrorCode::NotFound,
+                "Unknown instance",
+            )
+        })
     }
     fn plan(&self, name: &str) -> Result<DiagnosticPlan> {
         let route = self.route(name)?;
@@ -265,7 +287,7 @@ struct Work {
     // Internal dispatch policy, never accepted from the wire. Execute clients
     // can use a registered privilege service but cannot request UAC.
     allow_runtime_uac: bool,
-    reply: oneshot::Sender<Reply>,
+    reply: oneshot::Sender<Result<Reply>>,
     progress: progress::Sender,
     save: Option<oneshot::Sender<Result<astra_management::v2::SaveOutcome>>>,
 }
@@ -322,6 +344,29 @@ pub(crate) struct NativeClient {
     probes: super::probes::Probes,
 }
 impl NativeClient {
+    pub(crate) fn attach_network_scheduler(
+        &self,
+        scheduler: Arc<crate::network::Scheduler>,
+    ) -> Result<()> {
+        self.hub
+            .network_scheduler
+            .set(scheduler)
+            .map_err(|_| anyhow::anyhow!("Diagnostic scheduler already attached"))
+    }
+    /// The background diagnostic scheduler owns concurrency and cancellation.
+    pub(crate) async fn network_diagnostic(
+        &self,
+        name: &str,
+        request: astra_model::nettool::DetailedRequest,
+        output: mpsc::Sender<astra_model::nettool::Event>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.hub
+            .plan(name)?
+            .network_diagnostic(request, output, cancel)
+            .await
+    }
+
     /// One header exit probe; `keep_alive` keeps the probe core loaded between rounds.
     pub(crate) async fn exit_probe(
         &self,
@@ -330,7 +375,19 @@ impl NativeClient {
         keep_alive: Option<Duration>,
     ) -> Result<astra_model::diagnostics::Probe> {
         let plan = self.hub.plan(name)?;
-        self.probes.probe(name, plan, request, keep_alive).await
+        let probes = self.probes.clone();
+        let name = name.to_owned();
+        // Agent NAT exclusivity includes loaded probe cores; do not retain an
+        // idle core that could perform profile background work outside its slot.
+        let keep_alive = if self.hub.network_scheduler.get().is_some() {
+            None
+        } else {
+            keep_alive
+        };
+        self.hub
+            .spawn_legacy(async move { probes.probe(&name, plan, request, keep_alive).await })
+            .await
+            .context("Exit probe owner failed")?
     }
     pub(crate) async fn save(
         &self,
@@ -356,7 +413,7 @@ impl NativeClient {
             .await
             .context("Native actor stopped")?;
         loop {
-            tokio::select! {result=&mut receiver=>return result.context("Save outcome unknown; native actor stopped")?,changed=updates.changed()=>{if changed.is_err(){return receiver.await.context("Save outcome unknown; native actor stopped")?;}let update=updates.borrow_and_update().clone();if let Some(update)=update{progress::report(update.phase,update.detail);}}}
+            tokio::select! {result=&mut receiver=>return result.map_err(|error| crate::error::classified(astra_management::v2::ErrorCode::OutcomeUnknown, anyhow::Error::new(error).context("Save outcome unknown; native actor stopped")))?,changed=updates.changed()=>{if changed.is_err(){return receiver.await.map_err(|error| crate::error::classified(astra_management::v2::ErrorCode::OutcomeUnknown, anyhow::Error::new(error).context("Save outcome unknown; native actor stopped")))?;}let update=updates.borrow_and_update().clone();if let Some(update)=update{progress::report(update.phase,update.detail);}}}
         }
     }
     pub(crate) async fn runtime_sample(&self, name: &str) -> Result<serde_json::Value> {
@@ -455,14 +512,19 @@ impl NativeClient {
                 _ => unreachable!(),
             };
             let plan = self.hub.plan(name)?;
-            match action {
-                Action::UpdateSubscriptions(_) => plan.run_refresh().await,
-                Action::DiagnosticTargets(_) => plan.run_selection(None, true).await,
-                Action::DiagnosticsSelected { targets, .. } => {
-                    plan.run_selection(Some(targets), false).await
-                }
-                _ => plan.run().await,
-            }
+            self.hub
+                .spawn_legacy(async move {
+                    match action {
+                        Action::UpdateSubscriptions(_) => plan.run_refresh().await,
+                        Action::DiagnosticTargets(_) => plan.run_selection(None, true).await,
+                        Action::DiagnosticsSelected { targets, .. } => {
+                            plan.run_selection(Some(targets), false).await
+                        }
+                        _ => plan.run().await,
+                    }
+                })
+                .await
+                .context("Legacy diagnostic owner failed")?
         } else {
             let (sender, mut response) = oneshot::channel();
             let (progress, mut updates) = watch::channel(None);
@@ -477,7 +539,7 @@ impl NativeClient {
                 .await
                 .context("Native actor stopped")?;
             loop {
-                tokio::select! {result=&mut response=>break Ok(result.context("Native actor outcome unknown")?),changed=updates.changed()=>{if changed.is_err(){break Ok(response.await.context("Native actor outcome unknown")?);}let update=updates.borrow_and_update().clone();if let Some(update)=update{progress::report(update.phase,update.detail);}}}
+                tokio::select! {result=&mut response=>break result.map_err(|error| crate::error::classified(astra_management::v2::ErrorCode::OutcomeUnknown, anyhow::Error::new(error).context("Native actor outcome unknown")))?,changed=updates.changed()=>{if changed.is_err(){break response.await.map_err(|error| crate::error::classified(astra_management::v2::ErrorCode::OutcomeUnknown, anyhow::Error::new(error).context("Native actor outcome unknown")))?;}let update=updates.borrow_and_update().clone();if let Some(update)=update{progress::report(update.phase,update.detail);}}}
             }
         }?;
         if shutdown {
@@ -500,28 +562,34 @@ impl NativeClient {
             .context("Diagnostics are busy; retry shortly")?;
         let plan = self.hub.plan(name)?;
         let (reader, writer) = tokio::io::duplex(64 * 1024);
-        let producer = tokio::spawn(async move {
+        let producer = self.hub.spawn_legacy(async move {
             let mut writer = writer;
             plan.nettool(request, &mut writer).await
         });
         let mut reader = reader;
         let mut events = Vec::new();
-        loop {
-            let reply: Reply = astra_ipc::receive_management(&mut reader).await?;
-            if let Some(error) = reply.error {
-                anyhow::bail!(error);
+        let received = async {
+            loop {
+                let reply: Reply = astra_ipc::receive_management(&mut reader).await?;
+                if let Some(error) = reply.error {
+                    anyhow::bail!(error);
+                }
+                let event: astra_model::nettool::Event = serde_json::from_str(&reply.text)?;
+                let done = matches!(event, astra_model::nettool::Event::Done);
+                anyhow::ensure!(events.len() < 256, "Network event limit exceeded");
+                let _ = output.send(event.clone()).await;
+                events.push(event);
+                if done {
+                    break;
+                }
             }
-            let event: astra_model::nettool::Event = serde_json::from_str(&reply.text)?;
-            let done = matches!(event, astra_model::nettool::Event::Done);
-            anyhow::ensure!(events.len() < 256, "Network event limit exceeded");
-            let _ = output.send(event.clone()).await;
-            events.push(event);
-            if done {
-                break;
-            }
+            Ok::<_, anyhow::Error>(events)
         }
-        producer.await??;
-        Ok(events)
+        .await;
+        drop(reader);
+        let produced = producer.await.context("Legacy network tool owner failed")?;
+        produced?;
+        received
     }
     pub(crate) async fn diagnostics(
         &self,
@@ -536,41 +604,49 @@ impl NativeClient {
             .context("Diagnostics are busy; retry shortly")?;
         let plan = self.hub.plan(name)?;
         let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
-        let producer = tokio::spawn(async move { plan.stream(targets, &mut writer).await });
+        let producer = self
+            .hub
+            .spawn_legacy(async move { plan.stream(targets, &mut writer).await });
         let mut report = Report {
             url: String::new(),
             running_config: false,
             probes: vec![],
         };
         let mut count = 0;
-        loop {
-            let reply: Reply = astra_ipc::receive_management(&mut reader).await?;
-            if let Some(error) = reply.error {
-                anyhow::bail!(error);
-            }
-            let event: Event = serde_json::from_str(&reply.text)?;
-            count += 1;
-            anyhow::ensure!(count <= 4096, "Diagnostics event limit exceeded");
-            match &event {
-                Event::Started {
-                    url,
-                    running_config,
-                    ..
-                } => {
-                    report.url = url.clone();
-                    report.running_config = *running_config;
+        let received = async {
+            loop {
+                let reply: Reply = astra_ipc::receive_management(&mut reader).await?;
+                if let Some(error) = reply.error {
+                    anyhow::bail!(error);
                 }
-                Event::Finished { probe } => report.probes.push(probe.clone()),
-                _ => {}
+                let event: Event = serde_json::from_str(&reply.text)?;
+                count += 1;
+                anyhow::ensure!(count <= 4096, "Diagnostics event limit exceeded");
+                match &event {
+                    Event::Started {
+                        url,
+                        running_config,
+                        ..
+                    } => {
+                        report.url = url.clone();
+                        report.running_config = *running_config;
+                    }
+                    Event::Finished { probe } => report.probes.push(probe.clone()),
+                    _ => {}
+                }
+                let done = matches!(event, Event::Done);
+                let _ = output.send(event).await;
+                if done {
+                    break;
+                }
             }
-            let done = matches!(event, Event::Done);
-            let _ = output.send(event).await;
-            if done {
-                break;
-            }
+            Ok::<_, anyhow::Error>(report)
         }
-        producer.await??;
-        Ok(report)
+        .await;
+        drop(reader);
+        let produced = producer.await.context("Legacy diagnostic owner failed")?;
+        produced?;
+        received
     }
 }
 pub(super) async fn run(
@@ -615,11 +691,11 @@ pub(super) async fn run(
                             manager.action(work.action).await
                         }
                     }).await;
-                    let reply=reply(result);
-                    let shutdown_error=if shutdown {reply.error.clone()} else {None};
-                    actor_hub.log.write("manager",&format!("{} {title}",if reply.error.is_some(){"failed"}else{"completed"}));
+                    let shutdown_error=if shutdown {result.as_ref().err().map(|error| format!("{error:#}")).or_else(|| result.as_ref().ok().and_then(|reply| reply.error.clone()))} else {None};
+                    let failed=result.as_ref().map_or(true, |reply| reply.error.is_some());
+                    actor_hub.log.write("manager",&format!("{} {title}",if failed{"failed"}else{"completed"}));
                     actor_hub.publish(&manager);
-                    let _=work.reply.send(reply);
+                    let _=work.reply.send(result);
                     if shutdown{if let Some(error)=shutdown_error {return Err(anyhow::anyhow!(error));} break;}
                 }
                 _=tick.tick()=>{
@@ -1019,12 +1095,24 @@ async fn serve(
                     .context("Diagnostics are busy; retry shortly")?;
                 let plan = hub.plan(name)?;
                 let targets = targets.clone();
-                let (mut input, mut output) = tokio::io::split(stream);
-                let result = tokio::select! {result=plan.stream(targets,&mut output)=>result,_=input.read_u8()=>return Ok(())};
-                if let Err(error) = result {
-                    let _ = astra_ipc::send_management(&mut output, &reply(Err(error))).await;
-                }
-                return Ok(());
+                return hub
+                    .spawn_legacy(async move {
+                        let mut output = stream;
+                        if let Err(error) = plan.stream(targets, &mut output).await {
+                            let cleanup = error
+                                .downcast_ref::<crate::network::CleanupUnconfirmed>()
+                                .is_some();
+                            let text = format!("{error:#}");
+                            let _ =
+                                astra_ipc::send_management(&mut output, &reply(Err(error))).await;
+                            if cleanup {
+                                return Err(crate::network::CleanupUnconfirmed(text).into());
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .context("Legacy stream owner failed")?;
             }
             Action::NetTool { name, request } => {
                 let _permit = diagnostics
@@ -1032,12 +1120,24 @@ async fn serve(
                     .context("Diagnostics are busy; retry shortly")?;
                 let plan = hub.plan(name)?;
                 let request = request.clone();
-                let (mut input, mut output) = tokio::io::split(stream);
-                let result = tokio::select! {result=plan.nettool(request,&mut output)=>result,_=input.read_u8()=>return Ok(())};
-                if let Err(error) = result {
-                    let _ = astra_ipc::send_management(&mut output, &reply(Err(error))).await;
-                }
-                return Ok(());
+                return hub
+                    .spawn_legacy(async move {
+                        let mut output = stream;
+                        if let Err(error) = plan.nettool(request, &mut output).await {
+                            let cleanup = error
+                                .downcast_ref::<crate::network::CleanupUnconfirmed>()
+                                .is_some();
+                            let text = format!("{error:#}");
+                            let _ =
+                                astra_ipc::send_management(&mut output, &reply(Err(error))).await;
+                            if cleanup {
+                                return Err(crate::network::CleanupUnconfirmed(text).into());
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .context("Legacy stream owner failed")?;
             }
             _ => {}
         }
@@ -1055,27 +1155,30 @@ async fn serve(
                     let title = crate::action_description(&request.action);
                     hub.log.write("manager", &format!("started {title}"));
                     let (progress, mut updates) = watch::channel(None);
-                    let future = progress::scope(progress, async {
-                        let _permit = diagnostics
+                    let work_hub = hub.clone();
+                    let work_diagnostics = diagnostics.clone();
+                    let action = request.action.clone();
+                    let future = hub.spawn_legacy(progress::scope(progress, async move {
+                        let _permit = work_diagnostics
                             .try_acquire()
                             .context("Diagnostics are busy; retry shortly")?;
-                        let name = match &request.action {
+                        let name = match &action {
                             Action::Diagnostics(n)
                             | Action::DiagnosticTargets(n)
                             | Action::UpdateSubscriptions(n)
                             | Action::DiagnosticsSelected { name: n, .. } => n,
                             _ => unreachable!(),
                         };
-                        let plan = hub.plan(name)?;
+                        let plan = work_hub.plan(name)?;
                         progress::report(
-                            if matches!(&request.action, Action::UpdateSubscriptions(_)) {
+                            if matches!(&action, Action::UpdateSubscriptions(_)) {
                                 "Refresh subscriptions"
                             } else {
                                 "Run diagnostics"
                             },
                             name.clone(),
                         );
-                        match request.action {
+                        match action {
                             Action::UpdateSubscriptions(_) => plan.run_refresh().await,
                             Action::DiagnosticTargets(_) => plan.run_selection(None, true).await,
                             Action::DiagnosticsSelected { targets, .. } => {
@@ -1083,12 +1186,12 @@ async fn serve(
                             }
                             _ => plan.run().await,
                         }
-                    });
+                    }));
                     tokio::pin!(future);
                     let mut open = session;
                     let result = loop {
                         tokio::select! {
-                            result=&mut future=>break result,
+                            result=&mut future=>break result.context("Legacy diagnostic owner failed")?,
                             _=stream.read_u8()=>return Ok(()),
                             changed=updates.changed(),if open=>{
                                 if changed.is_err(){open=false;continue;}
@@ -1130,9 +1233,9 @@ async fn serve(
                         .await?;
                     loop {
                         tokio::select! {
-                            result=&mut receiver=>break result?,
+                            result=&mut receiver=>break reply(result?),
                             changed=updates.changed(),if session=>{
-                                if changed.is_err(){break receiver.await?;}
+                                if changed.is_err(){break reply(receiver.await?);}
                                 let event=updates.borrow_and_update().clone();if let Some(event)=event{hub.log.write("progress",&format!("{} {}",event.phase,event.detail));send(&mut stream,&Event::<Reply>::Progress(event)).await?;}
                             }
                         }
@@ -1245,6 +1348,12 @@ async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
             command,
             expected_pid,
         } => {
+            if let astra_model::runtime::Command::TestGroup(group) = command {
+                return Some(
+                    hub.manual_group_test(name.clone(), group.clone(), *expected_pid)
+                        .await,
+                );
+            }
             #[cfg(windows)]
             if matches!(command, astra_model::runtime::Command::Tun(true)) {
                 return None;
@@ -1348,6 +1457,10 @@ async fn fast_progress(
 #[path = "../test/manager_server_update_status_test.rs"]
 mod update_status_tests;
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "../test/manager_server_runtime_policy_test.rs"]
 mod runtime_policy_tests;
+
+#[cfg(all(test, unix))]
+#[path = "../test/manager_server_network_gate_test.rs"]
+mod network_gate_tests;

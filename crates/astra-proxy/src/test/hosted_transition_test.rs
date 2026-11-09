@@ -116,6 +116,8 @@ impl Fixture {
                         WorkerSample {
                             snapshot: astra_model::runtime::Snapshot::default(),
                             node_totals: Some([("node".into(), id * 100)].into()),
+                            dns: None,
+                            dns_resolver: None,
                         },
                     )
                     .await;

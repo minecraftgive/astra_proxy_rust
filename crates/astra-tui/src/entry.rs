@@ -215,7 +215,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
         println!("--endpoint PATH [--agent ID]: connect to a trusted local manager/controller IPC endpoint; remote nodes are selected by ID");
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         println!("--silent: start the manager and configured auto-start instances without opening the TUI; errors are saved to STATE_DIR/startup.log");
-        println!("--view overview|proxies|connections|rules|logs|profiles|settings|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–7: page in a new window");
+        println!("--view overview|proxies|connections|rules|logs|profiles|settings|dns|tui-log|diagnostics [--instance NAME] [--core proxy|rule] [--window-id ID]\nF8: current page in a new window · Alt+1–8: page in a new window");
 
         return Ok(());
     }

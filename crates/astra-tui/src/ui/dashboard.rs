@@ -22,6 +22,10 @@ pub(super) enum Target {
     /// A node row of a group unfolded in the Overview: (group, member).
     OverviewMember(usize, usize),
     Connection(u64),
+    DnsQuery(String, u64),
+    DnsQueryField(usize),
+    DnsQueryRun,
+    DnsStatus,
     ConnectionRow(ConnectionRowKey),
     Connect,
     Palette(usize),
@@ -185,7 +189,7 @@ impl Ui {
         let Some(row) = self.active_proxy() else {
             f.render_widget(
                 Paragraph::new(t(
-                    "No profile yet. Press 6 for Profiles, then n to create a proxy instance; : lists every command.",
+                    "No profile yet. Press 7 for Profiles, then n to create a proxy instance; : lists every command.",
                 ))
                 .wrap(Wrap { trim: false })
                 .block(card("Overview")),
@@ -260,7 +264,15 @@ impl Ui {
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(sidebar)]).split(area);
             self.overview_item_count.set(connection_count);
             self.render_overview_connections(f, columns[0], false);
-            self.render_snapshot(f, columns[1]);
+            if columns[1].height >= 12 {
+                let right =
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(columns[1]);
+                self.render_snapshot(f, right[0]);
+                self.render_dns_preview(f, right[1]);
+            } else {
+                self.render_snapshot(f, columns[1]);
+            }
             return;
         }
         let narrow = area.width < 80;
@@ -988,6 +1000,43 @@ impl Ui {
                 self.focus.region = focus::Region::Main;
                 self.select_connection_row_key(key);
                 self.toggle_connection_group();
+                Input::Idle
+            }
+            Some(Target::DnsStatus) if self.page == shell::DNS && self.live_input() => {
+                self.dns_state.status_open = true;
+                self.dns_state.query_open = false;
+                Input::Idle
+            }
+            Some(Target::DnsQueryField(field)) if self.page == shell::DNS && self.live_input() => {
+                if !self.dns_state.query_open {
+                    self.open_dns_query();
+                }
+                if field == 1 && self.dns_state.query_field == 1 {
+                    self.dns_state.record =
+                        (self.dns_state.record + 1) % astra_client::nettools::RECORDS.len();
+                }
+                self.dns_state.query_field = field;
+                Input::Idle
+            }
+            Some(Target::DnsQueryRun) if self.page == shell::DNS && self.live_input() => {
+                self.dns_state.query_field = 2;
+                if self.dns_query_running() {
+                    self.cancel_dns_query();
+                } else {
+                    self.request_dns_query();
+                }
+                Input::Idle
+            }
+            Some(Target::DnsQuery(resolver, id)) if self.can_switch_page() => {
+                if self.page != shell::DNS {
+                    self.navigate(shell::DNS);
+                    self.dns_state.filter.clear();
+                    self.dns_state.frozen = None;
+                }
+                self.focus.region = focus::Region::Main;
+                self.dns_state.selected = Some((resolver, id));
+                self.dns_state.query_open = false;
+                self.open_dns_detail();
                 Input::Idle
             }
             Some(Target::Connection(id)) => {

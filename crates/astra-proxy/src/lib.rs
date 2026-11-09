@@ -749,6 +749,33 @@ pub async fn run() -> Result<()> {
     if first.as_deref() == Some("--nettool") {
         return nettool::cli(args).await;
     }
+    if first.as_deref() == Some("--network-diagnostics-stream") {
+        use std::io::{Read, Write};
+        // Keep the command shape compatible with isolated diagnostic launchers.
+        let _path = args.next().context("expected config path")?;
+        let mut input = String::new();
+        std::io::stdin()
+            .take(512 * 1024 + 1)
+            .read_to_string(&mut input)?;
+        anyhow::ensure!(
+            input.len() <= 512 * 1024,
+            "Network diagnostic request exceeds limit"
+        );
+        let request: astra_model::nettool::DetailedRequest = serde_json::from_str(&input)?;
+        anyhow::ensure!(
+            request.config.is_empty(),
+            "Detailed diagnostics do not initialize a profile"
+        );
+        nettool::run_detailed_context(&request, |event| {
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer(&mut output, &event)?;
+            writeln!(output)?;
+            output.flush()?;
+            Ok(())
+        })
+        .await?;
+        return Ok(());
+    }
     if first.as_deref() == Some("--nettool-stream") {
         use std::io::{Read, Write};
         let path = std::path::absolute(args.next().context("expected config path")?)?;
@@ -761,8 +788,11 @@ pub async fn run() -> Result<()> {
             "Network tool request exceeds limit"
         );
         let request: astra_model::nettool::Request = serde_json::from_str(&input)?;
-        // Interface and system probes work without a loadable profile.
-        let app = if request.config.is_empty() {
+        // Host-path probes must not initialize unrelated profile state, even
+        // when an older caller still supplies a complete configuration.
+        let app = if !matches!(request.egress, astra_model::nettool::Egress::Outbound(_))
+            || request.config.is_empty()
+        {
             None
         } else {
             anyhow::ensure!(

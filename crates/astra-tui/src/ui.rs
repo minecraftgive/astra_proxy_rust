@@ -1,6 +1,8 @@
 mod animation;
 mod commands;
 mod connections;
+mod dns;
+mod dns_query;
 mod drafts;
 mod event_loop;
 mod focus;
@@ -71,6 +73,10 @@ struct Ui {
     focus: focus::Focus,
     animations: animation::Motion,
     live_view: live::Viewports,
+    dns_viewport: std::cell::Cell<usize>,
+    dns_detail_max: std::cell::Cell<u16>,
+    dns_query_max: std::cell::Cell<u16>,
+    dns_status_max: std::cell::Cell<u16>,
     palette: Option<shell::Palette>,
     /// Reject late view-opening results after the user has switched overlays.
     profile_viewport: std::cell::Cell<usize>,
@@ -166,6 +172,10 @@ impl Ui {
             focus: Default::default(),
             animations,
             live_view: Default::default(),
+            dns_viewport: Default::default(),
+            dns_detail_max: Default::default(),
+            dns_query_max: Default::default(),
+            dns_status_max: Default::default(),
             palette: None,
             profile_viewport: std::cell::Cell::new(1),
             overview_cursor: 0,
@@ -210,7 +220,23 @@ impl Ui {
         {
             return;
         }
-        self.client.paste_content(text);
+        if self.page == shell::DNS && self.dns_state.query_open {
+            if self.dns_state.query_field == 0 {
+                let room = 253usize.saturating_sub(self.dns_state.target.len());
+                self.dns_state.target.extend(
+                    text.chars()
+                        .filter(|c| c.is_ascii() && !c.is_control())
+                        .take(room),
+                );
+            }
+        } else if self.page == shell::DNS && self.dns_state.filtering {
+            self.dns_state
+                .filter
+                .extend(text.chars().filter(|c| !c.is_control()));
+            self.dns_state.selected = None;
+        } else {
+            self.client.paste_content(text);
+        }
     }
     fn key(&mut self, mut key: event::KeyEvent) -> Input {
         if key.kind == KeyEventKind::Release {
@@ -256,6 +282,43 @@ impl Ui {
             };
             return Input::Idle;
         }
+        // NetTool owns its page shortcuts before global navigation. Overlays
+        // above it retain their own input and application commands.
+        if !self.keymap_notice_pending
+            && self.palette.is_none()
+            && self.help_scroll.is_none()
+            && self.monitor.is_none()
+            && !self.client.tasks.showing_details()
+            && self.tui_viewer.is_none()
+            && self.explanation.is_none()
+            && self.recovery.is_none()
+            && self.prompt.is_none()
+            && self.menu.is_none()
+            && self.binding_picker.is_none()
+        {
+            if let Some(tools) = self
+                .diagnostics
+                .as_mut()
+                .and_then(|view| view.tools.as_mut())
+            {
+                if matches!(key.code, KeyCode::F(1..=12)) {
+                    return Input::Idle;
+                }
+                if key.modifiers == KeyModifiers::CONTROL
+                    && matches!(
+                        key.code,
+                        KeyCode::Char('d' | 'p' | 'r' | 'o' | 'y' | 'e' | 'l')
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Left
+                            | KeyCode::Right
+                    )
+                {
+                    tools.key(crate::input::key(key));
+                    return Input::Idle;
+                }
+            }
+        }
         // Window shortcuts are global, including when task/log overlays own input.
         if let Some(input) = self.window_key(key) {
             return input;
@@ -287,6 +350,12 @@ impl Ui {
                 return input;
             }
         }
+        if self.page == shell::DNS
+            && self.live_input()
+            && (self.dns_state.filtering || self.dns_state.query_open)
+        {
+            return self.dns_key(key).unwrap_or(Input::Idle);
+        }
         if let Some(input) = self.focus_key(key) {
             return input;
         }
@@ -308,6 +377,11 @@ impl Ui {
         }
         if let Some(input) = self.background_key(key) {
             return input;
+        }
+        if self.page == shell::DNS && self.live_input() {
+            if let Some(input) = self.dns_key(key) {
+                return input;
+            }
         }
         // Dialogs and local input modes consume Escape before page history.
         if key.code == KeyCode::Esc
@@ -863,6 +937,7 @@ impl Ui {
                 shell::OVERVIEW => self.render_overview(f, area),
                 shell::PROXIES => self.render_live_groups(f, area),
                 shell::CONNECTIONS => self.render_connections(f, area),
+                shell::DNS => self.render_dns(f, area),
                 shell::RULES => self.render_rules(f, area),
                 _ => self.render_profiles(f, area),
             }

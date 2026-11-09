@@ -56,7 +56,12 @@ impl Ui {
         super::dashboard::card(title).border_style(self.focus_border(region, Color::DarkGray))
     }
     pub(super) fn focus_key(&mut self, key: event::KeyEvent) -> Option<Input> {
-        if self.live_detail_open()
+        if (self.page == DNS
+            && (self.dns_state.detail
+                || self.dns_state.filtering
+                || self.dns_state.query_open
+                || self.dns_state.status_open))
+            || self.live_detail_open()
             || self.prompt.is_some()
             || self.recovery.is_some()
             || self.menu.is_some()
@@ -114,7 +119,7 @@ impl Ui {
             };
             self.focus.region = regions[next];
             self.focus.cursor = if self.focus.region == Region::Tabs {
-                self.page
+                page_position(self.page)
             } else {
                 0
             };
@@ -167,7 +172,7 @@ impl Ui {
             }
             KeyCode::Enter | KeyCode::Char(' ') => Some(match self.focus.region {
                 Region::Tabs => {
-                    let page = self.focus.cursor;
+                    let page = page_at(self.focus.cursor);
                     self.suspend_editor();
                     self.focus = Default::default();
                     self.navigate(page)
@@ -221,7 +226,7 @@ impl Ui {
             Region::Tabs => format!(
                 "{}: {}",
                 t("Pages"),
-                t(PAGES[self.focus.cursor.min(PAGES.len() - 1)])
+                t(PAGES[self.focus.cursor.min(PAGES.len() - 1)].1)
             ),
             Region::Controls if self.editor.is_some() => {
                 t(["Save draft", "Import", "Discard draft"][self.focus.cursor.min(2)]).into()

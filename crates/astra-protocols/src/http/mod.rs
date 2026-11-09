@@ -8,9 +8,22 @@ pub async fn http_connect(
     password: Option<&str>,
     target: &Target,
 ) -> Result<Stream> {
-    use base64::Engine;
-    let mut tcp = crate::egress::connect(server).await?;
+    let tcp = crate::egress::connect(server).await?;
     tcp.set_nodelay(true)?;
+    http_connect_on(tcp, username, password, target).await
+}
+/// Handshake on an already connected stream; no resolver or socket is opened here.
+pub async fn http_connect_on(
+    mut tcp: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    username: Option<&str>,
+    password: Option<&str>,
+    target: &Target,
+) -> Result<Stream> {
+    use base64::Engine;
+    ensure!(
+        username.is_some() == password.is_some(),
+        "HTTP credentials must include both username and password"
+    );
     if target.host.bytes().any(|b| b <= 32 || b == 127) {
         bail!("invalid HTTP destination");
     }
@@ -46,7 +59,7 @@ pub async fn http_connect(
     let version = fields.next().unwrap_or("");
     let status = fields.next().unwrap_or("").parse::<u16>().unwrap_or(0);
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || !(200..300).contains(&status) {
-        bail!("upstream HTTP CONNECT rejected: {line}");
+        bail!("upstream HTTP CONNECT rejected (status {status})");
     }
     Ok(Box::new(tcp))
 }

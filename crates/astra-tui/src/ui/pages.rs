@@ -8,7 +8,7 @@ impl Ui {
     pub(super) fn render_rules(&self, f: &mut Frame<'_>, area: Rect) {
         let Some(proxy) = self.active_proxy() else {
             f.render_widget(
-                Paragraph::new(t("No profile yet · 6 then n to create one"))
+                Paragraph::new(t("No profile yet · 7 then n to create one"))
                     .style(Style::default().fg(MUTED))
                     .block(card("Rules")),
                 area,
@@ -109,7 +109,7 @@ impl Ui {
                     )),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled(" 5 ", Style::default().fg(Color::White).bg(BLUE)),
+                    Span::styled(" 6 ", Style::default().fg(Color::White).bg(BLUE)),
                     Span::raw(format!(" {}", t("Logs · ] shows this rule core; set capture level ROUTE for each decision"))),
                 ]));
             }
@@ -124,7 +124,7 @@ impl Ui {
                     tr!("{} has no rule core bound.", proxy.instance.name)
                 }));
                 lines.push(Line::styled(
-                    t("Ctrl-P opens configuration selection. Tab to type, choose Proxy or Rules, then Enter to the list and Enter to select. Rule selection keeps the active proxy. In Profiles, select the proxy and press b to bind a rule core. To create a rule core: 6 → Right → Insert."),
+                    t("Ctrl-P opens configuration selection. Tab to type, choose Proxy or Rules, then Enter to the list and Enter to select. Rule selection keeps the active proxy. In Profiles, select the proxy and press b to bind a rule core. To create a rule core: 7 → Right → Insert."),
                     Style::default().fg(MUTED),
                 ));
             }
@@ -180,7 +180,7 @@ impl Ui {
                 Paragraph::new(if proxy.is_some() {
                     t("Log closed · Enter or [ opens the proxy log, ] the rule core log")
                 } else {
-                    t("No profile yet · 6 then n to create one")
+                    t("No profile yet · 7 then n to create one")
                 })
                 .style(Style::default().fg(MUTED))
                 .block(card("Logs")),

@@ -41,6 +41,9 @@ etherparse = "0.16"
 
 ipnet = { version = "2", features = ["serde"] }
 webpki-roots = "1"
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+x509-parser = "0.18"
 serde_json = "1"
 url = "2"
 
@@ -50,6 +53,10 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_WinInet", "Win32_System_IO", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Console"] }
+
+[[test]]
+name = "nettool_environment"
+path = "src/test/nettool_environment_test.rs"
 
 [[test]]
 name = "hosted_lifecycle"
