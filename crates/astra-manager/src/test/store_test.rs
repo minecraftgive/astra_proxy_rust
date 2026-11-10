@@ -176,6 +176,31 @@ fn progress_events_expose_objects_instead_of_nested_json_strings() {
     assert_eq!(event["message"], "Network probe progress");
 }
 #[test]
+fn installation_progress_events_carry_typed_steps_and_byte_counts() {
+    let store = memory();
+    let payload = crate::install::progress_payload(astra_update::installation::InstallProgress {
+        step: astra_update::installation::InstallStep::Copying,
+        current: 512,
+        total: 2048,
+    });
+    store
+        .event(
+            Some("install"),
+            "installation_event",
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+    let events = store.events(None, 10).unwrap();
+    let event = serde_json::to_value(&events.events[0]).unwrap();
+    assert_eq!(event["payload"]["type"], "installation");
+    assert_eq!(event["payload"]["data"]["step"], "copying");
+    assert_eq!(event["payload"]["data"]["step_index"], 1);
+    assert_eq!(event["payload"]["data"]["step_count"], 5);
+    assert_eq!(event["payload"]["data"]["current"], "512");
+    assert_eq!(event["payload"]["data"]["total"], "2048");
+    assert_eq!(event["message"], "Installation progress");
+}
+#[test]
 fn operation_route_cannot_change_agents() {
     let store = memory();
     store.route("op", "a", "request1", "forwarding").unwrap();

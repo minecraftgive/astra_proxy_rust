@@ -3,6 +3,7 @@
 pub mod elevation;
 pub mod installation;
 pub mod lifecycle;
+pub mod log_sessions;
 pub mod logging;
 pub mod platform;
 pub mod program_info;

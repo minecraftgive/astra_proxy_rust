@@ -7,11 +7,11 @@ use tokio::time::timeout;
 pub async fn connect(
     socket: &std::path::Path,
     name: String,
+    session: Option<String>,
     cursor: Option<LogCursor>,
 ) -> anyhow::Result<UnixStream> {
     timeout(Duration::from_secs(5), async {
-        let mut stream =
-            crate::protocol::subscribe(socket, Action::FollowLogs { name, cursor }).await?;
+        let mut stream = crate::protocol::subscribe_logs(socket, name, session, cursor).await?;
         let reply: Reply = astra_ipc::receive_management(&mut stream).await?;
         anyhow::ensure!(
             reply.version == astra_ipc::API_VERSION,

@@ -24,6 +24,9 @@ pub struct Guard {
     adapter: Option<Arc<super::windows_network::AdapterGuard>>,
 }
 impl Guard {
+    pub(crate) fn name(&self) -> Result<String> {
+        Ok(self._device.name()?)
+    }
     pub async fn failure(&mut self) -> Option<String> {
         match self.task.as_mut() {
             Some(task) => task.check().await,
@@ -39,7 +42,7 @@ impl Drop for Guard {
     }
 }
 #[derive(Default)]
-struct Routes {
+pub(crate) struct Routes {
     owned: Vec<Arc<OwnedRoute>>,
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -225,6 +228,11 @@ pub(super) fn recover_route(record: &RouteRecord, committed: bool) -> Result<()>
     ))
 }
 impl Routes {
+    /// Own a route into `interface` (the TUN) outside the TUN generation, e.g.
+    /// system DNS takeover routes; refuses to replace an existing route.
+    pub(crate) fn add_into(&mut self, cidr: &str, interface: &str) -> Result<()> {
+        self.add(cidr, Some(interface), None, None)
+    }
     fn add(
         &mut self,
         cidr: &str,

@@ -112,7 +112,13 @@ async fn execute_id(p: &Path, operation_id: String, c: v::Command) -> Result<v::
     loop {
         tokio::select! {result=&mut operation=>return result,_=timer.tick()=>{
          if let Ok(v::ResponseBody::Events(batch))=query(p,v::Query::Events{after:cursor.clone(),limit:Some(128)}).await{
-          cursor=Some(batch.cursor);for event in batch.events{if event.operation_id.as_deref()==Some(&operation_id){astra_ipc::progress::report(event.kind,event.message);}}
+          cursor=Some(batch.cursor);for event in batch.events{if event.operation_id.as_deref()==Some(&operation_id){
+           // Structured payloads travel as JSON so observers keep their counts.
+           match &event.payload {
+            Some(v::EventPayload::Installation(progress))=>{if let Ok(detail)=serde_json::to_string(progress){astra_ipc::progress::report(event.kind,detail);}}
+            _=>astra_ipc::progress::report(event.kind,event.message),
+           }
+          }}
          }
         }}
     }
@@ -492,6 +498,9 @@ pub(crate) fn native_numbers(value: serde_json::Value, key: Option<&str>) -> ser
                         | "active"
                         | "total"
                         | "elapsed_ms"
+                        | "timestamp_ms"
+                        | "duration_us"
+                        | "policy_count"
                         | "delay_ms"
                         | "connect_ms"
                         | "sample_sequence"
@@ -505,6 +514,12 @@ pub(crate) fn native_numbers(value: serde_json::Value, key: Option<&str>) -> ser
                         | "seq"
                         | "sent"
                         | "received"
+                        | "session"
+                        | "hour"
+                        | "day"
+                        | "week"
+                        | "month"
+                        | "persist"
                 )
             }) =>
         {
@@ -530,6 +545,100 @@ pub(crate) fn native_numbers(value: serde_json::Value, key: Option<&str>) -> ser
         other => other,
     }
 }
+/// Poll v2 log chunks into a local management stream until it closes.
+async fn follow_logs(
+    p: &Path,
+    writer: &mut astra_platform::platform::LocalStream,
+    name: String,
+    session: Option<String>,
+    mut cursor: Option<LogCursor>,
+) -> Result<()> {
+    astra_ipc::send_management(writer, &Reply::text("Streaming logs over management v2")).await?;
+    loop {
+        let v::ResponseBody::LogChunk(c) = query(
+            p,
+            v::Query::LogChunk {
+                instance: name.clone(),
+                cursor: cursor.map(|c| v::LogCursor {
+                    device: c.device.to_string(),
+                    inode: c.inode.to_string(),
+                    offset: c.offset.to_string(),
+                }),
+                session: session.clone(),
+            },
+        )
+        .await?
+        else {
+            anyhow::bail!("Expected log chunk")
+        };
+        let mut backlog = false;
+        let event = match c {
+            v::LogChunk::Data {
+                bytes,
+                cursor: c,
+                reset,
+                skip_prefix,
+                more,
+            } => {
+                let c = LogCursor {
+                    device: c.device.parse()?,
+                    inode: c.inode.parse()?,
+                    offset: c.offset.parse()?,
+                };
+                cursor = Some(c);
+                backlog = more;
+                LogEvent::Data {
+                    bytes,
+                    cursor: c,
+                    reset,
+                    skip_prefix,
+                }
+            }
+            v::LogChunk::Waiting => LogEvent::Waiting,
+            v::LogChunk::Error(e) => LogEvent::Error(e),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            astra_ipc::send_management(writer, &event),
+        )
+        .await??;
+        // A backlog (first open or a selected earlier session) loads at once.
+        if !backlog {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+/// Follow one log source, or one earlier `session` of it.
+pub async fn subscribe_logs(
+    socket: &Path,
+    name: String,
+    session: Option<String>,
+    cursor: Option<LogCursor>,
+) -> Result<astra_platform::platform::LocalStream> {
+    let (client, mut writer) = astra_platform::platform::stream_pair().await?;
+    let p = socket.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = follow_logs(&p, &mut writer, name, session, cursor).await {
+            let _ = astra_ipc::send_management(&mut writer, &LogEvent::Error(format!("{error:#}")))
+                .await;
+        }
+    });
+    Ok(client)
+}
+/// Sessions of a log source; empty for managers that predate log sessions.
+pub async fn log_sessions(socket: &Path, name: &str) -> Vec<v::LogSession> {
+    match query(
+        socket,
+        v::Query::LogSessions {
+            instance: name.to_owned(),
+        },
+    )
+    .await
+    {
+        Ok(v::ResponseBody::LogSessions(sessions)) => sessions,
+        _ => vec![],
+    }
+}
 pub async fn subscribe(
     socket: &Path,
     action: Action,
@@ -539,58 +648,8 @@ pub async fn subscribe(
     let log_stream = matches!(&action, Action::FollowLogs { .. });
     tokio::spawn(async move {
         let result: Result<()> = async {
-            if let Action::FollowLogs { name, mut cursor } = action {
-                astra_ipc::send_management(
-                    &mut writer,
-                    &Reply::text("Streaming logs over management v2"),
-                )
-                .await?;
-                loop {
-                    let v::ResponseBody::LogChunk(c) = query(
-                        &p,
-                        v::Query::LogChunk {
-                            instance: name.clone(),
-                            cursor: cursor.map(|c| v::LogCursor {
-                                device: c.device.to_string(),
-                                inode: c.inode.to_string(),
-                                offset: c.offset.to_string(),
-                            }),
-                        },
-                    )
-                    .await?
-                    else {
-                        anyhow::bail!("Expected log chunk")
-                    };
-                    let event = match c {
-                        v::LogChunk::Data {
-                            bytes,
-                            cursor: c,
-                            reset,
-                            skip_prefix,
-                        } => {
-                            let c = LogCursor {
-                                device: c.device.parse()?,
-                                inode: c.inode.parse()?,
-                                offset: c.offset.parse()?,
-                            };
-                            cursor = Some(c);
-                            LogEvent::Data {
-                                bytes,
-                                cursor: c,
-                                reset,
-                                skip_prefix,
-                            }
-                        }
-                        v::LogChunk::Waiting => LogEvent::Waiting,
-                        v::LogChunk::Error(e) => LogEvent::Error(e),
-                    };
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        astra_ipc::send_management(&mut writer, &event),
-                    )
-                    .await??;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
+            if let Action::FollowLogs { name, cursor } = action {
+                return follow_logs(&p, &mut writer, name, None, cursor).await;
             }
             if let Action::NetTool {
                 name: instance,
@@ -669,7 +728,7 @@ async fn stream_job(
     let result = loop {
         tokio::select! {result=&mut operation=>break result?,_=timer.tick()=>{
          if let Ok(v::ResponseBody::Events(batch))=query(path,v::Query::Events{after:cursor.clone(),limit:Some(256)}).await{cursor=Some(batch.cursor);
-          for event in batch.events{if event.operation_id.as_deref()==Some(&operation_id)&&event.kind==event_kind{let value=match event.payload {Some(v::EventPayload::Diagnostics(value)|v::EventPayload::NetTool(value))=>value,None=>continue};let text=serde_json::to_string(&native_numbers(value,None))?;if seen.insert(text.clone()){tokio::time::timeout(Duration::from_secs(3),astra_ipc::send_management(writer,&Reply::text(text))).await??;}}}
+          for event in batch.events{if event.operation_id.as_deref()==Some(&operation_id)&&event.kind==event_kind{let value=match event.payload {Some(v::EventPayload::Diagnostics(value)|v::EventPayload::NetTool(value))=>value,Some(v::EventPayload::Installation(_))|None=>continue};let text=serde_json::to_string(&native_numbers(value,None))?;if seen.insert(text.clone()){tokio::time::timeout(Duration::from_secs(3),astra_ipc::send_management(writer,&Reply::text(text))).await??;}}}
          }
         }}
     };

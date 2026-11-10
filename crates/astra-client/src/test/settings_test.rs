@@ -49,6 +49,18 @@ fn information_tokens_preserve_frontend_identity_and_strip_control_characters() 
     });
 }
 
+#[test]
+fn compiled_time_shows_utc_and_bracketed_local_time() {
+    let text = super::program_info::compiled_time("2026-11-10T08:30:00Z");
+    let local = chrono::DateTime::parse_from_rfc3339("2026-11-10T08:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string();
+    assert_eq!(text, format!("2026-11-10 08:30:00 UTC [{local}]"));
+    assert_eq!(super::program_info::compiled_time("unknown"), "unknown");
+}
+
 fn settings_ui() -> (Client, crate::import::tests::Fixture) {
     let dir = crate::import::tests::Fixture::new();
     let mut client = Client::new(crate::protocol::Kind::Proxy);

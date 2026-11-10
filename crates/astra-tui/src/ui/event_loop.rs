@@ -29,6 +29,13 @@ pub(super) async fn run_local(
     if let Some(kind) = launch.kind {
         ui.kind = kind;
     }
+    // A primary launch starts a new frontend log session; detached windows
+    // and resumed restarts keep writing to the running one.
+    if launch.window_id.is_none() && !resume_ui {
+        if let Some(home) = socket.parent() {
+            astra_client::tui_log::begin_session(home);
+        }
+    }
     ui.initialize_installation(&context, &socket, &launch, resume_ui);
     let window_id = launch.window_id.clone();
     let mut initial = Some(launch);

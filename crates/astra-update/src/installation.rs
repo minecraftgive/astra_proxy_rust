@@ -34,6 +34,90 @@ pub enum InstallOutcome {
     RequiresLocalAction(InstallationStatus),
 }
 
+/// Ordered installation steps reported to progress observers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallStep {
+    Preparing,
+    Copying,
+    Verifying,
+    Publishing,
+    Complete,
+}
+impl InstallStep {
+    pub const COUNT: u8 = 5;
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Preparing => 0,
+            Self::Copying => 1,
+            Self::Verifying => 2,
+            Self::Publishing => 3,
+            Self::Complete => 4,
+        }
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Copying => "copying",
+            Self::Verifying => "verifying",
+            Self::Publishing => "publishing",
+            Self::Complete => "complete",
+        }
+    }
+    pub fn from_key(key: &str) -> Option<Self> {
+        [
+            Self::Preparing,
+            Self::Copying,
+            Self::Verifying,
+            Self::Publishing,
+            Self::Complete,
+        ]
+        .into_iter()
+        .find(|step| step.key() == key)
+    }
+    /// English description retained for logs and non-localized observers.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing installation",
+            Self::Copying => "Copying the current program package",
+            Self::Verifying => "Verifying the installed program package",
+            Self::Publishing => "Publishing the installation entry",
+            Self::Complete => "Installation complete; the running processes are unchanged",
+        }
+    }
+}
+/// One progress observation; `current`/`total` count copied bytes while copying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallProgress {
+    pub step: InstallStep,
+    pub current: u64,
+    pub total: u64,
+}
+impl InstallProgress {
+    pub fn step(step: InstallStep) -> Self {
+        Self {
+            step,
+            current: 0,
+            total: 0,
+        }
+    }
+}
+impl std::fmt::Display for InstallProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.total > 0 {
+            write!(
+                f,
+                "{} ({}/{} bytes)",
+                self.step.description(),
+                self.current,
+                self.total
+            )
+        } else {
+            f.write_str(self.step.description())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -229,7 +313,7 @@ pub fn install(
     expected_release_id: &str,
     expected_manifest_sha256: &str,
     scope: InstallScope,
-    on_progress: impl FnMut(&str),
+    on_progress: impl FnMut(InstallProgress),
 ) -> Result<InstallOutcome> {
     let source = source(source_directory)?;
     let paths = platform::layout_for_frontend(
@@ -254,7 +338,7 @@ fn install_at(
     expected_release_id: &str,
     expected_manifest_sha256: &str,
     paths: InstallPaths,
-    mut on_progress: impl FnMut(&str),
+    mut on_progress: impl FnMut(InstallProgress),
 ) -> Result<InstallOutcome> {
     ensure!(
         source.manifest.release_id == expected_release_id
@@ -263,13 +347,14 @@ fn install_at(
     );
     let current = inspect(&source, &paths)?;
     if current.installed {
+        on_progress(InstallProgress::step(InstallStep::Complete));
         return Ok(InstallOutcome::Installed(current));
     }
     if current.requires_local_action {
         return Ok(InstallOutcome::RequiresLocalAction(current));
     }
     platform::check_entry(&paths)?;
-    on_progress("Preparing installation");
+    on_progress(InstallProgress::step(InstallStep::Preparing));
     platform::prepare_directory(&paths.root, paths.scope)?;
     let lock_path = paths.root.join("install.lock");
     platform::validate_destination(&lock_path, paths.scope)?;
@@ -295,6 +380,7 @@ fn install_at(
         .context("Another installation is in progress")?;
     let current = inspect(&source, &paths)?;
     if current.installed {
+        on_progress(InstallProgress::step(InstallStep::Complete));
         return Ok(InstallOutcome::Installed(current));
     }
     platform::check_entry(&paths)?;
@@ -323,8 +409,20 @@ fn install_at(
         let staging = staging_root.join(&id);
         platform::prepare_staging_directory(&staging, paths.scope)?;
         let temporary = Staging(staging.clone());
-        on_progress("Copying the current program package");
-        for file in &source.manifest.files {
+        let total = source
+            .manifest
+            .files
+            .iter()
+            .map(|file| file.size)
+            .sum::<u64>();
+        let mut copied = 0u64;
+        let mut reported = (0u64, std::time::Instant::now());
+        on_progress(InstallProgress {
+            step: InstallStep::Copying,
+            current: 0,
+            total,
+        });
+        for (index, file) in source.manifest.files.iter().enumerate() {
             let destination = staging.join(&file.path);
             let parent = destination.parent().context("Package file has no parent")?;
             platform::prepare_staging_directory(parent, paths.scope)?;
@@ -360,9 +458,23 @@ fn install_at(
             platform::protect_staging_file(&destination, paths.scope, binary)?;
             output.flush()?;
             output.sync_all()?;
+            copied += bytes;
+            // Throttle to whole-percent steps or 100 ms, always reporting the final file.
+            let last = index + 1 == source.manifest.files.len();
+            if last
+                || copied.saturating_sub(reported.0) >= total / 100
+                || reported.1.elapsed() >= std::time::Duration::from_millis(100)
+            {
+                reported = (copied, std::time::Instant::now());
+                on_progress(InstallProgress {
+                    step: InstallStep::Copying,
+                    current: copied,
+                    total,
+                });
+            }
         }
         platform::atomic_staging_file(&staging.join(MANIFEST_FILE), &source.bytes, paths.scope)?;
-        on_progress("Verifying the installed program package");
+        on_progress(InstallProgress::step(InstallStep::Verifying));
         ensure!(
             verify_installation_directory(&staging, &ImportOptions::default())? == source.manifest,
             "Copied package verification failed"
@@ -409,7 +521,7 @@ fn install_at(
         deployment,
     };
     platform::check_entry(&paths)?;
-    on_progress("Publishing the installation entry");
+    on_progress(InstallProgress::step(InstallStep::Publishing));
     platform::publish_entry(&paths, &executable(&directory, &source.manifest))?;
     let record_bytes = serde_json::to_vec_pretty(&record)?;
     if let Err(error) = platform::atomic_file(
@@ -428,7 +540,7 @@ fn install_at(
             .context("Installation record failed and the previous entry could not be restored")?;
         return Err(error.into());
     }
-    on_progress("Installation complete; the running processes are unchanged");
+    on_progress(InstallProgress::step(InstallStep::Complete));
     Ok(InstallOutcome::Installed(inspect(&source, &paths)?))
 }
 

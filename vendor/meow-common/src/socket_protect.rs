@@ -83,6 +83,16 @@ pub trait HostResolver: Send + Sync {
         let _ = host;
         None
     }
+
+    /// Async lookup for a re-entered hook, tried after
+    /// [`Self::resolve_all_local`]. Implementations that must never reach the
+    /// system resolver (e.g. encrypted-only DNS) answer here using a path
+    /// that cannot re-enter, or return `Some(Err(..))` to fail closed. `None`
+    /// (the default) keeps the historical system-resolver fallback.
+    async fn resolve_all_nested(&self, host: &str) -> Option<io::Result<Vec<IpAddr>>> {
+        let _ = host;
+        None
+    }
 }
 
 static RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
@@ -377,6 +387,19 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
                         .map(|ip| SocketAddr::new(ip, port))
                         .collect());
                 }
+            }
+            if let Some(result) = r.resolve_all_nested(host).await {
+                let ips = result?;
+                if ips.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("resolve: no address for {host}:{port}"),
+                    ));
+                }
+                return Ok(ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect());
             }
             tracing::debug!(
                 host,

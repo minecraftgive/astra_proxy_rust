@@ -121,9 +121,14 @@ impl Render for Viewer {
         }
         let status = tr!(
             "{}\n{}/{} lines · limit {} · released {}\n过滤: {}\n搜索: {}\nLocal log: {}",
-            self.frozen.as_ref().map_or_else(
-                || self.status.clone(),
-                |(_, stamp)| format!("{} · 冻结于 {stamp} · 后台仍更新", self.status)
+            format!(
+                "{} · {}{}",
+                self.frozen.as_ref().map_or_else(
+                    || self.status.clone(),
+                    |(_, stamp)| format!("{} · 冻结于 {stamp} · 后台仍更新", self.status)
+                ),
+                self.session_label(),
+                if self.sessions.len() > 1 { " · s" } else { "" }
             ),
             visible.len(),
             self.records.len(),
@@ -202,6 +207,30 @@ impl Render for Viewer {
                                 } else {
                                     t("core 记录级别 · 即时生效 · Enter 应用")
                                 })
+                                .borders(Borders::ALL),
+                        ),
+                    popup,
+                    &mut state,
+                );
+            }
+            Mode::Session(selected) => {
+                let choices = self.session_choices();
+                let height = (choices.len() as u16 + 2).clamp(3, 12).min(area.height);
+                let popup = Rect {
+                    x: area.x + 1,
+                    y: area.y + area.height.saturating_sub(height) / 2,
+                    width: area.width.saturating_sub(2),
+                    height,
+                };
+                frame.render_widget(Clear, popup);
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(
+                    List::new(choices.into_iter().map(ListItem::new))
+                        .highlight_symbol("› ")
+                        .highlight_style(crate::theme::selected())
+                        .block(
+                            Block::default()
+                                .title(t("日志会话 · ↑↓ 选择 · Enter 打开 · Esc 取消"))
                                 .borders(Borders::ALL),
                         ),
                     popup,

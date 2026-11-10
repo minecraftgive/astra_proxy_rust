@@ -68,7 +68,8 @@ impl Prepared {
             tasks: vec![],
         };
         for (udp, tcp) in self.sockets {
-            guard.addresses.push(tcp.local_addr().unwrap());
+            let local = tcp.local_addr().unwrap();
+            guard.addresses.push(local);
             let active = current.clone();
             guard.tasks.push(Task::spawn_result(format!("DNS UDP {}", tcp.local_addr().unwrap()), async move {
                 let mut jobs=JoinSet::new();let mut bytes=vec![0;65535];
@@ -84,6 +85,7 @@ impl Prepared {
                         // DNS listeners follow the same LAN ACL as proxy inbounds;
                         // a non-loopback bind must never become an open resolver.
                         if !app.inbound_allowed(peer.ip()){continue;}
+                        if crate::platform::system_dns::local_only(&app,local)&&!peer.ip().is_loopback(){continue;}
                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
                         if jobs.len()>=limit{continue;}
                         let request=bytes[..size].to_vec();let udp=udp.clone();
@@ -106,6 +108,7 @@ impl Prepared {
                             Err(error)=>return Err::<(),_>(error),
                         };let app=active.load_full();
                         if !app.inbound_allowed(peer.ip()){continue;}
+                        if crate::platform::system_dns::local_only(&app,local)&&!peer.ip().is_loopback(){continue;}
                         let _=stream.set_nodelay(true);
                         let limit=app.dns.as_ref().map(|dns|dns.config.max_concurrent).unwrap_or(0);
                         if jobs.len()>=limit{continue;}

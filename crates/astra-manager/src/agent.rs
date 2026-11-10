@@ -195,6 +195,25 @@ impl AgentService {
             .find(|(n, _)| n == name)
             .map(|(_, p)| p))
     }
+    /// The log session source of a viewer name: frontend logs, a server core
+    /// (`server-<name>`) or a known managed instance.
+    async fn log_source(&self, instance: &str) -> Result<String> {
+        if let Some(source) = crate::tui_log::source_name(instance) {
+            return Ok(source.into());
+        }
+        if self.server_path(instance).await?.is_some() {
+            return Ok(format!("server-{instance}"));
+        }
+        anyhow::ensure!(
+            self.call(old::Action::List)
+                .await?
+                .rows
+                .iter()
+                .any(|r| r.instance.name == instance),
+            crate::error::message(ErrorCode::NotFound, "instance not found")
+        );
+        Ok(instance.into())
+    }
     fn server_endpoint(&self, name: &str) -> PathBuf {
         self.config.state_dir.join(format!("server-{name}.sock"))
     }
@@ -377,7 +396,8 @@ impl AgentService {
             | Query::ExitProbe { instance, .. }
             | Query::LogLevel { instance }
             | Query::Logs { instance }
-            | Query::LogChunk { instance, .. } => {
+            | Query::LogChunk { instance, .. }
+            | Query::LogSessions { instance } => {
                 *instance = self.store.resolve(instance).await?;
             }
             _ => {}
@@ -608,7 +628,27 @@ impl AgentService {
                 };
                 ResponseBody::Logs { text }
             }
-            Query::LogChunk { instance, cursor } => {
+            Query::LogSessions { instance } => {
+                let source = self.log_source(&instance).await?;
+                let current =
+                    astra_platform::log_sessions::current(&self.config.state_dir, &source);
+                ResponseBody::LogSessions(
+                    astra_platform::log_sessions::list(&self.config.state_dir, &source)
+                        .into_iter()
+                        .map(|session| LogSession {
+                            current: current.as_ref() == Some(&session.path),
+                            id: session.id,
+                            started_ms: session.started_ms.to_string(),
+                            size: session.size.to_string(),
+                        })
+                        .collect(),
+                )
+            }
+            Query::LogChunk {
+                instance,
+                cursor,
+                session,
+            } => {
                 let cursor = cursor
                     .map(|c| {
                         Ok::<_, anyhow::Error>(old::LogCursor {
@@ -618,39 +658,19 @@ impl AgentService {
                         })
                     })
                     .transpose()?;
-                let mut stream = if self.server_path(&instance).await?.is_some() {
-                    let (reader, writer) = astra_platform::platform::stream_pair().await?;
-                    tokio::spawn(crate::log_stream::serve(
-                        writer,
-                        self.config.state_dir.join(format!("server-{instance}.log")),
-                        cursor,
-                    ));
-                    reader
-                } else {
-                    anyhow::ensure!(
-                        crate::tui_log::source_file(&instance).is_some()
-                            || self
-                                .call(old::Action::List)
-                                .await?
-                                .rows
-                                .iter()
-                                .any(|r| r.instance.name == instance),
-                        crate::error::message(ErrorCode::NotFound, "instance not found")
-                    );
-                    let (reader, writer) = astra_platform::platform::stream_pair().await?;
-                    tokio::spawn(crate::log_stream::serve(
-                        writer,
-                        self.config.state_dir.join(
-                            if let Some(file) = crate::tui_log::source_file(&instance) {
-                                file.into()
-                            } else {
-                                format!("{instance}.log")
-                            },
-                        ),
-                        cursor,
-                    ));
-                    reader
+                let source = self.log_source(&instance).await?;
+                let path = match session {
+                    Some(id) => crate::log_stream::LogPath::Fixed(
+                        astra_platform::log_sessions::resolve(&self.config.state_dir, &source, &id)
+                            .ok_or_else(|| {
+                                crate::error::message(ErrorCode::NotFound, "log session not found")
+                            })?,
+                    ),
+                    None => crate::log_stream::LogPath::current(&self.config.state_dir, source),
                 };
+                let (reader, writer) = astra_platform::platform::stream_pair().await?;
+                tokio::spawn(crate::log_stream::serve(writer, path, cursor));
+                let mut stream = reader;
                 let event: old::LogEvent = match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     astra_ipc::receive_management(&mut stream),
@@ -666,16 +686,20 @@ impl AgentService {
                         cursor,
                         reset,
                         skip_prefix,
-                    } => LogChunk::Data {
-                        bytes,
-                        cursor: LogCursor {
-                            device: cursor.device.to_string(),
-                            inode: cursor.inode.to_string(),
-                            offset: cursor.offset.to_string(),
-                        },
-                        reset,
-                        skip_prefix,
-                    },
+                    } => {
+                        let bytes_len = bytes.len();
+                        LogChunk::Data {
+                            bytes,
+                            cursor: LogCursor {
+                                device: cursor.device.to_string(),
+                                inode: cursor.inode.to_string(),
+                                offset: cursor.offset.to_string(),
+                            },
+                            reset,
+                            skip_prefix,
+                            more: bytes_len >= crate::log_stream::CHUNK,
+                        }
+                    }
                     old::LogEvent::Waiting => LogChunk::Waiting,
                     old::LogEvent::Error(e) => LogChunk::Error(e),
                 })
@@ -985,6 +1009,21 @@ impl AgentService {
                 }
             }
         };
+        // Persist a final step that raced with completion so observers see it.
+        let last = updates
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| updates.borrow_and_update().clone())
+            .flatten();
+        if let Some(event) = last {
+            if let Err(error) = self
+                .store
+                .event(Some(&id), &event.phase, &event.detail)
+                .await
+            {
+                eprintln!("Operation {id} progress persistence failed: {error:#}");
+            }
+        }
         self.finish_operation(&id, &result).await?;
         result
     }
@@ -1087,12 +1126,20 @@ impl AgentService {
                         &package_id,
                         &expected_release_id,
                         scope,
-                        |message| {
+                        |update| {
                             if let Some(progress) = &progress {
-                                progress.send_replace(Some(astra_ipc::progress::Progress::new(
-                                    "Installing package",
-                                    message,
-                                )));
+                                let payload = crate::install::progress_payload(update);
+                                if let Ok(detail) = serde_json::to_string(&payload) {
+                                    let mut event = astra_ipc::progress::Progress::new(
+                                        "installation_event",
+                                        detail,
+                                    );
+                                    if update.total > 0 {
+                                        event.current = Some(update.current);
+                                        event.total = Some(update.total);
+                                    }
+                                    progress.send_replace(Some(event));
+                                }
                             }
                         },
                     )
@@ -1532,7 +1579,10 @@ impl AgentService {
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(self.config.state_dir.join(format!("server-{name}.log")))?;
+            .open(astra_platform::log_sessions::new_session(
+                &self.config.state_dir,
+                &format!("server-{name}"),
+            )?)?;
         let mut command = std::process::Command::new(self.server_binary());
         command.envs(
             self.config

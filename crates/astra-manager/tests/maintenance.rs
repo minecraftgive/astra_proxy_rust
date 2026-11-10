@@ -203,10 +203,10 @@ async fn switches_real_backend_and_restores_exact_instances_on_both_roles() -> R
                 let config=f.config.config_dir.join(format!("{name}.toml"));
                 let text=if server {"allow_private_targets=true\nshutdown_timeout_secs=0\n[[listeners]]\ntag=\"test\"\nprotocol=\"socks5\"\nlisten=\"127.0.0.1:0\"\n[[listeners.users]]\nname=\"test\"\npassword=\"test-pass\"\n"} else {"standalone=true\nsocks5_listen=\"127.0.0.1:0\"\nshutdown_timeout_secs=0\n[[outbounds]]\nkind=\"socks5\"\ntag=\"node\"\nserver=\"127.0.0.1:9\"\n"};
                 let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-                std::fs::write(&config,text.replace("127.0.0.1:0", &format!("127.0.0.1:{port}")))?;
+                std::fs::write(&config,format!("auto_start = {}\n{}", name == "running", text.replace("127.0.0.1:0", &format!("127.0.0.1:{port}"))))?;
                 f.execute(astra_management::v2::Command::Add{name:name.into(),kind:if server{InstanceKind::Server}else{InstanceKind::Proxy},config}).await?;
             }
-            f.execute(astra_management::v2::Command::Start{instance:"running".into()}).await?;
+            f.execute(astra_management::v2::Command::StartSilent{instance:"running".into()}).await?;
             if !server {
                 let config=f.config.config_dir.join("rules.toml");
                 std::fs::write(&config, format!("socket={}\ndefault_action='direct'\n", toml::Value::String(f.root.path().join("routes.sock").to_string_lossy().into_owned())))?;
@@ -236,6 +236,37 @@ async fn switches_real_backend_and_restores_exact_instances_on_both_roles() -> R
                 assert_eq!(runtime["mode"], "direct");
                 assert!(instances.iter().find(|i|i.name=="rules").unwrap().pid.is_some());
             }
+            let selection: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                f.config.state_dir.join("maintenance/launch.json"),
+            )?)?;
+            assert_eq!(selection["directory"], f.new.to_string_lossy().as_ref());
+            assert_eq!(selection["manifest_sha256"], result.manifest_sha256);
+            // An old shortcut must still select the new host on the next silent startup.
+            let new_process = result.new_process.as_ref().context("new host identity")?;
+            let _ = f.execute(astra_management::v2::Command::Shutdown).await;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while astra_platform::lifecycle::matches_live(new_process)? {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await??;
+            let output = tokio::time::timeout(Duration::from_secs(45),
+                tokio::process::Command::new(f.old.join(astra_platform::platform::executable(
+                    if server { "astra-server-tui" } else { "astra-tui" },
+                )))
+                    .arg("--silent")
+                    .arg("--state-dir").arg(&f.config.state_dir)
+                    .arg("--config-dir").arg(&f.config.config_dir)
+                    .env("ASTRA_RUNTIME_DIR", f.config.runtime_dir.as_ref().unwrap())
+                    .kill_on_drop(true).output(),
+            ).await??;
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let ResponseBody::InstallationStatus(status) = f.query(Query::InstallationStatus).await? else { anyhow::bail!("installation status") };
+            assert!(status.packages.iter().any(|package| package.source == f.new));
+            assert!(status.packages.iter().all(|package| package.source != f.old));
+            let ResponseBody::Instances(instances) = f.query(Query::Instances).await? else { anyhow::bail!("instances") };
+            assert!(instances.iter().find(|i| i.name == "running").unwrap().pid.is_some());
+            assert!(instances.iter().find(|i| i.name == "stopped").unwrap().pid.is_none());
             Ok::<_,anyhow::Error>(())
         }.await;
         if result.is_err() {

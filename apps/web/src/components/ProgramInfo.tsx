@@ -86,9 +86,12 @@ function Facts({ entries }: { entries: [string, string][] }) {
 function compiledDate(value: string) {
   if (value === "unknown") return unknown;
   const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : `${date.toLocaleString("zh-CN", { timeZone: "UTC", hour12: false })} UTC`;
+  if (Number.isNaN(date.valueOf())) return value;
+  const utc = date.toLocaleString("zh-CN", { timeZone: "UTC", hour12: false });
+  const local = date.toLocaleString("zh-CN", { hour12: false });
+  const minutes = -date.getTimezoneOffset();
+  const offset = `UTC${minutes < 0 ? "-" : "+"}${String(Math.floor(Math.abs(minutes) / 60)).padStart(2, "0")}:${String(Math.abs(minutes) % 60).padStart(2, "0")}`;
+  return `${utc} UTC [${local} ${offset}]`;
 }
 
 export default function ProgramInfo({

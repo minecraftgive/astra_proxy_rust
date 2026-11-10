@@ -59,7 +59,16 @@ impl Drop for Core {
 }
 impl Core {
     async fn start(a: SocketAddr, b: SocketAddr, authenticated: bool) -> Self {
-        let root = std::env::temp_dir().join(format!("astra-rt-{}", uuid::Uuid::new_v4()));
+        // Leave room for the control/lifecycle sockets under macOS's long TMPDIR.
+        let temp = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = temp.join(format!(
+            "art-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(root.join("config")).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
         let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -126,6 +135,105 @@ impl Core {
             1
         );
     }
+}
+
+#[tokio::test]
+async fn ordinary_core_exposes_dns_telemetry_and_refreshes_it_after_reload() {
+    let mut core = Core::start(
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+        false,
+    )
+    .await;
+    let endpoint = astra_model::host_control::endpoint(&core.socket);
+    assert!(
+        astra_ipc::host::request_json_control(
+            &endpoint,
+            astra_model::host_control::Command::Telemetry
+        )
+        .await
+        .is_err(),
+        "ordinary mode must not depend on a resident host"
+    );
+    let sample = control::runtime_telemetry(&core.socket)
+        .await
+        .unwrap()
+        .unwrap();
+    let disabled: astra_model::runtime::RuntimeView = serde_json::from_value(sample).unwrap();
+    assert!(!disabled.telemetry.unwrap().dns_resolver.unwrap().enabled);
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    core.source.push_str(&format!("\n[dns]\nlisten=['127.0.0.1:{port}']\nfake_ip=true\nnameserver=['https://resolver.example/dns-query']\nfallback=['tls://1.1.1.1']\nplaintext_bypass=true\n"));
+    std::fs::write(core.root.join("config/proxy.toml"), &core.source).unwrap();
+    control::request(
+        &core.socket,
+        astra_model::control::Command::Reload { path: None },
+    )
+    .await
+    .unwrap();
+    let query = astra_dns::wire::query("ordinary.example", hickory_proto::rr::RecordType::A)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let mut dns = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    dns.write_u16(query.len() as u16).await.unwrap();
+    dns.write_all(&query).await.unwrap();
+    let size = dns.read_u16().await.unwrap();
+    let mut answer = vec![0; size as usize];
+    dns.read_exact(&mut answer).await.unwrap();
+    drop(dns);
+    let sample: astra_model::runtime::RuntimeView = serde_json::from_value(
+        control::runtime_telemetry(&core.socket)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let meta = sample.telemetry.as_ref().unwrap();
+    assert_eq!(meta.coverage, astra_model::runtime::Coverage::Complete);
+    assert_eq!(meta.sample_age_ms, 0);
+    let resolver = meta.dns_resolver.as_ref().unwrap();
+    assert!(resolver.enabled && resolver.fake_ip);
+    assert_eq!(resolver.nameservers[0].transport, "DoH");
+    assert_eq!(resolver.listen[0].port(), port);
+    assert_eq!(
+        meta.dns.as_ref().unwrap().records[0].domain,
+        "ordinary.example"
+    );
+    assert_eq!(meta.dns.as_ref().unwrap().records[0].source, "fake_ip");
+    // Old Snapshot consumers still use the same bincode command and layout.
+    assert_eq!(
+        core.command(Command::Snapshot).await.pid,
+        sample.snapshot.pid
+    );
+    core.source = core
+        .source
+        .replace("https://resolver.example/dns-query", "tcp://1.1.1.1:53");
+    std::fs::write(core.root.join("config/proxy.toml"), &core.source).unwrap();
+    control::request(
+        &core.socket,
+        astra_model::control::Command::Reload { path: None },
+    )
+    .await
+    .unwrap();
+    let next: astra_model::runtime::RuntimeView = serde_json::from_value(
+        control::runtime_telemetry(&core.socket)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let next = next.telemetry.unwrap();
+    assert_eq!(next.host_boot_id, meta.host_boot_id);
+    assert!(next.active_generation > meta.active_generation);
+    assert!(next.sample_sequence > meta.sample_sequence);
+    assert!(next.sample_elapsed_ms >= meta.sample_elapsed_ms);
+    assert_eq!(next.dns_resolver.unwrap().nameservers[0].transport, "TCP");
 }
 struct Server {
     address: SocketAddr,

@@ -132,6 +132,7 @@ enable=true
 fake_ip=true
 nameserver=["udp://1.1.1.1:53", "tcp://1.0.0.1:53", "tls://1.1.1.1:853", "https://resolver.example/dns-query"]
 fallback=["tls://8.8.8.8:853"]
+plaintext_bypass=true
 "#.into(),
     )
     .unwrap();

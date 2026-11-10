@@ -54,6 +54,30 @@ pub struct InstallationResult {
     pub launch_command: String,
 }
 
+/// Ordered installation steps carried by `EventPayload::Installation`.
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationStep {
+    Preparing,
+    Copying,
+    Verifying,
+    Publishing,
+    Complete,
+}
+
+/// Structured progress for one `install_current_package` operation. Byte
+/// counts are decimal strings and are non-zero only while copying.
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallationProgress {
+    pub step: InstallationStep,
+    pub step_index: u8,
+    pub step_count: u8,
+    pub current: String,
+    pub total: String,
+}
+
 /// Only returned through the target machine's private local IPC. No browser
 /// or remote controller may request a local interactive elevation launch.
 #[cfg_attr(feature = "bindings", derive(TS))]

@@ -290,6 +290,9 @@ impl Ui {
                 logs::Command::Reconnect => {
                     return Some(Input::Run(Action::Logs("@tui".into()), None))
                 }
+                command @ logs::Command::Session(_) => {
+                    return Some(self.client.frontend_log_command(command))
+                }
                 _ => {}
             }
             return Some(Input::Idle);

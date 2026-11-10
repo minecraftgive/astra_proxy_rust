@@ -336,8 +336,8 @@ async fn perform_logs(
 ) -> JobResult {
     // The legacy UI rows retain each instance's kind, while the server adapter
     // deliberately offers log reading without dynamic capture-level control.
-    let capture_supported =
-        name == "@tui" || (name != "@gui" && input.target(&name).kind != Kind::Server);
+    let server = !name.starts_with('@') && input.target(&name).kind == Kind::Server;
+    let capture_supported = name == "@tui" || (name != "@gui" && !server);
     let mut viewer = logs::Viewer::new(
         name.clone(),
         input.log_settings.remove(&name).unwrap_or_default(),
@@ -352,6 +352,20 @@ async fn perform_logs(
                 .text
                 .parse()?;
         }
+        let source = match crate::tui_log::source_name(&name) {
+            Some(source) => source.to_owned(),
+            None if server => format!("server-{name}"),
+            None => name.clone(),
+        };
+        let directory = socket
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("logs")
+            .join(source);
+        viewer.set_sessions(
+            crate::protocol::log_sessions(socket, &name).await,
+            directory,
+        );
         viewer.connect(socket).await
     }
     .await;
@@ -698,7 +712,7 @@ pub fn apply_operation<H: OperationHost>(
             ui.update_view = Some(view);
         }
         JobResult::Logs(viewer) => {
-            if crate::tui_log::source_file(&viewer.name).is_some() {
+            if crate::tui_log::source_name(&viewer.name).is_some() {
                 if context.log_target_current {
                     ui.tui_viewer = Some(viewer);
                 }
@@ -726,7 +740,7 @@ pub fn apply_operation<H: OperationHost>(
             if let Some(observed) = observed {
                 merge_observation(ui, &observed);
             }
-            if matches!(action,Action::Logs(name) if crate::tui_log::source_file(name).is_some())
+            if matches!(action,Action::Logs(name) if crate::tui_log::source_name(name).is_some())
                 && context.log_target_current
             {
                 ui.tui_viewer = None;

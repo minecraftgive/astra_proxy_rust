@@ -61,6 +61,53 @@ fn restart_for_completed_update() -> Restart {
         ..Default::default()
     }
 }
+
+#[tokio::test]
+async fn installation_completion_requires_the_target_backend_to_be_running() {
+    use crate::{
+        installation::Activation,
+        package_choice::tests::{maintenance_record, package},
+    };
+    let root = crate::import::tests::Fixture::new();
+    let target = package(&root.0.join("target"), b"new");
+    let context = crate::windows::Context {
+        home: root.0.join("state"),
+        bin: target.directory.clone(),
+        executable: target
+            .directory
+            .join(astra_platform::platform::executable("astra-tui")),
+        ..restart_context()
+    };
+    let mut client = Client::new(crate::protocol::Kind::Proxy);
+    client.installation.result = Some(astra_management::v2::InstallationResult {
+        role: "client".into(),
+        directory: target.directory.clone(),
+        entry: root.0.join("entry"),
+        already_installed: true,
+        message: String::new(),
+        launch_command: String::new(),
+    });
+    client.installation.activation = Some(Activation::Waiting);
+    let mut restart = Restart::default();
+    let mut record = maintenance_record(&root.0, &target);
+    astra_management::maintenance::write(&record).unwrap();
+    restart.poll_client(&mut client, &context, true).unwrap();
+    assert_eq!(client.installation.activation, Some(Activation::Waiting));
+    record.new_process = Some(astra_platform::lifecycle::capture(std::process::id()).unwrap());
+    astra_management::maintenance::write(&record).unwrap();
+    restart.poll_client(&mut client, &context, true).unwrap();
+    assert_eq!(client.installation.activation, Some(Activation::Running));
+    // A historical completed switch must not mark a later installation as running.
+    client.installation.result.as_mut().unwrap().directory = root.0.join("another-build");
+    restart.poll_client(&mut client, &context, true).unwrap();
+    assert_eq!(client.installation.activation, Some(Activation::Waiting));
+    client.installation.result.as_mut().unwrap().directory = target.directory;
+    record.new_process.as_mut().unwrap().started = "no-longer-the-recorded-process".into();
+    astra_management::maintenance::write(&record).unwrap();
+    restart.poll_client(&mut client, &context, true).unwrap();
+    assert_eq!(client.installation.activation, Some(Activation::Waiting));
+}
+
 #[tokio::test]
 async fn restart_does_not_replay_a_historical_completion() {
     let status = completed_update("historical-operation");

@@ -438,3 +438,91 @@ it("shows a failed installation task as an error and permits a deliberate retry"
   );
   expect(API.request).toHaveBeenCalledOnce();
 });
+
+it("shows structured step and byte progress from the event stream while installing", async () => {
+  let resolve: (value: { type: string; data: unknown }) => void = () => {};
+  vi.mocked(API.request).mockImplementation(
+    () =>
+      new Promise<{ type: string; data: unknown }>((done) => (resolve = done)),
+  );
+  const view = render(<Installation {...props} />);
+  fireEvent.click(await ready());
+  const progressbar = await screen.findByRole("progressbar", {
+    name: "安装进度",
+  });
+  expect(progressbar.getAttribute("aria-valuenow")).toBeNull();
+  expect(screen.getByText("正在连接目标节点…")).toBeTruthy();
+  const operation = (
+    vi.mocked(API.request).mock.calls[0][1] as {
+      data: { operation_id: string };
+    }
+  ).data.operation_id;
+  const event = (
+    step: "copying" | "verifying",
+    index: number,
+    current: number,
+    total: number,
+    operation_id = operation,
+  ): API.ManagementEvent => ({
+    sequence: String(index),
+    operation_id,
+    kind: "installation_event",
+    message: "Installation progress",
+    timestamp_ms: "1",
+    payload: {
+      type: "installation",
+      data: {
+        step,
+        step_index: index,
+        step_count: 5,
+        current: String(current),
+        total: String(total),
+      },
+    },
+  });
+  view.rerender(
+    <Installation
+      {...props}
+      events={[
+        event("copying", 1, 1024 * 1024, 4 * 1024 * 1024),
+        event("verifying", 2, 0, 0, "another-operation"),
+      ]}
+    />,
+  );
+  expect(
+    await screen.findByText("复制程序包 · 1.0 MiB / 4.0 MiB"),
+  ).toBeTruthy();
+  expect(screen.getByText("25%")).toBeTruthy();
+  expect(
+    screen
+      .getByRole("progressbar", { name: "安装进度" })
+      .getAttribute("aria-valuenow"),
+  ).toBe("25");
+  expect(screen.getByText("准备安装").className).toBe("done");
+  expect(screen.getByText("复制程序包").className).toBe("active");
+  expect(screen.getByText("校验已安装文件").className).toBe("pending");
+  expect(screen.queryByRole("alert")).toBeNull();
+  resolve({ type: "installation_result", data: installationResult });
+  expect(await screen.findByText(/安装完成。/)).toBeTruthy();
+});
+
+it("localizes backend task messages", async () => {
+  vi.mocked(API.request).mockResolvedValue({
+    type: "task",
+    data: {
+      ...completed(),
+      state: "running",
+      message: "Executing",
+      finished_ms: null,
+    },
+  });
+  vi.mocked(API.query).mockImplementation(async (_agent, type) => {
+    if (type === "hello")
+      return { type: "hello", data: { capabilities: ["installation"] } };
+    if (type === "installation_status") return { type, data: sample() };
+    return { type, data: { ...completed(), message: "Completed" } };
+  });
+  render(<Installation {...props} />);
+  fireEvent.click(await ready());
+  expect(await screen.findByText("安装任务已完成")).toBeTruthy();
+});

@@ -641,8 +641,8 @@ pub fn rows(
                 kind: Type::StringList,
                 ..text(
                     "nameserver",
-                    "DNS 上游（UDP/TCP/DoH/DoT）",
-                    "[\"udp://1.1.1.1:53\"]",
+                    "DNS 上游（默认仅 DoH/DoT）",
+                    "[\"https://1.1.1.1/dns-query\",\"tls://1.0.0.1:853\"]",
                     false,
                 )
             },
@@ -651,10 +651,28 @@ pub fn rows(
                 ..text("fallback", "DNS 失败备用上游", "[]", false)
             },
             Spec {
+                kind: Type::Boolean,
+                ..text(
+                    "plaintext_bypass",
+                    "允许明文 DNS（跳过 DoH/DoT 强制检查，不安全）",
+                    "false",
+                    false,
+                )
+            },
+            Spec {
+                kind: Type::StringList,
+                ..text(
+                    "plaintext_bypass_domains",
+                    "允许明文策略上游的域名（如 +.lan）",
+                    "[]",
+                    false,
+                )
+            },
+            Spec {
                 kind: Type::StringList,
                 ..text(
                     "bootstrap",
-                    "上游域名引导解析 IP",
+                    "明文引导解析 IP（仅 plaintext_bypass 时使用）",
                     "[\"1.1.1.1\",\"8.8.8.8\"]",
                     false,
                 )
@@ -670,6 +688,33 @@ pub fn rows(
             Spec {
                 kind: Type::Boolean,
                 ..text("hijack", "接管 TUN 的 53 端口 DNS", "true", false)
+            },
+            Spec {
+                kind: Type::Boolean,
+                ..text(
+                    "system_takeover",
+                    "TUN 期间将系统 DNS 指向 TUN（退出时恢复）",
+                    "true",
+                    false,
+                )
+            },
+            Spec {
+                kind: Type::Boolean,
+                ..text(
+                    "route_system_dns",
+                    "TUN 期间把原系统 DNS 服务器路由进 TUN",
+                    "true",
+                    false,
+                )
+            },
+            Spec {
+                kind: Type::Boolean,
+                ..text(
+                    "system_takeover_without_tun",
+                    "未开 TUN 时也接管系统 DNS（macOS，监听 53 端口，退出时恢复）",
+                    "false",
+                    false,
+                )
             },
             Spec {
                 kind: Type::Boolean,

@@ -49,9 +49,9 @@ fn log_controls_validate_limits_and_keep_frontend_source_independent() {
     client.frontend_log_command(Command::Close);
     assert!(client.tui_viewer.is_none());
     assert_eq!(client.viewer.as_ref().unwrap().name, "profile");
-    assert_eq!(crate::tui_log::source_file("@gui"), Some("gui.log"));
-    assert_eq!(crate::tui_log::source_file("@tui"), Some("tui.log"));
-    assert_eq!(crate::tui_log::source_file("../gui"), None);
+    assert_eq!(crate::tui_log::source_name("@gui"), Some("gui"));
+    assert_eq!(crate::tui_log::source_name("@tui"), Some("tui"));
+    assert_eq!(crate::tui_log::source_name("../gui"), None);
 }
 #[tokio::test]
 async fn diagnostics_mouse_intents_share_validation_and_abort_stream() {

@@ -15,6 +15,8 @@ pub enum Mode {
     DisplayLevel(usize),
     CaptureLevel(usize),
     MemoryLimit(String),
+    /// Picking a log session; the index is into `Viewer::sessions`.
+    Session(usize),
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +34,10 @@ pub struct Settings {
     pub wrap: bool,
     #[serde(default)]
     pub vim_navigation: bool,
+    /// A selected earlier session; never persisted, so every launch starts on
+    /// the current session.
+    #[serde(skip)]
+    pub session: Option<String>,
 }
 pub fn default_memory_lines() -> usize {
     5000
@@ -48,6 +54,7 @@ impl Default for Settings {
             memory_lines: default_memory_lines(),
             wrap: false,
             vim_navigation: false,
+            session: None,
         }
     }
 }
@@ -70,6 +77,8 @@ pub enum Command {
     Close,
     Reconnect,
     Capture(LogLevel),
+    /// Reconnect to another session; `None` is the current session.
+    Session(Option<String>),
 }
 pub struct Viewer {
     pub waker: crate::waker::Waker,
@@ -90,6 +99,10 @@ pub struct Viewer {
     pub viewport_height: Cell<usize>,
     pub viewport_width: Cell<u16>,
     pub source: std::path::PathBuf,
+    /// Sessions of this source, newest first, as listed when connecting.
+    pub sessions: Vec<astra_management::v2::LogSession>,
+    /// Local directory holding this source's session files (display only).
+    pub source_dir: std::path::PathBuf,
     pub vim_g: bool,
     pub frozen: Option<(VecDeque<Record>, String)>,
     pub revision: u64,
@@ -128,20 +141,29 @@ impl Viewer {
             viewport_height: Cell::new(10),
             viewport_width: Cell::new(80),
             source: Default::default(),
+            sessions: vec![],
+            source_dir: Default::default(),
             vim_g: false,
             frozen: None,
             revision: 0,
         }
     }
     pub async fn connect(&mut self, socket: &Path) -> Result<()> {
-        self.source = socket.parent().unwrap_or(Path::new(".")).join(
-            if let Some(file) = crate::tui_log::source_file(&self.name) {
-                file.to_owned()
-            } else {
-                format!("{}.log", self.name)
-            },
-        );
-        let mut stream = crate::log_stream::connect(socket, self.name.clone(), self.cursor).await?;
+        if self.source_dir.as_os_str().is_empty() {
+            self.source_dir = socket
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("logs")
+                .join(crate::tui_log::source_name(&self.name).unwrap_or(&self.name));
+        }
+        self.update_source();
+        let mut stream = crate::log_stream::connect(
+            socket,
+            self.name.clone(),
+            self.settings.session.clone(),
+            self.cursor,
+        )
+        .await?;
         let (sender, receiver) = mpsc::channel(16);
         let waker = self.waker.clone();
         let task = tokio::spawn(async move {
@@ -167,6 +189,77 @@ impl Viewer {
         self.feed = Some(Feed { task, receiver });
         self.status = t("实时连接").into();
         Ok(())
+    }
+    /// Index in `sessions` of the session being shown.
+    pub fn selected_session_index(&self) -> usize {
+        self.sessions
+            .iter()
+            .position(|session| match &self.settings.session {
+                Some(id) => &session.id == id,
+                None => session.current,
+            })
+            .unwrap_or(0)
+    }
+    /// The command that shows `sessions[index]`; the current one follows live.
+    pub fn select_session(&mut self, index: usize) -> Command {
+        let Some(session) = self.sessions.get(index) else {
+            return Command::None;
+        };
+        Command::Session((!session.current).then(|| session.id.clone()))
+    }
+    fn update_source(&mut self) {
+        let index = self.selected_session_index();
+        self.source = match self.sessions.get(index) {
+            Some(session) => self.source_dir.join(format!("{}.log", session.id)),
+            None => self.source_dir.clone(),
+        };
+    }
+    /// Install the session list fetched for this source.
+    pub fn set_sessions(
+        &mut self,
+        sessions: Vec<astra_management::v2::LogSession>,
+        source_dir: std::path::PathBuf,
+    ) {
+        self.sessions = sessions;
+        self.source_dir = source_dir;
+        // A selected session that no longer exists falls back to the current one.
+        if let Some(id) = &self.settings.session {
+            if !self.sessions.iter().any(|session| &session.id == id) {
+                self.settings.session = None;
+            }
+        }
+        self.update_source();
+    }
+    /// One picker row per session: start time, size, and which is current.
+    pub fn session_choices(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .map(|session| {
+                let size = crate::installation::format_bytes(session.size.parse().unwrap_or(0));
+                let start = session_time(&session.started_ms);
+                if session.current {
+                    tr!("本次会话 · {} · {}", start, size)
+                } else {
+                    format!("{start} · {size}")
+                }
+            })
+            .collect()
+    }
+    /// Which session is shown, for status lines.
+    pub fn session_label(&self) -> String {
+        match (
+            &self.settings.session,
+            self.sessions.get(self.selected_session_index()),
+        ) {
+            (None, Some(session)) => {
+                tr!("会话：本次（{}）", session_time(&session.started_ms))
+            }
+            (None, None) => t("会话：本次").into(),
+            (Some(_), Some(session)) => {
+                tr!("会话：历史（{}）", session_time(&session.started_ms))
+            }
+            (Some(id), None) => tr!("会话：历史（{}）", id),
+        }
     }
     pub fn stop(&mut self) {
         self.feed = None;
@@ -265,7 +358,14 @@ impl Viewer {
             } => {
                 if reset {
                     if self.cursor.is_some() {
-                        self.push(t("── 日志已轮换或截断，继续接收 ──").into());
+                        self.push(
+                            t(if self.settings.session.is_none() {
+                                "── 新的日志会话开始 ──"
+                            } else {
+                                "── 日志已轮换或截断，继续接收 ──"
+                            })
+                            .into(),
+                        );
                     }
                     self.partial.clear();
                     self.skip_line = skip_prefix;
@@ -505,6 +605,21 @@ impl Viewer {
                 }
                 return Command::None;
             }
+            Mode::Session(selected) => {
+                let max = self.sessions.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => self.cancel_input(),
+                    KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(max),
+                    KeyCode::Enter => {
+                        let selected = (*selected).min(max);
+                        self.settings.mode = Mode::Browse;
+                        return self.select_session(selected);
+                    }
+                    _ => {}
+                }
+                return Command::None;
+            }
             Mode::Browse => {}
         }
         if self.settings.vim_navigation
@@ -545,6 +660,9 @@ impl Viewer {
             KeyCode::Char('/') => self.settings.mode = Mode::Search(self.settings.search.clone()),
             KeyCode::Char('f') => self.settings.mode = Mode::Filter(self.settings.filter.clone()),
             KeyCode::Char('m') => self.settings.mode = Mode::MemoryLimit(String::new()),
+            KeyCode::Char('s') if !self.sessions.is_empty() => {
+                self.settings.mode = Mode::Session(self.selected_session_index())
+            }
             KeyCode::Char('v') => {
                 self.settings.mode = Mode::DisplayLevel(
                     self.settings
@@ -797,6 +915,12 @@ impl crate::state::Client {
                 self.overlay_epoch = self.overlay_epoch.wrapping_add(1);
             }
             Command::Reconnect => return crate::state::Input::Run(Action::Logs(name), None),
+            Command::Session(session) => {
+                let mut settings = viewer.settings.clone();
+                settings.session = session;
+                self.log_settings.insert(name.clone(), settings);
+                return crate::state::Input::Run(Action::Logs(name), None);
+            }
             Command::Capture(level) if viewer.capture_supported => {
                 return crate::state::Input::Run(Action::SetLogLevel { name, level }, None)
             }
@@ -809,3 +933,15 @@ impl crate::state::Client {
 #[cfg(test)]
 #[path = "test/observability_test.rs"]
 mod observability_tests;
+
+/// Local start time of a session, `MM-DD HH:MM:SS`.
+pub fn session_time(started_ms: &str) -> String {
+    let ms = started_ms.parse::<i64>().unwrap_or(0);
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| started_ms.to_owned())
+}

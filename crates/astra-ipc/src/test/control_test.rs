@@ -1,4 +1,44 @@
 use super::*;
+
+#[tokio::test]
+async fn telemetry_negotiates_capability_and_rejects_changed_boot() {
+    let path = std::env::temp_dir().join(format!("art-{}.sock", std::process::id()));
+    let control = Control::bind(Some(path.clone())).unwrap();
+    let task = tokio::spawn(async move { control.shutdown().await.unwrap() });
+    assert!(runtime_telemetry(&path).await.unwrap().is_none());
+    request(&path, Command::Stop).await.unwrap();
+    task.await.unwrap();
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = called.clone();
+    let control = Control::bind(Some(path.clone()))
+        .unwrap()
+        .with_runtime_telemetry(move || {
+            observed.store(true, std::sync::atomic::Ordering::Relaxed);
+            async { Err("sample failed".into()) }
+        });
+    let task = tokio::spawn(async move { control.shutdown().await.unwrap() });
+    let reply = rpc(
+        &path,
+        Command::RuntimeTelemetry {
+            expected_boot_id: "previous-boot".into(),
+        },
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(reply, Response::RuntimeTelemetry(Err(error)) if error.contains("boot changed"))
+    );
+    assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(runtime_telemetry(&path)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("sample failed"));
+    assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+    request(&path, Command::Stop).await.unwrap();
+    task.await.unwrap();
+}
 #[test]
 fn publisher_panic_cannot_poison_applied_snapshots() {
     let state = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());

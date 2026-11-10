@@ -27,6 +27,26 @@ const MAX_INTERFACES: usize = 128;
 const MAX_ROUTES: usize = 512;
 const MAX_RESOLVERS: usize = 256;
 
+/// Unique literal DNS server addresses configured on this host right now
+/// (scoped resolvers included, zone suffixes stripped). Read-only.
+pub async fn dns_servers() -> Vec<std::net::IpAddr> {
+    let (resolvers, _) = os::dns().await;
+    server_addresses(&resolvers)
+}
+pub fn server_addresses(resolvers: &[Resolver]) -> Vec<std::net::IpAddr> {
+    let mut found = Vec::new();
+    for raw in resolvers.iter().flat_map(|resolver| &resolver.servers) {
+        let raw = raw.trim().trim_start_matches('[');
+        let raw = raw.split(['%', ']']).next().unwrap_or_default();
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            if !found.contains(&ip) {
+                found.push(ip);
+            }
+        }
+    }
+    found
+}
+
 #[derive(Clone)]
 struct DnsSample {
     sampled_at_ms: String,

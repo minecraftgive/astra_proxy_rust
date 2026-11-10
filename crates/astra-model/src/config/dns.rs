@@ -30,13 +30,38 @@ pub struct Config {
     pub fake_ip_ttl: u32,
     pub mapping_ttl_secs: u32,
     pub mapping_capacity: usize,
+    /// Default false: only DoH (`https://`) and DoT (`tls://`) upstreams are
+    /// accepted, upstream hostnames are bootstrapped through IP-literal
+    /// encrypted upstreams, and failures never downgrade to plaintext.
+    /// true skips the check (insecure; allows `udp://`/`tcp://` upstreams and
+    /// plaintext UDP/53 bootstrap through `bootstrap`).
+    pub plaintext_bypass: bool,
+    /// Domain patterns whose `nameserver_policy` entries may use plaintext
+    /// upstreams while the global check stays on, e.g. `+.lan` for a router.
+    pub plaintext_bypass_domains: Vec<String>,
+    /// While TUN is active (with `enable` and `hijack`), point the OS resolver
+    /// at an address inside the TUN subnet so every system query is hijacked.
+    /// The previous settings are restored when TUN stops or on crash recovery.
+    pub system_takeover: bool,
+    /// While TUN is active, route the previously configured system DNS servers
+    /// (IPv6 too when tun.ipv6_address is set) into the TUN, so queries sent
+    /// straight to them are hijacked as well. Gateway/link-local servers are
+    /// skipped to keep the physical default route intact.
+    pub route_system_dns: bool,
+    /// Without TUN (macOS only): serve DNS on 0.0.0.0:53 to loopback clients
+    /// and point the OS resolver at 127.0.0.1, restoring it on exit. Opt-in
+    /// because it binds port 53 and changes system settings.
+    pub system_takeover_without_tun: bool,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             enable: true,
             listen: vec!["127.0.0.1:1053".parse().unwrap()],
-            nameserver: vec!["udp://1.1.1.1:53".into()],
+            nameserver: vec![
+                "https://1.1.1.1/dns-query".into(),
+                "tls://1.0.0.1:853".into(),
+            ],
             fallback: vec![],
             nameserver_policy: BTreeMap::new(),
             bootstrap: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
@@ -56,6 +81,11 @@ impl Default for Config {
             fake_ip_ttl: 60,
             mapping_ttl_secs: 86400,
             mapping_capacity: 8192,
+            plaintext_bypass: false,
+            plaintext_bypass_domains: vec![],
+            system_takeover: true,
+            route_system_dns: true,
+            system_takeover_without_tun: false,
         }
     }
 }
@@ -131,6 +161,14 @@ impl Config {
         for pattern in &self.fake_ip_filter {
             validate_pattern(pattern)?;
         }
+        ensure!(
+            self.plaintext_bypass_domains.len() <= 256,
+            "too many DNS plaintext bypass domains"
+        );
+        for pattern in &self.plaintext_bypass_domains {
+            validate_pattern(pattern)?;
+        }
+        self.validate_encryption()?;
         for raw in self
             .nameserver
             .iter()
@@ -151,6 +189,69 @@ impl Config {
             }
         }
         Ok(())
+    }
+    /// Encrypted-only policy. Errors name the offending entry and the bypass
+    /// switch so a rejected configuration is self-explaining.
+    fn validate_encryption(&self) -> Result<()> {
+        if self.plaintext_bypass {
+            return Ok(());
+        }
+        for raw in self.nameserver.iter().chain(&self.fallback) {
+            ensure!(
+                Upstream::parse(raw)?.is_encrypted(),
+                "DNS upstream {raw} is plaintext; only https:// (DoH) and tls:// (DoT) are allowed \
+                 (set dns.plaintext_bypass = true to allow plaintext, insecure)"
+            );
+        }
+        for (pattern, servers) in &self.nameserver_policy {
+            for raw in servers {
+                ensure!(
+                    Upstream::parse(raw)?.is_encrypted()
+                        || self
+                            .plaintext_bypass_domains
+                            .iter()
+                            .any(|bypass| covers(bypass, pattern)),
+                    "DNS policy {pattern} uses plaintext upstream {raw}; use DoH/DoT or add \
+                     {pattern} to dns.plaintext_bypass_domains"
+                );
+            }
+        }
+        let needs_bootstrap = self
+            .nameserver
+            .iter()
+            .chain(&self.fallback)
+            .chain(self.nameserver_policy.values().flatten())
+            .any(|raw| Upstream::parse(raw).is_ok_and(|u| u.host.parse::<IpAddr>().is_err()));
+        ensure!(
+            !needs_bootstrap || !self.encrypted_bootstrap().is_empty(),
+            "DNS upstream hostnames need an IP-literal DoH/DoT upstream in nameserver or \
+             fallback (e.g. https://1.1.1.1/dns-query) for encrypted bootstrap"
+        );
+        Ok(())
+    }
+    /// Whether a plaintext upstream may answer `domain`.
+    pub fn plaintext_allowed(&self, domain: &str) -> bool {
+        self.plaintext_bypass
+            || self
+                .plaintext_bypass_domains
+                .iter()
+                .any(|pattern| matches_domain(pattern, domain))
+    }
+    /// IP-literal DoH/DoT upstreams used to resolve upstream hostnames when
+    /// plaintext bootstrap is not allowed.
+    pub fn encrypted_bootstrap(&self) -> Vec<Upstream> {
+        self.nameserver
+            .iter()
+            .chain(&self.fallback)
+            .filter_map(|raw| Upstream::parse(raw).ok())
+            .filter(|u| u.is_encrypted() && u.host.parse::<IpAddr>().is_ok())
+            .collect()
+    }
+    /// Whether a nameserver_policy entry applies to `domain`.
+    pub fn has_policy(&self, domain: &str) -> bool {
+        self.nameserver_policy
+            .keys()
+            .any(|pattern| matches_domain(pattern, domain))
     }
     pub fn servers(&self, domain: &str) -> &[String] {
         self.nameserver_policy
@@ -180,6 +281,27 @@ fn validate_pattern(pattern: &str) -> Result<()> {
     );
     Ok(())
 }
+/// True when every domain matched by `pattern` is also matched by `bypass`.
+fn covers(bypass: &str, pattern: &str) -> bool {
+    fn parts(raw: &str) -> (&'static str, String) {
+        let raw = raw.trim_end_matches('.').to_ascii_lowercase();
+        for prefix in ["+.", "*."] {
+            if let Some(rest) = raw.strip_prefix(prefix) {
+                return (prefix, rest.to_owned());
+            }
+        }
+        ("", raw)
+    }
+    let (bypass_kind, base) = parts(bypass);
+    let (pattern_kind, domain) = parts(pattern);
+    let under = domain.ends_with(&format!(".{base}"));
+    match (bypass_kind, pattern_kind) {
+        (_, "") => matches_domain(bypass, &domain),
+        ("+.", _) | ("*.", "*.") => domain == base || under,
+        ("*.", _) => under,
+        _ => false,
+    }
+}
 pub fn matches_domain(pattern: &str, domain: &str) -> bool {
     let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
@@ -200,6 +322,10 @@ pub struct Upstream {
     pub path: String,
 }
 impl Upstream {
+    /// DoH or DoT; `udp`/`tcp` are plaintext.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.scheme.as_str(), "tls" | "https")
+    }
     pub fn parse(raw: &str) -> Result<Self> {
         let raw = if raw.contains("://") {
             raw.to_owned()

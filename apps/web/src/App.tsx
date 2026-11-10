@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as API from "./api";
 import { usePolling } from "./usePolling";
 import { readTheme, retainTheme } from "./resilience";
-import type { LogChunk, LogCursor } from "./generated/management";
+import type { LogChunk, LogCursor, LogSession } from "./generated/management";
 import Editor from "./components/Editor";
 import Login from "./components/Login";
 import Updates from "./components/Updates";
-import Installation from "./components/Installation";
+import Installation, { formatBytes } from "./components/Installation";
 import ProgramInfo from "./components/ProgramInfo";
 import NetworkRecovery from "./components/NetworkRecovery";
 import Monitor from "./components/Monitor";
@@ -210,9 +210,35 @@ export default function App() {
     cursor: null,
     decoder: new TextDecoder(),
   });
+  // "" follows the current session; an id reads one earlier session.
+  const [logSession, setLogSession] = useState("");
+  const [logSessions, setLogSessions] = useState<LogSession[]>([]);
+  const [sessionsVersion, setSessionsVersion] = useState(0);
+  useEffect(() => {
+    setLogSession("");
+  }, [agent, selected]);
   useEffect(() => {
     logState.current = { cursor: null, decoder: new TextDecoder() };
-  }, [page, agent, selected, paused]);
+    setLogs("");
+  }, [page, agent, selected, paused, logSession]);
+  useEffect(() => {
+    if (!authenticated || page !== "logs" || !agent || !selected) return;
+    const abort = new AbortController();
+    API.query<LogSession[]>(
+      agent,
+      "log_sessions",
+      { instance: selected },
+      abort.signal,
+    )
+      .then((r) => {
+        if (!abort.signal.aborted) setLogSessions(r.data);
+      })
+      // Older nodes have no session list; the current log still streams.
+      .catch(() => {
+        if (!abort.signal.aborted) setLogSessions([]);
+      });
+    return () => abort.abort();
+  }, [authenticated, page, agent, selected, sessionsVersion]);
   const refreshLogs = usePolling(
     async (signal) => {
       const state = logState.current;
@@ -220,20 +246,34 @@ export default function App() {
         const r = await API.query<LogChunk>(
           agent,
           "log_chunk",
-          { instance: selected, cursor: state.cursor },
+          {
+            instance: selected,
+            cursor: state.cursor,
+            ...(logSession ? { session: logSession } : {}),
+          },
           signal,
         );
         if (signal.aborted) return;
         if (r.data.type === "data") {
           const data = r.data.data;
+          const switched = data.reset && state.cursor !== null;
           state.cursor = data.cursor;
           if (data.reset) state.decoder = new TextDecoder();
           const text = state.decoder.decode(new Uint8Array(data.bytes), {
             stream: true,
           });
+          // A full chunk means a backlog: fetch the rest right away.
+          if (data.more) refreshLogs();
+          if (switched && !logSession) setSessionsVersion((v) => v + 1);
           setLogs((old) => {
             const combined =
-              (data.reset ? "[日志已重新定位或轮转]\n" : old) + text;
+              (data.reset
+                ? switched
+                  ? logSession
+                    ? "[日志已重新定位或截断]\n"
+                    : "[新的日志会话开始]\n"
+                  : ""
+                : old) + text;
             return combined.length > 2 * 1024 * 1024
               ? "[显示缓冲已截断；完整日志保存在节点]\n" +
                   combined.slice(-2 * 1024 * 1024)
@@ -247,7 +287,7 @@ export default function App() {
     authenticated && page === "logs" && agent && selected && !paused
       ? 5_000
       : null,
-    [page, agent, selected, paused, authenticated, fail],
+    [page, agent, selected, paused, authenticated, fail, logSession],
   );
   const refreshTasks = usePolling(
     async (signal) => {
@@ -578,6 +618,7 @@ export default function App() {
                   nodeName={node?.name}
                   online={online}
                   active={page === "settings"}
+                  events={events}
                   onOpen={() => {
                     setPage("settings");
                     setResult(null);
@@ -1017,6 +1058,24 @@ export default function App() {
               {page === "logs" && (
                 <>
                   <div className="toolbar">
+                    <select
+                      className="input"
+                      aria-label="日志会话"
+                      value={logSession}
+                      onChange={(e) => setLogSession(e.target.value)}
+                    >
+                      <option value="">本次会话</option>
+                      {logSessions
+                        .filter((session) => !session.current)
+                        .map((session) => (
+                          <option value={session.id} key={session.id}>
+                            {new Date(
+                              Number(session.started_ms),
+                            ).toLocaleString()}{" "}
+                            · {formatBytes(Number(session.size))}
+                          </option>
+                        ))}
+                    </select>
                     <input
                       className="input"
                       aria-label="筛选日志"

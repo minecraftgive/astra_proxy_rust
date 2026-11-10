@@ -100,12 +100,27 @@ impl Ui {
     }
 
     pub(super) fn button(&self, f: &mut Frame<'_>, area: Rect, label: &str, target: Target) {
-        f.render_widget(
-            Paragraph::new(format!(" {} ", t(label)))
-                .style(Style::default().bg(BLUE).fg(Color::White)),
-            area,
-        );
-        self.hit(area, target);
+        self.button_enabled(f, area, label, target, true);
+    }
+
+    /// A disabled button is dimmed and never registers a click target.
+    pub(super) fn button_enabled(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        label: &str,
+        target: Target,
+        enabled: bool,
+    ) {
+        let style = if enabled {
+            Style::default().bg(BLUE).fg(Color::White)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(MUTED)
+        };
+        f.render_widget(Paragraph::new(format!(" {} ", t(label))).style(style), area);
+        if enabled {
+            self.hit(area, target);
+        }
     }
 
     /// One rate row; `short` labels them P / D when the header runs out of room.

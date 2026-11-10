@@ -248,7 +248,7 @@ impl Context {
                 "No supported terminal is installed; install a terminal and rescan in Settings"
             );
         }
-        if let Ok(log) = crate::tui_log::Log::open(&crate::tui_log::frontend_path(&self.home)) {
+        if let Ok(log) = crate::tui_log::Log::frontend(&self.home) {
             log.write("window", &format!("opened {title}"));
         }
         Ok(())

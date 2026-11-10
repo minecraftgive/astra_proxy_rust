@@ -48,7 +48,7 @@ fn terminal_handoff_resolves_paths_and_preserves_language_override_intent() {
         Some("selected-instance".into()),
         protocol::Kind::Rule,
     );
-    let args = terminal_arguments(&context, &launch, false).unwrap();
+    let args = terminal_arguments(&context, &launch, false, true).unwrap();
     assert!(!args.iter().any(|arg| arg == "--lang"));
     for (option, relative) in [
         ("--config-dir", &context.config),
@@ -66,7 +66,10 @@ fn terminal_handoff_resolves_paths_and_preserves_language_override_intent() {
             .windows(2)
             .any(|pair| pair[0] == option && pair[1] == value));
     }
-    let explicit = terminal_arguments(&context, &launch, true).unwrap();
+    let unresolved = terminal_arguments(&context, &launch, false, false).unwrap();
+    assert!(!unresolved.iter().any(|arg| arg == "--bin-dir"));
+    assert!(unresolved.iter().any(|arg| arg == "--state-dir"));
+    let explicit = terminal_arguments(&context, &launch, true, true).unwrap();
     assert!(explicit
         .windows(2)
         .any(|pair| pair[0] == "--lang" && pair[1] == "zh-TW"));

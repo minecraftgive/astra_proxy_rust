@@ -1,6 +1,6 @@
 [package]
 name = "astra-proxy"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -32,6 +32,7 @@ base64 = "0.22"
 http = "1"
 
 arc-swap = "1.9.3"
+async-trait = "0.1"
 futures-util = "0.3.34"
 libc = "0.2.191"
 socket2 = "0.6.5"

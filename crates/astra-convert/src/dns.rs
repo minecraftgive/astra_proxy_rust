@@ -99,8 +99,66 @@ pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Val
             _ => warnings.push(format!("忽略不支持的 DNS 字段 {key}")),
         }
     }
+    encrypted_only(&mut config, warnings)?;
     config
         .validate()
         .context("invalid converted DNS configuration")?;
     Ok(toml::Value::try_from(&config)?)
+}
+
+/// Imported Mihomo profiles commonly list plaintext resolvers. Astra is
+/// encrypted-only by default, so drop them with a diagnostic rather than
+/// silently downgrading; the user can opt back in via dns.plaintext_bypass.
+fn encrypted_only(
+    config: &mut astra_model::config::dns::Config,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    use astra_model::config::dns::{Config, Upstream};
+    let mut keep = |list: &mut Vec<String>, label: &str| -> Result<()> {
+        let mut dropped = Vec::new();
+        let mut kept = Vec::new();
+        for raw in list.drain(..) {
+            if Upstream::parse(&raw)?.is_encrypted() {
+                kept.push(raw);
+            } else {
+                dropped.push(raw);
+            }
+        }
+        if !dropped.is_empty() {
+            warnings.push(format!(
+                "DNS {label} 中的明文上游已忽略（默认仅允许 DoH/DoT，可设置 dns.plaintext_bypass=true 放行）：{}",
+                dropped.join(", ")
+            ));
+        }
+        *list = kept;
+        Ok(())
+    };
+    keep(&mut config.nameserver, "nameserver")?;
+    keep(&mut config.fallback, "fallback")?;
+    let mut empty = Vec::new();
+    for (pattern, servers) in config.nameserver_policy.iter_mut() {
+        keep(servers, &format!("nameserver-policy {pattern}"))?;
+        if servers.is_empty() {
+            empty.push(pattern.clone());
+        }
+    }
+    for pattern in empty {
+        config.nameserver_policy.remove(&pattern);
+    }
+    if config.nameserver.is_empty() {
+        config.nameserver = Config::default().nameserver;
+        warnings.push(format!(
+            "DNS nameserver 无可用加密上游，已使用默认 {}",
+            config.nameserver.join(", ")
+        ));
+    }
+    if config.encrypted_bootstrap().is_empty() {
+        let defaults = Config::default().nameserver;
+        warnings.push(format!(
+            "DNS 上游均为域名，已追加 IP 直连加密上游 {} 用于加密引导解析",
+            defaults.join(", ")
+        ));
+        config.fallback.extend(defaults);
+    }
+    Ok(())
 }

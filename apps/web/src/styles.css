@@ -2057,7 +2057,30 @@ tr:last-child td {
 .installation-paths div { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 12px; }
 .installation-paths dt { color: var(--muted); }
 .installation-paths dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
-.installation-task, .installation-result { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 8px; }
+.installation-task, .installation-result { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 12px; }
+.installation-task-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.installation-task-details p { margin: 6px 0 0; overflow-wrap: anywhere; }
+.installation-result-title { margin: 0 0 4px; color: var(--ok, var(--text)); }
+/* Install progress: overall bar plus an ordered step checklist. */
+.install-progress { display: grid; gap: 8px; margin-bottom: 8px; }
+.install-progress-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.install-progress-head .mono { margin-left: auto; font-variant-numeric: tabular-nums; }
+.install-progress-bar { position: relative; height: 8px; border-radius: 999px; overflow: hidden; background: var(--border); }
+.install-progress-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); transition: width .3s ease; }
+.install-progress-bar.done > span { background: var(--ok, var(--accent)); }
+.install-progress-bar.failed > span { background: var(--err, #d64545); }
+.install-progress-bar.indeterminate > span { width: 30%; animation: install-indeterminate 1.2s ease-in-out infinite; }
+@keyframes install-indeterminate { from { left: -30%; } to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .install-progress-bar.indeterminate > span { animation: none; left: 0; width: 100%; opacity: .4; } }
+.install-steps { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.install-steps li { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.install-steps li::before { content: "·"; width: 1em; text-align: center; }
+.install-steps li.done { color: var(--ok, var(--text)); }
+.install-steps li.done::before { content: "✓"; }
+.install-steps li.active { color: var(--accent); font-weight: 600; }
+.install-steps li.active::before { content: "▶"; }
+.install-steps li.failed { color: var(--err, #d64545); }
+.install-steps li.failed::before { content: "✗"; }
 .program-info-heading, .program-info-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .program-info-heading { justify-content: space-between; }
 .program-info .program-info-heading h2 { margin: 0 0 4px; }

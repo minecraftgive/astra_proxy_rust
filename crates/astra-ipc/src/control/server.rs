@@ -58,7 +58,8 @@ fn response_error(response: &Response) -> Option<&str> {
         Response::Config(Err(error))
         | Response::Explanation(Err(error))
         | Response::Runtime(Err(error))
-        | Response::Monitor(Err(error)) => Some(error),
+        | Response::Monitor(Err(error))
+        | Response::RuntimeTelemetry(Err(error)) => Some(error),
         _ => None,
     }
 }
@@ -152,15 +153,28 @@ where
             Some(work) = commands.recv() => {
                 if work.reply.is_closed() { continue; }
                 let status = || Status { api_version: crate::API_VERSION, pid: std::process::id(), uptime_secs: control.started.elapsed().as_secs(), error: None, applied: applied_snapshot() };
-                let kind = match &work.command { Command::GetConfig => 1, Command::ExplainRoute(_) => 2, Command::Runtime(_) => 3, Command::Monitor => 4, Command::FakeIpLookup { .. } => 5, _ => 0 };
+                let kind = match &work.command { Command::GetConfig => 1, Command::ExplainRoute(_) => 2, Command::Runtime(_) => 3, Command::Monitor => 4, Command::FakeIpLookup { .. } => 5, Command::RuntimeTelemetry { .. } => 6, _ => 0 };
                 let mutation = matches!(&work.command, Command::Reload { .. } | Command::UpdateSubscriptions)
                     || matches!(&work.command, Command::Runtime(command) if !matches!(command, astra_model::runtime::Command::Snapshot));
-                let fast = matches!(&work.command, Command::FakeIpLookup { .. } | Command::Monitor | Command::Status | Command::Stop | Command::SetLogLevel(_) | Command::Runtime(astra_model::runtime::Command::Snapshot));
+                let fast = matches!(&work.command, Command::RuntimeTelemetry { .. } | Command::FakeIpLookup { .. } | Command::Monitor | Command::Status | Command::Stop | Command::SetLogLevel(_) | Command::Runtime(astra_model::runtime::Command::Snapshot));
                 if jobs.len() >= if fast {64} else {16} { let _ = work.reply.send(failure(kind, "Core is busy; retry shortly".into(), status())); continue; }
                 let baseline = status();
                 let future: Pin<Box<dyn Future<Output=Response> + Send + '_>> = match work.command {
                     Command::CommitService { boot_id } => { let mut reply = status(); reply.error = if boot_id != astra_platform::lifecycle::boot_id() {Some("Core boot changed; readiness commit rejected".into())} else {control.candidate.commit().err().map(|e|e.to_string())}; Box::pin(async move {Response::Status(reply)}) }
                     Command::Identity => { let mut identity = astra_platform::lifecycle::identity(applied_snapshot())?; identity.capabilities = Some(control.capabilities.clone()); Box::pin(async move { Response::Identity(identity) }) }
+                    Command::RuntimeTelemetry { expected_boot_id } => {
+                        let sample = control.telemetry.clone();
+                        Box::pin(async move {
+                            let result = if expected_boot_id != astra_platform::lifecycle::boot_id() {
+                                Err("Core boot changed; refresh runtime identity".into())
+                            } else if let Some(sample) = sample {
+                                sample().await
+                            } else {
+                                Err("Runtime telemetry is not supported by this core".into())
+                            };
+                            Response::RuntimeTelemetry(result)
+                        })
+                    }
                     Command::FakeIpLookup { expected_boot_id, addresses } => {
                         let lookup = control.fake_lookup.clone();
                         let boot_id = astra_platform::lifecycle::boot_id().to_owned();
@@ -211,6 +225,7 @@ fn failure(kind: u8, error: String, mut status: Status) -> Response {
         2 => Response::Explanation(Err(error)),
         3 => Response::Runtime(Err(error)),
         4 => Response::Monitor(Err(error)),
+        6 => Response::RuntimeTelemetry(Err(error)),
         5 => Response::FakeIpLookup(FakeIpLookupResponse {
             version: 1,
             boot_id: astra_platform::lifecycle::boot_id().into(),
@@ -349,6 +364,7 @@ async fn write_response(
         Response::Config(value) => send(stream, &value).await,
         Response::Explanation(value) => send(stream, &value).await,
         Response::Runtime(value) => send(stream, &value).await,
+        Response::RuntimeTelemetry(value) => send(stream, &value).await,
         Response::Monitor(value) => send(stream, &value).await,
     }
 }

@@ -592,8 +592,9 @@ async fn server_logs_remain_readable_without_log_level_control() {
     std::fs::write(config.state_dir.join("server-server.log"), text).unwrap();
     let ResponseBody::LogChunk(LogChunk::Data { bytes, .. }) = agent
         .query(Query::LogChunk {
-            instance: identity,
+            instance: identity.clone(),
             cursor: None,
+            session: None,
         })
         .await
         .unwrap()
@@ -601,6 +602,49 @@ async fn server_logs_remain_readable_without_log_level_control() {
         panic!("Stopped servers must retain access to their log file");
     };
     assert_eq!(bytes.as_slice(), text);
+    // A later session becomes current; the earlier one stays selectable.
+    let newer =
+        astra_platform::log_sessions::new_session(&config.state_dir, "server-server").unwrap();
+    std::fs::write(&newer, b"second session\n").unwrap();
+    let ResponseBody::LogSessions(sessions) = agent
+        .query(Query::LogSessions {
+            instance: identity.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("Log sessions must be listed");
+    };
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[0].current && !sessions[1].current);
+    assert!(sessions[1].id.contains("-legacy"));
+    for (session, expected) in [
+        (None, b"second session\n".as_slice()),
+        (Some(sessions[1].id.clone()), text.as_slice()),
+    ] {
+        let ResponseBody::LogChunk(LogChunk::Data { bytes, more, .. }) = agent
+            .query(Query::LogChunk {
+                instance: identity.clone(),
+                cursor: None,
+                session,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("Selected sessions must be readable");
+        };
+        assert_eq!(bytes.as_slice(), expected);
+        assert!(!more);
+    }
+    let error = agent
+        .query(Query::LogChunk {
+            instance: identity,
+            cursor: None,
+            session: Some("../manager".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("log session not found"));
     agent.call(old::Action::Shutdown).await.unwrap();
     native.await.unwrap().unwrap();
 }
@@ -687,6 +731,7 @@ async fn live_server_prepare_starts_existing_profile_and_streams_logs() {
             .query(Query::LogChunk {
                 instance: instance.clone(),
                 cursor: None,
+                session: None,
             })
             .await?;
         anyhow::ensure!(

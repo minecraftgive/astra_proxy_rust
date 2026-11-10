@@ -145,6 +145,12 @@ pub fn resolve_installation(
         installed.installed && installed.release_id == package.release_id,
         "The installed package changed; install it again before launching"
     );
+    if let Some(expected) = &package.manifest_sha256 {
+        anyhow::ensure!(
+            &installed.manifest_sha256 == expected,
+            "The installed package changed; install it again before launching"
+        );
+    }
     let directory = installed.directory.context("Missing installed package")?;
     anyhow::ensure!(
         directory == package.directory,

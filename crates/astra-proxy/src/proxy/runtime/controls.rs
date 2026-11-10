@@ -70,6 +70,10 @@ pub(super) fn load(path: &std::path::Path) -> Result<Overrides> {
 
 pub(super) fn snapshot(current: &Current) -> Snapshot {
     let app = current.load_full();
+    app_snapshot(&app)
+}
+
+pub(super) fn app_snapshot(app: &App) -> Snapshot {
     let mut snapshot = app.metrics.snapshot();
     snapshot.mode = app.overrides.load().mode;
     snapshot.system_proxy = app.config.system_proxy.is_some();

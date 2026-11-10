@@ -3,6 +3,7 @@ mod backend;
 mod keys;
 mod lifecycle;
 mod model;
+mod package_choice;
 mod pages;
 mod theme;
 pub mod views;
@@ -12,12 +13,49 @@ use astra_client::{bootstrap, i18n, protocol::Kind};
 use gpui::AppContext;
 
 pub fn run(kind: Kind) -> anyhow::Result<()> {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     if askpass::requested(&arguments) {
         std::process::exit(askpass::run());
     }
     i18n::init()?;
-    let options = bootstrap::Options::parse((kind == Kind::Server).then_some(kind), arguments)?;
+    let choosing = package_choice::Request::take(&mut arguments)?;
+    let mut options = bootstrap::Options::parse((kind == Kind::Server).then_some(kind), arguments)?;
+    let choice = astra_client::package_choice::Choice::discover(&options)?;
+    if let Some(request) = choosing {
+        std::process::exit(package_choice::run(request.verify(choice)?));
+    }
+    if let Some(choice) = choice {
+        let status = std::process::Command::new(&options.executable)
+            .arg("--choose-version")
+            .arg(choice.opened.id())
+            .arg(choice.selected.id())
+            .args(std::env::args_os().skip(1))
+            .status()?;
+        let opened = match status.code() {
+            Some(package_choice::OPENED) => true,
+            Some(package_choice::SELECTED) => false,
+            Some(package_choice::CANCELLED) => return Ok(()),
+            _ => {
+                anyhow::bail!("Version selection window exited with {status}; reopen the interface")
+            }
+        };
+        choice.choose(opened, &mut options)?;
+        if !opened {
+            let frontend = options.bin.join(
+                options
+                    .executable
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Unknown frontend"))?,
+            );
+            let status = std::process::Command::new(frontend)
+                .args(std::env::args_os().skip(1))
+                .arg("--bin-dir")
+                .arg(&options.bin)
+                .status()?;
+            anyhow::ensure!(status.success(), "Selected GUI exited with {status}");
+            return Ok(());
+        }
+    }
     if options.help {
         println!("Astra GUI\n\n--state-dir PATH  --config-dir PATH  --bin-dir PATH  --endpoint PATH  --agent ID\n--core proxy|rule|server  --view overview|proxies|connections|rules|logs|profiles|settings\n--silent  --shutdown  update|update-status|rollback");
         return Ok(());
@@ -113,9 +151,7 @@ pub fn run(kind: Kind) -> anyhow::Result<()> {
             .detach();
         });
     backend.shutdown();
-    if let Ok(log) =
-        astra_platform::tui_log::Log::open(&astra_platform::tui_log::frontend_path(&frontend_home))
-    {
+    if let Ok(log) = astra_platform::tui_log::Log::frontend(&frontend_home) {
         log.write("lifecycle", "native event loop and backend stopped");
     }
     let restart = restart_plan

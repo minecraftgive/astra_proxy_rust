@@ -111,6 +111,9 @@ pub struct RoutingContext {
     overrides: Arc<arc_swap::ArcSwap<astra_model::runtime::Overrides>>,
     egress_signal: EgressSignal,
     dns: Option<astra_dns::Resolver>,
+    /// Lookup-only resolver used when the DNS service is absent or disabled,
+    /// so local hostname resolution stays encrypted unless explicitly bypassed.
+    lookup_dns: Option<astra_dns::Resolver>,
     config: ProxyConfig,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
     outbounds: HashMap<String, OutboundConfig>,
@@ -536,7 +539,7 @@ impl App {
         interface: Option<&str>,
     ) -> Result<outbound::Stream> {
         if *action == RouteAction::Direct
-            && (interface.is_some() || self.config.tun.is_some() || self.dns.is_some())
+            && (interface.is_some() || self.config.tun.is_some() || self.resolver().is_some())
         {
             return timeout(
                 Duration::from_secs(self.config.connect_timeout_secs),
@@ -598,6 +601,16 @@ impl App {
     fn from_text(path: &std::path::Path, source_text: String) -> Result<Self> {
         let mut config: ProxyConfig = toml::from_str(&source_text)?;
         if let (Some(dns), Some(tun)) = (&config.dns, &mut config.tun) {
+            // DNS takeover with an IPv6 TUN: send IPv6 into the TUN too, so
+            // IPv6 resolvers (and other IPv6 traffic) cannot bypass the hijack.
+            if dns.enable
+                && dns.hijack
+                && (dns.system_takeover || dns.route_system_dns)
+                && tun.ipv6_address.is_some()
+                && !tun.routes.iter().any(|route| route.contains(':'))
+            {
+                tun.routes.extend(["::/1".to_owned(), "8000::/1".to_owned()]);
+            }
             if dns.enable && dns.fake_ip {
                 let range: ipnet::Ipv4Net = dns.fake_ip_range.parse()?;
                 let cidr = range.trunc().to_string();
@@ -669,6 +682,9 @@ impl App {
                 for address in [tun.address, subnet.network(), subnet.broadcast()] {
                     dns.reserve_address(address.into());
                 }
+                if let Some(address) = crate::platform::system_dns::dns_address(tun) {
+                    dns.reserve_address(address.into());
+                }
                 if let Some(address) = tun.ipv6_address {
                     let subnet = ipnet::Ipv6Net::new(address, tun.ipv6_prefix)?;
                     dns.reserve_address(address.into());
@@ -713,6 +729,7 @@ impl App {
                 metrics: Arc::default(),
                 overrides: Arc::default(),
                 egress_signal: EgressSignal::default(),
+                lookup_dns: crate::dns::lookup_resolver(dns.is_some(), config.dns.as_ref())?,
                 dns,
                 groups: proxy::groups::Groups::new(&config)?,
                 standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),

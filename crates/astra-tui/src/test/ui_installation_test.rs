@@ -144,3 +144,47 @@ fn installation_launch_controls_support_keys_and_ignore_key_repeat() {
     assert!(matches!(press(&mut ui, KeyCode::Char('l')), Input::Idle));
     assert!(!ui.client.update_launch.pending());
 }
+
+#[test]
+fn installation_progress_shows_gauge_and_step_checklist() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = fixture();
+        ui.installation.latest = Some(astra_client::installation::ProgressView {
+            step: v::InstallationStep::Copying,
+            step_index: 1,
+            step_count: 5,
+            current: 3 * 1024 * 1024,
+            total: 4 * 1024 * 1024,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| ui.render_installation(frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let text = rows.join("\n");
+        if std::env::var_os("ASTRA_PRINT_RENDER").is_some() {
+            println!("{text}");
+        }
+        for expected in [
+            "Installation progress",
+            "3.0 MiB / 4.0 MiB",
+            "65%",
+            "✓ Prepare installation",
+            "▶ Copy program package",
+            "· Publish launch entry",
+        ] {
+            assert!(text.contains(expected), "Missing {expected}: {text}");
+        }
+        for (width, height) in [(24, 8), (8, 4), (1, 1)] {
+            let mut small = Terminal::new(TestBackend::new(width, height)).unwrap();
+            small.draw(|frame| ui.render_installation(frame)).unwrap();
+        }
+    });
+}

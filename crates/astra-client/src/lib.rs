@@ -47,6 +47,7 @@ pub mod node_transfer;
 pub mod operations;
 pub mod overview;
 pub mod palette;
+pub mod package_choice;
 pub mod preferences;
 pub mod prompts;
 pub mod settings;

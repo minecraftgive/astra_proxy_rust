@@ -115,7 +115,7 @@ impl View {
                     .client
                     .active_log
                     .clone()
-                    .filter(|n| astra_client::tui_log::source_file(n).is_none())
+                    .filter(|n| astra_client::tui_log::source_name(n).is_none())
                     .or_else(|| {
                         view.model
                             .read(cx)
@@ -174,7 +174,7 @@ impl View {
         }
     }
     pub fn open_source(&mut self, source: String, cx: &mut Context<Self>) {
-        self.frontend = astra_client::tui_log::source_file(&source).is_some();
+        self.frontend = astra_client::tui_log::source_name(&source).is_some();
         self.model.update(cx, |model, cx| {
             model.tokio(|c| {
                 c.active_log = Some(source.clone());
@@ -315,6 +315,33 @@ impl Render for View {
             }
             levels = levels.child(button);
         }
+        // Sessions: the current one by default, earlier ones read on demand.
+        let selected_session = viewer.selected_session_index();
+        let mut sessions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(t("Log session"));
+        for (index, (label, session)) in viewer
+            .session_choices()
+            .into_iter()
+            .zip(&viewer.sessions)
+            .enumerate()
+        {
+            let session = (!session.current).then(|| session.id.clone());
+            let mut button =
+                Button::new(("log-session", index))
+                    .label(label)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.command(Command::Session(session.clone()), cx)
+                    }));
+            if index == selected_session {
+                button = button.primary();
+            }
+            sessions = sessions.child(button);
+        }
+        let session_status = viewer.session_label();
         if supported {
             levels = levels.child(t("Capture level"));
             for (index, level) in LogLevel::ALL.into_iter().enumerate() {
@@ -330,8 +357,10 @@ impl Render for View {
                 levels = levels.child(button);
             }
         }
-        root =
-            root.child(levels).child(
+        root = root
+            .child(sessions.child(div().text_xs().child(session_status)))
+            .child(levels)
+            .child(
                 div()
                     .flex()
                     .gap_2()

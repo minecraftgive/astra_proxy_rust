@@ -3,29 +3,48 @@ use crate::platform::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
-pub struct Log(Mutex<File>);
+/// An append-only activity log. A session log follows its source's newest
+/// session file, so long-lived writers move into a session started later.
+pub struct Log(Mutex<Target>);
+struct Target {
+    file: File,
+    path: PathBuf,
+    follow: Option<(PathBuf, &'static str)>,
+    checked: Instant,
+}
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 static GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Select the process-local frontend activity log before starting background work.
 pub fn use_gui_log() {
     GUI.store(true, std::sync::atomic::Ordering::Relaxed);
 }
-pub fn source_file(source: &str) -> Option<&'static str> {
+/// Log source name of a frontend viewer pseudo-instance (`@tui`, `@gui`).
+pub fn source_name(source: &str) -> Option<&'static str> {
     match source {
-        "@tui" => Some("tui.log"),
-        "@gui" => Some("gui.log"),
+        "@tui" => Some("tui"),
+        "@gui" => Some("gui"),
         _ => None,
     }
 }
-pub fn frontend_path(home: &Path) -> std::path::PathBuf {
-    home.join(if GUI.load(std::sync::atomic::Ordering::Relaxed) {
-        "gui.log"
+/// This process's frontend log source.
+pub fn frontend_source() -> &'static str {
+    if GUI.load(std::sync::atomic::Ordering::Relaxed) {
+        "gui"
     } else {
-        "tui.log"
-    })
+        "tui"
+    }
+}
+/// Begin a new frontend session; call once when a primary frontend starts,
+/// not for detached windows or a resumed restart.
+pub fn begin_session(home: &Path) {
+    if let Err(error) = crate::log_sessions::new_session(home, frontend_source()) {
+        eprintln!("Frontend log session could not be created: {error}");
+    }
 }
 pub fn stamp(ms: u64) -> String {
     chrono::DateTime::<chrono::Local>::from(
@@ -35,14 +54,35 @@ pub fn stamp(ms: u64) -> String {
     .to_string()
 }
 impl Log {
+    fn open_file(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    }
+    /// A fixed file, for logs outside the session layout.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        Ok(Self(Mutex::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(path)?,
-        )))
+        Ok(Self(Mutex::new(Target {
+            file: Self::open_file(path)?,
+            path: path.to_owned(),
+            follow: None,
+            checked: Instant::now(),
+        })))
+    }
+    /// The newest session of `source` under `home`, followed as sessions begin.
+    pub fn session(home: &Path, source: &'static str) -> std::io::Result<Self> {
+        let path = crate::log_sessions::latest_or_new(home, source)?;
+        Ok(Self(Mutex::new(Target {
+            file: Self::open_file(&path)?,
+            path,
+            follow: Some((home.to_owned(), source)),
+            checked: Instant::now(),
+        })))
+    }
+    /// This process's frontend session log.
+    pub fn frontend(home: &Path) -> std::io::Result<Self> {
+        Self::session(home, frontend_source())
     }
     pub fn write(&self, category: &str, message: &str) {
         // Single-line records; never accept Debug output of an Action or a profile.
@@ -51,9 +91,10 @@ impl Log {
             .filter(|c| !c.is_control())
             .take(1000)
             .collect();
-        if let Ok(mut file) = self.0.lock() {
+        if let Ok(mut target) = self.0.lock() {
+            target.follow_latest();
             let _ = writeln!(
-                file,
+                target.file,
                 "[{}] INFO {} {}",
                 stamp(
                     std::time::SystemTime::now()
@@ -64,6 +105,26 @@ impl Log {
                 category,
                 message
             );
+        }
+    }
+}
+
+impl Target {
+    fn follow_latest(&mut self) {
+        let Some((home, source)) = &self.follow else {
+            return;
+        };
+        if self.checked.elapsed() < FOLLOW_INTERVAL {
+            return;
+        }
+        self.checked = Instant::now();
+        if let Some(latest) = crate::log_sessions::latest(home, source) {
+            if latest != self.path {
+                if let Ok(file) = Log::open_file(&latest) {
+                    self.file = file;
+                    self.path = latest;
+                }
+            }
         }
     }
 }

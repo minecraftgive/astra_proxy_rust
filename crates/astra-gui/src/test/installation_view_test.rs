@@ -58,6 +58,23 @@ fn installation_controls_emit_frozen_package_scope_and_elevation_request(cx: &mu
     });
     cx.run_until_parked();
     assert!(captured.borrow().iter().any(|event| matches!(event, ViewEvent::Input(Input::Install(request)) if request.package_id == "frozen-package" && request.expected_release_id == "release-1" && request.elevate && request.scope == v::InstallationScope::System)));
+    // The progress section renders for a running copy and for a failed step.
+    model.update(cx, |model, cx| {
+        model.client.installation.latest = Some(astra_client::installation::ProgressView {
+            step: v::InstallationStep::Copying,
+            step_index: 1,
+            step_count: 5,
+            current: 1,
+            total: 2,
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    model.update(cx, |model, cx| {
+        model.client.installation.error = Some("copy failed".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
     model.update(cx, |model, _| {
         model.client.installation.query_error = Some("disconnected".into())
     });

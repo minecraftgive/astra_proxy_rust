@@ -10,6 +10,7 @@ pub mod system_proxy;
 #[cfg(windows)]
 #[path = "windows_system_proxy.rs"]
 pub mod system_proxy;
+pub(crate) mod system_dns;
 pub mod transparent;
 pub mod tun;
 mod tun_ingress;

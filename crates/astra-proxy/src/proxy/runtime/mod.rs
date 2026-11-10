@@ -34,6 +34,8 @@ pub struct State {
     text: String,
     current: Current,
     listeners: HashMap<Key, Listener>,
+    /// Declared before `tunnel` so the OS resolver is restored first on drop.
+    system_dns: Option<crate::platform::system_dns::Takeover>,
     tunnel: Option<tun::Guard>,
     tproxy_udp: Option<transparent::UdpGuard>,
     dns: Option<crate::dns::Guard>,
@@ -187,11 +189,16 @@ impl State {
         {
             anyhow::bail!("disabling active Fake IP requires a proxy restart");
         }
-        let dns_addresses = candidate
+        let mut dns_addresses = candidate
             .dns
             .as_ref()
             .map(|dns| dns.config.listen.clone())
             .unwrap_or_default();
+        if let Some(local) = crate::platform::system_dns::local_listener(&candidate.config) {
+            if !dns_addresses.contains(&local) {
+                dns_addresses.push(local);
+            }
+        }
         let replace_dns = self.dns.as_ref().map(|guard| &guard.addresses) != Some(&dns_addresses);
         let dns_prepared = if replace_dns && !dns_addresses.is_empty() {
             Some(
@@ -419,8 +426,20 @@ impl State {
         }
         self.listeners.retain(|key, _| keys.contains(key));
         if replace_tun {
+            // Restore the OS resolver while the old TUN can still answer.
+            self.system_dns = None;
             let previous = self.tunnel.take();
             self.tunnel = tunnel.map(|prepared| prepared.start(self.current.clone(), previous));
+        }
+        let wanted = crate::platform::system_dns::Key::wanted(
+            &self.current.load().config,
+            self.tunnel.as_ref().and_then(|tunnel| tunnel.name().ok()),
+        );
+        if self.system_dns.as_ref().map(|takeover| &takeover.key) != wanted.as_ref() {
+            self.system_dns = None;
+            if let Some(key) = wanted {
+                self.system_dns = Some(crate::platform::system_dns::Takeover::start(key).await);
+            }
         }
         if replace_udp {
             self.tproxy_udp = udp.map(|prepared| prepared.start(self.current.clone()));
@@ -504,6 +523,12 @@ async fn run_inner(
     }
     app.overrides.store(Arc::new(overrides));
     let current = Arc::new(ArcSwap::from_pointee(app));
+    // Node hostnames resolved inside protocol adapters follow the current
+    // generation's encrypted resolver instead of the system resolver.
+    let hook_current = current.clone();
+    meow_common::set_host_resolver(Arc::new(crate::dns::HostHook(Box::new(move || {
+        hook_current.load_full()
+    }))));
     let hosted = if std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some() {
         Some(crate::hosted::Host::start(path.clone(), &current).await?)
     } else {
@@ -521,6 +546,7 @@ async fn run_inner(
         group_worker: None,
         outbound_interface: None,
         elevated_tun,
+        system_dns: None,
         tunnel: None,
         tproxy_udp: None,
         dns: None,
@@ -810,6 +836,47 @@ async fn run_inner(
                     .collect()
             }
         });
+    let control = if state.lock().await.hosted.is_none() {
+        let state = state.clone();
+        let started = std::time::Instant::now();
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        control.with_runtime_telemetry(move || {
+            let state = state.clone();
+            let sequence = sequence.clone();
+            async move {
+                use astra_model::runtime::{
+                    Coverage, DnsResolverStatus, RuntimeTelemetry, RuntimeView,
+                };
+                let state = state.lock().await;
+                let app = state.current.load_full();
+                let view = RuntimeView {
+                    snapshot: controls::app_snapshot(&app),
+                    telemetry: Some(RuntimeTelemetry {
+                        host_boot_id: astra_platform::lifecycle::boot_id().into(),
+                        active_generation: Some(state.generation),
+                        sample_sequence: sequence
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1,
+                        sample_elapsed_ms: started.elapsed().as_millis() as u64,
+                        coverage: Coverage::Complete,
+                        dns: Some(Box::new(
+                            app.dns
+                                .as_ref()
+                                .map(|dns| dns.query_log())
+                                .unwrap_or_default(),
+                        )),
+                        dns_resolver: Some(Box::new(DnsResolverStatus::from_config(
+                            app.dns.as_ref().map(|dns| &dns.config),
+                        ))),
+                        ..Default::default()
+                    }),
+                };
+                serde_json::to_string(&view).map_err(|error| error.to_string())
+            }
+        })
+    } else {
+        control
+    };
     let service = control.run_with_runtime(
         |path| {
             let state = state.clone();
@@ -887,6 +954,7 @@ async fn run_inner(
     state.listeners.clear();
     state.group_worker.take();
     state.current.load().groups.stop_test();
+    state.system_dns.take();
     state.tunnel.take();
     state.tproxy_udp.take();
     state.dns.take();

@@ -73,7 +73,7 @@ impl Hub {
             list: watch::channel(Reply::text("")).0,
             updates: watch::channel(manager.cached_update_status()).0,
             generation: AtomicU64::new(0),
-            log: Arc::new(crate::tui_log::Log::open(&manager.home.join("tui.log"))?),
+            log: Arc::new(crate::tui_log::Log::session(&manager.home, "tui")?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             elevations: std::sync::Mutex::new(HashMap::new()),
         });
@@ -269,7 +269,7 @@ impl Hub {
         );
         Ok(DiagnosticPlan {
             runtime_dir: self.runtime_dir.clone(),
-            log_path: self.home.join(format!("{name}.log")),
+            log_path: astra_platform::log_sessions::latest_or_new(&self.home, name)?,
             executable: self.bin.join(Kind::Proxy.binary()),
             config_path: route.instance.config.clone(),
             text: if route.pid.is_some() {
@@ -448,10 +448,13 @@ impl NativeClient {
                             .any(|v| v.as_str() == Some("runtime_telemetry_v1"))
                     });
                 anyhow::ensure!(!enhanced,"Host telemetry is temporarily unavailable; refresh before changing runtime state");
-                serde_json::to_value(
-                    control::runtime(&route.socket, astra_model::runtime::Command::Snapshot)
-                        .await?,
-                )?
+                match control::runtime_telemetry(&route.socket).await? {
+                    Some(value) => value,
+                    None => serde_json::to_value(
+                        control::runtime(&route.socket, astra_model::runtime::Command::Snapshot)
+                            .await?,
+                    )?,
+                }
             }
         };
         anyhow::ensure!(
@@ -1036,21 +1039,32 @@ async fn serve(
                                 .any(|v| v.as_str() == Some("runtime_telemetry_v1"))
                         })
                 });
-                if enhanced {
+                let core_telemetry = if enhanced {
+                    false
+                } else {
+                    control::runtime_telemetry(&route.socket).await?.is_some()
+                };
+                if enhanced || core_telemetry {
                     let mut tick = tokio::time::interval(Duration::from_millis(
                         (*interval_ms).clamp(100, 5000),
                     ));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tokio::select! { _=tick.tick()=>{}, _=stream.read_u8()=>return Ok(()) }
-                        let value = timeout(
-                            Duration::from_secs(2),
-                            astra_management::host_control::request(
-                                &endpoint,
-                                astra_management::host_control::Command::Telemetry,
-                            ),
-                        )
-                        .await??;
+                        let value = if core_telemetry {
+                            control::runtime_telemetry(&route.socket).await?.context(
+                                "Core telemetry capability changed; reconnect runtime feed",
+                            )?
+                        } else {
+                            timeout(
+                                Duration::from_secs(2),
+                                astra_management::host_control::request(
+                                    &endpoint,
+                                    astra_management::host_control::Command::Telemetry,
+                                ),
+                            )
+                            .await??
+                        };
                         anyhow::ensure!(
                             value.get("pid").and_then(|v| v.as_u64()) == Some(*expected_pid as u64)
                                 && hub.route(name)?.pid == Some(*expected_pid),
@@ -1079,11 +1093,11 @@ async fn serve(
                 let _permit = followers
                     .try_acquire()
                     .context("Too many log subscribers")?;
-                let path = if let Some(file) = crate::tui_log::source_file(name) {
-                    hub.home.join(file)
+                let path = if let Some(source) = crate::tui_log::source_name(name) {
+                    crate::log_stream::LogPath::current(&hub.home, source)
                 } else {
                     hub.route(name)?;
-                    hub.home.join(format!("{name}.log"))
+                    crate::log_stream::LogPath::current(&hub.home, name.as_str())
                 };
                 send(&mut stream, &Reply::text("Streaming logs")).await?;
                 crate::log_stream::serve(stream, path, *cursor).await;
@@ -1378,7 +1392,7 @@ async fn fast(hub: &Arc<Hub>, action: &Action) -> Option<Result<Reply>> {
             .await
         }
         Action::GetLogLevel(name) => {
-            if crate::tui_log::source_file(name).is_some() {
+            if crate::tui_log::source_name(name).is_some() {
                 Ok(Reply::text("info"))
             } else {
                 hub.route(name).map(|_| {

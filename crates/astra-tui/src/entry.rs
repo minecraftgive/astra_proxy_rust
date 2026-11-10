@@ -115,6 +115,7 @@ fn terminal_arguments(
     context: &windows::Context,
     launch: &windows::Launch,
     explicit_language: bool,
+    inherit_bin: bool,
 ) -> Result<Vec<std::ffi::OsString>> {
     let mut context = context.clone();
     // Terminal profiles can change the working directory of the new process.
@@ -129,6 +130,12 @@ fn terminal_arguments(
             args.drain(index..index + 2);
         }
     }
+    if !inherit_bin {
+        // A terminal hop must not turn an unresolved package choice into an explicit directory.
+        if let Some(index) = args.iter().position(|arg| arg == "--bin-dir") {
+            args.drain(index..index + 2);
+        }
+    }
     Ok(args)
 }
 
@@ -139,6 +146,7 @@ async fn launch_terminal(
     terminal_native: bool,
     here: bool,
     resume_ui: bool,
+    inherit_bin: bool,
 ) -> Result<bool> {
     use std::io::IsTerminal;
     if terminal_child || terminal_native || resume_ui {
@@ -147,7 +155,7 @@ async fn launch_terminal(
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     anyhow::ensure!(!here || tty, "--here requires an interactive terminal");
     let here = here || remote_session(tty);
-    let args = terminal_arguments(context, launch, i18n::command_line_language())?;
+    let args = terminal_arguments(context, launch, i18n::command_line_language(), inherit_bin)?;
     let context = context.clone();
     tokio::task::spawn_blocking(move || {
         let preference = ui::preferred_terminal(&context.home);
@@ -163,12 +171,8 @@ async fn launch_terminal(
         }
         match crate::terminals::launch(&preference, &context.executable, &args)? {
             crate::terminals::LaunchOutcome::Native => Ok(false),
-            crate::terminals::LaunchOutcome::Launched { terminal } => {
-                if let Ok(log) = astra_platform::tui_log::Log::open(&context.home.join("tui.log")) {
-                    log.write("terminal", &format!("opened {terminal}"));
-                }
-                Ok(true)
-            }
+            // The hosted frontend owns the session, after any package choice.
+            crate::terminals::LaunchOutcome::Launched { .. } => Ok(true),
         }
     })
     .await
@@ -179,6 +183,64 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
     i18n::init()?;
     let options = astra_client::bootstrap::Options::parse(default_kind, std::env::args().skip(1))?;
     *silent = options.silent;
+    let (mut options, choice) = tokio::task::spawn_blocking(move || {
+        let choice = astra_client::package_choice::Choice::discover(&options);
+        (options, choice)
+    })
+    .await?;
+    if let Some(choice) = choice? {
+        let mut context = windows::Context {
+            executable: options.executable.clone(),
+            home: std::path::absolute(&options.home)?,
+            config: std::path::absolute(&options.config_home)?,
+            bin: choice.opened.directory.clone(),
+            language: i18n::language(),
+        };
+        if launch_terminal(
+            &context,
+            &options.launch,
+            options.terminal_child,
+            options.terminal_native,
+            options.here,
+            options.resume_ui,
+            false,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        prepare_interactive_console(
+            options.native_console,
+            options.terminal_child,
+            &options.launch,
+        )?;
+        let Some(opened) = ui::choose_package(&choice)? else {
+            return Ok(());
+        };
+        choice.choose(opened, &mut options)?;
+        // The chooser already owns a usable terminal. Keep it for either frontend.
+        options.terminal_child = true;
+        options.terminal_native = false;
+        if !opened {
+            let frontend = options
+                .bin
+                .join(options.executable.file_name().context("Unknown frontend")?);
+            context.bin = options.bin.clone();
+            let status = tokio::process::Command::new(frontend)
+                .args(terminal_arguments(
+                    &context,
+                    &options.launch,
+                    i18n::command_line_language(),
+                    true,
+                )?)
+                .arg("--terminal-child")
+                .status()
+                .await?;
+            anyhow::ensure!(status.success(), "Selected interface exited with {status}");
+            return Ok(());
+        }
+    }
     let astra_client::bootstrap::Options {
         executable,
         mut home,
@@ -275,6 +337,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
                 terminal_native,
                 here,
                 resume_ui,
+                true,
             )
             .await?
             {
@@ -409,6 +472,7 @@ async fn run_inner(default_kind: Option<protocol::Kind>, silent: &mut bool) -> R
             terminal_native,
             here,
             resume_ui,
+            true,
         )
         .await?
         {

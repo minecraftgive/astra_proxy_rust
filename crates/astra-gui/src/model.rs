@@ -809,6 +809,13 @@ impl AppModel {
                 self.client.apply_preferences(None);
                 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 self.client.load_startup_context(&prepared.context);
+                // A primary launch starts a new frontend log session; detached
+                // windows and resumed restarts keep the running one.
+                if prepared.launch.window_id.is_none() && !self.resume_ui {
+                    if let Some(home) = prepared.socket.parent() {
+                        astra_client::tui_log::begin_session(home);
+                    }
+                }
                 self.client.initialize_installation(
                     &prepared.context,
                     &prepared.socket,

@@ -30,6 +30,10 @@ pub enum Command {
         expected_boot_id: String,
         addresses: Vec<std::net::IpAddr>,
     },
+    /// Capability-negotiated JSON extension; legacy Snapshot stays unchanged.
+    RuntimeTelemetry {
+        expected_boot_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,7 +45,10 @@ pub enum Response {
     Identity(Identity),
     Monitor(Result<crate::monitor::InternalSnapshot, String>),
     FakeIpLookup(FakeIpLookupResponse),
+    RuntimeTelemetry(Result<String, String>),
 }
+
+pub const RUNTIME_TELEMETRY_CAPABILITY: &str = "runtime_telemetry_control_v1";
 
 /// A process number alone is never a durable process identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

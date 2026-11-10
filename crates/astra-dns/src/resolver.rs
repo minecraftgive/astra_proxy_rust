@@ -40,6 +40,7 @@ pub struct Resolver {
     permits: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     query_log: Arc<super::query_log::Store>,
+    bootstrap: Mutex<HashMap<String, (IpAddr, Instant)>>,
 }
 impl Resolver {
     pub fn new(config: Config) -> Result<Self> {
@@ -68,6 +69,7 @@ impl Resolver {
             mappings,
             cache: Mutex::new(HashMap::new()),
             query_log: Default::default(),
+            bootstrap: Default::default(),
         })
     }
     /// A reload keeps address ownership; changing fake ranges requires restart.
@@ -130,6 +132,26 @@ impl Resolver {
     }
     pub fn is_fake(&self, ip: IpAddr) -> bool {
         self.config.fake_ip && Mappings::contains_fake(&self.config, ip)
+    }
+    /// Cached bootstrap address of an upstream hostname, if still fresh.
+    pub fn bootstrap_cached(&self, host: &str) -> Option<IpAddr> {
+        let cache = self.bootstrap.lock().ok()?;
+        cache
+            .get(&host.to_ascii_lowercase())
+            .filter(|(_, expires)| *expires > Instant::now())
+            .map(|(ip, _)| *ip)
+    }
+    /// Remember an upstream hostname address; bounded by the configured
+    /// upstream count and capped at five minutes.
+    pub fn bootstrap_store(&self, host: &str, ip: IpAddr, ttl: u32) {
+        let ttl = Duration::from_secs(u64::from(ttl.clamp(1, 300)));
+        if let Ok(mut cache) = self.bootstrap.lock() {
+            let now = Instant::now();
+            cache.retain(|_, (_, expires)| *expires > now);
+            if cache.len() < 256 {
+                cache.insert(host.to_ascii_lowercase(), (ip, now + ttl));
+            }
+        }
     }
     pub fn query_log(&self) -> astra_model::runtime::DnsQueryLog {
         self.query_log.snapshot()
@@ -325,6 +347,19 @@ impl Resolver {
                 .chain(&self.config.fallback)
             {
                 let upstream = Upstream::parse(raw)?;
+                // Defense in depth for configs built without validate(): an
+                // encrypted-only resolver never downgrades to plaintext.
+                if !upstream.is_encrypted() && !self.config.plaintext_allowed(&domain) {
+                    astra_observe::counter!(
+                        "dns.upstream.plaintext_blocked",
+                        "DNS 明文上游被加密策略拦截"
+                    )
+                    .add(1);
+                    last = Some(anyhow::anyhow!(
+                        "plaintext DNS upstream {raw} blocked by encrypted-only policy"
+                    ));
+                    continue;
+                }
                 trace.upstream(raw);
                 let packet = query.to_vec()?;
                 let attempt = astra_observe::operation!("dns.upstream", "DNS 上游交换");

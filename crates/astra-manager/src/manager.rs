@@ -203,20 +203,6 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 #[path = "test/manager_runtime_directory_test.rs"]
 mod runtime_directory_tests;
 
-/// Core logs are appended across restarts; once one passes this size it is
-/// moved to `<name>.log.1` (replacing the previous one) when the core starts.
-const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
-fn rotate_log(path: &Path) {
-    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_ROTATE_BYTES) {
-        let mut old = path.as_os_str().to_owned();
-        old.push(".1");
-        let _ = fs::remove_file(&old);
-        if let Err(error) = fs::rename(path, &old) {
-            eprintln!("Log rotation skipped for {}: {error}", path.display());
-        }
-    }
-}
-
 /// The last bytes of a core log, for startup errors shown in the UI.
 fn log_tail(path: &Path, limit: u64) -> String {
     let read = || -> std::io::Result<String> {
@@ -596,7 +582,7 @@ impl Manager {
         let running = self.running.get(name);
         Ok(DiagnosticPlan {
             runtime_dir: self.runtime_dir.clone(),
-            log_path: self.log(name),
+            log_path: self.log(name)?,
             executable: self.bin.join(Kind::Proxy.binary()),
             config_path: running
                 .map(|r| r.config_path.clone())
@@ -716,8 +702,22 @@ impl Manager {
     fn socket(&self, name: &str) -> PathBuf {
         self.home.join(format!("{name}.sock"))
     }
-    fn log(&self, name: &str) -> PathBuf {
-        self.home.join(format!("{name}.log"))
+    /// The newest session file of an instance, where writers append; created
+    /// when the instance has none yet.
+    fn log(&self, name: &str) -> Result<PathBuf> {
+        Ok(astra_platform::log_sessions::latest_or_new(
+            &self.home, name,
+        )?)
+    }
+    /// Begin a log session for a core process about to start.
+    pub(crate) fn new_log(&self, name: &str) -> Result<PathBuf> {
+        Ok(astra_platform::log_sessions::new_session(&self.home, name)?)
+    }
+    /// The end of the current session, for startup errors.
+    fn tail(&self, name: &str, limit: u64) -> String {
+        astra_platform::log_sessions::current(&self.home, name)
+            .map(|path| log_tail(&path, limit))
+            .unwrap_or_default()
     }
     fn reap(&mut self) -> Result<()> {
         let mut exited = vec![];
@@ -1029,10 +1029,14 @@ impl Manager {
     ) -> Result<ManagedChild> {
         let instance = self.instance(name)?;
         let exe = self.bin.join(instance.kind.binary());
+        // A replacement is a new process: give it its own session, which is
+        // dropped again if authorization is refused before it writes.
+        let session = replaces.map(|_| self.new_log(name)).transpose()?;
+        let log = self.log(name)?;
         let mut args = astra_platform::elevation::core_arguments_in(
             &fs::canonicalize(&instance.config)?,
             Some(&self.socket(name)),
-            &self.log(name),
+            &log,
             self.level(name).as_str(),
             replaces,
             &self.runtime_dir,
@@ -1050,16 +1054,21 @@ impl Manager {
             );
         }
         let progress = astra_ipc::progress::sender();
-        let log = self.log(name);
         let name = name.to_owned();
-        Ok(ManagedChild::Elevated(
-            tokio::task::spawn_blocking(move || {
-                method.spawn_with_warning(&exe, &args, |warning| {
-                    report_windows_elevation_warning(&log, &name, progress.as_ref(), warning);
-                })
+        let spawned = tokio::task::spawn_blocking(move || {
+            method.spawn_with_warning(&exe, &args, |warning| {
+                report_windows_elevation_warning(&log, &name, progress.as_ref(), warning);
             })
-            .await??,
-        ))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result.map_err(anyhow::Error::from));
+        if spawned.is_err() {
+            if let Some(session) = &session {
+                astra_platform::log_sessions::discard_if_empty(session);
+            }
+        }
+        Ok(ManagedChild::Elevated(spawned?))
     }
     async fn start_one(&mut self, name: &str) -> Result<()> {
         self.start_with(name, None).await
@@ -1096,14 +1105,15 @@ impl Manager {
             } else {
                 prepare_control_endpoint(&socket).await?;
             }
-            // An adopted replacement already has the log open; never move it.
-            rotate_log(&self.log(name));
+            // Each fresh start is a new session; an adopted replacement
+            // already writes to the session it was given.
+            self.new_log(name)?;
         }
         let log = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(self.log(name))?;
+            .open(self.log(name)?)?;
         #[cfg(windows)]
         let elevate = adopted || self.needs_elevation(&instance)?;
         #[cfg(not(windows))]
@@ -1174,10 +1184,7 @@ impl Manager {
             }
             self.reap()?;
             let Some(run) = self.running.get(name) else {
-                bail!(
-                    "Core exited during startup:\n{}",
-                    log_tail(&self.log(name), 2048)
-                );
+                bail!("Core exited during startup:\n{}", self.tail(name, 2048));
             };
             if let Ok(status) = control::request(&socket, Command::Status).await {
                 anyhow::ensure!(Some(status.pid) == run.child.id(), "Core PID mismatch");
@@ -1192,10 +1199,7 @@ impl Manager {
             sleep(Duration::from_millis(50)).await;
         }
         self.stop(name).await?;
-        bail!(
-            "Core did not become ready:\n{}",
-            log_tail(&self.log(name), 2048)
-        )
+        bail!("Core did not become ready:\n{}", self.tail(name, 2048))
     }
     async fn reload(&mut self, name: &str, path: &Path) -> Result<()> {
         astra_ipc::progress::report("Reload core", name.to_owned());
@@ -2128,8 +2132,9 @@ impl Manager {
 
     async fn action_logs(&mut self, name: String) -> Result<Reply> {
         self.instance(&name)?;
-        let mut file =
-            fs::File::open(self.log(&name)).context("No log yet; start this instance first")?;
+        let path = astra_platform::log_sessions::current(&self.home, &name)
+            .context("No log yet; start this instance first")?;
+        let mut file = fs::File::open(path).context("No log yet; start this instance first")?;
         let size = file.metadata()?.len();
         file.seek(SeekFrom::Start(size.saturating_sub(24 * 1024)))?;
         let mut bytes = vec![];

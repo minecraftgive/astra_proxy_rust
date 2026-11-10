@@ -32,6 +32,7 @@ pub(super) enum Resource {
     WindowsAdapter(super::windows_network::AdapterSnapshot),
     #[cfg(not(windows))]
     UnixRoute(super::tun::RouteRecord),
+    SystemDns(super::system_dns::Snapshot),
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -536,6 +537,7 @@ fn recover_locked(path: &Path) -> Result<()> {
         }
         #[cfg(not(windows))]
         Resource::UnixRoute(route) => super::tun::recover_route(route, item.committed),
+        Resource::SystemDns(snapshot) => super::system_dns::recover(snapshot),
     });
     if let Err(primary) = restored {
         return match record_notice(path, &journal) {

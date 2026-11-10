@@ -69,11 +69,32 @@ async fn server_logs_read_chunks_without_requesting_capture_control() {
     let socket = fixture.0.join("management.sock");
     let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
+        // The session list is read first; a server's sessions are its own.
         let (stream, request) = test_rpc::next(&listener).await;
         assert!(
             matches!(
                 &request.body,
-                v::RequestBody::Query(v::Query::LogChunk { instance, .. }) if instance == "edge"
+                v::RequestBody::Query(v::Query::LogSessions { instance }) if instance == "edge"
+            ),
+            "Server logs must not issue a capture-level request: {:?}",
+            request.body
+        );
+        test_rpc::reply(
+            stream,
+            request,
+            v::ResponseBody::LogSessions(vec![v::LogSession {
+                id: "20260101T000000.000Z".into(),
+                started_ms: "1767225600000".into(),
+                size: "20".into(),
+                current: true,
+            }]),
+        )
+        .await;
+        let (stream, request) = test_rpc::next(&listener).await;
+        assert!(
+            matches!(
+                &request.body,
+                v::RequestBody::Query(v::Query::LogChunk { instance, session: None, .. }) if instance == "edge"
             ),
             "Server logs must not issue a capture-level request: {:?}",
             request.body
@@ -90,6 +111,7 @@ async fn server_logs_read_chunks_without_requesting_capture_control() {
                 },
                 reset: true,
                 skip_prefix: false,
+                more: false,
             }),
         )
         .await;
@@ -125,6 +147,9 @@ async fn server_logs_read_chunks_without_requesting_capture_control() {
             assert!(viewer.poll().is_none());
             if let Some(cursor) = viewer.cursor {
                 assert_eq!(cursor.offset, 20);
+                assert!(viewer
+                    .source
+                    .ends_with("logs/server-edge/20260101T000000.000Z.log"));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;

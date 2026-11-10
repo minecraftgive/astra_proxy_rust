@@ -48,9 +48,27 @@ pub struct Control {
     started: Instant,
     capabilities: Vec<String>,
     fake_lookup: Option<FakeLookup>,
+    telemetry: Option<
+        std::sync::Arc<
+            dyn Fn() -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+                > + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl Control {
+    pub fn with_runtime_telemetry<F, Fut>(mut self, sample: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        self.telemetry = Some(std::sync::Arc::new(move || Box::pin(sample())));
+        self.capabilities
+            .push(astra_model::control::RUNTIME_TELEMETRY_CAPABILITY.into());
+        self
+    }
     pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
         self.capabilities.extend(capabilities);
         self.capabilities.sort();
@@ -92,6 +110,7 @@ impl Control {
             started: Instant::now(),
             capabilities: Vec::new(),
             fake_lookup: None,
+            telemetry: None,
         })
     }
 
@@ -226,6 +245,7 @@ fn peer_pool(pool: &std::sync::Mutex<ControlPeers>) -> std::sync::MutexGuard<'_,
 async fn rpc(path: &std::path::Path, command: Command, seconds: u64) -> io::Result<Response> {
     let lane = match &command {
         Command::FakeIpLookup { .. }
+        | Command::RuntimeTelemetry { .. }
         | Command::Monitor
         | Command::Status
         | Command::Runtime(astra_model::runtime::Command::Snapshot) => 0,
@@ -298,6 +318,7 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
     if matches!(
         command,
         Command::FakeIpLookup { .. }
+            | Command::RuntimeTelemetry { .. }
             | Command::Identity
             | Command::GetConfig
             | Command::ExplainRoute(_)
@@ -332,6 +353,44 @@ pub async fn request(path: &std::path::Path, command: Command) -> io::Result<Sta
         }
         _ => Err(io::Error::other("unexpected core response")),
     }
+}
+
+/// None means the core explicitly lacks the JSON telemetry capability. Once
+/// advertised, failed reads remain errors instead of becoming legacy samples.
+pub async fn runtime_telemetry(path: &std::path::Path) -> io::Result<Option<serde_json::Value>> {
+    let identity = identity(path).await?;
+    if !identity
+        .capabilities
+        .as_ref()
+        .is_some_and(|caps| caps.iter().any(|cap| cap == RUNTIME_TELEMETRY_CAPABILITY))
+    {
+        return Ok(None);
+    }
+    let response = rpc(
+        path,
+        Command::RuntimeTelemetry {
+            expected_boot_id: identity.boot_id.clone(),
+        },
+        3,
+    )
+    .await?;
+    let Response::RuntimeTelemetry(result) = response else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unexpected runtime telemetry response",
+        ));
+    };
+    let value: serde_json::Value = serde_json::from_str(&result.map_err(io::Error::other)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if value["pid"].as_u64() != Some(u64::from(identity.process.pid))
+        || value["telemetry"]["host_boot_id"].as_str() != Some(&identity.boot_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Runtime telemetry identity changed",
+        ));
+    }
+    Ok(Some(value))
 }
 /// Read process-local instrumentation without changing core state.
 pub async fn monitor(path: &std::path::Path) -> io::Result<astra_model::monitor::InternalSnapshot> {

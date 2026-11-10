@@ -7,6 +7,7 @@ use astra_client::{
     installation,
     protocol::{self, Action},
 };
+#[cfg(test)]
 use astra_management::v2 as v;
 use std::{
     path::PathBuf,
@@ -252,18 +253,7 @@ async fn prepare_inner(request: Request, control: &Control) -> Result<Prepared> 
             }
         }
         Request::Install(request) => {
-            let response = protocol::request(
-                &control.socket,
-                v::RequestBody::Local(v::LocalCommand::PrepareInstallation {
-                    package_id: request.package_id.clone(),
-                    expected_release_id: request.expected_release_id.clone(),
-                    scope: request.scope,
-                }),
-            )
-            .await?;
-            let v::ResponseBody::InstallationLaunch(launch) = response else {
-                anyhow::bail!("{}", t("Unexpected installation response"));
-            };
+            let launch = installation::prepare_elevation(&control.socket, &request).await?;
             control.check()?;
             #[cfg(unix)]
             {

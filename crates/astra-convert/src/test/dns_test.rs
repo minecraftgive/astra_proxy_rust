@@ -13,11 +13,38 @@ fn mihomo_dns_and_fake_ip_convert_to_valid_native_settings() {
     config.validate().unwrap();
     assert!(config.fake_ip);
     assert_eq!(config.nameserver.len(), 2);
-    assert_eq!(config.nameserver_policy["+.example.org"], ["8.8.8.8"]);
+    assert!(
+        !config.nameserver_policy.contains_key("+.example.org"),
+        "plaintext-only policy is dropped, not downgraded"
+    );
+    assert!(converted
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("明文上游已忽略") && warning.contains("8.8.8.8")));
     assert!(!converted
         .warnings
         .iter()
         .any(|warning| warning.contains("忽略顶层配置 dns")));
+}
+#[test]
+fn plaintext_only_mihomo_dns_converts_to_encrypted_defaults() {
+    let input = "socks-port: 1080\nproxies:\n  - {name: node, type: socks5, server: 127.0.0.1, port: 9999}\ndns:\n  enable: true\n  nameserver: [223.5.5.5, 'udp://119.29.29.29']\n  fallback: ['tcp://8.8.8.8', https://dns.example/dns-query]\n";
+    let converted = convert(input, &Options::default()).unwrap();
+    let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
+    let config: astra_model::config::dns::Config = document["dns"].clone().try_into().unwrap();
+    config.validate().unwrap();
+    assert!(!config.plaintext_bypass);
+    assert_eq!(
+        config.nameserver,
+        astra_model::config::dns::Config::default().nameserver
+    );
+    assert!(config
+        .fallback
+        .contains(&"https://dns.example/dns-query".to_owned()));
+    assert!(converted
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("223.5.5.5")));
 }
 #[test]
 fn subscription_never_imports_dns_even_when_importing_groups() {

@@ -136,6 +136,9 @@ async fn exercise(case: String) {
                     v::RequestBody::Query(v::Query::LogLevel { .. }) => {
                         v::ResponseBody::LogLevel(LogLevel::Debug)
                     }
+                    v::RequestBody::Query(v::Query::LogSessions { .. }) => {
+                        v::ResponseBody::LogSessions(vec![])
+                    }
                     v::RequestBody::Query(v::Query::LogChunk { cursor: None, .. }) => {
                         v::ResponseBody::LogChunk(v::LogChunk::Data {
                             bytes: b"INFO stack regression\n".to_vec(),
@@ -146,6 +149,7 @@ async fn exercise(case: String) {
                             },
                             reset: true,
                             skip_prefix: false,
+                            more: false,
                         })
                     }
                     v::RequestBody::Query(v::Query::LogChunk { .. }) => {

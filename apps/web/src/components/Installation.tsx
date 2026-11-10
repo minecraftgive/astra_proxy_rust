@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as API from "../api";
 import type {
   Hello,
+  InstallationProgress,
   InstallationResult,
   InstallationScope,
   InstallationStatus,
+  InstallationStep,
 } from "../generated/management";
 import { usePolling } from "../usePolling";
 
@@ -16,6 +18,50 @@ const roles = [
 ] as const;
 const roleName = (role: string) =>
   roles.find(([id]) => id === role)?.[1] ?? role;
+const steps: [InstallationStep, string][] = [
+  ["preparing", "准备安装"],
+  ["copying", "复制程序包"],
+  ["verifying", "校验已安装文件"],
+  ["publishing", "发布启动入口"],
+  ["complete", "安装完成"],
+];
+/** Overall percentage: copying dominates, the short steps get fixed slices. */
+export function progressPercent(progress: InstallationProgress): number {
+  const current = Number(progress.current) || 0;
+  const total = Number(progress.total) || 0;
+  switch (progress.step) {
+    case "preparing":
+      return 2;
+    case "copying":
+      return total > 0
+        ? 5 + Math.floor((80 * Math.min(current, total)) / total)
+        : 5;
+    case "verifying":
+      return 88;
+    case "publishing":
+      return 96;
+    case "complete":
+      return 100;
+  }
+}
+export function formatBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+// Backend task and result messages are English protocol text.
+const messages: Record<string, string> = {
+  Executing: "正在执行安装…",
+  Completed: "安装任务已完成",
+  "Installation is ready for the next launch. Running processes, configuration, startup registration and the TUN service are unchanged.":
+    "安装已就绪，下次启动时生效。运行中的进程、配置、开机启动和 TUN 服务均未改变。",
+};
+const localize = (message: string) => messages[message] ?? message;
 const dismissedInMemory = new Set<string>();
 const reminderKey = (agent: string) =>
   `astra-installation-reminder:${encodeURIComponent(agent)}`;
@@ -88,10 +134,12 @@ export default function Installation({
   online,
   active,
   showReminder = true,
+  events = [],
   onOpen,
   onError,
 }: {
   agent: string;
+  events?: API.ManagementEvent[];
   nodeName?: string;
   online: boolean;
   active: boolean;
@@ -256,6 +304,21 @@ export default function Installation({
   useEffect(() => {
     if (task?.state === "complete") void refresh();
   }, [task?.id, task?.state, refresh]);
+
+  // The latest structured step for the current operation from the event stream.
+  const progress = useMemo(() => {
+    if (!task) return null;
+    let latest: InstallationProgress | null = null;
+    for (const event of events) {
+      if (
+        event.operation_id === task.id &&
+        event.payload?.type === "installation" &&
+        (!latest || event.payload.data.step_index >= latest.step_index)
+      )
+        latest = event.payload.data;
+    }
+    return latest;
+  }, [events, task]);
 
   const selected = status?.packages.find((item) => item.id === packageId);
   const destination = selected?.[scope];
@@ -426,12 +489,11 @@ export default function Installation({
         安装 {nodeName || status?.target || agent}{" "}
         上已有的完整程序包，并创建启动入口。此操作不下载软件，也不迁移配置或重启当前服务。
       </p>
-      {!online && (
-        <p className="notice-bar">节点离线，恢复连接后可检查安装信息。</p>
-      )}
-      {unavailable && (
+      {(!online || unavailable || (loading && !status)) && (
         <p className="notice-bar" role="status">
-          {unavailable}
+          {!online
+            ? "节点离线，恢复连接后可检查安装信息。"
+            : unavailable || "正在检查目标节点的完整包…"}
         </p>
       )}
       {error && (
@@ -439,7 +501,6 @@ export default function Installation({
           {error}
         </p>
       )}
-      {loading && !status && <p role="status">正在检查目标节点的完整包…</p>}
       {status && (
         <>
           <p className="muted">
@@ -577,7 +638,7 @@ export default function Installation({
           )}
         </>
       )}
-      {task && (
+      {task && (!result || progress) && (
         <div
           className="installation-task"
           role={
@@ -587,8 +648,13 @@ export default function Installation({
           }
           aria-busy={task.state === "running"}
         >
-          <p>{task.message}</p>
-          <p className="mono muted">安装任务：{task.id}</p>
+          {(task.state === "running" || progress) && (
+            <InstallProgressView
+              progress={progress}
+              failed={task.state === "failed"}
+            />
+          )}
+          {!result && <p>{localize(task.message)}</p>}
           {["outcome_unknown", "needs_recovery"].includes(task.state) && (
             <>
               <p>安装结果尚未确认。请查询原任务，勿重复提交。</p>
@@ -597,19 +663,95 @@ export default function Installation({
               </button>
             </>
           )}
+          <details className="installation-task-details">
+            <summary>任务详情</summary>
+            <p className="mono muted">安装任务：{task.id}</p>
+          </details>
         </div>
       )}
       {result && (
         <div className="installation-result">
-          <p>
-            {result.already_installed ? "此版本已安装并校验。" : "安装完成。"}{" "}
+          <p className="installation-result-title">
+            <strong>
+              {result.already_installed ? "此版本已安装并校验。" : "安装完成。"}
+            </strong>{" "}
             后续请使用新入口启动。
           </p>
-          <p className="mono installation-path">{result.directory}</p>
-          <p className="mono installation-path">启动入口：{result.entry}</p>
-          <p className="mono installation-path">{result.launch_command}</p>
+          <p className="muted">{localize(result.message)}</p>
+          <dl className="installation-paths">
+            <div>
+              <dt>安装位置</dt>
+              <dd>{result.directory}</dd>
+            </div>
+            <div>
+              <dt>启动入口</dt>
+              <dd>{result.entry}</dd>
+            </div>
+            <div>
+              <dt>启动命令</dt>
+              <dd>{result.launch_command}</dd>
+            </div>
+          </dl>
         </div>
       )}
     </section>
+  );
+}
+
+function InstallProgressView({
+  progress,
+  failed,
+}: {
+  progress: InstallationProgress | null;
+  failed: boolean;
+}) {
+  const percent = progress ? progressPercent(progress) : null;
+  const active = progress?.step_index ?? -1;
+  const current = Number(progress?.current) || 0;
+  const total = Number(progress?.total) || 0;
+  const label = !progress
+    ? "正在连接目标节点…"
+    : progress.step === "copying" && total > 0
+      ? `${steps[1][1]} · ${formatBytes(current)} / ${formatBytes(total)}`
+      : (steps.find(([step]) => step === progress.step)?.[1] ?? "");
+  return (
+    <div className="install-progress">
+      <div className="install-progress-head">
+        <strong>安装进度</strong>
+        <span className="muted">{label}</span>
+        {percent !== null && <span className="mono">{percent}%</span>}
+      </div>
+      <div
+        className={`install-progress-bar${percent === null ? " indeterminate" : ""}${failed ? " failed" : percent === 100 ? " done" : ""}`}
+        role="progressbar"
+        aria-label="安装进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+      >
+        <span style={percent === null ? undefined : { width: `${percent}%` }} />
+      </div>
+      <ol className="install-steps">
+        {steps.map(([step, name], index) => {
+          const state =
+            index < active || (step === "complete" && index === active)
+              ? "done"
+              : index === active || (active < 0 && index === 0)
+                ? failed
+                  ? "failed"
+                  : "active"
+                : "pending";
+          return (
+            <li
+              key={step}
+              className={state}
+              aria-current={state === "active" ? "step" : undefined}
+            >
+              {name}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
   );
 }

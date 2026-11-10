@@ -376,7 +376,8 @@ async fn policies_failover_and_ambiguous_real_addresses() {
     config
         .nameserver_policy
         .insert("+.special.example".into(), vec!["192.0.2.1".into()]);
-    config.fallback = vec!["tcp://192.0.2.2:5353".into()];
+    config.plaintext_bypass_domains = vec!["+.special.example".into()];
+    config.fallback = vec!["tls://192.0.2.2:5353".into()];
     let resolver = Resolver::new(config).unwrap();
     let mock = Mock {
         ttl: 30,
@@ -510,4 +511,98 @@ async fn negative_cache_uses_soa_and_fake_expiration_fails_closed() {
     assert_eq!(ip, "198.18.0.4".parse::<std::net::IpAddr>().unwrap());
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(fake.restore(ip).is_err());
+}
+
+#[test]
+fn encrypted_only_is_default_and_plaintext_needs_explicit_bypass() {
+    let defaults = Config::default();
+    defaults.validate().unwrap();
+    assert!(!defaults.plaintext_bypass);
+    assert!(defaults
+        .nameserver
+        .iter()
+        .all(|raw| Upstream::parse(raw).unwrap().is_encrypted()));
+    let with = |edit: fn(&mut Config)| {
+        let mut config = Config::default();
+        edit(&mut config);
+        config.validate()
+    };
+    let error = with(|c| c.nameserver = vec!["udp://1.1.1.1:53".into()]).unwrap_err();
+    assert!(error.to_string().contains("plaintext_bypass"), "{error}");
+    assert!(with(|c| c.nameserver = vec!["8.8.8.8".into()]).is_err());
+    assert!(with(|c| c.fallback = vec!["tcp://8.8.8.8:53".into()]).is_err());
+    with(|c| {
+        c.plaintext_bypass = true;
+        c.nameserver = vec!["udp://1.1.1.1:53".into()];
+        c.fallback = vec!["tcp://8.8.8.8".into()];
+    })
+    .unwrap();
+    // Hostname upstreams need an IP-literal encrypted upstream to bootstrap.
+    assert!(with(|c| c.nameserver = vec!["https://dns.example/dns-query".into()]).is_err());
+    with(|c| {
+        c.nameserver = vec!["https://dns.example/dns-query".into()];
+        c.fallback = vec!["tls://1.1.1.1".into()];
+    })
+    .unwrap();
+    assert!(with(|c| c.plaintext_bypass_domains = vec!["bad domain".into()]).is_err());
+
+    // Policy plaintext is allowed only where a bypass pattern covers it.
+    let policy = |pattern: &str, bypass: &[&str]| {
+        let mut config = Config::default();
+        config
+            .nameserver_policy
+            .insert(pattern.into(), vec!["udp://192.168.1.1:53".into()]);
+        config.plaintext_bypass_domains = bypass.iter().map(|b| (*b).to_owned()).collect();
+        config.validate().is_ok()
+    };
+    assert!(!policy("+.lan", &[]));
+    assert!(policy("+.lan", &["+.lan"]));
+    assert!(policy("*.corp.lan", &["+.lan"]));
+    assert!(policy("router.lan", &["*.lan"]));
+    assert!(policy("router.lan", &["router.lan"]));
+    assert!(
+        !policy("+.lan", &["*.lan"]),
+        "*.lan does not cover lan itself"
+    );
+    assert!(!policy("+.lan", &["router.lan"]));
+    assert!(!policy("*.lan", &["a.lan"]));
+    assert!(!policy("*.example", &["+.a.example"]));
+    assert!(!policy("+.lan", &["+.local"]));
+    // A policy may still mix in encrypted upstreams without any bypass.
+    let mut config = Config::default();
+    config
+        .nameserver_policy
+        .insert("+.example.org".into(), vec!["tls://9.9.9.9".into()]);
+    config.validate().unwrap();
+}
+#[tokio::test]
+async fn bypass_domains_use_plaintext_policy_while_other_names_stay_encrypted() {
+    let mut config = Config {
+        nameserver: vec!["https://1.1.1.1/dns-query".into()],
+        ..Config::default()
+    };
+    config
+        .nameserver_policy
+        .insert("+.lan".into(), vec!["udp://192.168.1.10:53".into()]);
+    config.plaintext_bypass_domains = vec!["+.lan".into()];
+    let resolver = Resolver::new(config).unwrap();
+    let mock = Mock {
+        ttl: 30,
+        ..Mock::default()
+    };
+    answer(&resolver, &mock, "printer.lan", RecordType::A).await;
+    answer(&resolver, &mock, "public.example", RecordType::A).await;
+    assert_eq!(&*mock.servers.lock().unwrap(), &["192.168.1.10", "1.1.1.1"]);
+    assert!(resolver.config.plaintext_allowed("printer.lan"));
+    assert!(!resolver.config.plaintext_allowed("public.example"));
+}
+#[test]
+fn bootstrap_cache_is_case_insensitive_and_expires() {
+    let resolver = Resolver::new(Config::default()).unwrap();
+    let ip: std::net::IpAddr = "192.0.2.53".parse().unwrap();
+    assert_eq!(resolver.bootstrap_cached("dns.example"), None);
+    resolver.bootstrap_store("DNS.example", ip, 1);
+    assert_eq!(resolver.bootstrap_cached("dns.EXAMPLE"), Some(ip));
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(resolver.bootstrap_cached("dns.example"), None);
 }

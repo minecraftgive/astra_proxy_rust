@@ -127,6 +127,7 @@ async fn dot_and_doh_exchange_over_verified_tls_and_reject_untrusted_certificate
                 &upstream,
                 query.to_vec().unwrap(),
                 Some(connector.clone()),
+                false,
             ),
         )
         .await
@@ -153,4 +154,33 @@ async fn dot_and_doh_exchange_over_verified_tls_and_reject_untrusted_certificate
     .await
     .is_err());
     worker.await.unwrap();
+}
+#[tokio::test]
+async fn strict_bootstrap_uses_encrypted_literal_upstream_and_caches() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // Accept the TLS dial and hang up: the handshake fails, proving bootstrap
+    // went to the encrypted literal upstream instead of plaintext UDP/53.
+    let worker = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket);
+    });
+    let app = crate::dns::tests::app(&format!(
+        "nameserver=['https://dns.example/dns-query']\nfallback=['tls://{address}']\nbootstrap=['192.0.2.1']\nquery_timeout_ms=1000"
+    ));
+    let error = bootstrap(&app, "dns.example", false).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("encrypted DNS bootstrap"),
+        "{error:#}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("bootstrap must dial the encrypted upstream")
+        .unwrap();
+    let dns = app.dns.as_ref().unwrap();
+    dns.bootstrap_store("dns.example", "192.0.2.53".parse().unwrap(), 60);
+    assert_eq!(
+        bootstrap(&app, "dns.example", false).await.unwrap(),
+        "192.0.2.53".parse::<IpAddr>().unwrap()
+    );
 }

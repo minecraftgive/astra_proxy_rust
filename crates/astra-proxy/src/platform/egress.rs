@@ -193,7 +193,8 @@ pub async fn connect(
     target: &astra_model::Target,
     interface: Option<&str>,
 ) -> Result<tokio::net::TcpStream> {
-    let addresses = tokio::net::lookup_host((target.host.as_str(), target.port)).await?;
+    // Literals short-circuit; hostnames use the installed resolver hook.
+    let addresses = meow_common::resolve_host_all(&target.host, target.port).await?;
     let mut last = None;
     for address in addresses {
         let address = scoped_destination(address, interface)?;

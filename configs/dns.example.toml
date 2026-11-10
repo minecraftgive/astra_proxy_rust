@@ -5,7 +5,9 @@ auto_start = false
 enable = true
 listen = ["127.0.0.1:1053"]
 nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
-fallback = ["udp://8.8.8.8:53"]
+fallback = ["tls://8.8.8.8:853"]
+# Encrypted-only by default; set true to allow udp:// / tcp:// upstreams (insecure).
+plaintext_bypass = false
 bootstrap = ["1.1.1.1", "8.8.8.8"]
 respect_rules = false
 fake_ip = false

@@ -200,8 +200,8 @@ fn copy_verification_failure_preserves_the_previous_installation() {
     let source = source(&fixture.source).unwrap();
     let release = source.manifest.release_id.clone();
     let hash = source.hash.clone();
-    let result = install_at(source, &release, &hash, fixture.paths.clone(), |phase| {
-        if phase == "Copying the current program package" {
+    let result = install_at(source, &release, &hash, fixture.paths.clone(), |progress| {
+        if progress.step == InstallStep::Copying && progress.current == 0 {
             fs::write(
                 fixture
                     .source
@@ -461,4 +461,42 @@ fn complete_package_updates_while_old_frontend_is_running() {
 
 fn source_manifest(directory: &Path) -> ReleaseManifest {
     serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE)).unwrap()).unwrap()
+}
+
+#[test]
+fn progress_reports_ordered_steps_and_monotonic_copied_bytes() {
+    let fixture = Fixture::new(ReleaseRole::Client);
+    let source = source(&fixture.source).unwrap();
+    let release = source.manifest.release_id.clone();
+    let hash = source.hash.clone();
+    let mut seen = Vec::new();
+    install_at(source, &release, &hash, fixture.paths.clone(), |progress| {
+        seen.push(progress)
+    })
+    .unwrap();
+    let steps = seen
+        .iter()
+        .map(|progress| progress.step.index())
+        .collect::<Vec<_>>();
+    assert!(steps.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(seen.first().unwrap().step, InstallStep::Preparing);
+    assert_eq!(seen.last().unwrap().step, InstallStep::Complete);
+    let copying = seen
+        .iter()
+        .filter(|progress| progress.step == InstallStep::Copying)
+        .collect::<Vec<_>>();
+    assert!(copying.len() >= 2);
+    assert!(copying
+        .windows(2)
+        .all(|pair| pair[0].current <= pair[1].current));
+    let last = copying.last().unwrap();
+    assert!(last.total > 0);
+    assert_eq!(last.current, last.total);
+    let mut again = Vec::new();
+    let source = super::source(&fixture.source).unwrap();
+    install_at(source, &release, &hash, fixture.paths.clone(), |progress| {
+        again.push(progress.step)
+    })
+    .unwrap();
+    assert_eq!(again, vec![InstallStep::Complete]);
 }

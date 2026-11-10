@@ -364,13 +364,16 @@ impl Store {
                 "nettool_event" => {
                     Some(EventPayload::NetTool(serde_json::from_str(&event.message)?))
                 }
+                "installation_event" => Some(EventPayload::Installation(serde_json::from_str(
+                    &event.message,
+                )?)),
                 _ => None,
             };
             if event.payload.is_some() {
-                event.message = if event.kind == "diagnostics_event" {
-                    "Diagnostic progress"
-                } else {
-                    "Network probe progress"
+                event.message = match event.kind.as_str() {
+                    "diagnostics_event" => "Diagnostic progress",
+                    "installation_event" => "Installation progress",
+                    _ => "Network probe progress",
                 }
                 .into();
             }

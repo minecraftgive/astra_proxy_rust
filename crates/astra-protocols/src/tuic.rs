@@ -199,9 +199,8 @@ impl Client {
         {
             return Ok(session.clone());
         }
-        let addresses: Vec<_> = tokio::net::lookup_host((self.server.as_str(), self.port))
-            .await?
-            .collect();
+        // Resolver hook: the proxy core's encrypted DNS, not getaddrinfo.
+        let addresses = meow_common::resolve_host_all(&self.server, self.port).await?;
         let mut last_error = None;
         for address in addresses {
             let bind: SocketAddr = if address.ip().is_loopback() {

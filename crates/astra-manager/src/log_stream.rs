@@ -46,8 +46,41 @@ async fn send(stream: &mut UnixStream, event: &LogEvent) -> io::Result<()> {
 async fn wait(stream: &mut UnixStream, timer: &mut tokio::time::Interval) -> io::Result<bool> {
     tokio::select! { _ = timer.tick() => Ok(true), _ = stream.read_u8() => Ok(false) }
 }
-pub async fn serve(mut stream: UnixStream, path: PathBuf, cursor: Option<LogCursor>) {
-    if let Err(error) = tail(&mut stream, path, cursor).await {
+/// First open reads at most this much of the current session.
+pub const INITIAL_WINDOW: u64 = 1024 * 1024;
+/// Bytes per Data event; a full chunk means more is already available.
+pub const CHUNK: usize = 128 * 1024;
+
+/// What a subscriber follows: one file, or a source's current session, which
+/// is re-resolved on every poll so a restarted process's new session replaces
+/// the old one (the cursor's file identity then reports `reset`).
+#[derive(Clone, Debug)]
+pub enum LogPath {
+    Fixed(PathBuf),
+    Current { home: PathBuf, source: String },
+}
+impl From<PathBuf> for LogPath {
+    fn from(path: PathBuf) -> Self {
+        Self::Fixed(path)
+    }
+}
+impl LogPath {
+    pub fn current(home: &std::path::Path, source: impl Into<String>) -> Self {
+        Self::Current {
+            home: home.to_owned(),
+            source: source.into(),
+        }
+    }
+    fn resolve(&self) -> Option<PathBuf> {
+        match self {
+            Self::Fixed(path) => Some(path.clone()),
+            Self::Current { home, source } => astra_platform::log_sessions::current(home, source),
+        }
+    }
+}
+
+pub async fn serve(mut stream: UnixStream, path: impl Into<LogPath>, cursor: Option<LogCursor>) {
+    if let Err(error) = tail(&mut stream, path.into(), cursor).await {
         let _ = send(
             &mut stream,
             &LogEvent::Error(format!("Read log stream: {error}")),
@@ -57,14 +90,18 @@ pub async fn serve(mut stream: UnixStream, path: PathBuf, cursor: Option<LogCurs
 }
 async fn tail(
     stream: &mut UnixStream,
-    path: PathBuf,
+    path: LogPath,
     mut cursor: Option<LogCursor>,
 ) -> io::Result<()> {
     let mut timer = interval(crate::UI_REFRESH_INTERVAL);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut waiting = false;
     loop {
-        let mut file = match tokio::fs::File::open(&path).await {
+        let opened = match path.resolve() {
+            Some(path) => tokio::fs::File::open(&path).await,
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+        let mut file = match opened {
             Ok(file) => {
                 waiting = false;
                 file
@@ -94,7 +131,7 @@ async fn tail(
         let offset = match cursor {
             Some(c) if same_file && c.offset <= metadata.len() => c.offset,
             Some(_) => 0,
-            None => metadata.len().saturating_sub(64 * 1024),
+            None => metadata.len().saturating_sub(INITIAL_WINDOW),
         };
         let mut skip_prefix = false;
         if cursor.is_none() && offset > 0 {
@@ -102,9 +139,12 @@ async fn tail(
             skip_prefix = file.read_u8().await? != b'\n';
         }
         file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut bytes = vec![0; 16 * 1024];
-        let n = file.read(&mut bytes).await?;
-        bytes.truncate(n);
+        // Fill whole chunks so a full one reliably signals a backlog.
+        let mut bytes = Vec::with_capacity(CHUNK);
+        let n = (&mut file)
+            .take(CHUNK as u64)
+            .read_to_end(&mut bytes)
+            .await?;
         let next = LogCursor {
             device,
             inode,

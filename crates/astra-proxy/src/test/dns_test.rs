@@ -72,7 +72,9 @@ async fn udp_upstream_retries_truncated_responses_over_tcp() {
         stream.write_u16(reply.len() as u16).await.unwrap();
         stream.write_all(&reply).await.unwrap();
     });
-    let app = app(&format!("nameserver=['udp://{address}']"));
+    let app = app(&format!(
+        "nameserver=['udp://{address}']\nplaintext_bypass=true"
+    ));
     let query = wire::query("truncate.example", RecordType::A).unwrap();
     let reply = tokio::time::timeout(
         Duration::from_secs(3),
@@ -163,7 +165,7 @@ async fn tun_dns_interception_and_fake_udp_direct_egress_preserve_virtual_source
         echo.send_to(&bytes[..size], peer).await.unwrap();
     });
     // Use a manual DIRECT group to avoid requiring a separate rule process.
-    let source=format!("standalone=true\nstandalone_outbound='direct-group'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct-group]\nmembers=['DIRECT']\n[dns]\nlisten=[]\nfake_ip=true\nnameserver=['udp://{upstream_address}']\n");
+    let source=format!("standalone=true\nstandalone_outbound='direct-group'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct-group]\nmembers=['DIRECT']\n[dns]\nlisten=[]\nfake_ip=true\nnameserver=['udp://{upstream_address}']\nplaintext_bypass=true\n");
     let source = format!("max_udp_flows=1\nudp_targets_per_association=1\n{source}");
     let app = App::from_text(&std::env::temp_dir().join("astra-dns-udp.toml"), source).unwrap();
     let current = Arc::new(arc_swap::ArcSwap::from_pointee(app));
@@ -243,4 +245,185 @@ async fn tun_dns_interception_and_fake_udp_direct_egress_preserve_virtual_source
     );
     dispatcher.abort();
     worker.abort();
+}
+
+use std::net::SocketAddr;
+fn core(extra: &str) -> App {
+    App::from_text(
+        &std::env::temp_dir().join("astra-dns-lookup-test.toml"),
+        format!("rule_socket='unused'\nsocks5_listen='127.0.0.1:1080'\n{extra}"),
+    )
+    .unwrap()
+}
+/// Answers every UDP query with 127.0.0.1, counting queries.
+async fn udp_mock() -> (SocketAddr, Arc<AtomicUsize>) {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = udp.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    tokio::spawn(async move {
+        let mut query = vec![0; 4096];
+        while let Ok((size, peer)) = udp.recv_from(&mut query).await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = udp.send_to(&response(&query[..size], false), peer).await;
+        }
+    });
+    (address, count)
+}
+
+#[test]
+fn local_lookups_use_an_encrypted_resolver_unless_plaintext_is_bypassed() {
+    // No [dns]: lookups still get the default encrypted resolver.
+    let app = core("");
+    assert!(app.dns.is_none());
+    let resolver = app.resolver().expect("lookup-only resolver");
+    assert!(resolver
+        .config
+        .nameserver
+        .iter()
+        .all(|raw| astra_dns::Upstream::parse(raw).unwrap().is_encrypted()));
+    assert!(!resolver.config.fake_ip && resolver.config.listen.is_empty());
+    // Disabled service: lookups keep the configured encrypted upstreams.
+    let app = core("[dns]\nenable=false\nnameserver=['tls://9.9.9.9']\n");
+    assert!(app.dns.is_none());
+    assert_eq!(app.resolver().unwrap().config.nameserver, ["tls://9.9.9.9"]);
+    // Explicit bypass with a disabled service: the system resolver is allowed.
+    let app = core("[dns]\nenable=false\nplaintext_bypass=true\n");
+    assert!(app.resolver().is_none());
+    // An enabled service answers lookups itself.
+    let app = app_with_service();
+    assert!(app.lookup_dns.is_none() && app.resolver().is_some());
+}
+fn app_with_service() -> App {
+    app("")
+}
+
+#[tokio::test]
+async fn lookups_short_circuit_literals_and_localhost_and_honour_bypass_policy() {
+    let app = core("");
+    for (host, expected) in [
+        ("192.0.2.7", vec!["192.0.2.7:80"]),
+        ("[2001:db8::1]", vec!["[2001:db8::1]:80"]),
+        ("localhost", vec!["127.0.0.1:80", "[::1]:80"]),
+        ("api.LOCALHOST.", vec!["127.0.0.1:80", "[::1]:80"]),
+    ] {
+        let found = app.lookup_real(host, 80).await.unwrap();
+        let expected: Vec<SocketAddr> = expected.iter().map(|a| a.parse().unwrap()).collect();
+        assert_eq!(found, expected, "{host}");
+    }
+    let (upstream, queries) = udp_mock().await;
+    let app = core(&format!(
+        "[dns]\nenable=false\nplaintext_bypass_domains=['+.corp']\n[dns.nameserver_policy]\n'+.corp'=['udp://{upstream}']\n"
+    ));
+    let found = tokio::time::timeout(Duration::from_secs(3), app.lookup_real("git.corp", 22))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, ["127.0.0.1:22".parse::<SocketAddr>().unwrap()]);
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        1,
+        "only the A query is needed"
+    );
+}
+
+#[tokio::test]
+async fn protocol_egress_resolves_node_hostnames_through_the_host_hook() {
+    use meow_common::HostResolver;
+    let (upstream, queries) = udp_mock().await;
+    let app = Arc::new(core(&format!(
+        "[dns]\nenable=false\nplaintext_bypass_domains=['+.corp']\n[dns.nameserver_policy]\n'+.corp'=['udp://{upstream}']\n"
+    )));
+    let hook = crate::dns::HostHook(Box::new({
+        let app = app.clone();
+        move || app.clone()
+    }));
+    assert_eq!(
+        hook.resolve_all("node.corp").await.unwrap(),
+        ["127.0.0.1".parse::<IpAddr>().unwrap()]
+    );
+    assert!(hook.resolve_all_nested("node.corp").await.unwrap().is_ok());
+    let bypass = Arc::new(core("[dns]\nenable=false\nplaintext_bypass=true\n"));
+    let open = crate::dns::HostHook(Box::new(move || bypass.clone()));
+    assert!(
+        open.resolve_all_nested("node.corp").await.is_none(),
+        "without an encrypted resolver nested lookups keep the legacy fallback"
+    );
+
+    // End to end through the vendored hook. The installed hook is
+    // process-global, so it only claims `.corp` names; everything else keeps
+    // the system path other concurrently running tests expect.
+    struct Scoped(crate::dns::HostHook);
+    #[async_trait::async_trait]
+    impl HostResolver for Scoped {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            Ok(self.resolve_all(host).await?[0])
+        }
+        async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if host.ends_with(".corp") {
+                return self.0.resolve_all(host).await;
+            }
+            Ok(tokio::net::lookup_host((host, 0))
+                .await?
+                .map(|a| a.ip())
+                .collect())
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    meow_common::set_host_resolver(Arc::new(Scoped(hook)));
+    let dial = astra_protocols::egress::connect(("proxy-node.corp", port)).await;
+    let text = format!("proxy-node.corp:{port}");
+    let dial_text = astra_protocols::egress::connect(text.as_str()).await;
+    meow_common::clear_host_resolver();
+    dial.unwrap();
+    dial_text.unwrap();
+    listener.accept().await.unwrap();
+    // node.corp + proxy-node.corp; the second dial is a cache hit.
+    assert_eq!(queries.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn ipv6_tun_takeover_adds_split_routes_and_reserves_the_tun_dns_address() {
+    let text = |extra: &str| {
+        format!("rule_socket='unused'\n[tun]\ninterface='en0'\nipv6_address='fdfe:dcba:9876::1'\n{extra}[dns]\nlisten=[]\nfake_ip=true\n")
+    };
+    let app = core_text(&text(""));
+    let routes = &app.config.tun.as_ref().unwrap().routes;
+    assert!(routes.contains(&"::/1".to_owned()) && routes.contains(&"8000::/1".to_owned()));
+    // An explicit IPv6 route list is left alone.
+    let app = core_text(&text("routes=['0.0.0.0/1','128.0.0.0/1','2000::/3']\n"));
+    let routes = &app.config.tun.as_ref().unwrap().routes;
+    assert!(routes.contains(&"2000::/3".to_owned()) && !routes.contains(&"::/1".to_owned()));
+    // Opting out of both takeover parts keeps the IPv4-only default.
+    let off = "rule_socket='unused'\n[tun]\ninterface='en0'\nipv6_address='fdfe:dcba:9876::1'\n[dns]\nlisten=[]\nsystem_takeover=false\nroute_system_dns=false\n";
+    assert!(!core_text(off)
+        .config
+        .tun
+        .as_ref()
+        .unwrap()
+        .routes
+        .iter()
+        .any(|r| r.contains(':')));
+
+    // 198.18.0.0-.3 are TUN network/address/DNS/broadcast; Fake IP starts after.
+    let query = wire::query("first.example", RecordType::A).unwrap();
+    let reply = Message::from_vec(
+        &core_text(&text(""))
+            .dns_answer(&query.to_vec().unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    match &reply.answers[0].data {
+        RData::A(ip) => assert_eq!(ip.0, std::net::Ipv4Addr::new(198, 18, 0, 4)),
+        other => panic!("{other:?}"),
+    }
+}
+fn core_text(text: &str) -> App {
+    App::from_text(
+        &std::env::temp_dir().join("astra-dns-takeover-test.toml"),
+        text.to_owned(),
+    )
+    .unwrap()
 }

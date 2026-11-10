@@ -710,22 +710,21 @@ fn rule_bindings_edit_the_same_relation_and_start_rule_before_all_proxies() {
     );
 }
 #[test]
-fn large_logs_rotate_to_a_single_previous_file() {
+fn each_core_start_gets_its_own_log_session() {
     let temp = Temp::new();
-    let log = temp.0.join("core.log");
-    let old = temp.0.join("core.log.1");
-    fs::write(&log, b"small").unwrap();
-    rotate_log(&log);
-    assert_eq!(fs::read(&log).unwrap(), b"small");
-    assert!(!old.exists());
-    fs::write(&old, b"older").unwrap();
-    fs::File::create(&log)
-        .unwrap()
-        .set_len(LOG_ROTATE_BYTES + 1)
-        .unwrap();
-    rotate_log(&log);
-    assert!(!log.exists());
-    assert_eq!(fs::metadata(&old).unwrap().len(), LOG_ROTATE_BYTES + 1);
+    let manager = Manager::load(temp.0.clone(), PathBuf::from("/unused")).unwrap();
+    fs::write(temp.0.join("core.log"), b"before sessions\n").unwrap();
+    let first = manager.new_log("core").unwrap();
+    let second = manager.new_log("core").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(manager.log("core").unwrap(), second);
+    assert!(!temp.0.join("core.log").exists());
+    let sessions = astra_platform::log_sessions::list(&temp.0, "core");
+    assert_eq!(sessions.len(), 3);
+    // Empty new sessions do not hide the last output from startup errors.
+    assert_eq!(manager.tail("core", 2048), "before sessions");
+    fs::write(&second, b"core failed to bind\n").unwrap();
+    assert_eq!(manager.tail("core", 2048), "core failed to bind");
 }
 #[test]
 fn proxy_without_binding_starts_the_rule_core_its_config_uses() {

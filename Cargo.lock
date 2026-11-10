@@ -660,6 +660,7 @@ dependencies = [
  "astra-observe",
  "astra-platform",
  "astra-protocols",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "etherparse",

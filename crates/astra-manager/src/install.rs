@@ -199,7 +199,7 @@ pub(crate) fn execute(
     id: &str,
     release: &str,
     value: InstallationScope,
-    progress: impl FnMut(&str),
+    progress: impl FnMut(engine::InstallProgress),
 ) -> Result<InstallationResult> {
     let source = selected(config, id, release)?;
     let before = engine::status(&source.path, scope(value))?;
@@ -230,6 +230,27 @@ pub(crate) fn execute(
         role, directory, entry: installed.entry, already_installed: before.installed,
         message: "Installation is ready for the next launch. Running processes, configuration, startup registration and the TUN service are unchanged.".into(),
     })
+}
+
+/// Contract form of one engine progress observation.
+pub(crate) fn progress_payload(
+    progress: engine::InstallProgress,
+) -> astra_management::v2::InstallationProgress {
+    use astra_management::v2::InstallationStep as Step;
+    use engine::InstallStep;
+    astra_management::v2::InstallationProgress {
+        step: match progress.step {
+            InstallStep::Preparing => Step::Preparing,
+            InstallStep::Copying => Step::Copying,
+            InstallStep::Verifying => Step::Verifying,
+            InstallStep::Publishing => Step::Publishing,
+            InstallStep::Complete => Step::Complete,
+        },
+        step_index: progress.step.index(),
+        step_count: InstallStep::COUNT,
+        current: progress.current.to_string(),
+        total: progress.total.to_string(),
+    }
 }
 
 pub(crate) fn prepare(
@@ -272,9 +293,9 @@ pub(crate) fn run_helper(arguments: Vec<OsString>) -> Result<()> {
     );
     let release = arguments[1].to_str().context("Invalid release ID")?;
     let digest = arguments[2].to_str().context("Invalid manifest digest")?;
-    match engine::install(&source, release, digest, InstallScope::System, |message| {
+    match engine::install(&source, release, digest, InstallScope::System, |progress| {
         use std::io::Write;
-        let _ = writeln!(std::io::stderr().lock(), "{message}");
+        let _ = writeln!(std::io::stderr().lock(), "{progress}");
     })? {
         engine::InstallOutcome::Installed(_) => Ok(()),
         engine::InstallOutcome::RequiresLocalAction(_) => {

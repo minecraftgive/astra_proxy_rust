@@ -172,9 +172,10 @@ pub(super) async fn prepare(
     let listener = UnixListener::bind(&socket_path)?;
     set_private(&socket_path, 0o600)?;
 
-    rotate_log(&manager.log(&name));
+    // The elevated replacement is a new process with its own log session.
+    let log = manager.new_log(&name)?;
     if let Some(warning) = &program.warning {
-        astra_platform::program_trust::append_warning(&manager.log(&name), warning);
+        astra_platform::program_trust::append_warning(&log, warning);
     }
     let offer = Offer {
         version: unix_handoff::PROTOCOL_VERSION,
@@ -203,7 +204,7 @@ pub(super) async fn prepare(
         version: unix_handoff::PROTOCOL_VERSION,
         config: fs::canonicalize(&active.path)?,
         control: socket,
-        log: manager.log(&name),
+        log: log.clone(),
         log_level: manager.level(&name).as_str().to_owned(),
         runtime_dir: fs::canonicalize(&runtime_dir)?,
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),

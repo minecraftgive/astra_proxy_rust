@@ -33,6 +33,20 @@ fn indicator(label: &str, state: Option<bool>, support: bool) -> Token {
         TokenStyle::default().kind(kind),
     )
 }
+/// Keeps the canonical UTC build time and appends the viewer's local time.
+pub(crate) fn compiled_time(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|date| {
+            let local = date.with_timezone(&chrono::Local);
+            format!(
+                "{} UTC [{}]",
+                date.naive_utc().format("%Y-%m-%d %H:%M:%S"),
+                local.format("%Y-%m-%d %H:%M:%S %:z")
+            )
+        })
+        .unwrap_or_else(|_| value.to_owned())
+}
+
 fn build_lines(lines: &mut Vec<Vec<Token>>, label: &str, build: &BuildInfo) {
     lines.push(value(
         label,
@@ -40,7 +54,7 @@ fn build_lines(lines: &mut Vec<Vec<Token>>, label: &str, build: &BuildInfo) {
     ));
     lines.push(value(
         "Compiled at",
-        format!("{} · {}", build.compiled_at, build.target),
+        format!("{} · {}", compiled_time(&build.compiled_at), build.target),
     ));
     lines.push(value(
         "Toolchain",

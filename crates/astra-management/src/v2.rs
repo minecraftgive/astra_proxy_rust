@@ -108,6 +108,14 @@ pub enum Query {
     LogChunk {
         instance: String,
         cursor: Option<LogCursor>,
+        /// A session id from `LogSessions`; absent follows the current session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "bindings", ts(optional))]
+        session: Option<String>,
+    },
+    /// Per-process log sessions of an instance, newest first.
+    LogSessions {
+        instance: String,
     },
     Tasks {
         limit: Option<u16>,
@@ -524,6 +532,7 @@ pub enum ResponseBody {
         text: String,
     },
     LogChunk(LogChunk),
+    LogSessions(Vec<LogSession>),
     UpdateStatus(
         #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
         #[serde(with = "update_json")]
@@ -691,9 +700,21 @@ pub enum LogChunk {
         cursor: LogCursor,
         reset: bool,
         skip_prefix: bool,
+        /// More bytes are already available; poll again without waiting.
+        #[serde(default)]
+        more: bool,
     },
     Waiting,
     Error(String),
+}
+/// One per-process log file. `current` marks the session viewers show by default.
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogSession {
+    pub id: String,
+    pub started_ms: String,
+    pub size: String,
+    pub current: bool,
 }
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +840,7 @@ pub struct Event {
 pub enum EventPayload {
     Diagnostics(serde_json::Value),
     NetTool(serde_json::Value),
+    Installation(InstallationProgress),
 }
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]

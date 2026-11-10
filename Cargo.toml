@@ -4,6 +4,7 @@ resolver = "2"
 exclude = ["vendor/meow-proxy", "vendor/netstack-smoltcp", "vendor/meow-common", "vendor/gpui-component"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
@@ -28,6 +29,9 @@ gpui-component = { path = "vendor/gpui-component" }
 
 # dev: minimum compile time. No optimization, no debug info, maximal codegen
 # parallelism and incremental reuse. Assertions and overflow checks stay on.
+[build]
+jobs = 16
+
 [profile.dev]
 opt-level = 0
 debug = false

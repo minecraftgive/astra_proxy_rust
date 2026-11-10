@@ -74,7 +74,7 @@ impl Jobs {
             waker,
             log: socket
                 .parent()
-                .and_then(|p| crate::tui_log::Log::open(&crate::tui_log::frontend_path(p)).ok())
+                .and_then(|p| crate::tui_log::Log::frontend(p).ok())
                 .map(std::sync::Arc::new),
         }
     }

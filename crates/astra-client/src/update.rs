@@ -160,6 +160,28 @@ impl Restart {
             client.update_launch.clear();
             return Ok(idle.then_some(target));
         }
+        if client.maintenance.record.as_ref().is_some_and(|r| {
+            r.phase == astra_management::maintenance::Phase::Complete
+                && r.new_process.as_ref().is_some_and(|process| {
+                    astra_platform::lifecycle::matches_live(process).is_ok_and(|live| live)
+                })
+                && !client.installation.busy()
+                && client
+                    .installation
+                    .result
+                    .as_ref()
+                    .is_none_or(|installed| installed.directory == r.target)
+                && std::fs::canonicalize(&context.executable)
+                    .is_ok_and(|p| p.parent() == Some(r.target.as_path()))
+        }) {
+            client.installation.activation = Some(crate::installation::Activation::Running);
+        } else if client.installation.activation == Some(crate::installation::Activation::Running) {
+            client.installation.activation = client
+                .installation
+                .result
+                .as_ref()
+                .map(|_| crate::installation::Activation::Waiting);
+        }
         if client.maintenance.active() || client.maintenance.failed() {
             client.update_launch.clear();
             client.message = client.maintenance.label();

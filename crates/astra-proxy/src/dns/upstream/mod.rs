@@ -25,37 +25,85 @@ pub(crate) use tcp::exchange as framed;
 pub(crate) use tls::connector as tls_connector;
 use udp::direct as udp_direct;
 
-async fn bootstrap(app: &App, host: &str) -> Result<IpAddr> {
+async fn bootstrap(app: &App, host: &str, direct: bool) -> Result<IpAddr> {
     if let Ok(ip) = host.parse() {
         return Ok(ip);
     }
-    let dns = app.dns.as_ref().context("DNS disabled")?;
+    let dns = app.resolver().context("DNS disabled")?;
+    if let Some(ip) = dns.bootstrap_cached(host) {
+        return Ok(ip);
+    }
+    let (ip, ttl) = if dns.config.plaintext_bypass {
+        plaintext_bootstrap(app, host).await?
+    } else {
+        encrypted_bootstrap(app, host, direct).await?
+    };
+    dns.bootstrap_store(host, ip, ttl);
+    Ok(ip)
+}
+fn first_a(query: &Message, bytes: &[u8]) -> Result<(IpAddr, u32)> {
+    let reply = Message::from_vec(bytes)?;
+    wire::validate_response(query, &reply)?;
+    reply
+        .answers
+        .iter()
+        .find_map(|record| {
+            if let RData::A(ip) = record.data {
+                Some((IpAddr::V4(ip.0), record.ttl))
+            } else {
+                None
+            }
+        })
+        .context("bootstrap has no A answer")
+}
+/// Resolve an upstream hostname only through IP-literal DoH/DoT upstreams;
+/// there is no plaintext fallback. Boxed as `Send` because exchange() calls
+/// back into bootstrap (literal-IP upstreams return before recursing).
+fn encrypted_bootstrap<'a>(
+    app: &'a App,
+    host: &'a str,
+    direct: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(IpAddr, u32)>> + Send + 'a>> {
+    Box::pin(async move {
+        let dns = app.resolver().context("DNS disabled")?;
+        let mut last = None;
+        for upstream in dns.config.encrypted_bootstrap() {
+            let query = wire::query(host, RecordType::A)?;
+            let result = tokio::time::timeout(
+                Duration::from_millis(dns.config.query_timeout_ms),
+                exchange_tls(app, &upstream, query.to_vec()?, None, direct),
+            )
+            .await;
+            match result {
+                Ok(Ok(bytes)) => match first_a(&query, &bytes) {
+                    Ok(found) => return Ok(found),
+                    Err(error) => last = Some(error),
+                },
+                Ok(Err(error)) => last = Some(error),
+                Err(error) => last = Some(error.into()),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| {
+                anyhow::anyhow!("no IP-literal DoH/DoT upstream for encrypted bootstrap")
+            })
+            .context(format!("encrypted DNS bootstrap for {host} failed")))
+    })
+}
+/// Legacy UDP/53 bootstrap, reachable only with dns.plaintext_bypass = true.
+async fn plaintext_bootstrap(app: &App, host: &str) -> Result<(IpAddr, u32)> {
+    let dns = app.resolver().context("DNS disabled")?;
     let mut last = None;
     for ip in &dns.config.bootstrap {
         let query = wire::query(host, RecordType::A)?;
         let target = SocketAddr::new(*ip, 53);
         let result = tokio::time::timeout(
             Duration::from_millis(dns.config.query_timeout_ms / 2),
-            async {
-                let bytes = udp_direct(app, target, &query.to_vec()?).await?;
-                let reply = Message::from_vec(&bytes)?;
-                wire::validate_response(&query, &reply)?;
-                reply
-                    .answers
-                    .iter()
-                    .find_map(|record| {
-                        if let RData::A(ip) = record.data {
-                            Some(IpAddr::V4(ip.0))
-                        } else {
-                            None
-                        }
-                    })
-                    .context("bootstrap has no A answer")
-            },
+            async { first_a(&query, &udp_direct(app, target, &query.to_vec()?).await?) },
         )
         .await;
         match result {
-            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Ok(found)) => return Ok(found),
             Ok(Err(error)) => last = Some(error),
             Err(error) => last = Some(error.into()),
         }
@@ -69,16 +117,25 @@ fn interface(app: &App) -> Option<&str> {
         .and_then(|tun| tun.interface.as_deref())
 }
 pub(super) async fn exchange(app: &App, upstream: &Upstream, query: Vec<u8>) -> Result<Vec<u8>> {
-    exchange_tls(app, upstream, query, None).await
+    exchange_tls(app, upstream, query, None, false).await
+}
+/// Same as exchange() but never routes through proxies (respect_rules).
+pub(super) async fn exchange_direct(
+    app: &App,
+    upstream: &Upstream,
+    query: Vec<u8>,
+) -> Result<Vec<u8>> {
+    exchange_tls(app, upstream, query, None, true).await
 }
 async fn exchange_tls(
     app: &App,
     upstream: &Upstream,
     query: Vec<u8>,
     connector: Option<tokio_rustls::TlsConnector>,
+    direct: bool,
 ) -> Result<Vec<u8>> {
-    let ip = bootstrap(app, &upstream.host).await?;
-    let dns = app.dns.as_ref().context("DNS disabled")?;
+    let ip = bootstrap(app, &upstream.host, direct).await?;
+    let dns = app.resolver().context("DNS disabled")?;
     let address = SocketAddr::new(ip, upstream.port);
     // Route using upstream hostname, dial its bootstrapped literal IP. This
     // avoids resolving the DNS server through itself.
@@ -95,7 +152,7 @@ async fn exchange_tls(
     } else {
         Network::Tcp
     };
-    let action = if dns.config.respect_rules {
+    let action = if dns.config.respect_rules && !direct {
         app.route_network(&target, Inbound::Tun, network).await?
     } else {
         RouteAction::Direct

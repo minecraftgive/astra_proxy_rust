@@ -199,7 +199,9 @@ impl Client {
             .count()
     }
     pub fn close_viewer(&mut self) {
-        if let Some(viewer) = self.viewer.take() {
+        if let Some(mut viewer) = self.viewer.take() {
+            // Reopening a log starts on the current session again.
+            viewer.settings.session = None;
             self.log_settings
                 .insert(viewer.name.clone(), viewer.settings.clone());
         }
@@ -812,6 +814,12 @@ impl Client {
             crate::logs::Command::Reconnect => return Input::Run(Action::Logs(name), None),
             crate::logs::Command::Capture(level) => {
                 return Input::Run(Action::SetLogLevel { name, level }, None)
+            }
+            crate::logs::Command::Session(session) => {
+                let mut settings = viewer.settings.clone();
+                settings.session = session;
+                self.log_settings.insert(name.clone(), settings);
+                return Input::Run(Action::Logs(name), None);
             }
             crate::logs::Command::None => {}
         }

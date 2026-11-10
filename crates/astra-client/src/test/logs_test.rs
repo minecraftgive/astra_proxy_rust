@@ -115,7 +115,8 @@ async fn real_log_stream_releases_rows_while_retaining_the_complete_local_file()
     let text = (0..50)
         .map(|i| format!("INFO line {i}\n"))
         .collect::<String>();
-    let path = fixture.write("proxy.log", &text);
+    std::fs::create_dir_all(fixture.0.join("logs/proxy")).unwrap();
+    let path = fixture.write("logs/proxy/20260101T000000.000Z.log", &text);
     let socket = fixture.0.join("management.sock");
     let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
@@ -141,6 +142,7 @@ async fn real_log_stream_releases_rows_while_retaining_the_complete_local_file()
                     },
                     reset: true,
                     skip_prefix: false,
+                    more: false,
                 }),
             ),
         )
@@ -153,6 +155,15 @@ async fn real_log_stream_releases_rows_while_retaining_the_complete_local_file()
             memory_lines: 3,
             ..Default::default()
         },
+    );
+    view.set_sessions(
+        vec![astra_management::v2::LogSession {
+            id: "20260101T000000.000Z".into(),
+            started_ms: "1767225600000".into(),
+            size: text.len().to_string(),
+            current: true,
+        }],
+        fixture.0.join("logs/proxy"),
     );
     view.connect(&socket).await.unwrap();
     for _ in 0..100 {
@@ -222,7 +233,17 @@ fn fragmented_utf8_ansi_and_rotation_keep_valid_complete_lines() {
     assert_eq!(view.records[1].level, Some(LogLevel::Error));
     view.apply(event(b"WARN rotated\n", 13, true));
     assert_eq!(view.records.back().unwrap().text, "WARN rotated");
-    assert!(view.records.iter().any(|r| r.text.contains("轮换")));
+    // Following the current session, a reset means a new session began.
+    assert!(view
+        .records
+        .iter()
+        .any(|r| r.text.contains("日志会话") || r.text.contains("New log session")));
+    view.settings.session = Some("20260101T000000.000Z".into());
+    view.apply(event(b"E\n", 2, true));
+    assert!(view
+        .records
+        .iter()
+        .any(|r| r.text.contains("轮换") || r.text.contains("rotated")));
 }
 #[test]
 fn search_filter_and_level_are_independent_and_follow_does_not_stop_ingestion() {
@@ -273,4 +294,60 @@ fn bounded_memory_and_pending_search_survive_settings_restore() {
     view.apply(event(&vec![b'x'; 80 * 1024], 100000, false));
     assert!(view.partial.len() <= 64 * 1024);
     assert!(view.records.back().unwrap().text.contains("已截断"));
+}
+
+#[test]
+fn session_picker_selects_earlier_sessions_without_persisting_the_choice() {
+    use crate::input::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let mut view = Viewer::new("proxy".into(), Settings::default());
+    // Without listed sessions the picker does not open.
+    assert!(matches!(view.key(key(KeyCode::Char('s'))), Command::None));
+    assert!(view.browsing());
+    let session = |id: &str, current| astra_management::v2::LogSession {
+        id: id.into(),
+        started_ms: "1767225600000".into(),
+        size: "2048".into(),
+        current,
+    };
+    view.set_sessions(
+        vec![
+            session("20260102T000000.000Z", true),
+            session("20260101T000000.000Z", false),
+        ],
+        "/state/logs/proxy".into(),
+    );
+    assert_eq!(
+        view.source,
+        std::path::PathBuf::from("/state/logs/proxy/20260102T000000.000Z.log")
+    );
+    assert!(
+        view.session_label().starts_with("会话：本次")
+            || view.session_label().starts_with("Session: current")
+    );
+    assert_eq!(view.session_choices().len(), 2);
+    view.key(key(KeyCode::Char('s')));
+    assert!(matches!(view.settings.mode, Mode::Session(0)));
+    view.key(key(KeyCode::Down));
+    let Command::Session(Some(id)) = view.key(key(KeyCode::Enter)) else {
+        panic!("An earlier session is selected by id");
+    };
+    assert_eq!(id, "20260101T000000.000Z");
+    assert!(view.browsing());
+    view.settings.session = Some(id);
+    view.key(key(KeyCode::Char('s')));
+    assert!(matches!(view.settings.mode, Mode::Session(1)));
+    view.key(key(KeyCode::Up));
+    assert!(matches!(
+        view.key(key(KeyCode::Enter)),
+        Command::Session(None)
+    ));
+    let saved = serde_json::to_value(&view.settings).unwrap();
+    assert!(saved.get("session").is_none());
+    // A vanished selection falls back to the current session.
+    view.set_sessions(
+        vec![session("20260103T000000.000Z", true)],
+        "/state/logs/proxy".into(),
+    );
+    assert_eq!(view.settings.session, None);
 }

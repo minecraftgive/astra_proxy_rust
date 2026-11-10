@@ -357,7 +357,7 @@ async fn prepare(context: &Context, target: &Context) -> Result<Record> {
     else {
         anyhow::bail!("Cannot identify local manager")
     };
-    ensure!(hello.capabilities.iter().any(|c| c == m::CAPABILITY), "The running manager needs one manual maintenance upgrade before automatic maintenance is available");
+    ensure!(hello.capabilities.iter().any(|c| c == m::CAPABILITY), crate::i18n::t("The package is installed; this manager requires a manual maintenance upgrade."));
     let digest = manifest_hash(&target.bin)?;
     let ResponseBody::MaintenanceStatus(Some(record)) = crate::protocol::request(
         &socket,

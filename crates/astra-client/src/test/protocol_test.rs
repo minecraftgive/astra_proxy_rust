@@ -1,5 +1,248 @@
 use super::*;
 
+fn runtime_wire_fixture() -> astra_model::runtime::RuntimeView {
+    use astra_model::runtime::*;
+    RuntimeView {
+        snapshot: Snapshot {
+            pid: 123,
+            upload: 9_007_199_254_740_993,
+            download: u64::MAX,
+            connections: vec![Connection {
+                id: 12,
+                source: Some("123".into()),
+                host: "456".into(),
+                port: 53,
+                network: "udp".into(),
+                inbound: "789".into(),
+                outbound: "12".into(),
+                upload: 13,
+                download: 14,
+                elapsed_ms: 15,
+            }],
+            groups: vec![Group {
+                name: "12".into(),
+                mode: "select".into(),
+                selected: Some("123".into()),
+                testing: false,
+                members: vec![Member {
+                    name: "123".into(),
+                    delay_ms: Some(12),
+                    alive: Some(true),
+                }],
+            }],
+            ..Default::default()
+        },
+        telemetry: Some(RuntimeTelemetry {
+            host_boot_id: "123".into(),
+            active_generation: Some(12),
+            coverage: Coverage::Complete,
+            sample_sequence: 13,
+            sample_elapsed_ms: 14,
+            sample_age_ms: 15,
+            generations: vec![
+                GenerationTelemetry {
+                    generation: 12,
+                    sample_age_ms: Some(13),
+                    healthy: true,
+                },
+                GenerationTelemetry {
+                    generation: 11,
+                    sample_age_ms: None,
+                    healthy: false,
+                },
+            ],
+            connection_generations: [(12, 13)].into_iter().collect(),
+            dns: Some(Box::new(DnsQueryLog {
+                records: vec![DnsQuery {
+                    resolver: "123".into(),
+                    id: u64::MAX,
+                    timestamp_ms: 1_800_000_000_012,
+                    domain: "123".into(),
+                    query_type: "TXT".into(),
+                    source: "cache".into(),
+                    upstream: Some("1.1.1.1:53".into()),
+                    status: "NoError".into(),
+                    answers: vec!["12".into(), "9007199254740993".into()],
+                    duration_us: 12,
+                    ..Default::default()
+                }],
+                truncated: false,
+            })),
+            dns_resolver: Some(Box::new(DnsResolverStatus {
+                enabled: true,
+                fake_ip: true,
+                listen: vec!["127.0.0.1:1053".parse().unwrap()],
+                policy_count: 12,
+                nameservers: vec![DnsServer {
+                    address: "https://resolver.example/dns-query".into(),
+                    transport: "DoH".into(),
+                }],
+                ..Default::default()
+            })),
+            traffic: Some(Box::new(TrafficTelemetry {
+                nodes: Some(
+                    [(
+                        "12".into(),
+                        NodeTraffic {
+                            session: 12,
+                            hour: 13,
+                            day: 14,
+                            week: 15,
+                            month: 9_007_199_254_740_993,
+                            persist: u64::MAX,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                selected_node: Some("12".into()),
+                history_error: None,
+            })),
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn runtime_v2_roundtrip_preserves_dns_and_traffic_counters_and_numeric_text() {
+    use astra_model::runtime::RuntimeView;
+    let populated = runtime_wire_fixture();
+    let mut empty = populated.clone();
+    empty
+        .telemetry
+        .as_mut()
+        .unwrap()
+        .dns
+        .as_mut()
+        .unwrap()
+        .records
+        .clear();
+    let legacy = RuntimeView {
+        snapshot: populated.snapshot.clone(),
+        telemetry: None,
+    };
+    for view in [populated, empty, legacy] {
+        let native = serde_json::to_value(&view).unwrap();
+        for wire in [native.clone(), v::browser_numbers(native.clone())] {
+            let response =
+                reply(v::ResponseBody::Runtime(v::RuntimeSnapshot::Client(wire))).unwrap();
+            let decoded: RuntimeView = serde_json::from_str(&response.text).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), native);
+        }
+    }
+    let mut wire = v::browser_numbers(serde_json::to_value(runtime_wire_fixture()).unwrap());
+    wire["telemetry"]["dns"]["records"][0]["duration_us"] = "18446744073709551616".into();
+    let response = reply(v::ResponseBody::Runtime(v::RuntimeSnapshot::Client(wire))).unwrap();
+    assert!(
+        serde_json::from_str::<RuntimeView>(&response.text).is_err(),
+        "overflow must remain an error instead of becoming zero or rounding"
+    );
+}
+
+#[tokio::test]
+async fn runtime_subscription_decodes_browser_formatted_dns_records() {
+    let fixture = crate::import::tests::Fixture::new();
+    let socket = fixture.0.join("runtime-v2.sock");
+    let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
+    let expected = serde_json::to_value(runtime_wire_fixture()).unwrap();
+    let wire = v::browser_numbers(expected.clone());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: v::Request = astra_management::client::receive(&mut stream)
+                .await
+                .unwrap();
+            assert!(
+                matches!(request.body, v::RequestBody::Query(v::Query::Runtime { instance }) if instance == "dns-profile")
+            );
+            astra_management::client::send(
+                &mut stream,
+                &v::Response::success(
+                    request.id,
+                    v::ResponseBody::Runtime(v::RuntimeSnapshot::Client(wire.clone())),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let mut stream = subscribe(
+        &socket,
+        Action::WatchRuntime {
+            name: "dns-profile".into(),
+            expected_pid: 123,
+            interval_ms: 500,
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let response: Reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            astra_ipc::receive_management(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let decoded: astra_model::runtime::RuntimeView =
+            serde_json::from_str(&response.text).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+    }
+    drop(stream);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "read-only check against ASTRA_RUNTIME_TEST_SOCKET and ASTRA_RUNTIME_TEST_INSTANCE"]
+async fn live_runtime_subscription_decodes_dns_metadata() {
+    let socket = PathBuf::from(
+        std::env::var_os("ASTRA_RUNTIME_TEST_SOCKET").expect("management socket required"),
+    );
+    let name = std::env::var("ASTRA_RUNTIME_TEST_INSTANCE").expect("instance required");
+    let response = reply(
+        query(
+            &socket,
+            v::Query::Runtime {
+                instance: name.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let first: astra_model::runtime::RuntimeView = serde_json::from_str(&response.text).unwrap();
+    let mut stream = subscribe(
+        &socket,
+        Action::WatchRuntime {
+            name,
+            expected_pid: first.snapshot.pid,
+            interval_ms: 500,
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let response: Reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            astra_ipc::receive_management(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let view: astra_model::runtime::RuntimeView = serde_json::from_str(&response.text).unwrap();
+        let meta = view.telemetry.expect("enhanced runtime telemetry required");
+        let records = meta.dns.expect("DNS history required");
+        assert!(
+            !records.records.is_empty(),
+            "generate a DNS query before running this read-only check"
+        );
+        assert!(meta.dns_resolver.is_some());
+        println!("Decoded live DNS sample: {} records", records.records.len());
+    }
+}
+
 #[test]
 fn force_start_is_explicit_for_local_and_remote_targets() {
     for local in [true, false] {

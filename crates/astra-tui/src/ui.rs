@@ -19,6 +19,8 @@ mod monitor;
 mod node_transfer;
 mod operations;
 mod pages;
+mod package_choice;
+pub(crate) use package_choice::choose_package;
 mod settings;
 pub(crate) fn preferred_terminal(home: &std::path::Path) -> String {
     settings::load(&home.join(settings::FILE), &Session::default())

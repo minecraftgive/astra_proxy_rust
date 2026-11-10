@@ -1,9 +1,9 @@
-//! Installation is requested from the selected management target, never inferred
-//! from the frontend's own filesystem. Queries do not enter the mutation queue.
+//! Local frontend packages and manager-discovered packages share one installation view.
 use super::*;
+#[cfg(test)]
 use astra_management::v2 as v;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::{layout::Rect, style::Modifier};
 
 pub use astra_client::installation::{InstallationAction, Request};
 #[derive(Clone)]
@@ -137,35 +137,52 @@ impl Ui {
             }
             return;
         }
+        let installation = &self.client.installation;
+        let maintenance = &self.client.maintenance;
+        let maintenance_label = maintenance.label();
+        let show_maintenance = maintenance.active()
+            || maintenance.failed()
+            || !maintenance_label.is_empty()
+            || maintenance.log.is_some();
+        let progress_height = if installation.progress_visible() {
+            4
+        } else {
+            0
+        };
+        let extra_height = 1 + u16::from(show_maintenance);
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(2),
                 Constraint::Min(1),
+                Constraint::Length(progress_height),
+                Constraint::Length(extra_height),
                 Constraint::Length(2),
             ])
             .split(inner);
-        let scope = self.client.installation.scope_label();
-        let target = self.client.installation.target_label();
+        let muted = Style::default().fg(dashboard::MUTED);
         frame.render_widget(
-            Paragraph::new(format!(
-                "{}: {target}\n{}: {}  [Tab / ←→]\n{}\n{} [l / a]\n{}",
-                t("Management target"),
-                t("Installation scope"),
-                t(scope),
-                t("↑↓ package · Enter install · r refresh · PgUp/PgDn scroll · Esc close"),
-                self.client.update_launch.label(),
-                t("Maintenance: m retry · b previous · v log · c cancel")
-            )),
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{}: ", t("Management target")), muted),
+                    Span::raw(installation.target_label()),
+                    Span::raw("   "),
+                    Span::styled(format!("{}: ", t("Installation scope")), muted),
+                    Span::styled(installation.scope_label(), Style::default().fg(Color::Cyan)),
+                    Span::styled("  [Tab]", muted),
+                ]),
+                Line::styled(
+                    t("↑↓ package · Enter install · r refresh · PgUp/PgDn scroll · Esc close"),
+                    muted,
+                ),
+            ]),
             sections[0],
         );
         self.hit(
-            Rect::new(sections[0].x, sections[0].y + 1, sections[0].width, 1),
+            Rect::new(sections[0].x, sections[0].y, sections[0].width, 1),
             dashboard::Target::Installation(Click::Scope),
         );
-        let mut lines: Vec<Line> = self
-            .client
-            .installation
+        let mut lines: Vec<Line> = installation
             .details()
             .into_iter()
             .map(|detail| {
@@ -187,28 +204,22 @@ impl Ui {
                 }
             })
             .collect();
-        if !self.client.maintenance.label().is_empty() {
-            lines.push(Line::from(self.client.maintenance.label()));
-        }
-        if let Some(log) = &self.client.maintenance.log {
-            lines.extend(log.lines().map(|line| Line::from(line.to_owned())));
+        if let Some(log) = &maintenance.log {
+            lines.extend(log.lines().map(|line| Line::styled(line.to_owned(), muted)));
         }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((self.client.installation.scroll, 0)),
+                .scroll((installation.scroll, 0)),
             sections[1],
         );
-        for (index, package) in self
-            .client
-            .installation
+        for (index, _) in installation
             .status
             .iter()
             .flat_map(|s| &s.packages)
             .enumerate()
         {
-            let _ = package;
-            if self.client.installation.scroll == 0 && index < sections[1].height as usize {
+            if installation.scroll == 0 && index < sections[1].height as usize {
                 self.hit(
                     Rect::new(
                         sections[1].x,
@@ -220,34 +231,146 @@ impl Ui {
                 );
             }
         }
-        let width = sections[2].width / 5;
-        for (i, (label, click)) in [
-            ("Install", Click::Install),
-            ("Launch now", Click::LaunchNow),
-            ("Auto / manual", Click::ToggleAutoLaunch),
-            ("Refresh", Click::Refresh),
-            ("Close", Click::Close),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            self.button(
+        if progress_height > 0 {
+            self.render_installation_progress(frame, sections[2]);
+        }
+        let mut extra = vec![Line::from(vec![
+            Span::raw(self.client.update_launch.label()),
+            Span::styled("  [l / a]", muted),
+        ])];
+        if show_maintenance {
+            extra.push(Line::from(vec![
+                Span::styled(maintenance_label, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        t("Maintenance: m retry · b previous · v log · c cancel")
+                    ),
+                    muted,
+                ),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(extra), sections[3]);
+        self.hit(
+            Rect::new(sections[3].x, sections[3].y, sections[3].width, 1),
+            dashboard::Target::Installation(Click::ToggleAutoLaunch),
+        );
+        let busy = installation.busy();
+        let mut buttons = vec![(
+            if busy { "Installing…" } else { "Install" },
+            Click::Install,
+            installation.can_install(),
+        )];
+        if self.client.update_launch.pending() {
+            buttons.push(("Launch now", Click::LaunchNow, true));
+        }
+        buttons.push(("Refresh", Click::Refresh, !busy));
+        buttons.push(("Close", Click::Close, true));
+        let width = sections[4].width / buttons.len() as u16;
+        for (i, (label, click, enabled)) in buttons.into_iter().enumerate() {
+            self.button_enabled(
                 frame,
                 Rect::new(
-                    sections[2].x + i as u16 * width,
-                    sections[2].y,
+                    sections[4].x + i as u16 * width,
+                    sections[4].y,
                     width.saturating_sub(1),
                     1,
                 ),
                 label,
                 dashboard::Target::Installation(click),
+                enabled,
             );
         }
     }
+
+    /// Gauge plus a step checklist; kept outside the scrolled details so the
+    /// current step is always visible.
+    fn render_installation_progress(&self, frame: &mut Frame<'_>, area: Rect) {
+        use astra_client::installation::StepState;
+        let installation = &self.client.installation;
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let failed = installation.error.is_some() && !installation.busy();
+        let title = Line::from(vec![
+            Span::styled(
+                t("Installation progress"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" · "),
+            Span::raw(installation.progress_label()),
+        ]);
+        frame.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+        if area.height < 2 {
+            return;
+        }
+        let percent = installation.percent();
+        let color = if failed {
+            Color::Red
+        } else if percent == Some(100) {
+            Color::Green
+        } else {
+            Color::Cyan
+        };
+        frame.render_widget(
+            ratatui::widgets::Gauge::default()
+                .gauge_style(Style::default().fg(color).bg(Color::DarkGray))
+                .ratio(f64::from(percent.unwrap_or(0)) / 100.0)
+                .label(percent.map_or_else(|| "…".to_owned(), |p| format!("{p}%"))),
+            Rect {
+                y: area.y + 1,
+                height: 1,
+                ..area
+            },
+        );
+        if area.height < 3 {
+            return;
+        }
+        // Pack whole steps per line so a mark never wraps away from its label.
+        let width = area.width as usize;
+        let mut lines = vec![Vec::new()];
+        let mut used = 0;
+        for row in installation.step_rows() {
+            let (mark, style) = match row.state {
+                StepState::Done => ("✓", Style::default().fg(Color::Green)),
+                StepState::Active => (
+                    "▶",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                StepState::Failed => ("✗", Style::default().fg(Color::Red)),
+                StepState::Pending => ("·", Style::default().fg(dashboard::MUTED)),
+            };
+            let item = format!("{mark} {}", row.label);
+            let cells = astra_tui_kit::text::width(&item);
+            let gap = if used == 0 { 0 } else { 3 };
+            if used > 0 && used + gap + cells > width {
+                lines.push(Vec::new());
+                used = 0;
+            } else if gap > 0 {
+                lines.last_mut().unwrap().push(Span::raw("   "));
+                used += gap;
+            }
+            used += cells;
+            lines.last_mut().unwrap().push(Span::styled(
+                astra_tui_kit::text::truncate_cells(&item, width, "…"),
+                style,
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()),
+            Rect {
+                y: area.y + 2,
+                height: area.height - 2,
+                ..area
+            },
+        );
+    }
 }
 
-/// Only a launch plan returned by the local private IPC is eligible for a
-/// terminal/UAC prompt. A cancellation never runs the follow-up Execute.
+/// Launch only the verified frontend package helper or a plan from local private IPC.
+/// A cancellation never runs the follow-up installation.
 pub(super) async fn elevate(
     socket: &std::path::Path,
     request: &Request,
@@ -258,18 +381,7 @@ pub(super) async fn elevate(
         "{}",
         t("Run installation on the target machine.")
     );
-    let launch = crate::protocol::request(
-        socket,
-        v::RequestBody::Local(v::LocalCommand::PrepareInstallation {
-            package_id: request.package_id.clone(),
-            expected_release_id: request.expected_release_id.clone(),
-            scope: request.scope,
-        }),
-    )
-    .await?;
-    let v::ResponseBody::InstallationLaunch(launch) = launch else {
-        anyhow::bail!("{}", t("Unexpected installation response"));
-    };
+    let launch = astra_client::installation::prepare_elevation(socket, request).await?;
     #[cfg(unix)]
     {
         let sudo = ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"].into_iter()

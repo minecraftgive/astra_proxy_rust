@@ -1455,6 +1455,10 @@ pub async fn worker() -> Result<()> {
         rule.start_observer();
     }
     let app = Arc::new(app);
+    let hook_app = app.clone();
+    meow_common::set_host_resolver(Arc::new(crate::dns::HostHook(Box::new(move || {
+        hook_app.clone()
+    }))));
     let listener = astra_platform::platform::bind_listener(&config.endpoint)?;
     astra_platform::platform::set_private(
         astra_platform::platform::endpoint_path(&config.endpoint),
