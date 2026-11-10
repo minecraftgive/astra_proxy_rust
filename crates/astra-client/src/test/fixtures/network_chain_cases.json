@@ -1,0 +1,563 @@
+[
+  {
+    "name": "system route without TUN stays on the adapter",
+    "runtime": {
+      "mode": "rule",
+      "tun": false,
+      "system_proxy": true,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › 系统代理 › 网卡 en0（默认路由）"
+  },
+  {
+    "name": "system route captured by TUN follows the rule default chain",
+    "runtime": {
+      "mode": "rule",
+      "tun": true,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › TUN › 规则 › PROXY → 香港 › 香港 → hk-01 › hk-01 › 网卡 en0（默认路由）"
+  },
+  {
+    "name": "global mode under TUN goes straight to PROXY",
+    "runtime": {
+      "mode": "global",
+      "tun": true,
+      "system_proxy": true,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › TUN + 系统代理 › PROXY → 香港 › 香港 → hk-01 › hk-01 › 网卡 en0（默认路由）"
+  },
+  {
+    "name": "direct mode under TUN ends at DIRECT",
+    "runtime": {
+      "mode": "direct",
+      "tun": true,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › TUN › DIRECT › 网卡 en0（默认路由）"
+  },
+  {
+    "name": "pinned group walks to its leaf",
+    "runtime": {
+      "mode": "rule",
+      "tun": false,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "outbound",
+      "name": "香港"
+    },
+    "expected": "系统 › 香港 → hk-01 › hk-01 › 网卡 en0（默认路由）"
+  },
+  {
+    "name": "adapter egress bypasses the proxy",
+    "runtime": {
+      "mode": "rule",
+      "tun": true,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": "香港"
+        },
+        {
+          "name": "香港",
+          "mode": "url-test",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "interface",
+      "name": "en0"
+    },
+    "expected": "系统 › 网卡 en0（指定网卡）"
+  },
+  {
+    "name": "group without selection is reported",
+    "runtime": {
+      "mode": "rule",
+      "tun": false,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "PROXY",
+          "mode": "select",
+          "selected": null
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "outbound",
+      "name": "PROXY"
+    },
+    "expected": "系统 › 网卡 en0（默认路由） › PROXY 无选择"
+  },
+  {
+    "name": "selection cycle is bounded",
+    "runtime": {
+      "mode": "rule",
+      "tun": false,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "A",
+          "mode": "select",
+          "selected": "B"
+        },
+        {
+          "name": "B",
+          "mode": "select",
+          "selected": "A"
+        }
+      ]
+    },
+    "network": null,
+    "egress": {
+      "kind": "outbound",
+      "name": "A"
+    },
+    "expected": "系统 › A → B › B → A › 选择链循环或超过 32 层"
+  },
+  {
+    "name": "missing runtime",
+    "runtime": null,
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › 网卡 en0（默认路由） › 实例未运行或运行快照不可用"
+  },
+  {
+    "name": "missing default group is reported, not shown as an exit",
+    "runtime": {
+      "mode": "rule",
+      "tun": true,
+      "system_proxy": false,
+      "groups": [
+        {
+          "name": "Proxies",
+          "mode": "select",
+          "selected": "hk-01"
+        }
+      ]
+    },
+    "network": {
+      "agent_id": "agent-1",
+      "interfaces": [
+        {
+          "id": "en0",
+          "name": "en0",
+          "kind": "physical",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "192.168.1.5"
+            }
+          ]
+        },
+        {
+          "id": "utun4",
+          "name": "utun4",
+          "kind": "virtual",
+          "connected": true,
+          "addresses": [
+            {
+              "address": "198.18.0.1"
+            }
+          ]
+        }
+      ],
+      "routes": [
+        {
+          "destination": "default",
+          "interface_id": "utun4"
+        },
+        {
+          "destination": "default",
+          "interface_id": "en0"
+        }
+      ],
+      "truncated": false
+    },
+    "egress": {
+      "kind": "system"
+    },
+    "expected": "系统 › TUN › 规则 › 网卡 en0（默认路由） › 未找到默认组 PROXY；实际出口由规则决定"
+  }
+]

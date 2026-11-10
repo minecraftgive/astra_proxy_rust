@@ -125,7 +125,7 @@ impl DiagnosticPlan {
         };
         if matches!(
             request.probe,
-            Probe::Trace { .. } | Probe::Icmp { .. } | Probe::Ipv6 { .. } | Probe::Nat { .. }
+            Probe::Trace { .. } | Probe::Icmp { .. } | Probe::Nat { .. }
         ) {
             request.path_context = Some(self.path_context(&context).await);
         }

@@ -32,6 +32,26 @@ fn fixture(cx: &mut TestAppContext) -> (Entity<AppModel>, Entity<View>, WindowHa
     (model, view.unwrap(), window)
 }
 
+fn tools_mut(
+    model: &Entity<AppModel>,
+    cx: &mut TestAppContext,
+    edit: impl FnOnce(&mut astra_client::nettools::View),
+) {
+    model.update(cx, |model, cx| {
+        edit(
+            model
+                .client
+                .diagnostics
+                .as_mut()
+                .unwrap()
+                .tools
+                .as_mut()
+                .unwrap(),
+        );
+        cx.notify();
+    });
+}
+
 #[gpui::test]
 fn all_tools_sync_inputs_and_render_in_compact_native_window(cx: &mut TestAppContext) {
     let (model, view, window) = fixture(cx);
@@ -70,87 +90,27 @@ fn all_tools_sync_inputs_and_render_in_compact_native_window(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn native_batch_shortcuts_keep_selection_and_edit_without_network(cx: &mut TestAppContext) {
-    let (model, view, window) = fixture(cx);
-    cx.simulate_keystrokes(window.into(), "ctrl-r");
-    model.read_with(cx, |model, _| {
-        let v = model
-            .client
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap();
-        assert!(v.section == Section::Findings);
-        assert_eq!(v.plan.projects.len(), 5);
-        assert!(!v.running());
+fn live_chain_and_single_result_column_render_together(cx: &mut TestAppContext) {
+    let (model, _view, window) = fixture(cx);
+    tools_mut(&model, cx, |tools| {
+        tools.context.runtime = Some(serde_json::json!({
+            "mode": "rule", "tun": true, "system_proxy": false,
+            "groups": [{"name": "PROXY", "mode": "select", "selected": "hk-01"}]
+        }));
     });
-    cx.simulate_keystrokes(window.into(), "c e");
-    model.read_with(cx, |model, _| {
-        let v = model
-            .client
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap();
-        assert!(v.plan.comparison);
-        assert_eq!(v.plan.projects.len(), 4);
-        assert!(v.section == Section::Tools);
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        window.resize(gpui::size(px(420.), px(560.)));
+        window.draw(cx).clear(cx);
     });
-    cx.simulate_keystrokes(window.into(), "ctrl-p ctrl-l ctrl-l delete");
-    model.read_with(cx, |model, _| {
-        let v = model
-            .client
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap();
-        assert_eq!(v.plan.projects.len(), 4);
-        assert!(!v.running());
-    });
-    view.update(cx, |view, cx| view.back(cx));
-    assert!(model.read_with(cx, |model, _| model.client.diagnostics.is_none()));
-}
-
-#[gpui::test]
-fn advanced_toggle_is_captured_inside_text_inputs_without_changing_the_request(
-    cx: &mut TestAppContext,
-) {
-    let (model, view, window) = fixture(cx);
-    let target = view.read_with(cx, |view, cx| view.tools(cx, |v| v.target.clone()).unwrap());
-    window
-        .update(cx, |_, window, cx| {
-            view.update(cx, |view, cx| {
-                let input = &view
-                    .inputs
-                    .iter()
-                    .find(|(field, _)| *field == Field::Target)
-                    .unwrap()
-                    .1;
-                input.update(cx, |input, cx| input.focus(window, cx));
-            });
-        })
-        .unwrap();
-    cx.run_until_parked();
-    view.read_with(cx, |view, cx| {
-        assert!(!view.tools(cx, |v| v.show_advanced).unwrap())
-    });
-    cx.simulate_keystrokes(window.into(), "ctrl-d");
-    view.read_with(cx, |view, cx| {
-        assert!(view.tools(cx, |v| v.show_advanced).unwrap());
-        assert_eq!(view.tools(cx, |v| v.target.clone()).unwrap(), target);
-    });
-    cx.simulate_keystrokes(window.into(), "ctrl-d");
-    view.read_with(cx, |view, cx| {
-        assert!(!view.tools(cx, |v| v.show_advanced).unwrap())
-    });
-    cx.simulate_keystrokes(window.into(), "f1 f5 f7 f9");
-    model.read_with(cx, |model, _| {
+    let chain = visual
+        .debug_bounds("network-live-chain")
+        .expect("live chain is always visible");
+    let result = visual
+        .debug_bounds("network-result")
+        .expect("one result column");
+    assert!(chain.origin.y < result.origin.y);
+    model.read_with(&visual, |model, _| {
         let tools = model
             .client
             .diagnostics
@@ -159,16 +119,10 @@ fn advanced_toggle_is_captured_inside_text_inputs_without_changing_the_request(
             .tools
             .as_ref()
             .unwrap();
-        assert!(tools.section == Section::Tools);
-        assert!(!tools.show_advanced);
-        assert!(tools.plan.projects.is_empty());
-        assert!(!tools.running());
-    });
-    cx.simulate_keystrokes(window.into(), "ctrl-l ctrl-d");
-    view.read_with(cx, |view, cx| {
-        assert!(view.tools(cx, |v| v.section == Section::Paths).unwrap());
-        assert!(view.tools(cx, |v| v.show_advanced).unwrap());
-        assert_eq!(view.tools(cx, |v| v.target.clone()).unwrap(), target);
+        assert_eq!(
+            tools.live_chain().text(),
+            "系统 › TUN › 规则 › PROXY → hk-01 › hk-01"
+        );
     });
 }
 
@@ -182,164 +136,76 @@ fn topology_fixture() -> Vec<serde_json::Value> {
 }
 
 #[gpui::test]
-fn conclusion_and_report_columns_stay_side_by_side_with_independent_scrolling(
-    cx: &mut TestAppContext,
-) {
+fn probe_path_pointer_opens_nodes_edges_and_original_project_evidence(cx: &mut TestAppContext) {
     let (model, view, window) = fixture(cx);
-    model.update(cx, |model, cx| {
-        let tools = model.client.diagnostics.as_mut().unwrap().tools.as_mut().unwrap();
-        tools.section = Section::Paths;
-        tools.details = topology_fixture();
-        for index in 0..80 {
-            tools.details.push(serde_json::json!({"event":"context", "config_digest":format!("{index}-{}", "report".repeat(100))}));
-        }
-        cx.notify();
-    });
-    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
-    visual.simulate_resize(gpui::size(px(900.), px(700.)));
-    visual.update(|window, cx| {
-        window.draw(cx).clear(cx);
-    });
-    let collapsed = visual.debug_bounds("network-conclusions-column").unwrap();
-    assert!(visual.debug_bounds("network-report-column").is_none());
-    cx.simulate_keystrokes(window.into(), "ctrl-d");
-    for (width, height) in [(900., 700.), (420., 460.)] {
-        visual.simulate_resize(gpui::size(px(width), px(height)));
-        visual.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        let left = visual.debug_bounds("network-conclusions-column").unwrap();
-        let right = visual.debug_bounds("network-report-column").unwrap();
-        let topology = visual.debug_bounds("network-report-topology").unwrap();
-        assert_eq!(left.origin.y, right.origin.y, "columns must never stack");
-        assert!(left.right() <= right.origin.x, "report stays to the right");
-        assert!(
-            right.right() <= px(width),
-            "long report cannot stretch the columns: left={left:?}, right={right:?}, window width={width}"
-        );
-        assert!(topology.origin.x >= right.origin.x && topology.right() <= right.right());
-        assert!(left.size.width < collapsed.size.width);
-    }
-    visual.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.report_horizontal
-                .set_offset(gpui::point(px(-80.), px(0.)));
-            view.report_scroll
-                .scroll_to_item(60, gpui::ScrollStrategy::Top);
-            cx.notify();
-        });
-        window.draw(cx).clear(cx);
-    });
-    view.read_with(cx, |view, _| {
-        assert!(view.report_horizontal.offset().x < px(0.));
-        assert!(view.report_scroll.0.borrow().base_handle.offset().y < px(0.));
-        assert_eq!(
-            view.conclusion_horizontal.offset(),
-            gpui::point(px(0.), px(0.))
-        );
-        assert_eq!(
-            view.conclusion_scroll.0.borrow().base_handle.offset(),
-            gpui::point(px(0.), px(0.))
-        );
-    });
-    cx.simulate_keystrokes(window.into(), "ctrl-d");
-    visual.update(|window, cx| {
-        window.draw(cx).clear(cx);
-    });
-    assert!(visual.debug_bounds("network-report-column").is_none());
-}
-
-#[gpui::test]
-fn topology_pointer_opens_nodes_edges_and_original_project_evidence(cx: &mut TestAppContext) {
-    let (model, view, window) = fixture(cx);
-    model.update(cx, |model, cx| {
-        let tools = model
-            .client
-            .diagnostics
-            .as_mut()
-            .unwrap()
-            .tools
-            .as_mut()
-            .unwrap();
-        tools.section = Section::Paths;
-        tools.show_advanced = true;
+    tools_mut(&model, cx, |tools| {
         tools.details = topology_fixture();
         tools.operation_id = Some("topology-report".into());
-        cx.notify();
     });
     let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
-        window.resize(gpui::size(px(420.), px(460.)));
+        window.resize(gpui::size(px(420.), px(560.)));
         window.draw(cx).clear(cx);
     });
+    // Connection row first: [client] [┄›] [target]; then the DNS row.
     let bounds = visual
-        .debug_bounds("network-topology-1")
-        .expect("DNS edge has a hit target");
+        .debug_bounds("network-path-1")
+        .expect("connection edge has a hit target");
     visual.simulate_click(bounds.center(), Default::default());
     visual.run_until_parked();
-    view.read_with(cx, |view, _| {
+    view.read_with(&visual, |view, _| {
         assert_eq!(
-            view.topology.selection,
-            Some(topology::Selection {
+            view.path.selection,
+            Some(path::Selection {
                 path: 0,
-                item: topology::Item::Edge(0)
+                item: path::Item::Edge(1)
             })
         )
     });
-    // Close the inspector without changing the report, then click its source node.
-    view.update(cx, |view, cx| {
-        view.topology.selection = None;
+    view.update(&mut visual, |view, cx| {
+        view.path.selection = None;
         cx.notify();
     });
     visual.update(|window, cx| {
         window.draw(cx).clear(cx);
     });
     let bounds = visual
-        .debug_bounds("network-topology-0")
+        .debug_bounds("network-path-0")
         .expect("source node has a hit target");
     visual.simulate_click(bounds.center(), Default::default());
-    view.read_with(cx, |view, _| {
+    view.read_with(&visual, |view, _| {
         assert_eq!(
-            view.topology.selection,
-            Some(topology::Selection {
+            view.path.selection,
+            Some(path::Selection {
                 path: 0,
-                item: topology::Item::Node("client".into())
+                item: path::Item::Node("client".into())
             })
         )
     });
-    model.update(cx, |model, cx| {
-        model
-            .client
-            .diagnostics
-            .as_mut()
-            .unwrap()
-            .tools
-            .as_mut()
-            .unwrap()
-            .operation_id = Some("next-report".into());
-        cx.notify();
+    tools_mut(&model, &mut visual, |tools| {
+        tools.operation_id = Some("next-report".into());
     });
     visual.update(|window, cx| {
         window.draw(cx).clear(cx);
     });
-    view.read_with(cx, |view, _| {
+    view.read_with(&visual, |view, _| {
         assert!(
-            view.topology.selection.is_none(),
+            view.path.selection.is_none(),
             "a new report clears the old evidence selection"
         )
     });
 }
 
 #[test]
-fn topology_evidence_preserves_backend_levels_and_never_invents_missing_events() {
+fn path_evidence_preserves_backend_levels_and_never_invents_missing_events() {
     let events = topology_fixture();
-    let report = serde_json::from_value(events[1].clone()).unwrap();
+    let report = events[1].clone();
     let edge = |index| {
-        topology::detail(
+        path::detail(
             &report,
-            &topology::Selection {
+            &path::Selection {
                 path: 0,
-                item: topology::Item::Edge(index),
+                item: path::Item::Edge(index),
             },
             &events,
         )
@@ -359,11 +225,11 @@ fn topology_evidence_preserves_backend_levels_and_never_invents_missing_events()
     }
     assert!(edge(1).contains("配置推断（非实测）"));
     assert!(edge(2).contains("未知边不代表探测成功"));
-    let missing = topology::detail(
+    let missing = path::detail(
         &report,
-        &topology::Selection {
+        &path::Selection {
             path: 0,
-            item: topology::Item::Edge(0),
+            item: path::Item::Edge(0),
         },
         &[],
     )
@@ -371,15 +237,41 @@ fn topology_evidence_preserves_backend_levels_and_never_invents_missing_events()
     .join("\n");
     assert!(missing.contains("原始事件未保留"));
     assert!(!missing.contains("192.0.2.10"));
-    let attachment = topology::detail(
+    let attachment = path::detail(
         &report,
-        &topology::Selection {
+        &path::Selection {
             path: 0,
-            item: topology::Item::Attachment(0),
+            item: path::Item::Attachment(0),
         },
         &events,
     )
     .unwrap()
     .join("\n");
     assert!(attachment.contains("不计作逐跳设备"));
+}
+
+#[test]
+fn path_evidence_accepts_browser_encoded_numbers() {
+    // Stored reports encode integers as decimal strings; evidence must still match.
+    let mut events = topology_fixture();
+    events[0]["project"]["round"] = "1".into();
+    events[0]["project"]["index"] = "3".into();
+    events[1]["rules_version"] = "1".into();
+    events[1]["topology"][0]["edges"][0]["evidence"][0]["round"] = "1".into();
+    events[1]["topology"][0]["edges"][0]["evidence"][0]["event_index"] = "3".into();
+    assert!(latest_for_test(&events).is_some());
+    let lines = path::detail(
+        &events[1],
+        &path::Selection {
+            path: 0,
+            item: path::Item::Edge(0),
+        },
+        &events,
+    )
+    .unwrap()
+    .join("\n");
+    assert!(lines.contains("192.0.2.10"), "{lines}");
+}
+fn latest_for_test(events: &[serde_json::Value]) -> Option<serde_json::Value> {
+    path::latest_report(events)
 }

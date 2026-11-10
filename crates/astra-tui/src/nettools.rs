@@ -2,8 +2,8 @@ use crate::{i18n::t, tr};
 pub use astra_client::nettools::*;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
@@ -19,46 +19,35 @@ fn result_style(tone: OutputTone) -> Style {
         OutputTone::Muted => crate::theme::MUTED,
     })
 }
-fn render_column(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    rows: Vec<OutputLine>,
-    scroll: usize,
-) {
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    // Wrap and clamp each column separately: a long report cannot push a
-    // conclusion out of its column or change its scrollable row count.
-    let lines = rows
-        .into_iter()
-        .flat_map(|row| {
-            wrap_lines(vec![row.text], inner.width.max(1) as usize)
-                .into_iter()
-                .map(move |text| Line::styled(text, result_style(row.tone)))
-        })
-        .collect::<Vec<_>>();
-    let height = inner.height as usize;
-    let skip = lines.len().saturating_sub(height).saturating_sub(scroll);
-    frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(skip)
-                .take(height)
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false }),
-        inner,
-    );
+fn chain_line(chain: &LiveChain) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "链路 ",
+        Style::default().fg(crate::theme::MUTED),
+    )];
+    for (index, (label, tone)) in chain.steps().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                " › ",
+                Style::default().fg(crate::theme::MUTED),
+            ));
+        }
+        spans.push(Span::styled(
+            clean(&label),
+            match tone {
+                "warning" => Style::default().fg(Color::Yellow),
+                "muted" => Style::default().fg(crate::theme::MUTED),
+                _ => Style::default().add_modifier(Modifier::BOLD),
+            },
+        ));
+    }
+    Line::from(spans)
 }
 impl Render for View {
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut fields = self.fields();
         // Preserve result space in short terminals. Field navigation still uses
         // the full shared form, showing the newly focused field on each key.
-        if !fields.is_empty() && area.height < fields.len() as u16 + 9 {
+        if !fields.is_empty() && area.height < fields.len() as u16 + 10 {
             fields = vec![fields
                 .iter()
                 .copied()
@@ -71,30 +60,21 @@ impl Render for View {
                 Constraint::Length(3),
                 Constraint::Length(fields.len() as u16 + 1),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ])
             .split(area);
         frame.render_widget(
-            Paragraph::new(format!(
-                "{}\n{}",
-                tr!("Network tools · {}", clean(&self.name)),
-                Section::ALL
-                    .into_iter()
-                    .map(|section| format!(
-                        "{}{}",
-                        if section == self.section { "●" } else { " " },
-                        section.label()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            ))
+            Paragraph::new(vec![
+                Line::from(tr!("Network tools · {}", clean(&self.name))),
+                chain_line(&self.live_chain()),
+            ])
+            .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::BOTTOM)),
             parts[0],
         );
         let lines: Vec<Line> = fields
             .iter()
             .map(|field| {
-                let label = t(field.label());
                 let mut value = self.field_value(*field);
                 if value.is_empty() {
                     value = self.field_hint(*field).into();
@@ -110,7 +90,7 @@ impl Render for View {
                     format!(
                         "{} {:<12} {}",
                         if selected { ">" } else { " " },
-                        label,
+                        t(field.label()),
                         clean(&value)
                     ),
                     if selected {
@@ -123,37 +103,44 @@ impl Render for View {
             .collect();
         frame.render_widget(Paragraph::new(lines), parts[1]);
 
-        if self.show_advanced {
-            let columns =
-                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                    .split(parts[2]);
-            render_column(
-                frame,
-                columns[0],
-                "结论",
-                self.conclusion_rows(),
-                self.scroll,
-            );
-            render_column(
-                frame,
-                columns[1],
-                "原始报告 · Ctrl+D 收起",
-                self.report_rows(),
-                self.scroll,
-            );
-        } else {
-            render_column(
-                frame,
-                parts[2],
-                "结论 · Ctrl+D 原始报告",
-                self.conclusion_rows(),
-                self.scroll,
-            );
+        let block = Block::default().borders(Borders::ALL).title(t("Result"));
+        let inner = block.inner(parts[2]);
+        let width = inner.width.max(1) as usize;
+        let mut rows: Vec<Line> = vec![];
+        for strip in self.path_strips() {
+            for row in &strip.rows {
+                for text in wrap_lines(vec![row.text()], width) {
+                    rows.push(Line::styled(text, Style::default().fg(Color::Cyan)));
+                }
+            }
+            for attachment in &strip.attachments {
+                rows.push(Line::styled(
+                    format!("旁注：{}", clean(attachment)),
+                    Style::default().fg(crate::theme::MUTED),
+                ));
+            }
         }
+        for row in self.result_rows() {
+            let style = result_style(row.tone);
+            for text in wrap_lines(vec![row.text], width) {
+                rows.push(Line::styled(text, style));
+            }
+        }
+        let height = inner.height as usize;
+        let skip = rows
+            .len()
+            .saturating_sub(height)
+            .saturating_sub(self.scroll);
+        frame.render_widget(block, parts[2]);
+        frame.render_widget(
+            Paragraph::new(rows.into_iter().skip(skip).take(height).collect::<Vec<_>>()),
+            inner,
+        );
         frame.render_widget(
             Paragraph::new(t(
-                "Ctrl+L 分区 · Ctrl+D 详情 · Ctrl+P 加入计划 · Ctrl+R 预设 · Ctrl+Y 复制 · Ctrl+E JSON\nEnter 运行/取消 · Ctrl+O 停止观察 · Ctrl+↑/↓ 滚动 · Esc 返回 · Ctrl+U 清空",
-            )),
+                "Enter 运行/取消 · ←→ 切换 · Ctrl+Y 复制 · Ctrl+E JSON · Ctrl+↑/↓ 滚动 · Esc 返回",
+            ))
+            .style(Style::default().fg(crate::theme::MUTED)),
             parts[3],
         );
     }

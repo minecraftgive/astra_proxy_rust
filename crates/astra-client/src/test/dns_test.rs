@@ -161,14 +161,18 @@ async fn query_dispatches_once_to_agent_and_retains_dns_answer() {
                     role: "agent".into(),
                     epoch: "boot".into(),
                     build_id: "fixture".into(),
-                    capabilities: vec![],
+                    capabilities: vec![
+                        v::NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+                        "network_diagnostics_tools_v1".into(),
+                        "network_diagnostics_resolution_v1".into(),
+                    ],
                 }),
                 v::RequestBody::Query(v::Query::Runtime { .. }) => {
                     v::ResponseBody::Runtime(v::RuntimeSnapshot::Client(serde_json::json!({})))
                 }
                 v::RequestBody::Execute {
-                    command: v::Command::NetTool { instance, request },
-                    ..
+                    operation_id,
+                    command: v::Command::NetworkDiagnostics { instance, request },
                 } => {
                     observed.fetch_add(1, Ordering::Relaxed);
                     assert_eq!(instance, "dns-profile");
@@ -182,6 +186,15 @@ async fn query_dispatches_once_to_agent_and_retains_dns_answer() {
                             server: "tcp://127.0.0.1:1053".into()
                         }
                     );
+                    v::ResponseBody::Task(v::Task {
+                        id: operation_id,
+                        state: v::TaskState::Running,
+                        message: "accepted".into(),
+                        started_ms: "1".into(),
+                        finished_ms: None,
+                    })
+                }
+                v::RequestBody::Query(v::Query::NetworkReport { operation_id, .. }) => {
                     let attempt = Attempt {
                         seq: 1,
                         rtt_ms: Some(1.0),
@@ -189,16 +202,33 @@ async fn query_dispatches_once_to_agent_and_retains_dns_answer() {
                         error: None,
                     };
                     let summary = Summary::from_attempts([&attempt]);
-                    v::ResponseBody::NetTool(
-                        vec![
-                            Event::Attempt(attempt),
-                            Event::Summary(summary),
-                            Event::Done,
-                        ]
-                        .into_iter()
-                        .map(|event| serde_json::to_value(event).unwrap())
-                        .collect(),
-                    )
+                    let items = [
+                        Event::Attempt(attempt),
+                        Event::Summary(summary),
+                        Event::Done,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, event)| v::NetworkResult {
+                        id: (index + 1).to_string(),
+                        sampled_at_ms: "1".into(),
+                        data: v::browser_numbers(serde_json::to_value(event).unwrap()),
+                    })
+                    .collect();
+                    v::ResponseBody::NetworkReport(v::NetworkReport {
+                        operation_id,
+                        schema_version: 1,
+                        revision: "1".into(),
+                        state: v::NetworkState::Complete,
+                        message: "done".into(),
+                        started_ms: "1".into(),
+                        finished_ms: Some("2".into()),
+                        truncated: false,
+                        expired: false,
+                        items,
+                        cursor: "3".into(),
+                        has_more: false,
+                    })
                 }
                 other => panic!("unexpected request {other:?}"),
             };

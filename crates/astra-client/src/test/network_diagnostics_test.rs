@@ -1,33 +1,5 @@
 use super::*;
 
-#[derive(serde::Deserialize)]
-struct EligibilityCase {
-    name: String,
-    request: v::NetworkDiagnosticsRequest,
-    legacy: bool,
-    resolution: bool,
-}
-
-#[test]
-fn native_and_web_share_legacy_and_resolution_admission_cases() {
-    let cases: Vec<EligibilityCase> =
-        serde_json::from_str(include_str!("network_eligibility_cases.json")).unwrap();
-    for case in cases {
-        assert_eq!(
-            validate_legacy(&case.request).is_ok(),
-            case.legacy,
-            "{}",
-            case.name
-        );
-        assert_eq!(
-            eligibility::needs_resolution(&case.request),
-            case.resolution,
-            "{}",
-            case.name
-        );
-    }
-}
-
 #[test]
 fn only_structured_existing_rejection_codes_are_definitive() {
     for (code, rejected) in [
@@ -123,7 +95,11 @@ fn hello(supported: bool) -> v::ResponseBody {
         epoch: "boot-1".into(),
         build_id: "test".into(),
         capabilities: if supported {
-            vec![v::NETWORK_DIAGNOSTICS_CAPABILITY.into()]
+            vec![
+                v::NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+                "network_diagnostics_tools_v1".into(),
+                "network_diagnostics_resolution_v1".into(),
+            ]
         } else {
             vec![]
         },

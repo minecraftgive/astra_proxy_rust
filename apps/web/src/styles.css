@@ -2149,176 +2149,216 @@ tr:last-child td {
 
 .network-tools {
   display: grid;
-  gap: 16px;
+  gap: 14px;
   min-width: 0;
 }
-.network-tools > *,
-.network-tools details,
-.network-tools fieldset {
+.network-tools > * {
   min-width: 0;
 }
-.network-tools fieldset {
-  margin: 16px 0;
-}
-.network-form input[type="checkbox"] {
-  width: auto;
-  justify-self: start;
-}
-.network-tools p,
-.network-tools code {
+.network-tools p {
+  margin: 0;
   overflow-wrap: anywhere;
 }
-.network-tabs,
-.network-actions {
+
+/* Link display: live chain and probe path share one chip style. */
+.network-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.network-chain-title {
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 3.5em;
+}
+.network-chain-step-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.network-chain-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 13px;
+  color: var(--text);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+button.network-chain-step:hover {
+  border-color: var(--accent);
+}
+.network-chain-step.is-muted {
+  color: var(--muted);
+  border-style: dashed;
+}
+.network-chain-step.is-warning {
+  color: color-mix(in srgb, var(--warn) 75%, var(--text));
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+.network-chain-badge {
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+.network-chain-arrow {
+  color: var(--faint);
+  font-family: var(--mono);
+  background: none;
+  border: 0;
+  padding: 0 2px;
+}
+button.network-chain-arrow.is-measured {
+  color: var(--ok);
+}
+button.network-chain-arrow.is-configuration {
+  color: var(--muted);
+}
+button.network-chain-arrow.is-unknown {
+  color: var(--warn);
+}
+.network-path {
+  display: grid;
+  gap: 8px;
+}
+.network-path > button {
+  justify-self: start;
+}
+.network-path-group {
+  display: grid;
+  gap: 6px;
+}
+.network-evidence {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.network-evidence pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow: auto;
+  margin: 6px 0 0;
+}
+
+/* Form: tool picker, fields that wrap, one action row. */
+.network-form {
+  display: grid;
+  gap: 12px;
+}
+.network-kinds,
+.network-actions,
+.network-checks {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-items: center;
+}
+.network-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 12px;
   align-items: end;
 }
-.network-tabs button[aria-pressed="true"] {
-  font-weight: 700;
-  outline: 2px solid currentColor;
-  outline-offset: -2px;
-}
-.network-form {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
-  gap: 12px;
-  margin: 16px 0;
-}
-.network-form label,
-.network-actions label {
+.network-fields > label {
   display: grid;
   gap: 6px;
   min-width: 0;
-}
-.network-form input,
-.network-form select,
-.network-form textarea {
-  width: 100%;
-  min-width: 0;
-}
-.network-actions label,
-.network-actions input {
-  max-width: 100%;
-}
-.network-facts {
-  display: grid;
-  gap: 6px;
-}
-.network-facts > div {
-  display: grid;
-  grid-template-columns: minmax(100px, 180px) minmax(0, 1fr);
-  gap: 12px;
-}
-.network-facts dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-.network-record {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  min-width: 200px;
-  max-width: 60ch;
-  max-height: 240px;
-  overflow: auto;
-}
-.network-tools th,
-.network-tools td {
-  vertical-align: top;
-}
-.network-tools pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 360px;
-  overflow: auto;
-}
-.network-tools .table-scroll {
-  overflow: auto;
-  max-width: 100%;
-}
-@media (max-width: 560px) {
-  .network-facts > div {
-    grid-template-columns: 1fr;
-    gap: 2px;
-  }
-}
-
-/* NetTool outcomes retain text labels as well as color in both themes. */
-.network-tools .network-tone-success,
-.network-result.network-tone-success,
-.network-result .network-tone-success {
-  color: color-mix(in srgb, var(--ok) 70%, var(--text));
-}
-.network-tools .network-tone-warning,
-.network-result.network-tone-warning,
-.network-result .network-tone-warning {
-  color: color-mix(in srgb, var(--warn) 70%, var(--text));
-}
-.network-tools .network-tone-error,
-.network-result.network-tone-error,
-.network-result .network-tone-error {
-  color: color-mix(in srgb, var(--err) 80%, var(--text));
-}
-.network-tools .network-tone-info,
-.network-result.network-tone-info,
-.network-result .network-tone-info {
-  color: var(--accent);
-}
-.network-tools .network-tone-muted,
-.network-result.network-tone-muted,
-.network-result .network-tone-muted {
+  font-size: 13px;
   color: var(--muted);
 }
-.network-conclusion {
-  border-inline-start: 3px solid currentColor;
-  padding-inline-start: 12px;
+.network-fields .network-field-wide {
+  grid-column: 1 / -1;
 }
-.network-tone-label {
-  display: inline-block;
-  font-weight: 600;
-  margin-inline-end: 8px;
+.network-fields input,
+.network-fields select,
+.network-fields textarea {
+  width: 100%;
+  min-width: 0;
+  color: var(--text);
+}
+.network-fields input[type="checkbox"],
+.network-checks input[type="checkbox"] {
+  width: auto;
+}
+.network-checks label,
+.network-fields > label:has(> input[type="checkbox"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
 }
 
-/* Keep the report beside its conclusion, including on narrow screens. */
-.network-result-scroll {
-  min-width: 0;
-  max-width: 100%;
-  overflow-x: auto;
-  padding-bottom: 8px;
-}
-.network-result-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 20px;
-  align-items: start;
-}
-.network-result-columns.is-expanded {
-  grid-template-columns: minmax(280px, 1fr) minmax(360px, 1.35fr);
-  min-width: 660px;
-}
-.network-result-column {
+/* Result: one column; tone is carried by color and the text itself. */
+.network-result {
   display: grid;
   gap: 12px;
   min-width: 0;
-  max-height: min(72vh, 900px);
-  overflow-y: auto;
-  overflow-x: hidden;
-  scrollbar-gutter: stable;
-  padding: 2px 4px;
-  align-content: start;
 }
-.network-result-column > h2 {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  margin: 0;
-  padding: 8px 0;
-  background: var(--bg);
+.network-lines {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
 }
-.network-result-column .network-result {
-  min-width: 0;
+.network-tools .network-tone-success {
+  color: color-mix(in srgb, var(--ok) 70%, var(--text));
 }
-.network-result-column pre {
+.network-tools .network-tone-warning {
+  color: color-mix(in srgb, var(--warn) 70%, var(--text));
+}
+.network-tools .network-tone-error {
+  color: color-mix(in srgb, var(--err) 80%, var(--text));
+}
+.network-tools .network-tone-info {
+  color: var(--accent);
+}
+.network-tools .network-tone-muted {
+  color: var(--muted);
+}
+.network-tools .table-scroll {
+  overflow-x: auto;
   max-width: 100%;
+}
+.nat-result {
+  display: grid;
+  gap: 8px;
+}
+.nat-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.nat-table th,
+.nat-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.nat-table th {
+  color: var(--muted);
+  font-weight: 500;
+}
+.nat-table tr.is-detected td {
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 600;
+}
+.nat-table tr.is-detected td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
 }

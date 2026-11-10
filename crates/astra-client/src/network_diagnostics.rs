@@ -6,8 +6,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-mod eligibility;
-pub(crate) use eligibility::{encrypted_dns, validate_legacy, LEGACY_NOTICE};
+pub(crate) const LEGACY_NOTICE: &str =
+    "目标 Agent 版本过旧，不支持后台网络诊断；请更新后再使用网络工具";
 
 /// Keep the server's structured error available to callers. Transport and
 /// protocol failures deliberately remain distinct from a rejected submission.
@@ -284,30 +284,23 @@ pub(crate) fn validate_page(report: &v::NetworkReport, previous: Option<&str>) -
     Ok(())
 }
 
-/// Older Agents can ignore unknown request fields. Reject new options before
-/// submission instead of accidentally losing the caller's resolution constraint.
+/// Every Agent with the job interface also ships the tool and resolution
+/// capabilities; the per-tool ones below are still checked so a request is
+/// never silently degraded by an Agent that ignores an option.
 pub(crate) fn validate_capabilities(
     capabilities: &[String],
     request: &v::NetworkDiagnosticsRequest,
 ) -> Result<()> {
     use astra_model::nettool::{Egress, Probe};
     let has = |cap: &str| capabilities.iter().any(|item| item == cap);
+    ensure!(
+        has("network_diagnostics_tools_v1") && has("network_diagnostics_resolution_v1"),
+        "Unsupported: {LEGACY_NOTICE}"
+    );
     if matches!(request.egress, Egress::Outbound(_)) {
         ensure!(
             has("network_diagnostics_pinned_v1"),
             "Unsupported: Agent 未声明固定出口能力；未提交探测"
-        );
-    }
-    let encrypted_dns = encrypted_dns(&request.probe);
-    let new_tool = !matches!(request.probe, Probe::Tcp { .. } | Probe::Dns { .. });
-    let encrypted_resolver = request
-        .resolver
-        .as_deref()
-        .is_some_and(eligibility::encrypted_endpoint);
-    if new_tool || request.family.is_some() || encrypted_dns || encrypted_resolver {
-        ensure!(
-            has("network_diagnostics_tools_v1"),
-            "Unsupported: Agent 未声明新版网络工具与系统根证书能力；未提交探测"
         );
     }
     if matches!(request.probe, Probe::Nat { .. }) {
@@ -320,12 +313,6 @@ pub(crate) fn validate_capabilities(
         ensure!(
             has("network_diagnostics_path_v1"),
             "Unsupported: Agent 未声明 TUN 感知路径能力"
-        );
-    }
-    if eligibility::needs_resolution(request) {
-        ensure!(
-            has("network_diagnostics_resolution_v1"),
-            "Unsupported: Agent 未声明约束解析能力；未提交探测"
         );
     }
     Ok(())

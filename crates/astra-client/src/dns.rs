@@ -115,23 +115,11 @@ impl Client {
                 .is_some_and(|view| view.running())
     }
     pub fn dns_query_output(&self) -> Vec<crate::nettools::OutputLine> {
-        use crate::nettools::{OutputLine, OutputTone};
-        let Some(view) = &self.dns_state.query else {
-            return Vec::new();
-        };
-        // Legacy Agents return answers in successful attempts, without the newer
-        // structured DNS events. Keep these visible in a simple query as well.
-        let mut rows: Vec<_> = view
-            .attempts
-            .iter()
-            .filter(|attempt| attempt.error.is_none() && !attempt.detail.is_empty())
-            .map(|attempt| OutputLine {
-                text: attempt.detail.chars().filter(|c| !c.is_control()).collect(),
-                tone: OutputTone::Success,
-            })
-            .collect();
-        rows.extend(view.output_rows());
-        rows
+        self.dns_state
+            .query
+            .as_ref()
+            .map(|view| view.output_rows())
+            .unwrap_or_default()
     }
     pub fn open_dns_query(&mut self) {
         self.dns_state.query_open = true;

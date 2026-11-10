@@ -30,7 +30,6 @@ impl View {
         self.error = None;
         self.operation_id = None;
         self.report_state = None;
-        self.probe_path = None;
         self.path_stale = false;
         self.captured_runtime = self.context.runtime.clone();
         self.captured_core = self.context.core.clone();

@@ -1,0 +1,282 @@
+[
+  {
+    "name": "full cone",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "endpoint_independent",
+      "traditional_type": "full_cone_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "full_cone"
+  },
+  {
+    "name": "restricted cone",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_dependent",
+      "traditional_type": "restricted_cone_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "restricted_cone"
+  },
+  {
+    "name": "port restricted cone",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "port_restricted_cone_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "port_restricted_cone"
+  },
+  {
+    "name": "symmetric",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "address_and_port_dependent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "symmetric_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "symmetric"
+  },
+  {
+    "name": "no translation",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "no_translation_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "no_translation"
+  },
+  {
+    "name": "unstable mapping is never classified",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "port_restricted_cone_observed",
+      "advanced_capable": true,
+      "unstable": true,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "undetermined"
+  },
+  {
+    "name": "partial measurement is never classified",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "port_restricted_cone_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": true,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "undetermined"
+  },
+  {
+    "name": "unverified physical path is never classified",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": false
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "address_and_port_dependent",
+      "traditional_type": "port_restricted_cone_observed",
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "undetermined"
+  },
+  {
+    "name": "unusual combination has no traditional name",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "endpoint_independent",
+      "filtering": "unknown",
+      "traditional_type": null,
+      "advanced_capable": true,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "undetermined"
+  },
+  {
+    "name": "basic STUN service without RFC 5780",
+    "report": {
+      "interface_id": "en0",
+      "interface_name": "en0",
+      "family": "ipv4",
+      "local_endpoint": "192.168.1.5:50000",
+      "physical_path": {
+        "binding_verified": true,
+        "route_verified": true
+      },
+      "comparison": "consistent",
+      "mapping": "unknown",
+      "filtering": "unknown",
+      "traditional_type": null,
+      "advanced_capable": false,
+      "unstable": false,
+      "partial": false,
+      "elapsed_ms": 1200,
+      "observations": [
+        {
+          "mapped_endpoint": "203.0.113.7:50000"
+        }
+      ],
+      "notes": []
+    },
+    "expected": "undetermined"
+  }
+]

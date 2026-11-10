@@ -966,11 +966,6 @@ fn dns_query_form_keeps_input_local_and_displays_settings_errors_and_answers() {
         });
         ui.dns_state.query = Some(Box::new(view));
         assert!(screen(&render(&ui, 160, 45)).contains("198.18.0.1"));
-        ui.key(event::KeyEvent::new(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-        ));
-        assert!(ui.dns_state.query.as_ref().unwrap().show_advanced);
         for (width, height) in [(100, 30), (80, 24), (60, 20), (35, 12), (12, 5)] {
             render(&ui, width, height);
         }

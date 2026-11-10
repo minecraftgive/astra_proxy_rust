@@ -1,9 +1,8 @@
-//! Multi-port TCP and IPv6 transport reachability share the constrained dialer.
+//! Single and multi-port TCP reachability share the constrained dialer.
 use super::{detailed::path::Route, millis};
 use anyhow::{bail, ensure, Result};
 use astra_model::nettool::{
-    AddressFamily, Attempt, ConnectionOutcome, ConnectionResult, DetailedRequest, Event, Probe,
-    Summary,
+    Attempt, ConnectionOutcome, ConnectionResult, DetailedRequest, Event, Probe, Summary,
 };
 use std::{
     io::ErrorKind,
@@ -14,15 +13,11 @@ pub(super) async fn run(
     request: &DetailedRequest,
     emit: impl Fn(Event) -> Result<()>,
 ) -> Result<Summary> {
-    let mut request = request.clone();
+    let request = request.clone();
     let probe = request.probe.clone();
     let (host, ports) = match &probe {
         Probe::Tcp { host, port } => (host.clone(), vec![*port]),
         Probe::TcpPorts { host, ports } => (host.clone(), ports.clone()),
-        Probe::Ipv6 { host, port } => {
-            request.family = Some(AddressFamily::Ipv6);
-            (host.clone(), vec![*port])
-        }
         _ => bail!("Invalid connection probe"),
     };
     ensure!(

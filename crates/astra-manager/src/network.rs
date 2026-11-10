@@ -739,15 +739,6 @@ pub(crate) fn validate(request: &NetworkDiagnosticsRequest) -> Result<()> {
                 "TCP requires 1–16 unique nonzero ports"
             )
         ),
-        Probe::Ipv6 { host, port } => anyhow::ensure!(
-            valid_text(host)
-                && *port != 0
-                && request.family != Some(astra_model::nettool::AddressFamily::Ipv4),
-            crate::error::message(
-                ErrorCode::InvalidRequest,
-                "Invalid IPv6 reachability request"
-            )
-        ),
         Probe::Tls {
             host,
             port,

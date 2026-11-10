@@ -1,15 +1,14 @@
 use super::*;
+use crate::i18n::t;
 use crate::protocol::{self, Action};
-use astra_client::input::{KeyCode, KeyEvent, KeyModifiers};
-use astra_model::nettool::{Attempt, Egress, Event, Summary};
+use astra_client::input::{KeyCode, KeyEvent};
+use astra_model::nettool::{Attempt, Egress, Summary};
 use ratatui::{backend::TestBackend, Terminal};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::from(code)
-}
-fn control(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::CONTROL)
 }
 fn view() -> View {
     let mut view = View::new(
@@ -25,60 +24,81 @@ fn view() -> View {
     ];
     view
 }
-#[tokio::test]
-async fn streamed_results_render_and_stop_keeps_partial_summary() {
-    let mut view = view();
-    view.show_advanced = true;
-    let (sender, receiver) = mpsc::channel(8);
-    view.receiver = Some(receiver);
-    for event in [
-        Event::Started {
-            egress: "iface:Wi-Fi".into(),
-            probe: "TCP host:443".into(),
-            note: "adapter Wi-Fi (index 7, 192.0.2.10)".into(),
-            running_config: true,
-        },
-        Event::Attempt(Attempt {
-            seq: 1,
-            rtt_ms: Some(12.5),
-            detail: "connected to 192.0.2.1:443".into(),
-            error: None,
-        }),
-        Event::Attempt(Attempt {
-            seq: 2,
-            rtt_ms: None,
-            detail: String::new(),
-            error: Some("timed out after 3000 ms".into()),
-        }),
-    ] {
-        sender.send(Ok(event)).await.unwrap();
-    }
-    view.poll();
-    assert!(view.running());
-    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+fn screen(view: &View, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|f| view.render(f, f.area())).unwrap();
-    let screen: String = terminal
+    terminal
         .backend()
         .buffer()
         .content
         .iter()
         .map(|c| c.symbol())
-        .collect();
-    assert!(
-        screen.contains("12.50 ms")
-            && screen.contains("192.0.2.10")
-            && screen.contains("timed out"),
-        "{screen}"
-    );
-    assert!(view.key(key(KeyCode::Esc)), "Esc while running only stops");
-    assert!(!view.running());
-    let summary = view.summary.clone().unwrap();
-    assert_eq!((summary.sent, summary.received), (2, 1));
+        .filter(|symbol| !symbol.trim().is_empty())
+        .collect()
+}
+
+#[tokio::test]
+async fn chain_results_and_nat_table_render_in_one_column() {
+    let mut view = view();
+    view.egress = 3;
+    view.context.runtime = Some(json!({
+        "mode": "rule", "tun": false, "system_proxy": false,
+        "groups": [{"name": "HK 01", "mode": "select", "selected": "hk-node"}]
+    }));
+    view.attempts = vec![
+        Attempt {
+            seq: 1,
+            rtt_ms: Some(12.5),
+            detail: "connected to 192.0.2.1:443".into(),
+            error: None,
+        },
+        Attempt {
+            seq: 2,
+            rtt_ms: None,
+            detail: String::new(),
+            error: Some("timed out after 3000 ms".into()),
+        },
+    ];
+    view.summary = Some(Summary::from_attempts(&view.attempts));
+    view.details = vec![json!({"event": "nat", "kind": "report", "report": {
+        "interface_name": "en0", "physical_path": {"binding_verified": true, "route_verified": true},
+        "traditional_type": "symmetric_observed", "advanced_capable": true, "unstable": false,
+        "partial": false, "mapping": "address_and_port_dependent", "filtering": "address_and_port_dependent",
+        "local_endpoint": "192.168.1.5:5000", "observations": [], "notes": []}})];
+    let text = screen(&view, 120, 40);
+    for expected in [
+        "链路",
+        "HK01→hk-node",
+        "12.50ms",
+        "timedout",
+        "丢失50%",
+        "▶对称型",
+        "P2P",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    assert!(!view.key(key(KeyCode::Esc)), "Esc while idle leaves");
     for (width, height) in [(40, 10), (5, 3)] {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| view.render(f, f.area())).unwrap();
+        screen(&view, width, height);
     }
 }
+
+#[test]
+fn probe_path_rows_come_from_backend_topology() {
+    let mut view = view();
+    view.details = vec![
+        json!({"event": "analysis", "findings": [], "notes": [], "topology": [{
+        "path_id": "path-a", "truncated": false,
+        "nodes": [{"id": "agent", "label": "Agent", "role": "agent"},
+                  {"id": "t", "label": "example.com", "role": "target"}],
+        "edges": [{"from": "agent", "to": "t", "section": "connection", "level": "measured",
+                   "description": "", "evidence": []}],
+        "attachments": []}]}),
+    ];
+    let text = screen(&view, 100, 30);
+    assert!(text.contains("[连接]Agent─›example.com"), "{text}");
+}
+
 struct Home(PathBuf);
 impl Drop for Home {
     fn drop(&mut self) {
@@ -147,6 +167,7 @@ async fn live_network_tools_probe_through_manager_and_profile_outbound() {
         .iter()
         .position(|egress| *egress == Egress::Outbound("edge".into()))
         .unwrap();
+    view.set_kind(Kind::Tcp);
     view.target = "nettool.example:443".into();
     view.count = 2;
     view.key(key(KeyCode::Enter));
@@ -159,13 +180,10 @@ async fn live_network_tools_probe_through_manager_and_profile_outbound() {
     .await
     .expect("the probe stream must finish");
     assert!(view.error.is_none(), "{:?}", view.error);
-    assert!(
-        view.probe_path
-            .as_deref()
-            .is_some_and(|note| note.contains("outbound:edge")),
-        "{:?}",
-        view.probe_path
-    );
+    assert!(view
+        .details
+        .iter()
+        .any(|item| item["event"] == "context" && item["actual_egress"]["name"] == "edge"));
     assert!(view
         .details
         .iter()
@@ -198,7 +216,6 @@ async fn live_network_tools_probe_through_manager_and_profile_outbound() {
 #[tokio::test]
 async fn narrow_terminal_scroll_keeps_wide_character_tail_reachable_in_all_sections() {
     let mut view = view();
-    view.show_advanced = true;
     view.note = Some(format!("{}12345Z", "中".repeat(26)));
     let mut reached_tail = false;
     for scroll in 0..8 {
@@ -220,22 +237,15 @@ async fn narrow_terminal_scroll_keeps_wide_character_tail_reachable_in_all_secti
         reached_tail,
         "Physical row scrolling must reach the end of a wrapped CJK result"
     );
-    for section in Section::ALL {
-        view.section = section;
-        for (width, height) in [(20, 12), (40, 10), (5, 3)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal
-                .draw(|frame| view.render(frame, frame.area()))
-                .unwrap();
-        }
+    for (width, height) in [(20, 12), (40, 10), (5, 3)] {
+        screen(&view, width, height);
     }
 }
 
 #[test]
-fn all_twelve_tools_and_new_fields_render_in_narrow_windows() {
+fn all_tools_and_fields_render_in_narrow_windows() {
     let mut view = view();
     for kind in Kind::ALL {
-        view.section = Section::Tools;
         view.set_kind(kind);
         for field in view.fields() {
             view.field = field;
@@ -272,74 +282,6 @@ fn all_twelve_tools_and_new_fields_render_in_narrow_windows() {
 }
 
 #[test]
-fn batch_keys_add_edit_remove_and_copy_paths_without_starting_network() {
-    let mut view = view();
-    view.key(control(KeyCode::Char('r')));
-    assert!(view.section == Section::Findings);
-    assert_eq!(view.plan.projects.len(), 5);
-    assert!(!view.running());
-    view.key(key(KeyCode::Char('c')));
-    assert!(view.plan.comparison);
-    view.key(key(KeyCode::Right));
-    view.key(key(KeyCode::Char('p')));
-    assert_eq!(view.plan.projects.len(), 10);
-    view.key(key(KeyCode::Char('e')));
-    assert!(view.section == Section::Tools);
-    assert_eq!(view.plan.projects.len(), 9);
-    // An unavailable remote adapter must fail safely rather than become System.
-    assert!(view.add_project().is_err());
-    view.key(control(KeyCode::Char('l')));
-    view.key(control(KeyCode::Char('l')));
-    view.key(key(KeyCode::Delete));
-    assert_eq!(view.plan.projects.len(), 8);
-    let mut terminal = Terminal::new(TestBackend::new(45, 15)).unwrap();
-    terminal
-        .draw(|frame| view.render(frame, frame.area()))
-        .unwrap();
-    assert!(!view.running());
-}
-
-#[test]
-fn default_results_hide_evidence_and_non_function_toggle_preserves_it() {
-    let mut view = view();
-    view.details.push(serde_json::json!({
-        "event": "context", "config_digest": "advanced-evidence-only"
-    }));
-    view.details.push(serde_json::json!({
-        "event": "tcp", "result": {"host": "example.test", "port": 443, "outcome": "connected"}
-    }));
-    view.summary = Some(Summary::from_attempts(&[Attempt {
-        seq: 1,
-        rtt_ms: Some(12.5),
-        detail: "connected".into(),
-        error: None,
-    }]));
-    assert!(!view.show_advanced);
-    assert!(!view.output().join("\n").contains("advanced-evidence-only"));
-    let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
-    terminal.draw(|f| view.render(f, f.area())).unwrap();
-    assert!(terminal
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .any(|cell| { !cell.symbol().trim().is_empty() && cell.fg == Color::Green }));
-    let before = view.section;
-    for number in 1..=12 {
-        view.key(key(KeyCode::F(number)));
-    }
-    assert!(view.section == before);
-    assert!(!view.show_advanced);
-    assert!(view.plan.projects.is_empty());
-    view.key(control(KeyCode::Char('d')));
-    assert!(view.show_advanced);
-    assert!(view.output().join("\n").contains("advanced-evidence-only"));
-    view.key(control(KeyCode::Char('d')));
-    assert!(!view.show_advanced);
-    assert_eq!(view.details.len(), 2);
-}
-
-#[test]
 fn wrapped_results_keep_semantic_colors_when_scrolled() {
     let mut view = view();
     view.error = Some(format!("{}END", "错误".repeat(40)));
@@ -357,54 +299,4 @@ fn wrapped_results_keep_semantic_colors_when_scrolled() {
             .any(|cell| cell.symbol() == "E" && cell.fg == Color::Red);
     }
     assert!(reached_tail, "wrapped colored text must remain reachable");
-}
-
-#[test]
-fn expanded_report_is_to_the_right_of_conclusions_and_keeps_its_own_wrapping() {
-    let mut view = view();
-    view.section = Section::Paths;
-    view.error = Some("LEFT_CONCLUSION".into());
-    view.details
-        .push(serde_json::json!({"event":"context", "config_digest":"REPORT_ONLY_MARKER"}));
-    let render = |view: &View, width, height| {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| view.render(f, f.area())).unwrap();
-        terminal
-    };
-    let collapsed = render(&view, 140, 28);
-    assert!(!collapsed
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>()
-        .contains("REPORT_ONLY_MARKER"));
-    view.toggle_advanced();
-    let expanded = render(&view, 140, 28);
-    let buffer = expanded.backend().buffer();
-    let column = |start, end| {
-        (4..26)
-            .map(|y| {
-                (start..end)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let left = column(0, 56);
-    let right = column(56, 140);
-    assert!(
-        left.replace(' ', "").contains("结论") && left.contains("LEFT_CONCLUSION"),
-        "{left}"
-    );
-    assert!(!left.contains("REPORT_ONLY_MARKER"));
-    assert!(
-        right.replace(' ', "").contains("原始报告") && right.contains("REPORT_ONLY_MARKER"),
-        "{right}"
-    );
-    for (width, height) in [(52, 20), (20, 12), (5, 3)] {
-        render(&view, width, height);
-    }
 }

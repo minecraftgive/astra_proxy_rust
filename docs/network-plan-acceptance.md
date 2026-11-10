@@ -1,5 +1,8 @@
 # 网络工具计划逐项追踪
 
+
+> **2026-11-10 界面重新设计：** 三端网络工具已改为单页（常驻链路条 + 工具表单 + 单栏结果 + 探测路径条），保留的工具与行为见 [网络诊断](network-diagnostics.md#三端页面单页)。下文中关于四分区、结论/原始报告双栏、Ctrl+D/L/P/R/O 快捷键、可编辑诊断计划与预设、“恢复后台任务”工具、IPv6 可达性工具和前端旧 Agent 准入矩阵（49 个共享样例）的条目是重新设计前的历史验收记录，已不再适用。后端任务/报告、批量任务、分析规则与拓扑、NAT、固定出口与调度器保持不变；批量任务在界面上以固定的“完整检查”提交。
+
 依据用户提供的 `/Users/Nothing/Downloads/PLAN.md`，原文件未修改。这里区分代码落地、自动测试和真实运行验收；不能将已写测试、交叉编译或模拟服务当作三平台真机验收通过。代码仍在同一工作区集成，本文不宣称已经分阶段合入发布。
 
 截至 2026-11-09，阶段 0–3 功能已实现，逐条实现位置与验证证据如下。明确已运行的本轮证据包括：macOS 便携式 NAT 8 项、STUN 3 项，Linux ARM64 独立 VM 九种内核 NAT 映射/过滤组合，Web 67 项网络页面测试与全套 143 项测试、类型检查及 Chromium 桌面/390px 检查。macOS 普通账户平台路径 7 项、代理路径 4 项通过；Linux VM 平台路径 5 项及代理 nettool 60 项通过，另一个 ignored 用例由 namespace 矩阵单独执行。Windows 已完成原生平台路径 4 项、系统状态 8 项、Core 工具 62 项、真实跨机批量/分页/取消、实际 TUN 与物理公网 STUN 样本；macOS 完成真实物理网卡跨机 STUN 与普通/root 权限差异。三组真实新旧版本组合与 GUI 可点击拓扑也已验证。
@@ -23,8 +26,8 @@
 | STUN/NAT | `astra-proxy/src/nettool/{stun,nat}.rs`、`astra-model/src/network_nat.rs`；`test/network_{stun,nat}_test.rs`、`network_nat_fixture.rs`；`scripts/nat_test_service.py`、`test_nat_namespaces.py` |
 | 物理路径 | `astra-platform/src/diagnostic_path/`、`astra-proxy/src/nettool/path_probe.rs`；平台 `diagnostic_path/tests.rs` 与 probe 单测；Agent `network_admission.rs` |
 | 规则/拓扑 | `astra-model/src/network_analysis.rs`、`astra-manager/src/network/analysis.rs`、`analysis/{rules,topology}.rs`；`test/network_analysis_test.rs` |
-| 客户端/原生界面 | `astra-client/src/nettools/{jobs,tools,plan,presentation,result_format,lookup}.rs`、`network_diagnostics.rs`；GUI `views/nettools.rs`、`views/nettools_topology.rs`、TUI `nettools.rs` 及各自测试 |
-| Web | `apps/web/src/components/NetworkTools.tsx`、`NetworkToolFields.tsx`、`NetworkBatchForm.tsx`、`NetworkDiagnosticDetails.tsx`、`networkToolsModel.ts`、生成管理契约；`NetworkTools.test.tsx`、`tests/e2e/network-tools.spec.ts` |
+| 客户端/原生界面 | `astra-client/src/nettools/{chain,form,full_check,jobs,lookup,nat,result}.rs`、`network_diagnostics.rs`；GUI `views/nettools.rs`、`views/nettools_path.rs`、TUI `nettools.rs` 及各自测试 |
+| Web | `apps/web/src/components/NetworkTools.tsx`、`NetworkPath.tsx`、`NetworkResult.tsx`、`networkChain.ts`、`networkNat.ts`、`networkToolsModel.ts`、生成管理契约；`NetworkTools.test.tsx`、`networkChain.test.ts`、`networkNat.test.ts`、`tests/e2e/network-tools.spec.ts` |
 
 `astra-*` 路径均位于 `crates/` 下。
 

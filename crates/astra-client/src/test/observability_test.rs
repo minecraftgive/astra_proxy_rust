@@ -100,7 +100,7 @@ fn nettools_form_changes_keep_requests_valid_and_preserve_host() {
     assert_eq!(choices.len(), 1);
     view.select_egress(choices[0].0);
     assert!(
-        matches!(view.request().unwrap().egress,astra_model::nettool::Egress::Outbound(name)if name=="proxy-one")
+        matches!(&view.request().unwrap().egress,astra_model::nettool::Egress::Outbound(name)if name=="proxy-one")
     );
     view.set_kind(Kind::Tcp);
     assert_eq!(view.target, "example.com:443");

@@ -1,5 +1,5 @@
 use super::*;
-use astra_model::nettool::{Egress, PinnedEgress, Request};
+use astra_model::nettool::{AddressFamily, Egress, PinnedEgress, Request};
 use std::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

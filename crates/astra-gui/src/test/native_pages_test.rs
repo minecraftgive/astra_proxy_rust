@@ -431,12 +431,13 @@ fn network_tool_keys_move_fields_and_hand_text_to_native_boxes(cx: &mut TestAppC
         })
     };
     let (_, kind, _) = tools(cx).unwrap();
-    cx.simulate_keystrokes(window.into(), "down right");
+    // The form opens on the tool row; arrows cycle the tool.
+    cx.simulate_keystrokes(window.into(), "right");
     let (field, changed, default) = tools(cx).unwrap();
     assert_eq!(field, Field::Kind);
     assert_ne!(changed, kind);
     // Single-letter shortcuts on a text row start editing instead of running commands.
-    cx.simulate_keystrokes(window.into(), "down x");
+    cx.simulate_keystrokes(window.into(), "down down x");
     cx.simulate_input(window.into(), "example.com");
     let (field, _, target) = tools(cx).unwrap();
     assert_eq!(field, Field::Target);

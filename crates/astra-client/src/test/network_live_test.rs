@@ -251,7 +251,7 @@ async fn real_agent_and_core_batch_pages_all_tools_and_cancels_without_more_pack
                 project(
                     "v6",
                     "path-a",
-                    Probe::Ipv6 {
+                    Probe::Tcp {
                         host: ipv6.ip().to_string(),
                         port: ipv6.port(),
                     },
@@ -483,7 +483,7 @@ async fn remote_controller_routes_shared_client_tools_pages_and_cancel_to_target
         project(
             "v6",
             "remote",
-            Probe::Ipv6 {
+            Probe::Tcp {
                 host: ipv6.ip().to_string(),
                 port: ipv6.port(),
             },
@@ -759,11 +759,11 @@ async fn check_mixed(
             .unwrap_err()
             .to_string();
         anyhow::ensure!(error.contains("Unsupported"), "{error}");
-        for kind in [crate::nettools::Kind::Tls, crate::nettools::Kind::Icmp] {
+        for kind in [crate::nettools::Kind::Http, crate::nettools::Kind::Icmp] {
             let mut view = crate::nettools::View::new(&relay, "mixed".into(), &[]);
             view.set_kind(kind);
-            view.target = if kind == crate::nettools::Kind::Tls {
-                tls_address.to_string()
+            view.target = if kind == crate::nettools::Kind::Http {
+                format!("https://{tls_address}/")
             } else {
                 "127.0.0.1".into()
             };
@@ -782,7 +782,7 @@ async fn check_mixed(
             anyhow::ensure!(
                 view.error
                     .as_ref()
-                    .is_some_and(|error| error.contains("旧 Agent")),
+                    .is_some_and(|error| error.contains("版本过旧")),
                 "legacy UI must explain rejection: {:?}",
                 view.error
             );
@@ -793,7 +793,7 @@ async fn check_mixed(
         }
         anyhow::ensure!(
             executes.load(Ordering::SeqCst) == before,
-            "new TLS/ICMP must not send Execute to old Agent"
+            "new HTTP/ICMP must not send Execute to old Agent"
         );
     } else {
         client

@@ -163,20 +163,5 @@
     "count": 1,
     "interval_ms": "0",
     "timeout_ms": "1000"
-  },
-  {
-    "resolver": null,
-    "family": "ipv6",
-    "egress": {
-      "kind": "system"
-    },
-    "probe": {
-      "kind": "ipv6",
-      "host": "2001:db8::1",
-      "port": 443
-    },
-    "count": 1,
-    "interval_ms": "0",
-    "timeout_ms": "1000"
   }
 ]

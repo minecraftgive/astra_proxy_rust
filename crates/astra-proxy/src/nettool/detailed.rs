@@ -586,7 +586,7 @@ pub async fn run_context(
         "Detailed diagnostics cannot initialize a profile"
     );
     match &request.probe {
-        Probe::Tcp { .. } | Probe::TcpPorts { .. } | Probe::Ipv6 { .. } => {
+        Probe::Tcp { .. } | Probe::TcpPorts { .. } => {
             return super::basic::run(request, emit).await
         }
         Probe::Nat { request: options } => {

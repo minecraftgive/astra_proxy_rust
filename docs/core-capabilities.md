@@ -35,7 +35,7 @@ cargo test -p astra-dns --lib diagnostic_tests
 
 有效元信息明确缺少新流能力时，只有 system TCP 和 UDP/TCP DNS 可以使用旧 `--nettool-stream`，报告标记 `legacy_details=true`，不补造详细 DNS 数据。指定接口、DoT、DoH 或显式 bootstrap 不降级。旧程序不认识元信息入口时能力无法确认；损坏输出、读取失败及异常退出分别保留实际失败，均不会当作明确不支持而继续探测。
 
-这与“新客户端连接旧 Agent”是两个不同分支：旧 Agent 的合法 Hello 未声明作业能力时，GUI/TUI 与 Web 才对系统 TCP/UDP-TCP DNS 或指定网卡的字面 IP 端点调用原 `Command::NetTool`；所有配置出口（包括 DIRECT）、网卡域名、显式 resolver/bootstrap 和新工具均在提交前拒绝。新 Agent 连接旧探测程序仍先执行上述程序能力查询，不能因 Agent 自身支持作业而跳过校验，也不能因查询失败而偷偷调用旧工具。
+这与“新客户端连接旧 Agent”是两个不同分支：旧 Agent 的合法 Hello 未声明作业能力时，GUI/TUI 与 Web 提示 Agent 版本过旧，不再调用原 `Command::NetTool`（该命令仍保留给旧调用者）。新 Agent 连接旧探测程序仍先执行上述程序能力查询，不能因 Agent 自身支持作业而跳过校验，也不能因查询失败而偷偷调用旧工具。
 
 旧流内部的 `nettool/mod.rs::resolve` 仍会对域名执行系统 `lookup_host`，不受后续 socket 网卡绑定约束；允许的系统路由兼容请求保留这一已知限制，不宣称复现实例 DNS/代理路径。旧管理命令、二进制布局和文本入口尚有实际兼容调用，本轮继续保留；完全迁移调用者后再单独评估废弃。详见[网络诊断的解析边界](network-diagnostics.md#dns解析边界与探测上下文)。
 

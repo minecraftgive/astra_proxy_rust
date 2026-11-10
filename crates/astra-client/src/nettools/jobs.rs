@@ -1,5 +1,7 @@
 use super::*;
+use crate::protocol;
 use astra_management::v2 as v;
+use astra_model::nettool::Event;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -16,7 +18,6 @@ pub(super) enum Update {
     Accepted(String),
     Rejected,
     Report(v::NetworkReport),
-    Legacy(Event),
     Notice(String),
     Error(String),
     FakeIp(v::FakeIpLookupReply),
@@ -56,26 +57,10 @@ pub(super) async fn run(
         };
         if *cancel.borrow() { return Ok(()); }
         let id = operation_id();
-        if matches!(available, crate::network_diagnostics::Availability::Legacy { .. }) {
-            crate::network_diagnostics::validate_legacy(&request)?;
-            send(&sender, &waker, Update::Notice(crate::network_diagnostics::LEGACY_NOTICE.into())).await?;
-            let result = tokio::select! {
-                response = client.request(v::RequestBody::Execute { operation_id: id, command: v::Command::NetTool { instance, request: request.request } }) => response?,
-                _ = async { let _ = cancel.wait_for(|stop| *stop).await; } => {
-                    send(&sender, &waker, Update::Notice("已停止观察；旧 Agent 无法确认取消，原任务可能仍在执行".into())).await?;
-                    return Ok(());
-                }
-            };
-            let v::ResponseBody::NetTool(events) = result else { anyhow::bail!("Protocol error: expected legacy network tool result"); };
-            for event in events {
-                let event = serde_json::from_value(protocol::native_numbers(event, None))?;
-                send(&sender, &waker, Update::Legacy(event)).await?;
-            }
-            return Ok(());
-        }
-        if let crate::network_diagnostics::Availability::Available { capabilities, .. } = &available {
-            crate::network_diagnostics::validate_capabilities(capabilities, &request)?;
-        }
+        let crate::network_diagnostics::Availability::Available { capabilities, .. } = &available else {
+            anyhow::bail!("{}", crate::network_diagnostics::LEGACY_NOTICE);
+        };
+        crate::network_diagnostics::validate_capabilities(capabilities, &request)?;
         // Publish identity before the request: lost acceptance replies remain queryable.
         send(&sender, &waker, Update::Accepted(id.clone())).await?;
         let submission = tokio::select! {
@@ -175,50 +160,6 @@ async fn observe(
 }
 
 impl View {
-    pub(super) fn resume_report(&mut self) {
-        let id = self.target.trim().to_owned();
-        if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
-            self.error = Some("请输入有效的原任务标识（最多 128 字节）".into());
-            return;
-        }
-        self.details.clear();
-        self.attempts.clear();
-        self.summary = None;
-        self.error = None;
-        self.report_state = None;
-        self.operation_id = Some(id.clone());
-        self.probe_path = None;
-        self.path_stale = false;
-        self.note = Some("正在查询原任务；不会重新执行探测".into());
-        let (sender, receiver) = mpsc::channel(32);
-        let (cancel, control) = watch::channel(false);
-        let client = self.client.clone();
-        let waker = self.waker.clone();
-        self.task = Some(tokio::spawn(async move {
-            let result = observe(&client, &id, &sender, control, &waker).await;
-            if let Err(error) = result {
-                let _ = send(&sender, &waker, Update::Error(format!("{error:#}"))).await;
-            }
-            let _ = send(&sender, &waker, Update::Finished).await;
-        }));
-        self.cancel = Some(cancel);
-        self.updates = Some(receiver);
-    }
-
-    /// Drop only the local observer; the Agent owns the diagnostic lifetime.
-    pub fn stop_observing(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-        self.updates = None;
-        self.receiver = None;
-        self.cancel = None;
-        self.note = Some(format!(
-            "已停止观察；未发送取消。原任务：{}",
-            self.operation_id.as_deref().unwrap_or("未取得标识")
-        ));
-    }
-
     pub fn export_json(&self) -> anyhow::Result<String> {
         let result = serde_json::json!({
             "schema_version":1,
@@ -227,7 +168,7 @@ impl View {
             "state":self.report_state,
             "observation_active":self.running(),
             "path_stale":self.path_stale,
-            "probe_path":self.probe_path,
+            "live_chain":self.live_chain(),
             "details":self.details,
             "attempts":self.attempts,
             "summary":self.summary,
@@ -362,6 +303,7 @@ impl View {
         if let Some(receiver) = &mut self.context_receiver {
             if let Ok(context) = receiver.try_recv() {
                 let selected = self.egresses[self.egress].clone();
+                let comparison = self.comparison.map(|i| self.egresses[i].clone());
                 self.egresses.retain(|e| !matches!(e, Egress::Interface(_)));
                 if let Some(interfaces) = context
                     .network
@@ -384,6 +326,8 @@ impl View {
                     .iter()
                     .position(|e| *e == selected)
                     .unwrap_or(0);
+                self.comparison =
+                    comparison.and_then(|c| self.egresses.iter().position(|e| *e == c));
                 if self.running()
                     && (self.captured_runtime.as_ref().map(runtime_selection)
                         != context.runtime.as_ref().map(runtime_selection)
@@ -412,9 +356,6 @@ impl View {
                 Update::FakeIp(reply) => self
                     .details
                     .push(serde_json::json!({"event":"fake_ip", "reply":reply})),
-                Update::Legacy(event) => {
-                    self.apply_event(serde_json::to_value(event).unwrap_or_default())
-                }
                 Update::Report(report) => {
                     self.report_state = Some(report.state);
                     self.error = None;
@@ -449,14 +390,7 @@ impl View {
     }
     fn apply_event(&mut self, event: Value) {
         match event["event"].as_str() {
-            Some("started") => {
-                self.note = event["note"].as_str().map(str::to_owned);
-                self.probe_path = Some(format!(
-                    "{} · {}",
-                    event["egress"].as_str().unwrap_or("unknown"),
-                    self.note.as_deref().unwrap_or("")
-                ));
-            }
+            Some("started") => self.note = event["note"].as_str().map(str::to_owned),
             Some("attempt") => {
                 if let Ok(Event::Attempt(attempt)) =
                     serde_json::from_value(protocol::native_numbers(event, None))
@@ -499,7 +433,7 @@ async fn run_batch(
             result = tokio::time::timeout(Duration::from_secs(8), client.availability()) => result??,
             _ = async { let _ = cancel.wait_for(|stop| *stop).await; } => return Ok(()),
         };
-        let crate::network_diagnostics::Availability::Available { capabilities, .. } = available else { anyhow::bail!("旧 Agent 不支持批量诊断；未提交探测"); };
+        let crate::network_diagnostics::Availability::Available { capabilities, .. } = available else { anyhow::bail!("{}", crate::network_diagnostics::LEGACY_NOTICE); };
         crate::network_diagnostics::validate_batch_capabilities(&capabilities, &request)?;
         if *cancel.borrow() { return Ok(()); }
         let id = operation_id();
@@ -538,20 +472,8 @@ impl View {
             self.error = Some(error.to_string());
             return;
         }
-        self.details.clear();
-        self.attempts.clear();
-        self.summary = None;
-        self.error = None;
-        self.scroll = 0;
-        self.path_stale = false;
-        self.probe_path = None;
-        self.operation_id = None;
-        self.report_state = None;
-        self.captured_runtime = self.context.runtime.clone();
-        self.captured_core = self.context.core.clone();
-        self.note = Some(
-            "批量诊断：普通项目最多并发 4 项，总时限 180 秒含队列等待；NAT 优先独占执行".into(),
-        );
+        self.reset_result();
+        self.note = Some("完整检查：最多并发 4 项，总时限 180 秒；NAT 先独占执行".into());
         // A NAT selection is never carried over to another run.
         if request
             .projects

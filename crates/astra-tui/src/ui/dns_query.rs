@@ -10,12 +10,6 @@ impl Ui {
     pub(super) fn dns_query_key(&mut self, key: event::KeyEvent) -> Input {
         let field = self.dns_state.query_field;
         match key.code {
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(view) = &mut self.dns_state.query {
-                    view.toggle_advanced();
-                    self.dns_state.query_scroll = 0;
-                }
-            }
             KeyCode::Esc => self.dns_state.query_open = false,
             KeyCode::Tab => self.dns_state.query_field = (field + 1) % 3,
             KeyCode::BackTab => self.dns_state.query_field = (field + 2) % 3,

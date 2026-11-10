@@ -4,13 +4,13 @@ pub mod mode_config;
 pub mod network_recovery;
 pub(crate) mod privilege;
 pub(crate) mod process;
+pub(crate) mod system_dns;
 #[cfg(not(windows))]
 #[path = "unix_system_proxy.rs"]
 pub mod system_proxy;
 #[cfg(windows)]
 #[path = "windows_system_proxy.rs"]
 pub mod system_proxy;
-pub(crate) mod system_dns;
 pub mod transparent;
 pub mod tun;
 mod tun_ingress;
@@ -59,7 +59,7 @@ pub fn entry() -> anyhow::Result<()> {
             ), FeatureSupport::new(
                 astra_model::control::NETWORK_DIAGNOSTICS_TOOLS_CAPABILITY,
                 "HTTP, native-root TLS and transport evidence", true,
-                "Bounded HTTP/TLS, multi-port TCP, address-family and STUN diagnostics.",
+                "Bounded HTTP/TLS, single and multi-port TCP (optional address family) and STUN diagnostics.",
             ), FeatureSupport::new(
                 astra_model::control::NETWORK_DIAGNOSTICS_NAT_CAPABILITY,
                 "Physical-interface NAT diagnostics", true,

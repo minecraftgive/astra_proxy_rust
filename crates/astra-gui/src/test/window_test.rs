@@ -53,9 +53,9 @@ fn nettools_chords_bypass_global_bindings_and_keep_overlay_shortcuts(cx: &mut Te
             .tools
             .as_ref()
             .unwrap();
-        assert_eq!(tools.plan.projects.len(), 1);
-        assert!(tools.show_advanced);
+        // Removed page chords are inert: no batch, no probe, no report toggle.
         assert!(!tools.running());
+        assert!(tools.details.is_empty() && tools.operation_id.is_none());
     });
     assert_eq!(cx.read(|cx| cx.windows().len()), 1);
     cx.simulate_keystrokes(handle.into(), "ctrl-k");

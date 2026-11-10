@@ -115,10 +115,6 @@ pub enum Probe {
         max_hops: u8,
         probes_per_hop: u8,
     },
-    Ipv6 {
-        host: String,
-        port: u16,
-    },
 }
 impl std::fmt::Display for Probe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,7 +134,6 @@ impl std::fmt::Display for Probe {
             Probe::Stun { .. } => f.write_str("UDP/STUN egress"),
             Probe::Nat { .. } => f.write_str("Physical-interface NAT"),
             Probe::Trace { host, .. } => write!(f, "Trace {host}"),
-            Probe::Ipv6 { host, port } => write!(f, "IPv6 [{host}]:{port}"),
         }
     }
 }

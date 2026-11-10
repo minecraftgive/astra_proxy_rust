@@ -32,7 +32,12 @@ fn hello() -> v::ResponseBody {
         role: "agent".into(),
         epoch: "remote-boot".into(),
         build_id: "fixture".into(),
-        capabilities: vec![v::NETWORK_DIAGNOSTICS_CAPABILITY.into()],
+        capabilities: vec![
+            v::NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+            "network_diagnostics_tools_v1".into(),
+            "network_diagnostics_resolution_v1".into(),
+            "network_diagnostics_pinned_v1".into(),
+        ],
     })
 }
 fn report(id: &str, state: v::NetworkState) -> v::NetworkReport {
@@ -112,114 +117,10 @@ fn connected_view(socket: PathBuf) -> View {
     let mut view = idle_view();
     view.client =
         crate::network_diagnostics::Client::for_target(socket, Some("remote-agent".into()));
+    view.kind = Kind::Tcp;
     view.target = "127.0.0.1:8080".into();
     view.count = 1;
     view
-}
-
-#[tokio::test]
-async fn legacy_snapshot_shows_the_dns_limitation_before_any_execute() {
-    let fixture = crate::import::tests::Fixture::new();
-    let socket = fixture.0.join("legacy-notice.sock");
-    let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, request) = next(&listener).await;
-        let v::ResponseBody::Hello(mut metadata) = hello() else {
-            unreachable!()
-        };
-        metadata.capabilities.clear();
-        reply(stream, request, v::ResponseBody::Hello(metadata)).await;
-        let (stream, request) = next(&listener).await;
-        assert!(matches!(
-            request.body,
-            v::RequestBody::Query(v::Query::Runtime { .. })
-        ));
-        reply(
-            stream,
-            request,
-            v::ResponseBody::Runtime(v::RuntimeSnapshot::Client(json!({}))),
-        )
-        .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
-        );
-    });
-    let mut view = connected_view(socket);
-    view.next_refresh = Instant::now();
-    poll_until(&mut view, |view| view.context.notice.is_some()).await;
-    let notice = view.context.notice.as_deref().unwrap();
-    assert!(
-        notice.contains("系统域名解析路径不可确认")
-            && notice.contains("bootstrap")
-            && notice.contains("不使用客户端本机网卡")
-    );
-    assert!(view.operation_id.is_none() && !view.running());
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn legacy_execute_is_sent_only_for_the_shared_safe_cases() {
-    let cases: Vec<serde_json::Value> =
-        serde_json::from_str(include_str!("network_eligibility_cases.json")).unwrap();
-    for case in cases {
-        let fixture = crate::import::tests::Fixture::new();
-        let socket = fixture.0.join("legacy-admission.sock");
-        let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
-        let allowed = case["legacy"].as_bool().unwrap();
-        let request: v::NetworkDiagnosticsRequest =
-            serde_json::from_value(case["request"].clone()).unwrap();
-        let expected = serde_json::to_value(&request.request).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, request) = next(&listener).await;
-            let v::ResponseBody::Hello(mut metadata) = hello() else {
-                unreachable!()
-            };
-            metadata.capabilities.clear();
-            reply(stream, request, v::ResponseBody::Hello(metadata)).await;
-            if allowed {
-                let (stream, request) = next(&listener).await;
-                let v::RequestBody::Execute {
-                    command: v::Command::NetTool { request: sent, .. },
-                    ..
-                } = &request.body
-                else {
-                    panic!("expected legacy tool only")
-                };
-                assert_eq!(serde_json::to_value(sent).unwrap(), expected);
-                reply(
-                    stream,
-                    request,
-                    v::ResponseBody::NetTool(vec![json!({"event":"done"})]),
-                )
-                .await;
-            }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), listener.accept())
-                    .await
-                    .is_err(),
-                "rejected requests never execute; successful legacy requests never replay"
-            );
-        });
-        let (sender, mut updates) = mpsc::channel(16);
-        let (_cancel, control) = tokio::sync::watch::channel(false);
-        jobs::run(
-            crate::network_diagnostics::Client::for_target(socket, None),
-            "proxy".into(),
-            request,
-            sender,
-            control,
-            crate::waker::Waker::default(),
-        )
-        .await;
-        let mut failed = false;
-        while let Some(update) = updates.recv().await {
-            failed |= matches!(update, jobs::Update::Error(_));
-        }
-        assert_eq!(failed, !allowed, "{}", case["name"]);
-        server.await.unwrap();
-    }
 }
 
 #[tokio::test]
@@ -296,6 +197,8 @@ async fn single_and_batch_receipts_use_typed_codes_and_never_replay() {
             if batch {
                 view.context.capabilities = vec![
                     v::NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+                    "network_diagnostics_tools_v1".into(),
+                    "network_diagnostics_resolution_v1".into(),
                     v::NETWORK_BATCH_CAPABILITY.into(),
                 ];
                 view.start_batch(v::NetworkBatchRequest {
@@ -325,42 +228,6 @@ async fn single_and_batch_receipts_use_typed_codes_and_never_replay() {
     }
 }
 
-#[tokio::test]
-async fn legacy_icmp_cannot_bypass_tun_awareness_or_send_an_execute() {
-    let fixture = crate::import::tests::Fixture::new();
-    let socket = fixture.0.join("legacy-icmp.sock");
-    let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, request) = next(&listener).await;
-        assert!(matches!(
-            request.body,
-            v::RequestBody::Query(v::Query::Hello)
-        ));
-        let v::ResponseBody::Hello(mut metadata) = hello() else {
-            unreachable!()
-        };
-        metadata.capabilities.clear();
-        reply(stream, request, v::ResponseBody::Hello(metadata)).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                .await
-                .is_err(),
-            "legacy ICMP must be rejected before Execute"
-        );
-    });
-    let mut view = connected_view(socket);
-    view.set_kind(Kind::Icmp);
-    view.target = "127.0.0.1".into();
-    view.start();
-    poll_until(&mut view, |view| !view.running()).await;
-    assert!(view
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("TUN") && error.contains("未启动探测")));
-    assert!(view.attempts.is_empty() && view.summary.is_none() && view.operation_id.is_none());
-    server.await.unwrap();
-}
-
 #[test]
 fn fake_ip_input_is_bounded_and_readonly_tabs_do_not_start_jobs() {
     assert!(lookup::addresses("example.test").is_err());
@@ -370,76 +237,12 @@ fn fake_ip_input_is_bounded_and_readonly_tabs_do_not_start_jobs() {
         vec!["198.18.0.1", "::1"]
     );
     let mut view = idle_view();
-    view.section = Section::Overview;
+    view.set_kind(Kind::FakeIp);
+    view.target = "example.test".into();
     view.start();
-    assert!(!view.running());
+    assert!(!view.running() && view.error.is_some());
     view.details = vec![json!({"large":"x".repeat(2 * 1024 * 1024)})];
     assert!(view.export_json().is_err());
-}
-
-#[tokio::test]
-async fn earlier_job_agent_cannot_silently_ignore_explicit_resolver() {
-    let directory = crate::import::tests::Fixture::new();
-    let socket = directory.0.join("old-jobs.sock");
-    let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, request) = next(&listener).await;
-        assert!(matches!(
-            request.body,
-            v::RequestBody::Query(v::Query::Hello)
-        ));
-        reply(stream, request, hello()).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), listener.accept())
-                .await
-                .is_err()
-        );
-    });
-    let mut view = connected_view(socket);
-    view.resolver = "udp://127.0.0.1:5353".into();
-    view.start();
-    poll_until(&mut view, |view| !view.running()).await;
-    assert!(view
-        .error
-        .as_deref()
-        .unwrap()
-        .contains("未声明约束解析能力"));
-    assert!(view.operation_id.is_none());
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn resume_only_reads_original_report_and_keeps_terminal_evidence() {
-    let directory = crate::import::tests::Fixture::new();
-    let socket = directory.0.join("resume.sock");
-    let listener = astra_platform::platform::LocalListener::bind(&socket).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, request) = next(&listener).await;
-        assert!(
-            matches!(&request.body, v::RequestBody::Query(v::Query::NetworkReport { operation_id, cursor: None }) if operation_id == "original-job")
-        );
-        assert_eq!(request.agent_id.as_deref(), Some("remote-agent"));
-        let mut page = report("original-job", v::NetworkState::Cancelled);
-        page.message = "cancelled with retained evidence".into();
-        reply(stream, request, v::ResponseBody::NetworkReport(page)).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), listener.accept())
-                .await
-                .is_err()
-        );
-    });
-    let mut view = connected_view(socket);
-    view.kind = Kind::Report;
-    view.target = "original-job".into();
-    view.start();
-    poll_until(&mut view, |view| !view.running()).await;
-    assert_eq!(view.operation_id.as_deref(), Some("original-job"));
-    assert_eq!(view.report_state, Some(v::NetworkState::Cancelled));
-    assert!(view
-        .export_json()
-        .unwrap()
-        .contains("cancelled with retained evidence"));
-    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -546,51 +349,6 @@ async fn only_target_snapshot_supplies_interfaces_and_missing_selection_never_fa
     );
     assert!(view.request().unwrap_err().contains("无法确认"));
     assert!(!view.running());
-}
-
-#[test]
-fn dns_details_keep_flags_sections_ttl_and_full_bounded_record_text() {
-    let mut view = idle_view();
-    view.show_advanced = true;
-    let text = format!("{}-last-marker", "x".repeat(8000));
-    view.details = vec![
-        json!({"event":"dns","seq":"1","detail":{"kind":"response","outcome":"resolved","flags":{"authenticated_data":true},"dnssec_locally_validated":false,"edns":{"udp_payload":"1232"}}}),
-        json!({"event":"dns","seq":"1","detail":{"kind":"records","section":"authority","records":[{"name":"example.test.","class":"IN","record_type":"TXT","ttl":"123","text":text,"text_truncated":true}]}}),
-    ];
-    let output = view.output().join("\n");
-    for expected in [
-        "authenticated_data",
-        "dnssec_locally_validated: false",
-        "1232",
-        "authority",
-        "TTL=123",
-        "-last-marker",
-        "已截断",
-    ] {
-        assert!(output.contains(expected), "missing {expected}");
-    }
-    assert!(output.contains(&"x".repeat(8000)));
-}
-
-#[test]
-fn four_sections_and_scroll_keys_preserve_the_form_without_starting_probes() {
-    let mut view = idle_view();
-    let target = view.target.clone();
-    view.section = Section::Findings;
-    for section in Section::ALL {
-        assert!(view.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)));
-        assert!(view.section == section);
-        if section != Section::Tools {
-            assert!(view.fields().is_empty());
-            assert!(!view.output().is_empty());
-        }
-        assert!(!view.running());
-    }
-    assert!(view.key(KeyEvent::from(KeyCode::PageUp)));
-    assert_eq!(view.scroll, 10);
-    assert!(view.key(KeyEvent::from(KeyCode::PageDown)));
-    assert_eq!(view.scroll, 0);
-    assert_eq!(view.target, target);
 }
 
 #[tokio::test]

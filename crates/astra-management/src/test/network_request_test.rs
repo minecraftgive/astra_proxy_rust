@@ -47,7 +47,7 @@ fn public_request_cannot_supply_a_pin_or_forge_interface_resolvers() {
 fn typed_web_probe_fixtures_roundtrip_through_single_and_batch_commands() {
     let values: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("fixtures/network_requests.json")).unwrap();
-    assert_eq!(values.len(), 11);
+    assert_eq!(values.len(), 10);
     for value in values {
         let request: NetworkDiagnosticsRequest = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&request).unwrap(), value);

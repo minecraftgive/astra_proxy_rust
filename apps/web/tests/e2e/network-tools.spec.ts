@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("network tools remain manual and usable at desktop and narrow widths", async ({
+test("network tools stay manual, show the link and fit desktop and narrow widths", async ({
   page,
 }, testInfo) => {
   const executions: unknown[] = [];
@@ -148,7 +148,15 @@ test("network tools remain manual and usable at desktop and narrow widths", asyn
                 flags: [],
               },
             ],
-            routes: [],
+            routes: [
+              {
+                destination: "default",
+                gateway: null,
+                interface_id: "en0",
+                flags: [],
+                source: "fixture",
+              },
+            ],
             issues: [],
             truncated: false,
           };
@@ -235,234 +243,44 @@ test("network tools remain manual and usable at desktop and narrow widths", asyn
   await page.getByLabel("管理员密码", { exact: true }).fill("fixture-password");
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await page.getByRole("button", { name: /网络工具/ }).click();
-  await expect(
-    page.getByText("核心状态：能力已确认", { exact: true }),
-  ).toBeVisible();
+  const chain = page.getByTestId("network-live-chain");
+  await expect(chain).toContainText("网卡 目标节点物理网卡（默认路由）");
   expect(executions).toHaveLength(0);
   expect(fakeLookups).toBe(0);
-  await expect(page.getByText("核心启动标识", { exact: true })).toHaveCount(0);
-  const toggle = page.getByRole("button", { name: /显示原始报告/ });
-  await toggle.focus();
-  await page.keyboard.press("Control+d");
-  await expect(page.getByText("核心启动标识", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /隐藏原始报告/ }).click();
-  await expect(page.getByText("核心启动标识", { exact: true })).toHaveCount(0);
-  await page.screenshot({
-    path: testInfo.outputPath("network-desktop.png"),
-    fullPage: true,
-  });
-  await page.setViewportSize({ width: 390, height: 844 });
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await page.getByRole("button", { name: /显示原始报告/ }).click();
-  const scroll = page.locator(".network-tools .table-scroll").first();
-  expect(
-    await scroll.evaluate(
-      (element) => element.scrollWidth > element.clientWidth,
-    ),
-  ).toBe(true);
-  await page.getByLabel("待查询 IP 地址").fill("198.18.0.1");
-  await page
-    .getByRole("button", { name: "查询 Fake-IP 映射", exact: true })
-    .click();
-  await expect(
-    page.getByText("未命中（不能据此判断是否为 Fake-IP）", { exact: true }),
-  ).toBeVisible();
-  expect(fakeLookups).toBe(1);
-  expect(executions).toHaveLength(0);
-  await page
-    .getByRole("region", { name: "Fake-IP 映射结果" })
-    .scrollIntoViewIfNeeded();
-  await page.screenshot({
-    path: testInfo.outputPath("network-mobile-overview.png"),
-    fullPage: true,
-  });
-  await page.getByRole("button", { name: /隐藏原始报告/ }).click();
-  await page.getByRole("button", { name: "工具箱", exact: true }).click();
-  await page.getByLabel("本次探测出口").selectOption("outbound:固定节点");
-  await page
-    .getByLabel("解析器（可选）")
-    .fill(
-      "https://resolver.example/private-path?token=fixture-secret#bootstrap=192.0.2.53",
-    );
+  // A pinned outbound follows the instance's group selection.
+  await page.getByRole("radio", { name: "TCP 连接" }).click();
+  await page.getByLabel("出口", { exact: true }).selectOption("outbound:选择组");
+  await expect(chain).toContainText("选择组 → 固定节点");
+  await page.getByLabel("目标", { exact: true }).fill("example.com:80,443");
   await page.getByRole("button", { name: "运行", exact: true }).click();
-  await expect(
-    page.getByText("Fixture complete", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByRole("log", { name: "结果" })).toContainText(
+    "long-text-evidence-",
+  );
   expect(executions).toHaveLength(1);
-  const pendingDownload = page.waitForEvent("download");
-  await page.getByRole("button", { name: "导出 JSON", exact: true }).click();
-  const download = await pendingDownload;
-  const stream = await download.createReadStream();
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
-  const exported = Buffer.concat(chunks).toString("utf8");
-  expect(exported).toContain('"report"');
-  expect(exported).not.toContain("fixture-secret");
-  expect(exported).not.toContain("private-path");
-  await expect(
-    page.getByText(/a-very-long-diagnostic-response-name.example.*TXT →/),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("region", { name: "DNS 记录", exact: true }),
-  ).toHaveCount(0);
   expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await page.locator(".network-result").first().scrollIntoViewIfNeeded();
+    (executions[0] as any).command.data.request.probe,
+  ).toEqual({ kind: "tcp_ports", host: "example.com", ports: [80, 443] });
   await page.screenshot({
-    path: testInfo.outputPath("network-mobile-conclusions.png"),
+    path: testInfo.outputPath("network-tools-desktop.png"),
     fullPage: true,
   });
-  await page.getByRole("button", { name: /显示原始报告/ }).click();
-  const conclusionColumn = page.getByRole("region", {
-    name: "结论",
-    exact: true,
-  });
-  const reportColumn = page.getByRole("region", {
-    name: "原始报告",
-    exact: true,
-  });
-  const resultScroll = page.getByRole("region", {
-    name: "结论与原始报告",
-    exact: true,
-  });
-  for (const width of [1440, 390]) {
-    await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 });
-    await conclusionColumn.scrollIntoViewIfNeeded();
-    const left = (await conclusionColumn.boundingBox())!;
-    const right = (await reportColumn.boundingBox())!;
-    expect(right.x).toBeGreaterThanOrEqual(left.x + left.width);
-    expect(Math.abs(right.y - left.y)).toBeLessThan(2);
-    await expect(conclusionColumn.getByText(/TXT →/)).toBeVisible();
-    expect(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= innerWidth,
-      ),
-    ).toBe(true);
-    if (width === 390)
-      expect(
-        await resultScroll.evaluate(
-          (element) => element.scrollWidth > element.clientWidth,
-        ),
-      ).toBe(true);
-    const conclusionBefore = await conclusionColumn.evaluate((element) => ({
-      scroll: element.scrollTop,
-      top: element.getBoundingClientRect().top,
-    }));
-    await reportColumn.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-    });
-    expect(
-      await reportColumn.evaluate((element) => element.scrollTop),
-    ).toBeGreaterThan(0);
-    expect(
-      await conclusionColumn.evaluate((element) => ({
-        scroll: element.scrollTop,
-        top: element.getBoundingClientRect().top,
-      })),
-    ).toEqual(conclusionBefore);
-    await reportColumn.evaluate((element) => {
-      element.scrollTop = 0;
-    });
-    await page.screenshot({
-      path: testInfo.outputPath(`network-columns-${width}.png`),
-      fullPage: true,
-    });
-  }
-  await expect(
-    page.getByRole("cell", { name: "TXT", exact: true }),
-  ).toBeVisible();
-  expect(
-    (await page.locator(".network-record").boundingBox())!.height,
-  ).toBeLessThanOrEqual(240);
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await reportColumn
-    .locator(".network-result")
-    .first()
-    .scrollIntoViewIfNeeded();
+  // Narrow width: no horizontal page scroll; long results scroll inside their box.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(chain).toBeVisible();
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
   await page.screenshot({
-    path: testInfo.outputPath("network-mobile-results.png"),
+    path: testInfo.outputPath("network-tools-narrow.png"),
     fullPage: true,
   });
-  const records = page.getByRole("region", { name: "DNS 记录", exact: true });
-  await records.evaluate((element) => {
-    element.scrollLeft = element.scrollWidth;
-  });
-  expect(
-    await records.evaluate((element) => element.scrollLeft),
-  ).toBeGreaterThan(0);
-  await page.screenshot({
-    path: testInfo.outputPath("network-mobile-dns-records.png"),
-    fullPage: true,
-  });
-  await page.getByRole("button", { name: "路径", exact: true }).click();
-  await expect(
-    page.getByText("配置出口 固定节点", { exact: true }),
-  ).toBeVisible();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await page.screenshot({
-    path: testInfo.outputPath("network-mobile-path.png"),
-    fullPage: true,
-  });
-  const sentBefore = executions.length;
-  await page.getByRole("button", { name: "工具箱", exact: true }).click();
-  await page
-    .getByRole("combobox", { name: "工具", exact: true })
-    .selectOption("nat");
-  await expect(
-    page.getByRole("combobox", { name: "NAT 物理网卡", exact: true }),
-  ).toHaveValue("");
-  await page.getByRole("button", { name: "运行", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("请选择物理网卡");
-  await page
-    .getByRole("combobox", { name: "地址族", exact: true })
-    .selectOption("ipv6");
-  await expect(
-    page
-      .getByRole("combobox", { name: "NAT 物理网卡", exact: true })
-      .getByRole("option"),
-  ).toHaveCount(2);
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await page.screenshot({
-    path: testInfo.outputPath("network-mobile-nat.png"),
-    fullPage: true,
-  });
-  await page.getByRole("button", { name: "诊断", exact: true }).click();
-  await page.getByLabel("包含 NAT 检测", { exact: false }).check();
-  await expect(
-    page.getByRole("combobox", { name: "批量 NAT 物理网卡", exact: true }),
-  ).toHaveValue("");
-  await page.getByRole("button", { name: "添加路径", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "添加路径", exact: true }),
-  ).toBeDisabled();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth,
-    ),
-  ).toBe(true);
-  await page.screenshot({
-    path: testInfo.outputPath("network-mobile-batch.png"),
-    fullPage: true,
-  });
-  expect(executions.length).toBe(sentBefore);
+  // Fake-IP stays a read-only lookup.
+  await page.getByRole("radio", { name: "Fake-IP" }).click();
+  await page.getByLabel("IP 地址").fill("198.18.0.5");
+  await page.getByRole("button", { name: "查询映射" }).click();
+  await expect(page.getByText("198.18.0.5 → 未查到映射，无法判断用途")).toBeVisible();
+  expect(fakeLookups).toBe(1);
+  expect(executions).toHaveLength(1);
   expect(errors).toEqual([]);
 });

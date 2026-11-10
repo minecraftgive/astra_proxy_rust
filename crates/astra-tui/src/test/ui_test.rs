@@ -18,31 +18,19 @@ async fn nettools_shortcuts_precede_global_navigation_but_not_overlays() {
     ui.diagnostics = Some(diagnostics);
     let page = ui.page;
     let ctrl = |code| event::KeyEvent::new(code, KeyModifiers::CONTROL);
+    // Former page chords are inert on the simplified page.
     assert!(matches!(ui.key(ctrl(KeyCode::Char('p'))), Input::Idle));
-    assert_eq!(
-        ui.diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap()
-            .plan
-            .projects
-            .len(),
-        1
-    );
     assert_eq!(ui.page, page);
     assert!(ui.palette.is_none());
     ui.key(ctrl(KeyCode::Char('d')));
-    assert!(
-        ui.diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap()
-            .show_advanced
-    );
+    assert!(!ui
+        .diagnostics
+        .as_ref()
+        .unwrap()
+        .tools
+        .as_ref()
+        .unwrap()
+        .running());
     for n in 1..=12 {
         assert!(matches!(press(&mut ui, KeyCode::F(n)), Input::Idle));
     }
@@ -57,15 +45,7 @@ async fn nettools_shortcuts_precede_global_navigation_but_not_overlays() {
     ui.key(key('x'));
     press(&mut ui, KeyCode::F(1));
     assert!(ui.help_scroll.is_some());
-    assert!(
-        ui.diagnostics
-            .as_ref()
-            .unwrap()
-            .tools
-            .as_ref()
-            .unwrap()
-            .show_advanced
-    );
+    assert!(ui.diagnostics.as_ref().unwrap().tools.is_some());
 }
 
 fn sample_ui(running: bool) -> Ui {

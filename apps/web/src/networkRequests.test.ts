@@ -15,10 +15,9 @@ const probes = {
   stun: { kind: "stun", server: "stun:192.0.2.1:3478" },
   nat: { kind: "nat", request: { agent_id: "agent-test", interface_id: "eth0", family: "ipv4", servers: ["192.0.2.1:3478"], advanced: false } },
   trace: { kind: "trace", host: "192.0.2.1", max_hops: 30, probes_per_hop: 3 },
-  ipv6: { kind: "ipv6", host: "2001:db8::1", port: 443 },
 } satisfies Record<Probe["kind"], Probe>;
 const requests: NetworkDiagnosticsRequest[] = Object.values(probes).map((probe) => ({
-  resolver: null, family: probe.kind === "ipv6" ? "ipv6" : null,
+  resolver: null, family: null,
   egress: probe.kind === "nat" || probe.kind === "trace" ? { kind: "interface", name: "eth0" } : { kind: "system" },
   probe, count: 1, interval_ms: "0", timeout_ms: "1000",
 }));
