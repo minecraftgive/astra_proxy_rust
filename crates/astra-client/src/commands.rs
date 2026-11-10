@@ -253,23 +253,32 @@ use crate::{
     input::{KeyCode, KeyModifiers},
 };
 pub fn shortcut(key: crate::input::Key) -> Option<Id> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.kind == crate::input::KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers == KeyModifiers::CONTROL {
+        return match key.code {
+            KeyCode::Char('k') => Some(Id::Palette),
+            KeyCode::Char('p') => Some(Id::Profiles),
+            KeyCode::Char('f') => Some(Id::Search),
+            KeyCode::Char('s') => Some(Id::Save),
+            _ => None,
+        };
+    }
+    if key.modifiers == KeyModifiers::SHIFT && key.code == KeyCode::F(3) {
+        return Some(Id::PreviousMatch);
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
     match key.code {
         KeyCode::F(1) => Some(Id::Help),
         KeyCode::F(2) => Some(Id::Palette),
-        KeyCode::F(4) if key.modifiers.is_empty() => Some(Id::CopyTerminal),
+        KeyCode::F(4) => Some(Id::CopyTerminal),
         KeyCode::F(6) => Some(Id::Tasks),
         KeyCode::F(7) => Some(Id::Logs),
         KeyCode::F(9) => Some(Id::Monitor),
-        KeyCode::Char('k') if ctrl => Some(Id::Palette),
-        KeyCode::Char('p') if ctrl => Some(Id::Profiles),
-        KeyCode::Char('f') if ctrl => Some(Id::Search),
-        KeyCode::Char('s') if ctrl => Some(Id::Save),
-        KeyCode::F(3) => Some(if key.modifiers.contains(KeyModifiers::SHIFT) {
-            Id::PreviousMatch
-        } else {
-            Id::NextMatch
-        }),
+        KeyCode::F(3) => Some(Id::NextMatch),
         _ => None,
     }
 }
@@ -304,6 +313,7 @@ pub fn help() -> String {
     for spec in SPECS.iter().filter(|s| !s.key.is_empty()) {
         text.push_str(&format!("{}  {}\n", spec.key, t(spec.label)));
     }
+    text.push_str(&format!("\n{}\n{}\n", t("Logs"), t(crate::logs::KEY_HELP)));
     text.push_str(t("\nAll other actions are in the command palette. Q, R and 0 no longer execute destructive actions.\n"));
     text
 }

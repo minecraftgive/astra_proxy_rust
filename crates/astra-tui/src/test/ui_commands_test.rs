@@ -13,6 +13,94 @@ fn rendered(ui: &Ui) -> String {
         .map(|cell| cell.symbol())
         .collect()
 }
+
+#[test]
+fn log_limit_shortcut_and_help_survive_page_and_overlay_dispatch() {
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        for frontend in [false, true] {
+            let mut ui = Ui::new(Session::default());
+            ui.page = shell::LOGS;
+            let mut viewer = logs::Viewer::new("test".into(), Default::default());
+            for index in 0..10 {
+                viewer.push(format!("INFO {index}"));
+            }
+            if frontend {
+                ui.tui_viewer = Some(viewer);
+            } else {
+                ui.viewer = Some(viewer);
+            }
+            let screen = rendered(&ui);
+            assert!(
+                screen.contains("m memory"),
+                "limit shortcut must be discoverable ({frontend}): {screen}"
+            );
+            assert!(ui.command_help().contains("m memory"));
+            for ch in ['m', '0'] {
+                press(&mut ui, KeyCode::Char(ch));
+            }
+            press(&mut ui, KeyCode::Enter);
+            assert!(matches!(
+                ui.log_viewer(frontend).unwrap().settings.mode,
+                logs::Mode::MemoryLimit(_)
+            ));
+            ui.key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ));
+            press(&mut ui, KeyCode::Char('3'));
+            press(&mut ui, KeyCode::Enter);
+            assert_eq!(ui.log_viewer(frontend).unwrap().settings.memory_lines, 3);
+            assert_eq!(ui.log_viewer(frontend).unwrap().records.len(), 3);
+            press(&mut ui, KeyCode::Char('m'));
+            press(&mut ui, KeyCode::Char('1'));
+            press(&mut ui, KeyCode::Esc);
+            assert_eq!(ui.log_viewer(frontend).unwrap().settings.memory_lines, 3);
+            assert_eq!(ui.page, shell::LOGS);
+            press(&mut ui, KeyCode::Char(' '));
+            assert!(ui.log_viewer(frontend).unwrap().paused());
+        }
+    });
+}
+
+#[test]
+fn extra_modifiers_do_not_trigger_global_shortcuts() {
+    let mut ui = Ui::new(Session::default());
+    ui.viewer = Some(logs::Viewer::new("test".into(), Default::default()));
+    for modifiers in [
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SHIFT,
+    ] {
+        for number in [1, 2, 4, 6, 7, 8, 9] {
+            assert!(matches!(
+                ui.key(event::KeyEvent::new(KeyCode::F(number), modifiers)),
+                Input::Idle
+            ));
+            assert!(ui.palette.is_none() && ui.help_scroll.is_none() && ui.monitor.is_none());
+            assert!(ui.tui_viewer.is_none() && !ui.tasks.showing_details());
+        }
+    }
+    assert!(matches!(
+        ui.key(event::KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )),
+        Input::Idle
+    ));
+    for modifiers in [
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for ch in ['c', 'f', 'k', 'p'] {
+            assert!(matches!(
+                ui.key(event::KeyEvent::new(KeyCode::Char(ch), modifiers)),
+                Input::Idle
+            ));
+            assert!(ui.palette.is_none());
+            assert!(ui.viewer.as_ref().unwrap().browsing());
+        }
+    }
+}
 #[test]
 fn global_overlay_keys_replace_visible_layers_and_preserve_underlying_input() {
     crate::i18n::with_language(crate::i18n::Language::English, || {

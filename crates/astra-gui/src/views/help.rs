@@ -48,5 +48,13 @@ impl Render for View {
                             .child(t(spec.label))
                     }))
             }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_lg().child(t("Logs")))
+                    .child(t(astra_client::logs::KEY_HELP)),
+            )
     }
 }

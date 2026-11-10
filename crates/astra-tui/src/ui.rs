@@ -18,8 +18,8 @@ mod live;
 mod monitor;
 mod node_transfer;
 mod operations;
-mod pages;
 mod package_choice;
+mod pages;
 pub(crate) use package_choice::choose_package;
 mod settings;
 pub(crate) fn preferred_terminal(home: &std::path::Path) -> String {
@@ -325,6 +325,13 @@ impl Ui {
         if let Some(input) = self.window_key(key) {
             return input;
         }
+        // Alt-page chords above are the only Alt bindings. Do not reinterpret
+        // other modifier combinations as unmodified page actions or text.
+        if key.modifiers.intersects(
+            KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+        ) {
+            return Input::Idle;
+        }
         if let Some(input) = self.command_key(key) {
             return input;
         }
@@ -420,7 +427,7 @@ impl Ui {
 
     fn key_context(&mut self, key: event::KeyEvent) -> Input {
         if self.help_scroll.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers == KeyModifiers::CONTROL
             && key.code == KeyCode::Char('c')
         {
             return Input::Quit;
@@ -449,7 +456,7 @@ impl Ui {
         if self.recovery.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.recover_key(key.code);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             // Detach with the draft intact; the next launch restores this exact step.
             return Input::Quit;
         }

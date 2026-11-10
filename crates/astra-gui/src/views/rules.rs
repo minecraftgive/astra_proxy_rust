@@ -80,6 +80,7 @@ impl Render for View {
                     || event.is_held
                     || event.keystroke.modifiers.control
                     || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform
                 {
                     return;
                 }

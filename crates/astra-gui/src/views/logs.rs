@@ -1,7 +1,8 @@
 use crate::{model::AppModel, views::ViewEvent, widgets::Empty};
 use astra_client::{
     i18n::t,
-    logs::{Command, Viewer},
+    input::{KeyCode, KeyModifiers},
+    logs::{Command, Mode, Viewer},
     protocol::{Action, LogLevel},
 };
 use gpui::{
@@ -73,24 +74,33 @@ impl View {
                 view.sync_inputs(window, cx);
                 cx.notify();
             }),
-            cx.subscribe(&filter, |view, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().to_string();
-                    view.mutate(|v| v.set_filter(text), cx);
-                }
-            }),
-            cx.subscribe(&search, |view, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().to_string();
-                    view.mutate(|v| v.set_search(text), cx);
-                }
-            }),
-            cx.subscribe(&limit, |view, input, event: &InputEvent, cx| {
+            cx.subscribe_in(
+                &filter,
+                window,
+                |view, input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value().to_string();
+                        view.mutate(|v| v.set_filter(text), cx);
+                    } else if matches!(event, InputEvent::PressEnter { .. }) {
+                        window.focus(&view.focus, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &search,
+                window,
+                |view, input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value().to_string();
+                        view.mutate(|v| v.set_search(text), cx);
+                    } else if matches!(event, InputEvent::PressEnter { .. }) {
+                        window.focus(&view.focus, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(&limit, window, |view, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).value().to_string();
-                    let mut error = None;
-                    view.mutate(|v| error = v.set_memory_limit(&text).err(), cx);
-                    view.error = error;
+                    view.apply_limit(window, cx);
                 }
             }),
         ];
@@ -205,6 +215,32 @@ impl View {
         self.reveal = true;
         cx.notify();
     }
+    fn apply_limit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.limit.read(cx).value().to_string();
+        let mut error = None;
+        self.mutate(|v| error = v.set_memory_limit(&text).err(), cx);
+        self.error = error;
+        if self.error.is_none() {
+            window.focus(&self.focus, cx);
+        }
+    }
+    fn log_key(&mut self, key: astra_client::input::Key, cx: &mut Context<Self>) {
+        let frontend = self.frontend;
+        let command = self.model.update(cx, |model, cx| {
+            let command = model.tokio(|client| {
+                client
+                    .log_viewer_mut(frontend)
+                    .map_or(Command::None, |v| v.key(key))
+            });
+            cx.notify();
+            command
+        });
+        self.reveal = true;
+        if !matches!(command, Command::None) {
+            self.command(command, cx);
+        }
+        cx.notify();
+    }
     pub fn registered_command(
         &mut self,
         id: astra_client::commands::Id,
@@ -246,9 +282,16 @@ impl Render for View {
         let _ = &self.observations;
         let client = &self.model.read(cx).client;
         let sources = client.log_sources();
+        let picking_session = client
+            .log_viewer(self.frontend)
+            .is_some_and(|v| matches!(v.settings.mode, Mode::Session(_)));
         let mut root = div()
             .id("logs-view")
-            .key_context("AstraLogs")
+            .key_context(if picking_session {
+                "AstraLogs AstraLogPicker"
+            } else {
+                "AstraLogs"
+            })
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -325,7 +368,10 @@ impl Render for View {
             levels = levels.child(button);
         }
         // Sessions: the current one by default, earlier ones read on demand.
-        let selected_session = viewer.selected_session_index();
+        let selected_session = match viewer.settings.mode {
+            Mode::Session(index) => index,
+            _ => viewer.selected_session_index(),
+        };
         let mut sessions = div()
             .flex()
             .flex_wrap()
@@ -351,6 +397,9 @@ impl Render for View {
             sessions = sessions.child(button);
         }
         let session_status = viewer.session_label();
+        if picking_session {
+            sessions = sessions.child(t("↑↓ select · Enter apply · Esc back"));
+        }
         if supported {
             levels = levels.child(t("Capture level"));
             for (index, level) in LogLevel::ALL.into_iter().enumerate() {
@@ -366,37 +415,43 @@ impl Render for View {
                 levels = levels.child(button);
             }
         }
-        root = root
-            .child(sessions.child(div().text_xs().child(session_status)))
-            .child(levels)
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(Input::new(&self.filter))
-                    .child(div().w(px(140.)).child(Input::new(&self.limit)))
-                    .child(
-                        Button::new("log-wrap")
-                            .label(format!("{} {}", if wrap { "☑" } else { "☐" }, t("Wrap")))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.mutate(|v| v.set_wrap(!v.settings.wrap), cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("log-follow")
-                            .label(format!(
-                                "{} {}",
-                                if follow { "☑" } else { "☐" },
-                                t("Follow")
-                            ))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.mutate(|v| v.set_follow(!v.settings.follow), cx)
-                            })),
-                    )
-                    .child(Button::new("log-reconnect").label(t("Reconnect")).on_click(
-                        cx.listener(|view, _, _, cx| view.command(Command::Reconnect, cx)),
-                    )),
-            );
+        root =
+            root.child(sessions.child(div().text_xs().child(session_status)))
+                .child(levels)
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(Input::new(&self.filter))
+                        .child(format!("{} (m)", t("Memory limit")))
+                        .child(div().w(px(140.)).child(Input::new(&self.limit)))
+                        .child(Button::new("log-apply-limit").label(t("Apply")).on_click(
+                            cx.listener(|view, _, window, cx| view.apply_limit(window, cx)),
+                        ))
+                        .child(
+                            Button::new("log-wrap")
+                                .label(format!("{} {}", if wrap { "☑" } else { "☐" }, t("Wrap")))
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.mutate(|v| v.set_wrap(!v.settings.wrap), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("log-follow")
+                                .label(format!(
+                                    "{} {}",
+                                    if follow { "☑" } else { "☐" },
+                                    t("Follow")
+                                ))
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.mutate(|v| v.set_follow(!v.settings.follow), cx)
+                                })),
+                        )
+                        .child(Button::new("log-reconnect").label(t("Reconnect")).on_click(
+                            cx.listener(|view, _, _, cx| view.command(Command::Reconnect, cx)),
+                        )),
+                );
         let width = self.presentation.width_chars as f32 * 8.;
         let list = list(self.scroll.clone(), move |index, _, cx| {
             let record = &rows[index];
@@ -456,39 +511,93 @@ impl Render for View {
             root = root.child(div().text_color(cx.theme().danger).child(error.clone()));
         }
         root.on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-            if !view.focus.is_focused(window)
-                || event.keystroke.modifiers.alt
-                || event.keystroke.modifiers.platform
+            if event.keystroke.modifiers.alt || event.keystroke.modifiers.platform {
+                return;
+            }
+            if !view.focus.is_focused(window) {
+                if event.keystroke.key == "escape" && !event.keystroke.modifiers.control {
+                    window.focus(&view.focus, cx);
+                    view.error = None;
+                    view.sync_inputs(window, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            let Some(key) = crate::keys::from_keystroke(&event.keystroke, event.is_held) else {
+                return;
+            };
+            if event.is_held
+                && !matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::F(3)
+                        | KeyCode::Char('n' | 'N' | 'h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'u' | 'd')
+                )
             {
                 return;
             }
-            if event.keystroke.modifiers.control && event.keystroke.key == "f" {
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
                 view.search.update(cx, |input, cx| input.focus(window, cx));
                 cx.stop_propagation();
                 return;
             }
             if event.keystroke.modifiers.control
-                && !matches!(event.keystroke.key.as_str(), "u" | "d")
+                && (key.modifiers != KeyModifiers::CONTROL
+                    || !matches!(key.code, KeyCode::Char('u' | 'd')))
             {
                 return;
             }
-            match event.keystroke.key.as_str() {
-                "/" => {
+            if view
+                .model
+                .read(cx)
+                .client
+                .log_viewer(view.frontend)
+                .is_some_and(|v| matches!(v.settings.mode, Mode::Session(_)))
+            {
+                if !event.keystroke.modifiers.control
+                    && matches!(
+                        key.code,
+                        KeyCode::Esc
+                            | KeyCode::Enter
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Char('j' | 'k')
+                    )
+                {
+                    view.log_key(key, cx);
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            match key.code {
+                KeyCode::Char('/') => {
                     view.search.update(cx, |input, cx| input.focus(window, cx));
                     cx.stop_propagation();
                     return;
                 }
-                "f" => {
+                KeyCode::Char('f') => {
                     view.filter.update(cx, |input, cx| input.focus(window, cx));
                     cx.stop_propagation();
                     return;
                 }
-                "m" => {
-                    view.limit.update(cx, |input, cx| input.focus(window, cx));
+                KeyCode::Char('m') => {
+                    view.error = None;
+                    view.limit.update(cx, |input, cx| {
+                        input.focus(window, cx);
+                        input.select_all(window, cx);
+                    });
                     cx.stop_propagation();
                     return;
                 }
-                "v" => {
+                KeyCode::Char('v') => {
                     view.mutate(
                         |v| {
                             let next = v
@@ -503,7 +612,7 @@ impl Render for View {
                     cx.stop_propagation();
                     return;
                 }
-                "l" if event.keystroke.modifiers.shift => {
+                KeyCode::Char('L') => {
                     let level = view
                         .model
                         .read(cx)
@@ -520,14 +629,25 @@ impl Render for View {
                     cx.stop_propagation();
                     return;
                 }
-                _ => {}
+                KeyCode::Esc
+                | KeyCode::Backspace
+                | KeyCode::F(3)
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Char(
+                    'r' | 'w' | 's' | 'n' | 'N' | ' ' | 'h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'u'
+                    | 'd',
+                ) => {}
+                _ => return,
             }
-            if let Some(key) = crate::keys::from_keystroke(&event.keystroke, event.is_held) {
-                let mut command = Command::None;
-                view.mutate(|v| command = v.key(key), cx);
-                view.command(command, cx);
-                cx.stop_propagation();
-            }
+            view.log_key(key, cx);
+            cx.stop_propagation();
         }))
     }
 }

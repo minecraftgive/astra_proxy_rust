@@ -16,6 +16,37 @@ fn key(c: char) -> KeyEvent {
 }
 
 #[test]
+fn modified_log_shortcuts_do_not_run_plain_actions_or_insert_text() {
+    let mut view = Viewer::new("test".into(), Settings::default());
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        for ch in ['m', 'v', 'r', 'w', ' ', '/'] {
+            let wrap = view.settings.wrap;
+            assert!(matches!(
+                view.key(KeyEvent::new(KeyCode::Char(ch), modifiers)),
+                Command::None
+            ));
+            assert!(view.browsing());
+            assert!(!view.paused());
+            assert_eq!(view.settings.wrap, wrap);
+        }
+    }
+    view.key(key('m'));
+    view.key(key('2'));
+    view.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+    view.key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ));
+    assert!(matches!(&view.settings.mode, Mode::MemoryLimit(text) if text == "2"));
+    view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(view.settings.memory_lines, 2);
+}
+
+#[test]
 fn pause_freezes_display_while_collection_and_rotation_continue() {
     let mut view = Viewer::new("test".into(), Settings::default());
     view.settings.memory_lines = 1;

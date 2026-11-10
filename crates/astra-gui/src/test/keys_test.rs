@@ -66,6 +66,15 @@ fn bindings_respect_native_input_and_editor_contexts(cx: &mut TestAppContext) {
             assert!(!predicate.eval(std::slice::from_ref(&editor)));
             assert!(!predicate.eval(&[shell.clone(), input.clone()]));
             assert!(!predicate.eval(&[editor.clone(), input.clone()]));
+            if chord.len() == 1 && chord.as_bytes()[0].is_ascii_digit() {
+                let logs = gpui::KeyContext::parse("AstraLogs").unwrap();
+                let picker = gpui::KeyContext::parse("AstraLogs AstraLogPicker").unwrap();
+                assert!(predicate.depth_of(&[shell.clone(), logs.clone()]).is_some());
+                assert!(predicate
+                    .depth_of(&[shell.clone(), logs, input.clone()])
+                    .is_none());
+                assert!(predicate.depth_of(&[shell.clone(), picker]).is_none());
+            }
         }
     });
 }

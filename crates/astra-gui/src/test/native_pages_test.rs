@@ -98,6 +98,127 @@ fn fixture<V: Render + Focusable + EventEmitter<ViewEvent> + 'static>(
     cx.run_until_parked();
     (entity.unwrap(), window, events)
 }
+
+fn held_key(cx: &mut TestAppContext, window: WindowHandle<Root>, chord: &'static str) {
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse(chord).unwrap(),
+                    is_held: true,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn connection_filter_enter_and_escape_restore_list_shortcuts(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    let (view, window, events) = fixture(cx, model.clone(), connections::View::new);
+    for exit in ["enter", "escape"] {
+        cx.simulate_keystrokes(window.into(), "/");
+        cx.simulate_input(window.into(), "example");
+        cx.simulate_keystrokes(window.into(), exit);
+        window
+            .update(cx, |_, window, cx| {
+                assert!(view.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
+    }
+    // Replace the query using the shared model, then act on the filtered row.
+    model.update(cx, |model, cx| {
+        model.client.filter_connections("example".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "x");
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        ViewEvent::Input(ClientInput::Run(
+            Action::Runtime {
+                command: Command::Disconnect(Some(7)),
+                ..
+            },
+            _
+        ))
+    )));
+}
+
+#[gpui::test]
+fn log_session_keys_preserve_selection_and_toggles_ignore_repeats(cx: &mut TestAppContext) {
+    use crate::views::logs;
+    use astra_client::logs::{Mode, Viewer};
+    cx.update(gpui_component::init);
+    let model = model(cx);
+    model.update(cx, |model, _| {
+        let mut viewer = Viewer::new("@gui".into(), Default::default());
+        viewer.set_sessions(
+            vec![
+                astra_management::v2::LogSession {
+                    id: "current".into(),
+                    started_ms: "0".into(),
+                    size: "0".into(),
+                    current: true,
+                },
+                astra_management::v2::LogSession {
+                    id: "previous".into(),
+                    started_ms: "0".into(),
+                    size: "0".into(),
+                    current: false,
+                },
+            ],
+            "/unused/logs".into(),
+        );
+        model.client.tui_viewer = Some(viewer);
+    });
+    let (_, window, events) = fixture(cx, model.clone(), logs::View::frontend);
+    cx.simulate_keystrokes(window.into(), "s down");
+    model.read_with(cx, |model, _| {
+        assert!(matches!(
+            model.client.tui_viewer.as_ref().unwrap().settings.mode,
+            Mode::Session(1)
+        ));
+    });
+    cx.simulate_keystrokes(window.into(), "escape");
+    model.read_with(cx, |model, _| {
+        let viewer = model.client.tui_viewer.as_ref().unwrap();
+        assert!(viewer.browsing() && viewer.settings.session.is_none());
+    });
+    cx.simulate_keystrokes(window.into(), "s down enter");
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.client.log_settings["@gui"].session.as_deref(),
+            Some("previous")
+        );
+    });
+    assert!(events.borrow().iter().any(|event| matches!(event,
+        ViewEvent::Input(ClientInput::Run(Action::Logs(name), None)) if name == "@gui")));
+    assert!(!events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, ViewEvent::Dismiss)));
+    cx.simulate_keystrokes(window.into(), "space w");
+    held_key(cx, window, "space");
+    held_key(cx, window, "w");
+    cx.simulate_keystrokes(window.into(), "ctrl-m alt-m shift-m");
+    model.read_with(cx, |model, _| {
+        let viewer = model.client.tui_viewer.as_ref().unwrap();
+        assert!(viewer.paused() && viewer.settings.wrap && viewer.browsing());
+    });
+    cx.simulate_keystrokes(window.into(), "m");
+    cx.simulate_input(window.into(), "12");
+    cx.simulate_keystrokes(window.into(), "enter space");
+    model.read_with(cx, |model, _| {
+        let viewer = model.client.tui_viewer.as_ref().unwrap();
+        assert_eq!(viewer.settings.memory_lines, 12);
+        assert!(!viewer.paused());
+    });
+}
 #[gpui::test]
 fn native_page_controls_emit_shared_actions_and_preserve_runtime_identity(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -184,6 +305,11 @@ fn server_page_has_no_proxy_fallback_and_recovery_retries_the_saved_operation(
         )
     });
     let (_, window, events) = fixture(cx, model.clone(), recovery::View::new);
+    cx.simulate_keystrokes(window.into(), "ctrl-c alt-c shift-c");
+    assert!(
+        events.borrow().is_empty(),
+        "modified C must not retry recovery"
+    );
     cx.simulate_keystrokes(window.into(), "c");
     assert!(
         matches!(&events.borrow()[0],ViewEvent::Input(ClientInput::Run(Action::Start(name),None))if name=="proxy")
@@ -296,6 +422,13 @@ fn observability_tasks_cancel_only_running_records_and_refresh_updates(cx: &mut 
         1
     );
     assert_eq!(events.borrow().len(), 1);
+    cx.simulate_keystrokes(window.into(), "ctrl-f5 alt-f5 shift-f5");
+    held_key(cx, window, "f5");
+    assert_eq!(
+        events.borrow().len(),
+        1,
+        "only an unmodified F5 press refreshes"
+    );
     cx.simulate_keystrokes(window.into(), "f5");
     assert!(events.borrow().iter().any(|event| matches!(
         event,

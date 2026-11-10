@@ -26,6 +26,9 @@ impl Ui {
             .await
     }
     pub(super) fn installation_key(&mut self, key: event::KeyEvent) -> Input {
+        if !key.modifiers.is_empty() {
+            return Input::Idle;
+        }
         if key.kind == KeyEventKind::Repeat
             && !matches!(
                 key.code,

@@ -1,10 +1,13 @@
-use crate::input::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::protocol::*;
 use crate::{i18n::t, tr};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, collections::VecDeque, path::Path};
 use tokio::{sync::mpsc, task::JoinHandle};
+
+/// Common log controls, shared by native and terminal help.
+pub const KEY_HELP: &str = "m memory limit · / search · f filter · v level · Space pause\nn/N next/previous · w wrap · L capture · r reconnect · End follow · Esc back";
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub enum Mode {
@@ -571,6 +574,30 @@ impl Viewer {
     }
 
     pub fn key(&mut self, mut key: KeyEvent) -> Command {
+        // Only plain/Shift text and the explicit Ctrl chords belong to logs.
+        // Modified application shortcuts must not become plain log actions.
+        if key.kind == KeyEventKind::Release
+            || !matches!(
+                key.modifiers,
+                KeyModifiers::NONE | KeyModifiers::SHIFT | KeyModifiers::CONTROL
+            )
+            || (key.modifiers == KeyModifiers::CONTROL
+                && !matches!(key.code, KeyCode::Char('f' | 'u' | 'd')))
+        {
+            return Command::None;
+        }
+        if key.modifiers == KeyModifiers::CONTROL {
+            let allowed = if self.browsing() {
+                key.code == KeyCode::Char('f')
+                    || (self.settings.vim_navigation
+                        && matches!(key.code, KeyCode::Char('u' | 'd')))
+            } else {
+                self.accepts_text_input() && key.code == KeyCode::Char('u')
+            };
+            if !allowed {
+                return Command::None;
+            }
+        }
         if !self.capture_supported && matches!(self.settings.mode, Mode::CaptureLevel(_)) {
             self.cancel_input();
             return Command::None;

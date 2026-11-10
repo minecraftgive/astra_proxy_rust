@@ -3,6 +3,64 @@ use astra_client::editor::{Editor, Mode};
 use gpui::{AppContext, Focusable, TestAppContext};
 
 #[gpui::test]
+fn log_limit_editing_returns_focus_and_preserves_application_shortcuts(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys(keys::bindings(cx));
+    });
+    let (commands, _receiver) = async_channel::unbounded();
+    let model = cx.new(|_| AppModel::new_test(Kind::Proxy, commands));
+    model.update(cx, |model, _| {
+        model.client.viewer = Some(astra_client::logs::Viewer::new(
+            "proxy".into(),
+            Default::default(),
+        ));
+    });
+    let mut app = None;
+    let handle = cx.add_window(|window, cx| {
+        let view = cx.new(|cx| AppWindow::new(model.clone(), Some(4), window, cx));
+        app = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app = app.unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle.into(), "m");
+    cx.simulate_input(handle.into(), "25");
+    cx.simulate_keystrokes(handle.into(), "enter space");
+    model.read_with(cx, |model, _| {
+        let viewer = model.client.viewer.as_ref().unwrap();
+        assert_eq!(viewer.settings.memory_lines, 25);
+        assert!(viewer.paused(), "Enter must return focus to log shortcuts");
+    });
+    // Invalid drafts stay editable; Escape cancels them without leaving Logs.
+    cx.simulate_keystrokes(handle.into(), "m");
+    cx.simulate_input(handle.into(), "0");
+    cx.simulate_keystrokes(handle.into(), "enter escape");
+    app.read_with(cx, |app, _| assert_eq!(app.page, Some(4)));
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.client.viewer.as_ref().unwrap().settings.memory_lines,
+            25
+        );
+    });
+    cx.simulate_keystrokes(handle.into(), "f");
+    cx.simulate_input(handle.into(), "q1/ ");
+    cx.simulate_keystrokes(handle.into(), "enter space");
+    model.read_with(cx, |model, _| {
+        let viewer = model.client.viewer.as_ref().unwrap();
+        assert_eq!(viewer.settings.filter, "q1/ ");
+        assert!(!viewer.paused());
+    });
+    // A page's raw key handler must not consume registered application actions.
+    cx.simulate_keystrokes(handle.into(), "f6");
+    app.read_with(cx, |app, _| assert_eq!(app.panel, Some(Panel::Tasks)));
+    cx.simulate_keystrokes(handle.into(), "escape 2");
+    app.read_with(cx, |app, _| assert_eq!(app.page, Some(1)));
+    cx.simulate_keystrokes(handle.into(), "5 7");
+    app.read_with(cx, |app, _| assert_eq!(app.page, Some(6)));
+}
+
+#[gpui::test]
 fn nettools_chords_bypass_global_bindings_and_keep_overlay_shortcuts(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

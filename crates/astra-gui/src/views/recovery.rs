@@ -77,7 +77,10 @@ impl Render for View {
             .p_6()
             .overflow_y_scroll()
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                if !view.focus.is_focused(window) || event.is_held {
+                if !view.focus.is_focused(window)
+                    || event.is_held
+                    || event.keystroke.modifiers != gpui::Modifiers::default()
+                {
                     return;
                 }
                 let action = match event.keystroke.key.as_str() {

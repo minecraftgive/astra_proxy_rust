@@ -118,7 +118,7 @@ impl Ui {
         self.monitor = None;
     }
     pub(super) fn command_key(&mut self, key: event::KeyEvent) -> Option<Input> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
         if ctrl && key.code == KeyCode::Char('c') {
             return Some(self.run_command(Id::Quit));
         }
@@ -168,7 +168,7 @@ impl Ui {
             self.suspend_editor();
             return Some(self.navigate(shell::page_at(next)));
         }
-        if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) {
+        if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
             match key.code {
                 KeyCode::Char(c @ '1'..='8') => {
                     self.suspend_editor();

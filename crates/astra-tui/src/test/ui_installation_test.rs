@@ -131,6 +131,20 @@ fn installation_panel_renders_all_roles_target_and_result_on_small_terminals() {
 fn installation_launch_controls_support_keys_and_ignore_key_repeat() {
     let mut ui = fixture();
     assert!(ui.client.update_launch.automatic);
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        for code in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Esc] {
+            assert!(matches!(
+                ui.key(event::KeyEvent::new(code, modifiers)),
+                Input::Idle
+            ));
+            assert!(ui.installation.open);
+            assert!(ui.client.update_launch.automatic);
+        }
+    }
     press(&mut ui, KeyCode::Char('a'));
     assert!(!ui.client.update_launch.automatic);
     ui.installation_key(event::KeyEvent::new_with_kind(

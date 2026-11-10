@@ -237,10 +237,10 @@ impl Ui {
         false
     }
     pub(super) fn background_key(&mut self, key: event::KeyEvent) -> Option<Input> {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             return Some(Input::Quit);
         }
-        if key.code == KeyCode::F(6) {
+        if key.code == KeyCode::F(6) && key.modifiers.is_empty() {
             self.client.tasks.details = if self.client.tasks.details.is_some() {
                 None
             } else {
@@ -258,7 +258,7 @@ impl Ui {
             };
             return Some(Input::Idle);
         }
-        if key.code == KeyCode::F(7) {
+        if key.code == KeyCode::F(7) && key.modifiers.is_empty() {
             self.client.tasks.details = None;
             return Some(if self.tui_viewer.take().is_some() {
                 Input::Idle
@@ -302,7 +302,14 @@ impl Ui {
     pub(super) fn render_background(&self, f: &mut Frame<'_>) {
         let area = f.area();
         if let Some(viewer) = &self.tui_viewer {
-            viewer.render(f, area);
+            // The task status owns the final row. Keep it outside the log
+            // viewport so it cannot erase the log shortcuts and bottom border.
+            let log_area = ratatui::layout::Rect {
+                height: area.height.saturating_sub(1),
+                ..area
+            };
+            f.render_widget(Clear, log_area);
+            viewer.render(f, log_area);
             self.hits.borrow_mut().clear();
         }
         if let Some(scroll) = self.client.tasks.details {

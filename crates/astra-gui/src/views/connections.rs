@@ -72,19 +72,25 @@ impl View {
                 }
                 cx.notify();
             }),
-            cx.subscribe(&filter, |view, state, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let query = state.read(cx).value().to_string();
-                    view.dispatch(
-                        |client| {
-                            client.filter_connections(query);
-                            ClientInput::Idle
-                        },
-                        cx,
-                    );
-                }
-                cx.notify();
-            }),
+            cx.subscribe_in(
+                &filter,
+                window,
+                |view, state, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let query = state.read(cx).value().to_string();
+                        view.dispatch(
+                            |client| {
+                                client.filter_connections(query);
+                                ClientInput::Idle
+                            },
+                            cx,
+                        );
+                    } else if matches!(event, InputEvent::PressEnter { .. }) {
+                        window.focus(&view.focus, cx);
+                    }
+                    cx.notify();
+                },
+            ),
         ];
         Self {
             model,
@@ -106,11 +112,17 @@ impl View {
         window.focus(&self.focus, cx);
     }
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus.is_focused(window)
-            || event.keystroke.modifiers.control
+        if event.keystroke.modifiers.control
             || event.keystroke.modifiers.alt
             || event.keystroke.modifiers.platform
         {
+            return;
+        }
+        if !self.focus.is_focused(window) {
+            if event.keystroke.key == "escape" {
+                window.focus(&self.focus, cx);
+                cx.stop_propagation();
+            }
             return;
         }
         match event.keystroke.key.as_str() {

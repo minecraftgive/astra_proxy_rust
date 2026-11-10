@@ -150,7 +150,7 @@ impl Render for Viewer {
                 Block::default()
                     .borders(Borders::ALL)
                     .title_bottom(Line::from(crate::theme::key_hints(t(
-                        "End bottom / follow",
+                        "m memory limit · End bottom / follow",
                     )))),
             ),
             parts[1],

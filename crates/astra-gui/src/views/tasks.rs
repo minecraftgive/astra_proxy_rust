@@ -156,7 +156,11 @@ impl Render for View {
             );
         }
         root.on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-            if view.focus.is_focused(window) && event.keystroke.key == "f5" {
+            if view.focus.is_focused(window)
+                && event.keystroke.key == "f5"
+                && !event.is_held
+                && event.keystroke.modifiers == gpui::Modifiers::default()
+            {
                 cx.emit(ViewEvent::Input(astra_client::state::Input::Run(
                     astra_client::protocol::Action::UpdateStatus,
                     None,

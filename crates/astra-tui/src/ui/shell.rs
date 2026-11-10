@@ -272,7 +272,7 @@ impl Ui {
     pub(super) fn viewer_page_key(&mut self, key: event::KeyEvent) -> Option<Input> {
         if self.page == LOGS
             && key.code == KeyCode::Char('f')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers == KeyModifiers::CONTROL
         {
             let viewer = self.viewer.as_mut().filter(|v| v.browsing())?;
             viewer.begin_search();
@@ -700,7 +700,7 @@ impl Ui {
         } else if self.editor.is_some() {
             "Enter edit · Space toggle · Ctrl-S save · Ctrl-Z/Y undo/redo · Esc retain draft"
         } else if self.viewer.is_some() {
-            "End bottom · [ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
+            "m memory limit · End bottom · [ ] source · / search · f filter · v level · Space pause · Esc close · ? all keys"
         } else if self.runtime_picker.is_some() {
             "↑↓ member · Enter select · / find · t test · Esc groups"
         } else {
