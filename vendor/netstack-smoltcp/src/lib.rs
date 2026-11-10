@@ -20,3 +20,6 @@ pub use stack::{Stack, StackBuilder};
 
 /// Re-export
 pub use smoltcp;
+
+mod staging;
+pub use staging::{metrics as staging_metrics, observe as observe_staging, Event as StagingEvent};

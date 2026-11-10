@@ -99,6 +99,7 @@ class Resources:
         self.errors = set()
         self.process_names = set()
         self.samples = 0
+        self.per_process = {}
         self.lock = threading.Lock()
 
     def sample(self):
@@ -127,7 +128,11 @@ class Resources:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
                 self.cpu[identity] = max(self.cpu.get(identity, 0), cpu.user + cpu.system)
-                total_rss += process.memory_info().rss
+                rss = process.memory_info().rss
+                total_rss += rss
+                record = self.per_process.setdefault(identity, {"pid": process.pid, "name": process.name(), "sampled_peak_rss_bytes": 0, "sampled_cpu_seconds": 0})
+                record["sampled_peak_rss_bytes"] = max(record["sampled_peak_rss_bytes"], rss)
+                record["sampled_cpu_seconds"] = max(record["sampled_cpu_seconds"], cpu.user + cpu.system)
                 self.process_names.add(process.name())
                 alive += 1
             except psutil.Error as error:
@@ -158,6 +163,7 @@ class Resources:
             'sampled_peak_aggregate_rss_bytes': self.peak_rss if self.samples else None,
             'peak_process_count': self.peak_processes if self.samples else None,
             'process_names': sorted(self.process_names),
+            'per_process': list(self.per_process.values()),
             'sample_interval_ms': 100,
             'samples': self.samples,
             'collection_errors': sorted(self.errors),

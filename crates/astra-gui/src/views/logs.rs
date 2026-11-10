@@ -24,6 +24,7 @@ pub struct View {
     observations: Vec<Subscription>,
     scroll: gpui::ListState,
     signature: Option<(String, u64, String, Option<LogLevel>, bool)>,
+    presentation: astra_client::logs::PresentationCache,
     reveal: bool,
     error: Option<String>,
 }
@@ -103,6 +104,7 @@ impl View {
             observations,
             scroll: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             signature: None,
+            presentation: Default::default(),
             reveal: true,
             error: None,
         };
@@ -174,6 +176,7 @@ impl View {
         }
     }
     pub fn open_source(&mut self, source: String, cx: &mut Context<Self>) {
+        self.presentation = Default::default();
         self.frontend = astra_client::tui_log::source_name(&source).is_some();
         self.model.update(cx, |model, cx| {
             model.tokio(|c| {
@@ -263,22 +266,28 @@ impl Render for View {
         }
         root = root.child(toolbar);
         let Some(viewer) = client.log_viewer(self.frontend) else {
+            self.presentation = Default::default();
             return root.child(Empty::new(t("Logs"), t("连接中")));
         };
-        let rows = std::sync::Arc::new(
-            viewer
-                .visible()
-                .iter()
-                .map(|record| (*record).clone())
-                .collect::<Vec<_>>(),
-        );
+        self.presentation.update(viewer);
+        let rows = self.presentation.rows.clone();
         let follow = viewer.settings.follow;
         let wrap = viewer.settings.wrap;
         let display = viewer.settings.min_level;
         let capture = viewer.capture_level;
         let supported = viewer.capture_supported;
         let status = viewer.status.clone();
-        let top = viewer.selected_record_index();
+        let top = if self.reveal && !follow {
+            let mut height = 0;
+            rows.iter()
+                .position(|record| {
+                    height += viewer.row_count(record);
+                    height > viewer.top
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let signature = (
             viewer.name.clone(),
             viewer.revision,
@@ -388,12 +397,7 @@ impl Render for View {
                         cx.listener(|view, _, _, cx| view.command(Command::Reconnect, cx)),
                     )),
             );
-        let width = rows
-            .iter()
-            .map(|r| r.text.chars().count())
-            .max()
-            .unwrap_or(0) as f32
-            * 8.;
+        let width = self.presentation.width_chars as f32 * 8.;
         let list = list(self.scroll.clone(), move |index, _, cx| {
             let record = &rows[index];
             let color = match record.level {
@@ -406,7 +410,7 @@ impl Render for View {
                 .text_xs()
                 .font_family(crate::theme::mono(cx))
                 .text_color(color)
-                .child(record.text.clone());
+                .child(gpui::SharedString::from(record.text.clone()));
             if wrap {
                 row.w_full().into_any_element()
             } else {

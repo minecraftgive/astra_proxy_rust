@@ -1,5 +1,6 @@
 //! Reusable, OS-independent proxy protocols and transports.
 pub mod accept;
+pub mod adaptive;
 pub mod config;
 pub mod datagram;
 pub mod egress;

@@ -69,8 +69,41 @@ impl Drop for Feed {
 }
 #[derive(Clone)]
 pub struct Record {
-    pub text: String,
+    pub text: std::sync::Arc<str>,
     pub level: Option<LogLevel>,
+}
+/// A view-owned snapshot: redraws share immutable text and only rebuild on change.
+#[derive(Default)]
+pub struct PresentationCache {
+    signature: Option<(u64, u64, String, Option<LogLevel>, bool)>,
+    pub rows: std::sync::Arc<[Record]>,
+    pub width_chars: usize,
+}
+impl PresentationCache {
+    pub fn update(&mut self, viewer: &Viewer) {
+        let signature = (
+            viewer.generation,
+            if viewer.paused() {
+                viewer.frozen_revision
+            } else {
+                viewer.content_revision
+            },
+            viewer.settings.filter.clone(),
+            viewer.settings.min_level,
+            viewer.paused(),
+        );
+        if self.signature.as_ref() == Some(&signature) {
+            return;
+        }
+        let rows: Vec<_> = viewer.visible().into_iter().cloned().collect();
+        self.width_chars = rows
+            .iter()
+            .map(|r| r.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.rows = rows.into();
+        self.signature = Some(signature);
+    }
 }
 pub enum Command {
     None,
@@ -106,6 +139,9 @@ pub struct Viewer {
     pub vim_g: bool,
     pub frozen: Option<(VecDeque<Record>, String)>,
     pub revision: u64,
+    generation: u64,
+    content_revision: u64,
+    frozen_revision: u64,
 }
 impl Viewer {
     pub fn with_waker(mut self, waker: crate::waker::Waker) -> Self {
@@ -113,6 +149,7 @@ impl Viewer {
         self
     }
     pub fn new(name: String, mut settings: Settings) -> Self {
+        static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         settings.memory_lines = settings.memory_lines.clamp(1, 100_000);
         if settings.level_order_version == 0 {
             match &mut settings.mode {
@@ -146,6 +183,9 @@ impl Viewer {
             vim_g: false,
             frozen: None,
             revision: 0,
+            generation: NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            content_revision: 0,
+            frozen_revision: 0,
         }
     }
     pub async fn connect(&mut self, socket: &Path) -> Result<()> {
@@ -298,6 +338,7 @@ impl Viewer {
                 self.records.clone(),
                 crate::tui_log::stamp(astra_ipc::progress::now_ms()),
             ));
+            self.frozen_revision = self.content_revision;
             self.settings.follow = false;
         }
         self.revision = self.revision.wrapping_add(1);
@@ -404,11 +445,17 @@ impl Viewer {
     pub fn push(&mut self, text: String) {
         self.bytes += text.len();
         let level = detect_level(&text);
-        self.records.push_back(Record { text, level });
+        self.revision = self.revision.wrapping_add(1);
+        self.content_revision = self.content_revision.wrapping_add(1);
+        self.records.push_back(Record {
+            text: text.into(),
+            level,
+        });
         self.evict();
     }
     pub fn evict(&mut self) {
         // The manager streams an existing on-disk log: eviction never loses its source.
+        let before = self.records.len();
         while self.records.len() > self.settings.memory_lines || self.bytes > 2 * 1024 * 1024 {
             if let Some(line) = self.records.pop_front() {
                 self.bytes -= line.text.len();
@@ -417,6 +464,10 @@ impl Viewer {
                     self.top = self.top.saturating_sub(self.row_count(&line));
                 }
             }
+        }
+        if self.records.len() != before {
+            self.content_revision = self.content_revision.wrapping_add(1);
+            self.revision = self.revision.wrapping_add(1);
         }
     }
     pub fn matches(&self, line: &Record) -> bool {
@@ -430,11 +481,17 @@ impl Viewer {
                 .contains(&self.settings.filter.to_lowercase()))
     }
     pub fn visible(&self) -> Vec<&Record> {
+        let filter = self.settings.filter.to_lowercase();
         self.frozen
             .as_ref()
             .map_or(&self.records, |(records, _)| records)
             .iter()
-            .filter(|line| self.matches(line))
+            .filter(|line| {
+                self.settings.min_level.is_none_or(|min| {
+                    line.level
+                        .is_none_or(|level| level.severity() >= min.severity())
+                }) && (filter.is_empty() || line.text.to_lowercase().contains(&filter))
+            })
             .collect()
     }
     pub fn browsing(&self) -> bool {

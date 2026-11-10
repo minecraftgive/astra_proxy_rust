@@ -1,5 +1,7 @@
 //! Bounded DNS cache and address mappings, independent of platform and proxy I/O.
+mod cache;
 pub mod config;
+mod maintenance;
 mod mapping;
 mod query_log;
 mod resolver;

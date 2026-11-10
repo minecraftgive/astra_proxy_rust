@@ -83,7 +83,7 @@ impl Query {
             record.upstream = Some(bounded(upstream, 200));
         }
     }
-    pub fn finish(&mut self, result: Result<Option<Message>, String>) {
+    pub fn finish(&mut self, result: Result<Option<&Message>, String>) {
         if let Some(record) = &mut self.record {
             match result {
                 Ok(Some(reply)) => {

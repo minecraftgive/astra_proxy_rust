@@ -37,11 +37,11 @@ async fn accepted_socket_keeps_tcp_windows_with_smaller_staging_rings() {
         let control = stream.control.lock();
         assert_eq!(
             control.recv_buffer.capacity(),
-            staging.unwrap_or(256 * 1024) as usize
+            staging.map(|n| n.min(4096)).unwrap_or(256 * 1024) as usize
         );
         assert_eq!(
             control.send_buffer.capacity(),
-            staging.unwrap_or(512 * 1024) as usize
+            staging.map(|n| n.min(4096)).unwrap_or(512 * 1024) as usize
         );
     }
 }

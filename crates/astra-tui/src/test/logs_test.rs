@@ -4,7 +4,7 @@ use astra_client::input::{KeyCode, KeyEvent, KeyModifiers};
 fn wrapping_preserves_unicode_tail_navigation_search_and_settings() {
     let mut view = Viewer::new("test".into(), Settings::default());
     view.records.push_back(Record {
-        text: format!("INFO {}TAIL", "中文長字串".repeat(12)),
+        text: format!("INFO {}TAIL", "中文長字串".repeat(12)).into(),
         level: Some(LogLevel::Info),
     });
     view.records.push_back(Record {
@@ -70,7 +70,7 @@ fn fixed_capture_logs_discard_pending_capture_and_keep_display_filtering() {
     ));
     assert_eq!(view.settings.min_level, Some(LogLevel::Error));
     assert_eq!(view.visible().len(), 1);
-    assert_eq!(view.visible()[0].text, "ERROR failed");
+    assert_eq!(view.visible()[0].text.as_ref(), "ERROR failed");
 }
 fn event(bytes: &[u8], offset: u64, reset: bool) -> LogEvent {
     LogEvent::Data {

@@ -509,6 +509,10 @@ action='proxy:second'
 ",
     );
     assert!(engine.regex_set.is_some());
+    assert!(
+        engine.regex_fallback.is_empty(),
+        "combined matcher must not retain individual automata"
+    );
     assert_eq!(
         engine.decide(&request("ABC.test", None)),
         RouteAction::Block
@@ -783,4 +787,28 @@ fn malformed_geosite_selector_is_not_hidden_by_a_later_missing_group() {
     config.rules.swap(0, 1);
     assert!(RuleEngine::compile_at(&config, &dir).is_ok());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn regex_fallback_preserves_decisions_and_explanations() {
+    let mut engine = compile("[[rules]]\nkind='domain_regex'\nvalue='^a.*'\naction='block'\n[[rules]]\nkind='domain_regex'\nvalue='^ab'\naction='direct'");
+    let requests = [request("ABC.test", None), request("other.test", None)];
+    let expected: Vec<_> = requests
+        .iter()
+        .map(|r| {
+            let d = engine.decision(r);
+            (d.action, engine.matched_condition(&d.path))
+        })
+        .collect();
+    // A combined-set allocation failure selects these individually validated patterns.
+    engine.regex_fallback = engine
+        .regexes
+        .iter()
+        .map(|(p, _)| compile_regex(p).unwrap())
+        .collect();
+    engine.regex_set = None;
+    for (request, expected) in requests.iter().zip(expected) {
+        let d = engine.decision(request);
+        assert_eq!((d.action, engine.matched_condition(&d.path)), expected);
+    }
 }

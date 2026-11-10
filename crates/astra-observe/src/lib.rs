@@ -40,6 +40,9 @@ impl Handle {
     pub fn add(&self, amount: u64) {
         self.0.fetch_add(amount, Ordering::Relaxed);
     }
+    pub fn subtract(&self, amount: u64) {
+        self.0.fetch_sub(amount, Ordering::Relaxed);
+    }
     pub fn set(&self, value: u64) {
         self.0.store(value, Ordering::Relaxed);
     }

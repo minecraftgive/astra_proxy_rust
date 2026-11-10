@@ -140,7 +140,11 @@ async fn download_keeps_the_first_write_deadline_for_a_batch() {
     .await
     .unwrap_err();
     assert!(error.is::<tokio::time::error::Elapsed>());
-    assert!(writer.bytes >= 16384 && writer.bytes < payload.len());
+    assert_eq!(
+        writer.bytes,
+        astra_protocols::adaptive::MIN_SIZE,
+        "only the first write may finish before the original batch deadline"
+    );
     assert_eq!(stats.download.load(Ordering::Relaxed), 0);
     assert_eq!(*updates.borrow(), initial);
     assert!(!updates.has_changed().unwrap());

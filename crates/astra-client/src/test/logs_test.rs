@@ -23,8 +23,8 @@ fn pause_freezes_display_while_collection_and_rotation_continue() {
     view.toggle_pause();
     view.push("INFO second".into());
     assert!(view.paused());
-    assert_eq!(view.visible()[0].text, "INFO first");
-    assert_eq!(view.records[0].text, "INFO second");
+    assert_eq!(view.visible()[0].text.as_ref(), "INFO first");
+    assert_eq!(view.records[0].text.as_ref(), "INFO second");
     view.apply(LogEvent::Data {
         bytes: b"WARN rotated\n".to_vec(),
         cursor: LogCursor {
@@ -35,10 +35,10 @@ fn pause_freezes_display_while_collection_and_rotation_continue() {
         reset: true,
         skip_prefix: false,
     });
-    assert_eq!(view.visible()[0].text, "INFO first");
+    assert_eq!(view.visible()[0].text.as_ref(), "INFO first");
     view.toggle_pause();
     assert!(!view.paused());
-    assert_eq!(view.visible()[0].text, "WARN rotated");
+    assert_eq!(view.visible()[0].text.as_ref(), "WARN rotated");
     assert!(view.settings.follow);
 }
 #[test]
@@ -98,7 +98,7 @@ fn memory_limit_is_editable_persistent_and_releases_old_rows_immediately() {
     view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(view.records.len(), 3);
     assert_eq!(view.dropped, 97);
-    assert_eq!(view.records.front().unwrap().text, "INFO 97");
+    assert_eq!(view.records.front().unwrap().text.as_ref(), "INFO 97");
     let settings = serde_json::from_slice(&serde_json::to_vec(&view.settings).unwrap()).unwrap();
     let restored = Viewer::new("proxy".into(), settings);
     assert_eq!(restored.settings.memory_lines, 3);
@@ -227,12 +227,15 @@ fn fragmented_utf8_ansi_and_rotation_keep_valid_complete_lines() {
     view.apply(event(&text[..split], split as u64, true));
     assert!(view.records.is_empty());
     view.apply(event(&text[split..], text.len() as u64, false));
-    assert_eq!(view.records[0].text, "2026-10-18 INFO target: 中文");
+    assert_eq!(
+        view.records[0].text.as_ref(),
+        "2026-10-18 INFO target: 中文"
+    );
     view.apply(event(b"\x1b[31mERROR bad\x1b[0m\n", 100, false));
-    assert_eq!(view.records[1].text, "ERROR bad");
+    assert_eq!(view.records[1].text.as_ref(), "ERROR bad");
     assert_eq!(view.records[1].level, Some(LogLevel::Error));
     view.apply(event(b"WARN rotated\n", 13, true));
-    assert_eq!(view.records.back().unwrap().text, "WARN rotated");
+    assert_eq!(view.records.back().unwrap().text.as_ref(), "WARN rotated");
     // Following the current session, a reset means a new session began.
     assert!(view
         .records
@@ -350,4 +353,69 @@ fn session_picker_selects_earlier_sessions_without_persisting_the_choice() {
         "/state/logs/proxy".into(),
     );
     assert_eq!(view.settings.session, None);
+}
+
+#[test]
+fn presentation_shares_text_and_reuses_unchanged_rows() {
+    let mut viewer = Viewer::new("test".into(), Settings::default());
+    viewer.push("INFO first".into());
+    let mut cache = PresentationCache::default();
+    cache.update(&viewer);
+    let rows = cache.rows.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        &rows[0].text,
+        &viewer.records[0].text
+    ));
+    cache.update(&viewer);
+    assert!(std::sync::Arc::ptr_eq(&rows, &cache.rows));
+    viewer.toggle_pause();
+    viewer.push("WARN second".into());
+    cache.update(&viewer);
+    assert_eq!(cache.rows.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&rows[0].text, &cache.rows[0].text));
+    let paused = cache.rows.clone();
+    viewer.push("INFO third".into());
+    cache.update(&viewer);
+    assert!(std::sync::Arc::ptr_eq(&paused, &cache.rows));
+    viewer.toggle_pause();
+    viewer.settings.filter = "second".into();
+    cache.update(&viewer);
+    assert_eq!(cache.rows[0].text.as_ref(), "WARN second");
+    assert_eq!(cache.width_chars, 11);
+}
+
+#[test]
+fn presentation_ignores_status_updates_and_tracks_history_eviction() {
+    let mut viewer = Viewer::new("test".into(), Settings::default());
+    viewer.push("INFO a long first line".into());
+    viewer.push("INFO last".into());
+    let mut cache = PresentationCache::default();
+    cache.update(&viewer);
+    let rows = cache.rows.clone();
+    viewer.apply(LogEvent::Waiting);
+    cache.update(&viewer);
+    assert!(std::sync::Arc::ptr_eq(&rows, &cache.rows));
+    viewer.set_memory_limit("1").unwrap();
+    cache.update(&viewer);
+    assert_eq!(cache.rows.len(), 1);
+    assert_eq!(cache.rows[0].text.as_ref(), "INFO last");
+    assert_eq!(cache.width_chars, 9);
+    viewer.toggle_pause();
+    viewer.push("INFO current".into());
+    viewer.set_follow(true);
+    cache.update(&viewer);
+    assert_eq!(cache.rows[0].text.as_ref(), "INFO current");
+}
+
+#[test]
+fn presentation_refreshes_when_a_session_replaces_the_viewer_with_equal_revision() {
+    let mut cache = PresentationCache::default();
+    let mut previous = Viewer::new("proxy".into(), Settings::default());
+    previous.push("INFO previous session".into());
+    cache.update(&previous);
+    let mut current = Viewer::new("proxy".into(), Settings::default());
+    current.push("INFO current session".into());
+    assert_eq!(previous.revision, current.revision);
+    cache.update(&current);
+    assert_eq!(cache.rows[0].text.as_ref(), "INFO current session");
 }

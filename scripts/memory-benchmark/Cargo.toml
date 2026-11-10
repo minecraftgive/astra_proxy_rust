@@ -1,0 +1,25 @@
+[package]
+name = "astra-memory-benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[features]
+legacy = []
+[dependencies]
+astra-client = { path = "../../crates/astra-client" }
+astra-rule = { path = "../../crates/astra-rule" }
+astra-dns = { path = "../../crates/astra-dns" }
+astra-model = { path = "../../crates/astra-model" }
+astra-observe = { path = "../../crates/astra-observe" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util"] }
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+serde_json = "1"
+toml = "0.9"
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+panic = "unwind"

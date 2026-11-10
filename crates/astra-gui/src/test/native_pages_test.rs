@@ -229,7 +229,7 @@ fn observability_logs_route_commands_to_the_visible_source(cx: &mut TestAppConte
         let mut frontend = astra_client::logs::Viewer::new("@gui".into(), Default::default());
         for index in 0..2000 {
             frontend.records.push_back(astra_client::logs::Record {
-                text: format!("INFO event {index} {}", "a long record ".repeat(20)),
+                text: format!("INFO event {index} {}", "a long record ".repeat(20)).into(),
                 level: None,
             });
         }

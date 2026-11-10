@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-observe = { path = "../astra-observe" }
 astra-model = { path = "../astra-model" }
 tokio.workspace = true
 serde.workspace = true
@@ -37,3 +38,6 @@ quiche = "0.30"
 [[test]]
 name = "handshakes"
 path = "src/test/handshakes_test.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

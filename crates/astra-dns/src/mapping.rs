@@ -1,9 +1,9 @@
 use super::Config;
 use anyhow::{bail, Result};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,8 @@ pub trait MappingStore: Send + Sync {
 /// object; no mapping tables need to be serialized across worker generations.
 #[derive(Default)]
 pub struct LocalMappingStore {
-    state: Mutex<SharedMappings>,
+    state: Arc<Mutex<SharedMappings>>,
+    maintenance: crate::maintenance::Maintenance,
 }
 
 #[derive(Default)]
@@ -83,6 +84,7 @@ impl SharedMappings {
 
 impl MappingStore for LocalMappingStore {
     fn configure(&self, config: &Config, reserved: &HashSet<IpAddr>) -> Result<()> {
+        self.maintenance.start(&self.state);
         self.state
             .lock()
             .map_err(|_| anyhow::anyhow!("DNS mapping store is unavailable"))?
@@ -95,6 +97,7 @@ impl MappingStore for LocalMappingStore {
         ipv6: bool,
         reserved: &HashSet<IpAddr>,
     ) -> Result<Option<IpAddr>> {
+        self.maintenance.start(&self.state);
         anyhow::ensure!(config.enable && config.fake_ip, "Fake IP is disabled");
         let mut state = self
             .state
@@ -124,9 +127,10 @@ impl MappingStore for LocalMappingStore {
             .fake
             .get(&ip)
             .filter(|entry| entry.expires > Instant::now())
-            .map(|entry| entry.domain.clone()))
+            .map(|entry| entry.domain.to_string()))
     }
     fn observe(&self, config: &Config, domain: &str, ip: IpAddr, ttl: u32) -> Result<()> {
+        self.maintenance.start(&self.state);
         let mut state = self
             .state
             .lock()
@@ -138,16 +142,21 @@ impl MappingStore for LocalMappingStore {
 }
 
 struct Entry {
-    domain: String,
+    domain: Arc<str>,
     expires: Instant,
 }
 struct RealEntry {
-    domain: Option<String>,
+    domain: Option<Arc<str>>,
     expires: Instant,
 }
 pub(crate) struct Mappings {
     fake: HashMap<IpAddr, Entry>,
     real: HashMap<IpAddr, RealEntry>,
+    domains: [HashMap<Arc<str>, IpAddr>; 2],
+    fake_expiry: BTreeSet<(Instant, IpAddr)>,
+    real_expiry: BTreeSet<(Instant, IpAddr)>,
+    fake_underused: crate::maintenance::Underused,
+    real_underused: crate::maintenance::Underused,
     next4: u32,
     next6: u128,
 }
@@ -156,12 +165,40 @@ impl Default for Mappings {
         Self {
             fake: HashMap::new(),
             real: HashMap::new(),
+            domains: Default::default(),
+            fake_expiry: Default::default(),
+            real_expiry: Default::default(),
+            fake_underused: Default::default(),
+            real_underused: Default::default(),
             next4: 2,
             next6: 2,
         }
     }
 }
 impl Mappings {
+    fn expire(&mut self, now: Instant) {
+        while let Some(&(expires, ip)) = self.fake_expiry.first() {
+            if expires > now {
+                break;
+            }
+            self.fake_expiry.pop_first();
+            if let Some(entry) = self.fake.remove(&ip) {
+                self.domains[usize::from(ip.is_ipv6())].remove(&entry.domain);
+                astra_observe::gauge!("dns.mapping.fake.entries", "Fake-IP 映射条目", "count")
+                    .subtract(1);
+            }
+        }
+        while let Some(&(expires, ip)) = self.real_expiry.first() {
+            if expires > now {
+                break;
+            }
+            self.real_expiry.pop_first();
+            if self.real.remove(&ip).is_some() {
+                astra_observe::gauge!("dns.mapping.real.entries", "真实地址映射条目", "count")
+                    .subtract(1);
+            }
+        }
+    }
     pub fn contains_fake(config: &Config, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(ip) => config
@@ -183,16 +220,15 @@ impl Mappings {
         reserved: &std::collections::HashSet<IpAddr>,
     ) -> Result<Option<IpAddr>> {
         let now = Instant::now();
-        self.fake.retain(|_, entry| entry.expires > now);
-        if let Some((ip, entry)) = self
-            .fake
-            .iter_mut()
-            .find(|(ip, entry)| ip.is_ipv6() == ipv6 && entry.domain == domain)
-        {
+        self.expire(now);
+        if let Some(ip) = self.domains[usize::from(ipv6)].get(domain).copied() {
+            let entry = self.fake.get_mut(&ip).expect("mapping index");
+            self.fake_expiry.remove(&(entry.expires, ip));
             entry.expires = entry
                 .expires
                 .max(now + Duration::from_secs(config.mapping_ttl_secs.into()));
-            return Ok(Some(*ip));
+            self.fake_expiry.insert((entry.expires, ip));
+            return Ok(Some(ip));
         }
         if ipv6 && config.fake_ip_range6.is_none() {
             return Ok(None);
@@ -229,10 +265,19 @@ impl Mappings {
                 continue;
             }
             if let std::collections::hash_map::Entry::Vacant(slot) = self.fake.entry(ip) {
+                let domain: Arc<str> = domain.into();
+                let expires = now + Duration::from_secs(config.mapping_ttl_secs.into());
                 slot.insert(Entry {
-                    domain: domain.to_owned(),
-                    expires: now + Duration::from_secs(config.mapping_ttl_secs.into()),
+                    domain: domain.clone(),
+                    expires,
                 });
+                self.domains[usize::from(ipv6)].insert(domain, ip);
+                self.fake_expiry.insert((expires, ip));
+                if self.fake.len().saturating_mul(4) >= self.fake.capacity() {
+                    self.fake_underused = Default::default();
+                }
+                astra_observe::gauge!("dns.mapping.fake.entries", "Fake-IP 映射条目", "count")
+                    .add(1);
                 return Ok(Some(ip));
             }
         }
@@ -245,7 +290,7 @@ impl Mappings {
                 .fake
                 .get(&ip)
                 .filter(|entry| entry.expires > now)
-                .map(|entry| Some(entry.domain.clone()))
+                .map(|entry| Some(entry.domain.to_string()))
                 .ok_or_else(|| {
                     anyhow::anyhow!("unknown or expired Fake IP {ip}; refresh client DNS cache")
                 });
@@ -254,33 +299,68 @@ impl Mappings {
             .real
             .get(&ip)
             .filter(|entry| entry.expires > now)
-            .and_then(|entry| entry.domain.clone()))
+            .and_then(|entry| entry.domain.as_ref().map(ToString::to_string)))
     }
     pub fn observe(&mut self, config: &Config, domain: &str, ip: IpAddr, ttl: u32) {
         if ttl == 0 || Self::contains_fake(config, ip) {
             return;
         }
         let now = Instant::now();
-        self.real.retain(|_, entry| entry.expires > now);
+        self.expire(now);
         if !self.real.contains_key(&ip) && self.real.len() >= config.mapping_capacity {
             return;
         }
         let expires = now + Duration::from_secs(ttl.min(config.cache_max_ttl_secs).into());
-        self.real
-            .entry(ip)
-            .and_modify(|entry| {
-                if entry.domain.as_deref() != Some(domain) {
-                    entry.domain = None;
-                }
-                // Retain ambiguity until all observed answers have expired.
-                entry.expires = entry.expires.max(expires);
-            })
-            .or_insert(RealEntry {
-                domain: Some(domain.to_owned()),
-                expires,
-            });
+        if let Some(entry) = self.real.get_mut(&ip) {
+            self.real_expiry.remove(&(entry.expires, ip));
+            if entry.domain.as_deref() != Some(domain) {
+                entry.domain = None;
+            }
+            entry.expires = entry.expires.max(expires);
+            self.real_expiry.insert((entry.expires, ip));
+        } else {
+            self.real.insert(
+                ip,
+                RealEntry {
+                    domain: Some(domain.into()),
+                    expires,
+                },
+            );
+            self.real_expiry.insert((expires, ip));
+            if self.real.len().saturating_mul(4) >= self.real.capacity() {
+                self.real_underused = Default::default();
+            }
+            astra_observe::gauge!("dns.mapping.real.entries", "真实地址映射条目", "count").add(1);
+        }
     }
 }
+
+impl crate::maintenance::Maintain for SharedMappings {
+    fn maintain(&mut self, now: Instant) {
+        let m = &mut self.mappings;
+        m.expire(now);
+        if m.fake_underused.ready(m.fake.len(), m.fake.capacity(), now) {
+            m.fake.shrink_to_fit();
+            for domains in &mut m.domains {
+                domains.shrink_to_fit();
+            }
+        }
+        if m.real_underused.ready(m.real.len(), m.real.capacity(), now) {
+            m.real.shrink_to_fit();
+        }
+    }
+}
+impl Drop for Mappings {
+    fn drop(&mut self) {
+        astra_observe::gauge!("dns.mapping.fake.entries", "Fake-IP 映射条目", "count")
+            .subtract(self.fake.len() as u64);
+        astra_observe::gauge!("dns.mapping.real.entries", "真实地址映射条目", "count")
+            .subtract(self.real.len() as u64);
+    }
+}
+#[cfg(test)]
+#[path = "test/mapping_memory_test.rs"]
+mod memory_tests;
 
 #[cfg(test)]
 mod diagnostic_tests {

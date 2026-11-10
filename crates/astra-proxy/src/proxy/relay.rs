@@ -50,8 +50,7 @@ where
         inner: a,
         progress: progress.clone(),
     };
-    let copy =
-        tokio::io::copy_bidirectional_with_sizes(&mut a, b, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE);
+    let copy = astra_protocols::adaptive::copy_bidirectional(&mut a, b, COPY_BUFFER_SIZE);
     tokio::select! {
         result = copy => result,
         () = progress.linger_expired(linger) => {

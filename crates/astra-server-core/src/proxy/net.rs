@@ -220,14 +220,15 @@ pub async fn relay(client: Stream, remote: TcpStream, app: Arc<App>) -> Result<(
     let idle = Duration::from_secs(app.config.idle_timeout_secs);
     let (activity, mut updates) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let upload = async {
-        let mut buf = [0; 16384];
+        let mut buf = astra_protocols::adaptive::Buffer::new(16384);
         loop {
-            let n = cr.read(&mut buf).await?;
+            let n = buf.read(&mut cr).await?;
             if n == 0 {
                 rw.shutdown().await?;
                 return Ok::<(), anyhow::Error>(());
             }
-            tokio::time::timeout(idle, rw.write_all(&buf[..n])).await??;
+            tokio::time::timeout(idle, rw.write_all(&buf.bytes()[..n])).await??;
+            buf.completed(n);
             app.stats.upload.fetch_add(n as u64, Ordering::Relaxed);
             activity.send_replace(tokio::time::Instant::now());
         }
@@ -249,14 +250,14 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     activity: &tokio::sync::watch::Sender<tokio::time::Instant>,
     idle: Duration,
 ) -> Result<()> {
-    let mut buf = [0; 16384];
+    let mut buf = astra_protocols::adaptive::Buffer::new(16384);
     let mut next = None;
     let mut unflushed = 0;
     let mut deadline = None;
     loop {
         let n = match next.take() {
             Some(result) => result?,
-            None => reader.read(&mut buf).await?,
+            None => buf.read(reader).await?,
         };
         if n == 0 {
             writer.shutdown().await?;
@@ -264,10 +265,12 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         let batch_deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + idle);
         tokio::time::timeout_at(batch_deadline, async {
-            writer.write_all(&buf[..n]).await?;
+            writer.write_all(&buf.bytes()[..n]).await?;
+            let full = n == buf.len();
+            buf.completed(n);
             unflushed += n;
-            if n == buf.len() && unflushed < 64 * 1024 {
-                next = reader.read(&mut buf).now_or_never();
+            if full && unflushed < 64 * 1024 {
+                next = reader.read(buf.bytes()).now_or_never();
                 if matches!(next, Some(Ok(count)) if count > 0) {
                     return Ok::<(), std::io::Error>(());
                 }
@@ -312,9 +315,9 @@ impl Hub {
             loop {
                 tokio::select! {
                     Some(packet)=rx.recv()=>{
-                        flows.retain(|_,tx|!tx.is_closed());let key=(packet.association,packet.target.host.clone(),packet.target.port);
-                        if let Some(tx)=flows.get(&key){let _=tx.try_send(packet);continue}
-                        if flows.len()>=64{continue}let Ok(permit)=app.udp.clone().try_acquire_owned()else{continue};
+                        let key=(packet.association,packet.target.host.clone(),packet.target.port);
+                        if let Some(tx)=flows.get(&key){if !tx.is_closed(){let _=tx.try_send(packet);continue}flows.remove(&key);}
+                        if flows.len()>=64{flows.retain(|_,tx|!tx.is_closed());if flows.len()>=64{continue}}let Ok(permit)=app.udp.clone().try_acquire_owned()else{continue};
                         let(tx,mut input)=mpsc::channel(4);let _=tx.try_send(packet);flows.insert(key.clone(),tx);let app=app.clone();let reply=reply.clone();
                         tasks.spawn(async move{let _permit=permit;let target=Target{host:key.1,port:key.2};let Ok(socket)=app.datagram_socket(&target).await else{return};let mut buf=vec![0u8;65536];
                             loop{tokio::select!{
@@ -325,7 +328,7 @@ impl Hub {
                         });
                     },
                     _=cleanup.tick()=>flows.retain(|_,tx|!tx.is_closed()),
-                    Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
+                    Some(_)=tasks.join_next(),if !tasks.is_empty()=>{flows.retain(|_,tx|!tx.is_closed());},
                     else=>break,
                 }
             }

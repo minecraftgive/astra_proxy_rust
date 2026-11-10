@@ -25,18 +25,13 @@ pub trait Transport: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 }
 
-struct Cached {
-    message: Message,
-    inserted: Instant,
-    ttl: u32,
-    bytes: usize,
-}
 pub struct Resolver {
     excluded: std::collections::HashSet<String>,
     reserved: std::collections::HashSet<IpAddr>,
     pub config: Config,
     mappings: Arc<dyn MappingStore>,
-    cache: Mutex<HashMap<Vec<u8>, Cached>>,
+    cache: Arc<Mutex<crate::cache::Cache>>,
+    maintenance: crate::maintenance::Maintenance,
     permits: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     query_log: Arc<super::query_log::Store>,
@@ -67,7 +62,8 @@ impl Resolver {
             permits: Arc::new(Semaphore::new(config.max_concurrent)),
             config,
             mappings,
-            cache: Mutex::new(HashMap::new()),
+            cache: Default::default(),
+            maintenance: Default::default(),
             query_log: Default::default(),
             bootstrap: Default::default(),
         })
@@ -97,7 +93,7 @@ impl Resolver {
         mappings.configure(&self.config, &self.reserved)?;
         self.mappings = mappings;
         self.cache
-            .get_mut()
+            .lock()
             .map_err(|_| anyhow::anyhow!("DNS cache is unavailable"))?
             .clear();
         Ok(())
@@ -158,24 +154,33 @@ impl Resolver {
     }
     pub async fn answer(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
         let operation = astra_observe::operation!("dns.answer", "DNS 应答");
-        let mut trace =
-            super::query_log::Query::new(&self.query_log, Message::from_vec(raw).ok().as_ref());
-        let result = self.answer_inner(raw, transport, &mut trace).await;
-        trace.finish(
-            result
-                .as_ref()
-                .map(|raw| Message::from_vec(raw).ok())
-                .map_err(|e| e.to_string()),
-        );
+        let query = Message::from_vec(raw).map_err(Into::into);
+        let mut trace = super::query_log::Query::new(&self.query_log, query.as_ref().ok());
+        let result = match self.answer_inner(query, transport, &mut trace).await {
+            Ok(message) => {
+                let result = message.to_vec().map_err(anyhow::Error::from);
+                trace.finish(
+                    result
+                        .as_ref()
+                        .map(|_| Some(&message))
+                        .map_err(|e| e.to_string()),
+                );
+                result
+            }
+            Err(error) => {
+                trace.finish(Err(error.to_string()));
+                Err(error)
+            }
+        };
         operation.finish(result.is_ok());
         result
     }
     async fn answer_inner(
         &self,
-        raw: &[u8],
+        query: Result<Message>,
         transport: &dyn Transport,
         trace: &mut super::query_log::Query,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Message> {
         let _request = self
             .requests
             .clone()
@@ -185,7 +190,7 @@ impl Resolver {
                     .add(1);
             })
             .context("DNS concurrent request limit reached")?;
-        let query = Message::from_vec(raw)?;
+        let query = query?;
         wire::validate_query(&query)?;
         let q = &query.queries[0];
         let domain = q
@@ -195,7 +200,7 @@ impl Resolver {
             .to_ascii_lowercase();
         if q.query_type() == RecordType::AAAA && !self.config.ipv6 {
             trace.source("ipv6_disabled");
-            return Ok(wire::response(&query, ResponseCode::NoError).to_vec()?);
+            return Ok(wire::response(&query, ResponseCode::NoError));
         }
         if self.config.use_fake(&domain) && !self.excluded.contains(&domain) {
             // Prevent HTTPS/SVCB address hints bypassing Fake IP domain routing.
@@ -206,7 +211,7 @@ impl Resolver {
                     "Fake-IP 屏蔽 HTTPS/SVCB 地址提示"
                 )
                 .add(1);
-                return Ok(wire::response(&query, ResponseCode::NoError).to_vec()?);
+                return Ok(wire::response(&query, ResponseCode::NoError));
             }
             if matches!(q.query_type(), RecordType::A | RecordType::AAAA) {
                 trace.source("fake_ip");
@@ -227,12 +232,11 @@ impl Resolver {
                         data,
                     ));
                 }
-                let bytes = reply.to_vec()?;
                 astra_observe::counter!("dns.fake_ip.replies", "Fake-IP 应答").add(1);
-                return Ok(bytes);
+                return Ok(reply);
             }
         }
-        Ok(self.real(&query, transport, trace).await?.to_vec()?)
+        self.real(&query, transport, trace).await
     }
     pub async fn lookup(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = name.parse() {
@@ -247,12 +251,7 @@ impl Resolver {
             let query = wire::query(name, kind)?;
             let mut trace = super::query_log::Query::new(&self.query_log, Some(&query));
             let result = self.real(&query, transport, &mut trace).await;
-            trace.finish(
-                result
-                    .as_ref()
-                    .map(|reply| Some(reply.clone()))
-                    .map_err(|e| e.to_string()),
-            );
+            trace.finish(result.as_ref().map(Some).map_err(|e| e.to_string()));
             match result {
                 Ok(reply) => {
                     for record in reply.answers {
@@ -297,29 +296,22 @@ impl Resolver {
         let mut normalized = query.clone();
         normalized.metadata.id = 0;
         let key = normalized.to_vec()?;
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(entry) = cache.get(&key) {
-                let age = entry.inserted.elapsed().as_secs();
-                if age < entry.ttl as u64 {
-                    astra_observe::counter!("dns.cache.hits", "DNS 缓存命中").add(1);
-                    trace.source("cache");
-                    let mut message = entry.message.clone();
-                    message.metadata.id = query.metadata.id;
-                    for record in message
-                        .answers
-                        .iter_mut()
-                        .chain(&mut message.authorities)
-                        .chain(&mut message.additionals)
-                    {
-                        record.ttl = record.ttl.saturating_sub(age as u32);
-                    }
-                    return Ok(message);
-                }
+        self.maintenance.start(&self.cache);
+        let cached = self.cache.lock().unwrap().get(&key, Instant::now());
+        if let Some((wire, age)) = cached {
+            astra_observe::counter!("dns.cache.hits", "DNS 缓存命中").add(1);
+            trace.source("cache");
+            let mut message = Message::from_vec(&wire)?;
+            message.metadata.id = query.metadata.id;
+            for record in message
+                .answers
+                .iter_mut()
+                .chain(&mut message.authorities)
+                .chain(&mut message.additionals)
+            {
+                record.ttl = record.ttl.saturating_sub(age);
             }
-            if cache.remove(&key).is_some() {
-                astra_observe::counter!("dns.cache.expired", "DNS 缓存过期移除").add(1);
-            }
+            return Ok(message);
         }
         astra_observe::counter!("dns.cache.misses", "DNS 缓存未命中").add(1);
         let _permit = self
@@ -483,34 +475,13 @@ impl Resolver {
                 ResponseCode::NoError | ResponseCode::NXDomain
             )
         {
-            let mut cache = self.cache.lock().unwrap();
-            let before = cache.len();
-            cache.retain(|_, entry| entry.inserted.elapsed().as_secs() < entry.ttl as u64);
-            astra_observe::counter!("dns.cache.expired", "DNS 缓存过期移除")
-                .add((before - cache.len()) as u64);
-            let bytes = key.len() + message.to_vec()?.len();
-            while cache.len() >= self.config.cache_capacity
-                || cache.values().map(|entry| entry.bytes).sum::<usize>() + bytes > 16 * 1024 * 1024
-            {
-                if let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.inserted)
-                    .map(|(key, _)| key.clone())
-                {
-                    cache.remove(&oldest);
-                    astra_observe::counter!("dns.cache.evictions", "DNS 缓存容量淘汰").add(1);
-                } else {
-                    break;
-                }
-            }
-            cache.insert(
+            let wire = message.to_vec()?;
+            self.cache.lock().unwrap().insert(
                 key,
-                Cached {
-                    message: message.clone(),
-                    inserted: Instant::now(),
-                    ttl,
-                    bytes,
-                },
+                wire,
+                ttl,
+                self.config.cache_capacity,
+                Instant::now(),
             );
         }
         Ok(message)

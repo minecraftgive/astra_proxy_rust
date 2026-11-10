@@ -129,7 +129,8 @@ pub struct RuleEngine {
     countries: HashMap<Box<str>, Entry>,
     keywords: Vec<(Box<str>, Entry)>,
     keyword_matcher: Option<aho_corasick::AhoCorasick>,
-    regexes: Vec<(regex::Regex, Entry)>,
+    regexes: Vec<(Box<str>, Entry)>,
+    regex_fallback: Vec<regex::Regex>,
     /// All `regexes` in one automaton: a lookup scans the domain once instead
     /// of once per pattern. `None` only if the combined set exceeds its limits.
     regex_set: Option<regex::RegexSet>,
@@ -151,11 +152,11 @@ fn compile_regex(pattern: &str) -> Result<regex::Regex> {
 
 /// Each pattern was already validated alone by `compile_regex`; the set uses
 /// the same flags and a limit that grows with the number of patterns.
-fn regex_set(regexes: &[(regex::Regex, Entry)]) -> Option<regex::RegexSet> {
+fn regex_set(regexes: &[(Box<str>, Entry)]) -> Option<regex::RegexSet> {
     if regexes.is_empty() {
         return None;
     }
-    regex::RegexSetBuilder::new(regexes.iter().map(|(regex, _)| regex.as_str()))
+    regex::RegexSetBuilder::new(regexes.iter().map(|(regex, _)| regex.as_ref()))
         .case_insensitive(true)
         .size_limit((2 * 1024 * 1024 * regexes.len()).min(256 * 1024 * 1024))
         .build()
@@ -528,6 +529,7 @@ impl RuleEngine {
             keywords: Vec::new(),
             keyword_matcher: None,
             regexes: Vec::new(),
+            regex_fallback: Vec::new(),
             regex_set: None,
             patterns: HashMap::new(),
             subdomains: HashMap::new(),
@@ -563,7 +565,8 @@ impl RuleEngine {
                         .push((r.value.to_ascii_lowercase().into_boxed_str(), entry));
                 }
                 Kind::DomainRegex => {
-                    out.regexes.push((compile_regex(&r.value)?, entry));
+                    out.regex_fallback.push(compile_regex(&r.value)?);
+                    out.regexes.push((r.value.into_boxed_str(), entry));
                 }
                 Kind::DomainSubdomain => {
                     anyhow::ensure!(!r.value.contains('*'), "use domain_pattern for wildcards");
@@ -659,6 +662,9 @@ impl RuleEngine {
         out.v4 = v4.into_iter().collect();
         out.v6 = v6.into_iter().collect();
         out.regex_set = regex_set(&out.regexes);
+        if out.regex_set.is_some() {
+            out.regex_fallback = Vec::new();
+        }
         if !out.keywords.is_empty() {
             out.keyword_matcher = Some(
                 aho_corasick::AhoCorasick::new(
@@ -785,7 +791,7 @@ impl RuleEngine {
                     }
                 }
                 None => {
-                    for (pattern, entry) in &self.regexes {
+                    for (pattern, (_, entry)) in self.regex_fallback.iter().zip(&self.regexes) {
                         if pattern.is_match(&domain) {
                             consider(&mut best, Some(entry));
                         }
@@ -893,7 +899,7 @@ impl RuleEngine {
             .iter()
             .find(|(_, entry)| entry.index as usize == index)
         {
-            return Some(("domain_regex".into(), regex.as_str().into()));
+            return Some(("domain_regex".into(), regex.to_string()));
         }
         if let Some((value, _)) = self
             .port

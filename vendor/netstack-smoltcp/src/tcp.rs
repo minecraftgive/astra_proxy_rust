@@ -14,7 +14,6 @@ use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
     socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
-    storage::RingBuffer,
     time::{Duration, Instant},
     wire::{HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv6Address, TcpPacket},
 };
@@ -44,9 +43,9 @@ enum TcpSocketState {
 
 struct TcpSocketControl {
     dropped: bool,
-    send_buffer: RingBuffer<'static, u8>,
+    send_buffer: crate::staging::Staging,
     send_waker: Option<Waker>,
-    recv_buffer: RingBuffer<'static, u8>,
+    recv_buffer: crate::staging::Staging,
     recv_waker: Option<Waker>,
     recv_state: TcpSocketState,
     send_state: TcpSocketState,
@@ -171,17 +170,15 @@ impl TcpListenerRunner {
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
                     dropped: false,
-                    send_buffer: RingBuffer::new(vec![
-                        0u8;
-                        tcp_staging_buffer_size.unwrap_or(tcp_send_buffer_size)
-                            as usize
-                    ]),
+                    send_buffer: crate::staging::Staging::new(
+                        tcp_staging_buffer_size.unwrap_or(tcp_send_buffer_size) as usize,
+                        tcp_staging_buffer_size.is_some(),
+                    ),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![
-                        0u8;
-                        tcp_staging_buffer_size.unwrap_or(tcp_recv_buffer_size)
-                            as usize
-                    ]),
+                    recv_buffer: crate::staging::Staging::new(
+                        tcp_staging_buffer_size.unwrap_or(tcp_recv_buffer_size) as usize,
+                        tcp_staging_buffer_size.is_some(),
+                    ),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -282,6 +279,11 @@ impl TcpListenerRunner {
                     control.send_state = TcpSocketState::Closing;
                 }
 
+                let now = std::time::Instant::now();
+                control.send_buffer.idle(now);
+                control.recv_buffer.idle(now);
+                control.recv_buffer.grow_if_full(socket.can_recv());
+
                 // Check if readable
                 let mut wake_receiver = false;
                 while socket.can_recv() && !control.recv_buffer.is_full() {
@@ -291,7 +293,10 @@ impl TcpListenerRunner {
                     });
 
                     match result {
-                        Ok(..) => wake_receiver = true,
+                        Ok(..) => {
+                            wake_receiver = true;
+                            control.recv_buffer.grow_if_full(socket.can_recv());
+                        }
                         Err(err) => {
                             error!("socket recv error: {:?}, {:?}", err, socket.state());
 
@@ -390,7 +395,8 @@ impl TcpListenerRunner {
             } else {
                 let next_duration = iface
                     .poll_delay(before_poll, &socket_set)
-                    .unwrap_or(Duration::from_millis(5));
+                    .unwrap_or(Duration::from_millis(5))
+                    .min(Duration::from_secs(5));
                 if next_duration != Duration::ZERO {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from(next_duration),
@@ -575,6 +581,7 @@ impl AsyncWrite for TcpStream {
 
         // Write to buffer
 
+        control.send_buffer.grow_if_full(!buf.is_empty());
         if control.send_buffer.is_full() {
             if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
                 if !old_waker.will_wake(cx.waker()) {

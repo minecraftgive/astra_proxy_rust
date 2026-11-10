@@ -464,6 +464,22 @@ impl Prepared {
     }
 }
 async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Result<()> {
+    netstack_smoltcp::observe_staging(|event| {
+        use netstack_smoltcp::StagingEvent;
+        let bytes = astra_observe::gauge!("buffer.tun.bytes", "TUN 暂存缓冲已分配", "bytes");
+        match event {
+            StagingEvent::Allocated(n) => bytes.add(n as u64),
+            StagingEvent::Released(n) => bytes.subtract(n as u64),
+            StagingEvent::Grown(n) => {
+                bytes.add(n as u64);
+                astra_observe::counter!("buffer.tun.grows", "TUN 暂存缓冲扩容次数").add(1);
+            }
+            StagingEvent::Shrunk(n) => {
+                bytes.subtract(n as u64);
+                astra_observe::counter!("buffer.tun.shrinks", "TUN 暂存缓冲收缩次数").add(1);
+            }
+        }
+    });
     let (stack, runner, udp, tcp) = netstack_smoltcp::StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
@@ -471,7 +487,7 @@ async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Re
         .stack_buffer_size(256)
         .tcp_buffer_size(256)
         .udp_buffer_size(256)
-        // Two 256 KiB windows plus two 64 KiB staging buffers per socket:
+        // Two 256 KiB windows plus two adaptive 4..64 KiB staging buffers:
         // cap TCP buffers at 160 MiB, including SYNs awaiting dispatch.
         .tcp_socket_limit(256)
         .tcp_recv_buffer_size(256 * 1024)
