@@ -77,6 +77,10 @@ fn runtime_wire_fixture() -> astra_model::runtime::RuntimeView {
                     address: "https://resolver.example/dns-query".into(),
                     transport: "DoH".into(),
                 }],
+                proxy_server_nameserver: vec![DnsServer {
+                    address: "tls://192.0.2.53".into(),
+                    transport: "DoT".into(),
+                }],
                 ..Default::default()
             })),
             traffic: Some(Box::new(TrafficTelemetry {

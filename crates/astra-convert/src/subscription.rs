@@ -425,12 +425,13 @@ pub fn merge(current: &str, converted: &str, ownership: &mut Subscription) -> Re
                 .and_then(|v| v.get("selected"))
                 .and_then(|v| v.as_str())
             {
-                if group
-                    .get("members")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|m| m.iter().any(|m| m.as_str() == Some(selected)))
-                    || (group.get("include_all").and_then(|v| v.as_bool()) == Some(true)
-                        && tags.contains(selected))
+                if group.get("mode").and_then(|v| v.as_str()) != Some("relay")
+                    && (group
+                        .get("members")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|m| m.iter().any(|m| m.as_str() == Some(selected)))
+                        || (group.get("include_all").and_then(|v| v.as_bool()) == Some(true)
+                            && tags.contains(selected)))
                 {
                     group
                         .as_table_mut()

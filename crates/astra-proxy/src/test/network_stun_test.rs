@@ -127,6 +127,7 @@ async fn socks_udp_uses_explicit_relay_and_independent_owned_control_sessions() 
         interface_source: None,
         selection_chain: vec![],
         node: Some(OutboundConfig::Socks5 {
+            dialer_proxy: None,
             tag: "socks-fixture".into(),
             server: endpoint.to_string(),
             username: None,
@@ -171,6 +172,7 @@ async fn unverified_udp_protocol_is_rejected_without_direct_probe() {
         interface_source: None,
         selection_chain: vec![],
         node: Some(OutboundConfig::Http {
+            dialer_proxy: None,
             tag: "http".into(),
             server: "127.0.0.1:9".into(),
             username: None,

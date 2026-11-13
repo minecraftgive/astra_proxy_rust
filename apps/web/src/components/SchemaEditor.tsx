@@ -163,6 +163,23 @@ function FieldEditor({
 }) {
   const [input, setInput] = useState(field.value ?? "");
   const kind = field.field_type;
+  let members: string[] = [];
+  if (field.key === "members") {
+    try {
+      const parsed: unknown = JSON.parse(input);
+      if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string"))
+        members = parsed;
+    } catch {
+      /* The text input also accepts TOML arrays. */
+    }
+  }
+  const moveMember = (index: number, direction: number) => {
+    const next = index + direction;
+    if (next < 0 || next >= members.length) return;
+    const reordered = [...members];
+    [reordered[index], reordered[next]] = [reordered[next], reordered[index]];
+    setInput(JSON.stringify(reordered));
+  };
   const common = {
     value: input,
     disabled: busy,
@@ -186,6 +203,35 @@ function FieldEditor({
         </label>
         <p className="muted">{field.help}</p>
       </div>
+      {members.length > 0 && (
+        <div aria-label="成员顺序">
+          {members.map((name, index) => (
+            <div className="toolbar" key={`${index}-${name}`}>
+              <span>
+                {index + 1}. {name}
+              </span>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={busy || index === 0}
+                aria-label={`上移 ${name}`}
+                onClick={() => moveMember(index, -1)}
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                className="btn sm"
+                disabled={busy || index === members.length - 1}
+                aria-label={`下移 ${name}`}
+                onClick={() => moveMember(index, 1)}
+              >
+                ↓
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="toolbar">
         {kind.kind === "boolean" ? (
           <select {...common}>

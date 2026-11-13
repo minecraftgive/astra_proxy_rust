@@ -544,6 +544,10 @@ fn legacy(node: &Table, tag: &str, kind: &str) -> Result<String> {
 
 /// Export one TOML `outbounds` node as a common share URI.
 pub fn export_node(node: &Value) -> Result<String> {
+    ensure!(
+        node.get("dialer_proxy").is_none() && node.get("dialer-proxy").is_none(),
+        "share links cannot preserve a proxy chain; export the full configuration"
+    );
     let node = node
         .as_table()
         .ok_or_else(|| anyhow::anyhow!("outbound node must be a table"))?;

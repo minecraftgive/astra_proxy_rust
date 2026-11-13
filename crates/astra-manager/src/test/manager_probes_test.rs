@@ -20,7 +20,7 @@ fn plan(dir: &std::path::Path, text: &str) -> DiagnosticPlan {
         log_path: dir.join("core.log"),
         executable: fake_core(dir),
         config_path: dir.join("proxy.toml"),
-        text: text.into(),
+        text: format!("# {text}\n"),
         running: true,
         control: None,
     }
@@ -31,6 +31,21 @@ fn request() -> ProbeRequest {
         outbound: "node".into(),
         ip: false,
     }
+}
+
+#[tokio::test]
+async fn configured_probe_budget_survives_the_old_manager_watchdog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plan = plan(dir.path(), "slow probe");
+    plan.text.push_str("diagnostic_connect_timeout_secs = 20\n");
+    std::fs::write(&plan.executable,
+        "#!/bin/sh\nread config\nread request\nsleep 16\nprintf '{\"outbound\":\"node\",\"direct\":false,\"connect_ms\":16000,\"elapsed_ms\":16000,\"ip\":null,\"error\":null}\\n'\n"
+    ).unwrap();
+    let result = Probes::default()
+        .probe("proxy", plan, request(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.connect_ms, Some(16000));
 }
 
 async fn pid(probes: &Probes, plan: DiagnosticPlan, keep: Option<Duration>) -> u64 {

@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn diagnostic_connect_timeout_is_editable_validated_and_defaults_for_old_profiles() {
+    use astra_model::config::proxy::ProxyConfig;
+    let source = "standalone=true\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:1081'\n";
+    let mut document = Document::parse(CoreKind::Proxy, source).unwrap();
+    let parse = |text: &str| toml::from_str::<ProxyConfig>(text).unwrap();
+    assert_eq!(parse(source).diagnostic_connect_timeout_secs, 3);
+    for platform in [
+        Platform::Windows,
+        Platform::Macos,
+        Platform::Linux,
+        Platform::Other,
+    ] {
+        let schema = document.schema(&[], platform).unwrap();
+        let field = schema
+            .rows
+            .iter()
+            .find_map(|row| match row {
+                SchemaRow::Field { field } if field.key == "diagnostic_connect_timeout_secs" => {
+                    Some(field)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(field.default, "3");
+        assert!(field.value.is_none());
+    }
+    for seconds in [1, 15, 60] {
+        document
+            .apply(EditCommand::SetField {
+                path: vec![],
+                key: "diagnostic_connect_timeout_secs".into(),
+                input: seconds.to_string(),
+            })
+            .unwrap();
+        document.validate_structure().unwrap();
+        let config = parse(document.text());
+        assert_eq!(config.diagnostic_connect_timeout_secs, seconds);
+        assert_eq!(config.connect_timeout_secs, 8);
+        assert_eq!(
+            parse(&toml::to_string(&config).unwrap()).diagnostic_connect_timeout_secs,
+            seconds
+        );
+    }
+    document
+        .apply(EditCommand::RemoveField {
+            path: vec![],
+            key: "diagnostic_connect_timeout_secs".into(),
+        })
+        .unwrap();
+    assert_eq!(parse(document.text()).diagnostic_connect_timeout_secs, 3);
+    for invalid in ["0", "61", "-1", "'15'", "1.5", "18446744073709551615"] {
+        assert!(Document::parse(
+            CoreKind::Proxy,
+            &format!("diagnostic_connect_timeout_secs={invalid}\n{source}")
+        )
+        .and_then(|document| document.validate_structure())
+        .is_err());
+    }
+}
+
 fn roundtrip_auto_start(kind: CoreKind, text: &str) -> (bool, String) {
     macro_rules! roundtrip {
         ($config:ty) => {{
@@ -281,4 +342,52 @@ fn structure_validation_runs_without_resource_or_host_access() {
     )
     .unwrap();
     assert!(invalid.validate_structure().is_err());
+}
+
+#[test]
+fn chain_editor_preserves_order_and_protects_front_references() {
+    let source = "standalone=true\nstandalone_outbound='exit'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='entry'\nserver='127.0.0.1:1081'\n[[outbounds]]\nkind='socks5'\ntag='exit'\nserver='127.0.0.1:1082'\ndialer_proxy='entry'\n[proxy_groups.chain]\nmembers=['entry','exit']\nselected='exit'\n";
+    let mut doc = Document::parse(CoreKind::Proxy, source).unwrap();
+    doc.apply(EditCommand::SetField {
+        path: vec![Part::Key("proxy_groups".into()), Part::Key("chain".into())],
+        key: "mode".into(),
+        input: "relay".into(),
+    })
+    .unwrap();
+    doc.validate_structure().unwrap();
+    assert!(!doc.text.contains("selected="));
+    assert!(doc
+        .apply(EditCommand::RemoveEntry {
+            path: vec![Part::Key("outbounds".into())],
+            index: 0
+        })
+        .is_err());
+    let schema = doc
+        .schema(
+            &[Part::Key("outbounds".into()), Part::Index(1)],
+            Platform::current(),
+        )
+        .unwrap();
+    assert!(schema.rows.iter().any(|row| matches!(row, SchemaRow::Field { field } if field.key == "dialer_proxy" && field.help.contains("entry entry → exit exit"))));
+
+    let mut alias = Document::parse(
+        CoreKind::Proxy,
+        &doc.text().replace("dialer_proxy", "dialer-proxy"),
+    )
+    .unwrap();
+    let path = vec![Part::Key("outbounds".into()), Part::Index(1)];
+    let schema = alias.schema(&path, Platform::current()).unwrap();
+    assert!(schema.rows.iter().any(|row| matches!(row, SchemaRow::Field { field } if field.key == "dialer-proxy" && field.value.as_deref() == Some("entry"))));
+    assert!(!schema
+        .rows
+        .iter()
+        .any(|row| matches!(row, SchemaRow::Field { field } if field.key == "dialer_proxy")));
+    alias
+        .apply(EditCommand::SetField {
+            path,
+            key: "dialer-proxy".into(),
+            input: "DIRECT".into(),
+        })
+        .unwrap();
+    alias.validate_structure().unwrap();
 }

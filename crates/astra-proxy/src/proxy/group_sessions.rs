@@ -24,6 +24,8 @@ pub(crate) struct Lease(
     pub Option<String>,
     // Keep only cancellation epochs alive after the configuration is released.
     #[allow(dead_code)] Arc<Sessions>,
+    pub Vec<String>,
+    pub Vec<String>,
 );
 impl Sessions {
     fn groups(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<u64>>> {
@@ -61,6 +63,8 @@ impl Sessions {
                 .collect(),
             None,
             Arc::clone(self),
+            Vec::new(),
+            path.to_vec(),
         )
     }
     pub fn disconnect(&self, group: &str, reason: &str) {
@@ -72,6 +76,13 @@ impl Sessions {
     }
 }
 impl Lease {
+    pub fn epochs(&self) -> Vec<(String, u64)> {
+        self.4
+            .iter()
+            .cloned()
+            .zip(self.0.iter().map(|(_, epoch)| *epoch))
+            .collect()
+    }
     pub async fn cancelled(&self) {
         if self.0.is_empty() {
             std::future::pending::<()>().await;

@@ -37,13 +37,17 @@ impl astra_dns::Transport for DirectTransport<'_> {
 }
 
 /// Build the lookup-only resolver: none when the DNS service already exists
-/// or plaintext is explicitly allowed; otherwise the configured (or default)
-/// encrypted upstreams without listener, hijack or Fake IP.
+/// or plaintext is allowed with no dedicated proxy DNS; otherwise use the
+/// configured (or default) upstreams without listener, hijack or Fake IP.
 pub(crate) fn lookup_resolver(
     service: bool,
     config: Option<&astra_dns::Config>,
 ) -> Result<Option<astra_dns::Resolver>> {
-    if service || config.is_some_and(|config| config.plaintext_bypass) {
+    if service
+        || config.is_some_and(|config| {
+            config.plaintext_bypass && config.proxy_server_nameserver.is_empty()
+        })
+    {
         return Ok(None);
     }
     let mut config = config.cloned().unwrap_or_default();
@@ -138,7 +142,13 @@ impl App {
         host: &str,
         port: u16,
     ) -> Result<Vec<std::net::SocketAddr>> {
-        self.lookup_with(host, port, false).await
+        let proxy = self
+            .proxy_domains
+            .contains(&host.trim_end_matches('.').to_ascii_lowercase())
+            && self
+                .resolver()
+                .is_some_and(|dns| !dns.config.proxy_server_nameserver.is_empty());
+        self.lookup_with(host, port, proxy).await
     }
     /// Resolve for a local dial. The system resolver is used only when no
     /// encrypted resolver exists (plaintext_bypass) or for a
@@ -162,6 +172,17 @@ impl App {
         let Some(dns) = self.resolver() else {
             return Ok(tokio::net::lookup_host((host, port)).await?.collect());
         };
+        if direct && !dns.config.proxy_server_nameserver.is_empty() {
+            return Ok(dns
+                .lookup_proxy(host, &DirectTransport(self))
+                .await?
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect());
+        }
+        if self.dns.is_none() && dns.config.plaintext_bypass {
+            return Ok(tokio::net::lookup_host((host, port)).await?.collect());
+        }
         if !dns.config.plaintext_bypass
             && dns.config.plaintext_allowed(host)
             && !dns.config.has_policy(host)

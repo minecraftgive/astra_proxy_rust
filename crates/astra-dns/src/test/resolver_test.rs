@@ -23,6 +23,59 @@ struct Mock {
     negative: bool,
 }
 
+#[test]
+fn proxy_dns_requires_independent_bootstrap_and_obeys_encryption_and_loop_checks() {
+    let mut config = Config::default();
+    config.proxy_server_nameserver = vec!["https://dns.example/dns-query".into()];
+    assert!(config.validate().is_err());
+    config
+        .proxy_server_nameserver
+        .push("https://192.0.2.53/dns-query".into());
+    config.nameserver = vec!["https://other.example/dns-query".into()];
+    config.validate().unwrap();
+    config.proxy_server_nameserver = vec!["udp://192.0.2.53".into()];
+    assert!(config.validate().is_err());
+    config.plaintext_bypass = true;
+    config.validate().unwrap();
+    config.proxy_server_nameserver = vec!["udp://127.0.0.1:1053".into()];
+    assert!(
+        config.validate().is_err(),
+        "must not point back to its own DNS listener"
+    );
+}
+
+#[tokio::test]
+async fn proxy_dns_ignores_business_policy_has_separate_cache_and_never_uses_regular_fallback() {
+    let config = Config {
+        proxy_server_nameserver: vec!["tls://192.0.2.1".into(), "tls://192.0.2.53".into()],
+        nameserver_policy: [("node.example".into(), vec!["tls://192.0.2.99".into()])]
+            .into_iter()
+            .collect(),
+        ipv6: false,
+        ..Default::default()
+    };
+    let resolver = Resolver::new(config.clone()).unwrap();
+    let mock = Mock {
+        ttl: 60,
+        ..Default::default()
+    };
+    resolver.lookup("node.example", &mock).await.unwrap();
+    resolver.lookup_proxy("node.example", &mock).await.unwrap();
+    resolver.lookup_proxy("node.example", &mock).await.unwrap();
+    resolver.lookup("node.example", &mock).await.unwrap();
+    assert_eq!(
+        *mock.servers.lock().unwrap(),
+        ["192.0.2.99", "192.0.2.1", "192.0.2.53"]
+    );
+    let mut failed = config;
+    failed.proxy_server_nameserver.pop();
+    failed.fallback = vec!["tls://192.0.2.100".into()];
+    let resolver = Resolver::new(failed).unwrap();
+    let mock = Mock::default();
+    assert!(resolver.lookup_proxy("node.example", &mock).await.is_err());
+    assert_eq!(*mock.servers.lock().unwrap(), ["192.0.2.1"]);
+}
+
 #[tokio::test]
 async fn shared_mapping_store_preserves_ownership_and_reservations_across_generations() {
     let config = Config {

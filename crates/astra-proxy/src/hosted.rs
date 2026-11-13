@@ -81,6 +81,8 @@ enum WorkerRequest {
 /// Additive JSON response: old hosts ignore node totals, new hosts accept old workers.
 #[derive(Serialize, Deserialize)]
 struct WorkerSample {
+    #[serde(default)]
+    chains: Option<astra_model::runtime::ChainTelemetry>,
     #[serde(flatten)]
     snapshot: astra_model::runtime::Snapshot,
     #[serde(default)]
@@ -101,8 +103,9 @@ fn worker_sample(app: &App) -> WorkerSample {
     WorkerSample {
         snapshot,
         node_totals: Some(nodes),
+        chains: Some(app.chain_telemetry()),
         dns_resolver: Some(astra_model::runtime::DnsResolverStatus::from_config(
-            app.dns.as_ref().map(|dns| &dns.config),
+            app.config.dns.as_ref(),
         )),
         dns: Some(
             app.dns
@@ -942,6 +945,7 @@ impl Host {
         let now = traffic_history::minute();
         let mut node_coverage = true;
         let mut dns_logs = Vec::new();
+        let mut chain_samples = BTreeMap::new();
         let mut dns_supported = None;
         let mut dns_resolver = None;
         for (generation, result, sampled_at) in samples {
@@ -951,6 +955,9 @@ impl Host {
                 Err(_) => return,
             };
             if let Ok(sample) = result {
+                if let Some(chains) = sample.chains {
+                    chain_samples.insert(generation.id, chains);
+                }
                 if generation.id == active {
                     dns_supported = Some(sample.dns.is_some());
                     dns_resolver = Some(sample.dns_resolver);
@@ -1003,6 +1010,10 @@ impl Host {
             }),
         );
         let mut origins = BTreeMap::new();
+        let mut chains = astra_model::runtime::ChainTelemetry::default();
+        if let Some(sample) = chain_samples.get(&active) {
+            chains.previews = sample.previews.clone();
+        }
         for (generation, mut snapshot) in snapshots {
             combined.upload += snapshot.upload;
             combined.download += snapshot.download;
@@ -1016,8 +1027,15 @@ impl Host {
                     combined.truncated = true;
                     continue;
                 };
+                let captured_path = chain_samples
+                    .get(&generation)
+                    .and_then(|sample| sample.connections.get(&connection.id))
+                    .cloned();
                 connection.id = id;
                 if combined.connections.len() < 128 {
+                    if let Some(path) = captured_path {
+                        chains.connections.insert(id, path);
+                    }
                     origins.insert(id, generation);
                     combined.connections.push(connection.clone());
                 } else {
@@ -1029,6 +1047,7 @@ impl Host {
             }
         }
         if let Ok(mut telemetry) = self.checked_lock("telemetry", &self.telemetry) {
+            telemetry.chains = Some(Box::new(chains));
             telemetry.publish(combined, health, origins);
             telemetry.merge_dns(dns_logs, dns_supported);
             if let Some(resolver) = dns_resolver {

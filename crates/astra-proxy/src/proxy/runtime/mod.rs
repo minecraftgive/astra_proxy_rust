@@ -865,8 +865,9 @@ async fn run_inner(
                                 .map(|dns| dns.query_log())
                                 .unwrap_or_default(),
                         )),
+                        chains: Some(Box::new(app.chain_telemetry())),
                         dns_resolver: Some(Box::new(DnsResolverStatus::from_config(
-                            app.dns.as_ref().map(|dns| &dns.config),
+                            app.config.dns.as_ref(),
                         ))),
                         ..Default::default()
                     }),

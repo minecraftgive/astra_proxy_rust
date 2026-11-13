@@ -14,8 +14,49 @@ impl View {
             .enumerate()
             .filter(|(_, label)| label.to_lowercase().contains(&query))
             .collect();
+        let mut order = div().flex().flex_col().gap_1();
+        for (index, name) in chosen.iter().enumerate() {
+            let up = name.clone();
+            let down = name.clone();
+            order = order.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(format!("{}. {}", index + 1, name))
+                    .child(Button::new(("chain-member-up", index)).label("↑").on_click(
+                        cx.listener(move |view, _, _, cx| {
+                            view.edit(
+                                |editor| {
+                                    editor.move_member(&up, false);
+                                    Ok(())
+                                },
+                                cx,
+                            );
+                        }),
+                    ))
+                    .child(
+                        Button::new(("chain-member-down", index))
+                            .label("↓")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.edit(
+                                    |editor| {
+                                        editor.move_member(&down, true);
+                                        Ok(())
+                                    },
+                                    cx,
+                                );
+                            })),
+                    ),
+            );
+        }
         let view = cx.entity().downgrade();
         Card::new(t("Group members"))
+            .child(
+                order
+                    .id("chain-member-order")
+                    .max_h(px(160.))
+                    .overflow_y_scroll(),
+            )
             .child(Input::new(&self.member_search))
             .child(
                 gpui::uniform_list("editor-member-list", rows.len(), move |range, _, _| {

@@ -12,6 +12,7 @@ pub(crate) fn wake() {
     animation::wake();
 }
 mod background;
+mod chain;
 mod dashboard;
 mod detached;
 mod live;
@@ -84,6 +85,7 @@ struct Ui {
     profile_viewport: std::cell::Cell<usize>,
     /// Items reachable by Overview scrolling; narrow layouts include proxy groups.
     overview_cursor: usize,
+    chain_focus: std::cell::RefCell<Option<(String, u32, chain::Source)>>,
     overview_item_count: std::cell::Cell<usize>,
     /// Proxy group unfolded in place in the Overview's group column, and the
     /// node row under the cursor inside it (None while the group row is focused).
@@ -181,6 +183,7 @@ impl Ui {
             palette: None,
             profile_viewport: std::cell::Cell::new(1),
             overview_cursor: 0,
+            chain_focus: Default::default(),
             overview_item_count: Default::default(),
             overview_unfolded: None,
             overview_member: None,

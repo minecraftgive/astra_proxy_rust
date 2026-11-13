@@ -12,6 +12,9 @@ pub struct Config {
     pub listen: Vec<SocketAddr>,
     pub nameserver: Vec<String>,
     pub fallback: Vec<String>,
+    /// Dedicated resolvers for proxy endpoints and DNS hostname bootstrap.
+    /// Always dialed directly. Empty preserves the existing resolver policy.
+    pub proxy_server_nameserver: Vec<String>,
     pub nameserver_policy: BTreeMap<String, Vec<String>>,
     pub bootstrap: Vec<IpAddr>,
     pub respect_rules: bool,
@@ -63,6 +66,7 @@ impl Default for Config {
                 "tls://1.0.0.1:853".into(),
             ],
             fallback: vec![],
+            proxy_server_nameserver: vec![],
             nameserver_policy: BTreeMap::new(),
             bootstrap: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
             respect_rules: false,
@@ -108,6 +112,13 @@ impl Config {
                     .all(|ip| !ip.is_unspecified() && !ip.is_multicast()),
             "DNS bootstrap requires 1..8 literal IP addresses"
         );
+        ensure!(
+            self.proxy_server_nameserver.len() <= 16,
+            "DNS proxy_server_nameserver accepts at most 16 upstreams"
+        );
+        if !self.proxy_server_nameserver.is_empty() {
+            ensure!(!self.proxy_bootstrap().is_empty(), "DNS proxy_server_nameserver requires at least one IP-literal upstream for direct bootstrap");
+        }
         ensure!(
             self.cache_capacity <= 65536 && (1..=65536).contains(&self.mapping_capacity),
             "DNS cache/mapping capacity exceeds limit"
@@ -173,6 +184,7 @@ impl Config {
             .nameserver
             .iter()
             .chain(&self.fallback)
+            .chain(&self.proxy_server_nameserver)
             .chain(self.nameserver_policy.values().flatten())
         {
             let upstream = Upstream::parse(raw)?;
@@ -196,7 +208,12 @@ impl Config {
         if self.plaintext_bypass {
             return Ok(());
         }
-        for raw in self.nameserver.iter().chain(&self.fallback) {
+        for raw in self
+            .nameserver
+            .iter()
+            .chain(&self.fallback)
+            .chain(&self.proxy_server_nameserver)
+        {
             ensure!(
                 Upstream::parse(raw)?.is_encrypted(),
                 "DNS upstream {raw} is plaintext; only https:// (DoH) and tls:// (DoT) are allowed \
@@ -223,7 +240,9 @@ impl Config {
             .chain(self.nameserver_policy.values().flatten())
             .any(|raw| Upstream::parse(raw).is_ok_and(|u| u.host.parse::<IpAddr>().is_err()));
         ensure!(
-            !needs_bootstrap || !self.encrypted_bootstrap().is_empty(),
+            !needs_bootstrap
+                || !self.encrypted_bootstrap().is_empty()
+                || !self.proxy_bootstrap().is_empty(),
             "DNS upstream hostnames need an IP-literal DoH/DoT upstream in nameserver or \
              fallback (e.g. https://1.1.1.1/dns-query) for encrypted bootstrap"
         );
@@ -246,6 +265,19 @@ impl Config {
             .filter_map(|raw| Upstream::parse(raw).ok())
             .filter(|u| u.is_encrypted() && u.host.parse::<IpAddr>().is_ok())
             .collect()
+    }
+    pub fn proxy_bootstrap(&self) -> Vec<Upstream> {
+        self.proxy_server_nameserver
+            .iter()
+            .filter_map(|raw| Upstream::parse(raw).ok())
+            .filter(|upstream| upstream.host.parse::<IpAddr>().is_ok())
+            .collect()
+    }
+    pub fn always_direct(&self, upstream: &Upstream) -> bool {
+        self.proxy_server_nameserver
+            .iter()
+            .filter_map(|raw| Upstream::parse(raw).ok())
+            .any(|server| server == *upstream)
     }
     /// Whether a nameserver_policy entry applies to `domain`.
     pub fn has_policy(&self, domain: &str) -> bool {

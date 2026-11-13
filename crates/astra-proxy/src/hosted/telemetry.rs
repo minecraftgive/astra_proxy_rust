@@ -20,6 +20,7 @@ pub(super) struct Store {
     pub traffic_history_error: Option<String>,
     dns: astra_model::runtime::DnsQueryLog,
     dns_supported: bool,
+    pub chains: Option<Box<astra_model::runtime::ChainTelemetry>>,
     pub dns_resolver: Option<Box<astra_model::runtime::DnsResolverStatus>>,
 }
 impl Default for Store {
@@ -37,6 +38,7 @@ impl Default for Store {
             dns: Default::default(),
             dns_supported: false,
             dns_resolver: None,
+            chains: None,
         }
     }
 }
@@ -152,6 +154,7 @@ impl Store {
             connection_generations: self.origins.clone(),
             dns: self.dns_supported.then(|| Box::new(self.dns.clone())),
             dns_resolver: self.dns_resolver.clone(),
+            chains: self.chains.clone(),
             traffic: Some(Box::new(astra_model::runtime::TrafficTelemetry {
                 nodes: self.node_traffic.clone(),
                 history_error: self.traffic_history_error.clone(),

@@ -156,6 +156,9 @@ pub struct ProxyConfig {
     pub decision_timeout_ms: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+    /// TCP/proxy handshake budget for node diagnostics and exit probes.
+    #[serde(default = "default_diagnostic_connect_timeout")]
+    pub diagnostic_connect_timeout_secs: u64,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     #[serde(default = "default_udp_flows")]
@@ -196,6 +199,9 @@ fn default_timeout() -> u64 {
 fn default_connect_timeout() -> u64 {
     8
 }
+fn default_diagnostic_connect_timeout() -> u64 {
+    3
+}
 fn default_max_connections() -> usize {
     4096
 }
@@ -204,6 +210,16 @@ fn default_cache_ttl() -> u64 {
 }
 
 impl ProxyConfig {
+    /// Leave two seconds after the connection budget for HTTPS/IP lookup.
+    pub fn diagnostic_node_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.diagnostic_connect_timeout_secs + 2)
+    }
+
+    pub fn diagnostic_batch_timeout(&self) -> std::time::Duration {
+        self.diagnostic_node_timeout()
+            .max(std::time::Duration::from_secs(30))
+    }
+
     pub fn dns_only(&self) -> bool {
         self.socks5_listen.is_none()
             && self.http_listen.is_none()
@@ -340,6 +356,11 @@ impl ProxyConfig {
         if self.decision_timeout_ms == 0 || self.connect_timeout_secs == 0 {
             bail!("timeouts must be positive");
         }
+        anyhow::ensure!(
+            (1..=crate::diagnostics::MAX_CONNECT_TIMEOUT_SECS)
+                .contains(&self.diagnostic_connect_timeout_secs),
+            "diagnostic_connect_timeout_secs must be between 1 and 60"
+        );
         if self.max_udp_flows == 0
             || self.max_udp_flows > 65536
             || self.udp_targets_per_association == 0
@@ -382,6 +403,7 @@ impl ProxyConfig {
         }
         crate::groups::validate(&self.proxy_groups, &map.keys().cloned().collect())
             .map_err(anyhow::Error::msg)?;
+        crate::chain::validate(&self.proxy_groups, &map)?;
         if !self.proxy_groups.is_empty() && map.keys().any(|tag| crate::groups::builtin(tag)) {
             bail!("outbound tags DIRECT and REJECT are reserved when using proxy groups");
         }

@@ -7,7 +7,7 @@ mod adapter {
         tag: &str,
         cfg: &NodeConfig,
         _base: &Path,
-        _dialer: Arc<meow_proxy::dialer::DirectDialer>,
+        _dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
         mux: Option<meow_proxy::mux::MuxOptions>,
     ) -> Result<Arc<dyn ProxyAdapter>> {
         if cfg.transport.kind != TransportKind::Tcp || mux.is_some() {

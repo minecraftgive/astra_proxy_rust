@@ -48,6 +48,7 @@ impl Resolver {
             .nameserver
             .iter()
             .chain(&config.fallback)
+            .chain(&config.proxy_server_nameserver)
             .chain(config.nameserver_policy.values().flatten())
             .filter_map(|raw| {
                 Upstream::parse(raw)
@@ -236,9 +237,21 @@ impl Resolver {
                 return Ok(reply);
             }
         }
-        self.real(&query, transport, trace).await
+        self.real(&query, transport, trace, false).await
     }
     pub async fn lookup(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
+        self.lookup_with(name, transport, false).await
+    }
+    /// Real answers from the dedicated direct list, with a separate cache scope.
+    pub async fn lookup_proxy(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
+        self.lookup_with(name, transport, true).await
+    }
+    async fn lookup_with(
+        &self,
+        name: &str,
+        transport: &dyn Transport,
+        proxy: bool,
+    ) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = name.parse() {
             return Ok(vec![ip]);
         }
@@ -250,7 +263,7 @@ impl Resolver {
             }
             let query = wire::query(name, kind)?;
             let mut trace = super::query_log::Query::new(&self.query_log, Some(&query));
-            let result = self.real(&query, transport, &mut trace).await;
+            let result = self.real(&query, transport, &mut trace, proxy).await;
             trace.finish(result.as_ref().map(Some).map_err(|e| e.to_string()));
             match result {
                 Ok(reply) => {
@@ -281,9 +294,10 @@ impl Resolver {
         query: &Message,
         transport: &dyn Transport,
         trace: &mut super::query_log::Query,
+        proxy: bool,
     ) -> Result<Message> {
         let operation = astra_observe::operation!("dns.resolve", "DNS 真实解析（含缓存）");
-        let result = self.real_inner(query, transport, trace).await;
+        let result = self.real_inner(query, transport, trace, proxy).await;
         operation.finish(result.is_ok());
         result
     }
@@ -292,10 +306,13 @@ impl Resolver {
         query: &Message,
         transport: &dyn Transport,
         trace: &mut super::query_log::Query,
+        proxy: bool,
     ) -> Result<Message> {
         let mut normalized = query.clone();
         normalized.metadata.id = 0;
-        let key = normalized.to_vec()?;
+        let dedicated = proxy && !self.config.proxy_server_nameserver.is_empty();
+        let mut key = normalized.to_vec()?;
+        key.push(u8::from(dedicated));
         self.maintenance.start(&self.cache);
         let cached = self.cache.lock().unwrap().get(&key, Instant::now());
         if let Some((wire, age)) = cached {
@@ -332,12 +349,17 @@ impl Resolver {
         // Each upstream gets its own deadline; the entire ordered failover list
         // is also bounded so an unreachable list cannot multiply user wait time.
         let exchange = async {
-            for raw in self
-                .config
-                .servers(&domain)
-                .iter()
-                .chain(&self.config.fallback)
-            {
+            let servers = if dedicated {
+                self.config.proxy_server_nameserver.as_slice()
+            } else {
+                self.config.servers(&domain)
+            };
+            let fallback = if dedicated {
+                &[][..]
+            } else {
+                self.config.fallback.as_slice()
+            };
+            for raw in servers.iter().chain(fallback) {
                 let upstream = Upstream::parse(raw)?;
                 // Defense in depth for configs built without validate(): an
                 // encrypted-only resolver never downgrades to plaintext.

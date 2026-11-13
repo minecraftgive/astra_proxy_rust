@@ -18,3 +18,5 @@ pub mod vless;
 pub mod vmess;
 pub mod wire;
 pub mod xhttp;
+
+pub mod chain;

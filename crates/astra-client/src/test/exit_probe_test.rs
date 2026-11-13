@@ -69,6 +69,28 @@ fn keep_alive_outlasts_the_gap_between_rounds() {
 }
 
 #[tokio::test]
+async fn header_waits_for_configurable_probe_budget_but_still_bounds_a_missing_reply() {
+    let (_sender, receiver) = mpsc::channel(1);
+    let started = Instant::now();
+    let mut prober = Prober {
+        exit: Some(exit("Tokyo")),
+        round: Some(Round {
+            task: tokio::spawn(std::future::pending()),
+            receiver,
+            started,
+            ip: false,
+            initial: false,
+        }),
+        ..Default::default()
+    };
+    assert!(!prober.collect(plan(false, Some(30)), started + Duration::from_secs(72)));
+    assert!(prober.running());
+    prober.collect(plan(false, Some(30)), started + Duration::from_secs(78));
+    assert!(!prober.running());
+    assert_eq!(prober.next, Some(started + Duration::from_secs(88)));
+}
+
+#[tokio::test]
 async fn first_round_records_latency_and_ip_then_later_rounds_skip_the_ip() {
     let mut prober = answered(exit("Tokyo"), true, probe(Some(42), Some("203.0.113.7"))).await;
     assert!(tick(&mut prober, Some(exit("Tokyo")), plan(true, Some(30))));

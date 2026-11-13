@@ -210,6 +210,20 @@ impl Document {
                         .is_some_and(|i| i.is_table() || i.is_array_of_tables()),
                     "cannot replace a group with a field"
                 );
+                if key == "mode"
+                    && parsed.as_str() == Some("relay")
+                    && crate::edit::proxy_group_name(&path).is_some()
+                {
+                    for field in [
+                        "selected",
+                        "include_all",
+                        "include_all_groups",
+                        "filter",
+                        "exclude_filter",
+                    ] {
+                        table.remove(field);
+                    }
+                }
                 replace_field(table, &key, parsed);
             }
             EditCommand::RemoveField { path, key } => {

@@ -71,10 +71,22 @@ pub enum TransportKind {
 pub enum OutboundConfig {
     Native {
         tag: String,
+        #[serde(
+            default,
+            alias = "dialer-proxy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dialer_proxy: Option<String>,
         config: Box<NodeConfig>,
     },
     Socks5 {
         tag: String,
+        #[serde(
+            default,
+            alias = "dialer-proxy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dialer_proxy: Option<String>,
         server: String,
         #[serde(default)]
         username: Option<String>,
@@ -83,6 +95,12 @@ pub enum OutboundConfig {
     },
     Http {
         tag: String,
+        #[serde(
+            default,
+            alias = "dialer-proxy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dialer_proxy: Option<String>,
         server: String,
         #[serde(default)]
         username: Option<String>,
@@ -91,12 +109,24 @@ pub enum OutboundConfig {
     },
     TrojanTls {
         tag: String,
+        #[serde(
+            default,
+            alias = "dialer-proxy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dialer_proxy: Option<String>,
         server: String,
         sni: String,
         password: String,
     },
     VlessTls {
         tag: String,
+        #[serde(
+            default,
+            alias = "dialer-proxy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dialer_proxy: Option<String>,
         server: String,
         sni: String,
         uuid: String,
@@ -111,5 +141,36 @@ impl OutboundConfig {
             | Self::TrojanTls { tag, .. }
             | Self::VlessTls { tag, .. } => tag,
         }
+    }
+}
+
+impl OutboundConfig {
+    pub fn dialer_proxy(&self) -> Option<&str> {
+        match self {
+            Self::Native { dialer_proxy, .. }
+            | Self::Socks5 { dialer_proxy, .. }
+            | Self::Http { dialer_proxy, .. }
+            | Self::TrojanTls { dialer_proxy, .. }
+            | Self::VlessTls { dialer_proxy, .. } => dialer_proxy.as_deref(),
+        }
+    }
+    pub fn protocol_name(&self) -> &'static str {
+        match self {
+            Self::Socks5 { .. } => "SOCKS5",
+            Self::Http { .. } => "HTTP",
+            Self::TrojanTls { .. } => "Trojan",
+            Self::VlessTls { .. } => "VLESS",
+            Self::Native { config, .. } => match config.protocol {
+                Protocol::Tuic => "TUIC",
+                Protocol::Hysteria2 => "Hysteria2",
+                Protocol::Vless => "VLESS",
+                Protocol::Vmess => "VMess",
+                Protocol::Shadowsocks => "Shadowsocks",
+                Protocol::Trojan => "Trojan",
+            },
+        }
+    }
+    pub fn requires_direct_entry(&self) -> bool {
+        matches!(self, Self::Native { config, .. } if matches!(config.protocol, Protocol::Tuic | Protocol::Hysteria2))
     }
 }

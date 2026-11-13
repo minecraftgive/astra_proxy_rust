@@ -48,6 +48,10 @@ impl<'a> Route<'a> {
             }
         };
         if let Some(node) = proxy {
+            ensure!(
+                node.dialer_proxy().is_none(),
+                "Unsupported: detailed diagnostics cannot bypass a proxy chain"
+            );
             ensure!(matches!(node, OutboundConfig::Socks5 { .. } | OutboundConfig::Http { .. }), "Unsupported: only SOCKS5 and HTTP CONNECT have verified diagnostic bootstrap and remote DNS");
             if let Probe::Dns { server, .. } = &request.probe {
                 ensure!(Endpoint::parse(server)?.protocol != Protocol::Udp, "Unsupported: proxy DNS requires TCP, DoT or DoH; UDP is not silently sent DIRECT");

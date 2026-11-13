@@ -25,7 +25,7 @@ pub(crate) use tcp::exchange as framed;
 pub(crate) use tls::connector as tls_connector;
 use udp::direct as udp_direct;
 
-async fn bootstrap(app: &App, host: &str, direct: bool) -> Result<IpAddr> {
+async fn bootstrap(app: &App, host: &str, _direct: bool) -> Result<IpAddr> {
     if let Ok(ip) = host.parse() {
         return Ok(ip);
     }
@@ -33,10 +33,12 @@ async fn bootstrap(app: &App, host: &str, direct: bool) -> Result<IpAddr> {
     if let Some(ip) = dns.bootstrap_cached(host) {
         return Ok(ip);
     }
-    let (ip, ttl) = if dns.config.plaintext_bypass {
+    let (ip, ttl) = if !dns.config.proxy_server_nameserver.is_empty() {
+        encrypted_bootstrap(app, host, true).await?
+    } else if dns.config.plaintext_bypass {
         plaintext_bootstrap(app, host).await?
     } else {
-        encrypted_bootstrap(app, host, direct).await?
+        encrypted_bootstrap(app, host, true).await?
     };
     dns.bootstrap_store(host, ip, ttl);
     Ok(ip)
@@ -67,7 +69,12 @@ fn encrypted_bootstrap<'a>(
     Box::pin(async move {
         let dns = app.resolver().context("DNS disabled")?;
         let mut last = None;
-        for upstream in dns.config.encrypted_bootstrap() {
+        let servers = if dns.config.proxy_server_nameserver.is_empty() {
+            dns.config.encrypted_bootstrap()
+        } else {
+            dns.config.proxy_bootstrap()
+        };
+        for upstream in servers {
             let query = wire::query(host, RecordType::A)?;
             let result = tokio::time::timeout(
                 Duration::from_millis(dns.config.query_timeout_ms),
@@ -152,7 +159,7 @@ async fn exchange_tls(
     } else {
         Network::Tcp
     };
-    let action = if dns.config.respect_rules && !direct {
+    let action = if dns.config.respect_rules && !direct && !dns.config.always_direct(upstream) {
         app.route_network(&target, Inbound::Tun, network).await?
     } else {
         RouteAction::Direct

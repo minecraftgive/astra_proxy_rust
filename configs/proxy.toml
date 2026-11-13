@@ -6,6 +6,8 @@ http_listen = "127.0.0.1:8080"
 ipc_connections = 8
 decision_timeout_ms = 500
 connect_timeout_secs = 8
+# Node diagnostics / exit-probe TCP and proxy handshake budget (1..60 seconds).
+diagnostic_connect_timeout_secs = 3
 max_connections = 4096
 decision_cache_ttl_secs = 5
 

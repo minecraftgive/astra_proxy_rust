@@ -443,7 +443,7 @@ impl Render for Editor {
                     let mut state = ListState::default().with_selected(Some(*cursor));
                     let query = find.as_ref().map(|q| q.to_lowercase()).filter(|q| !q.is_empty());
                     let items = options.iter().map(|name| {
-                        let item = ListItem::new(format!("[{}] {}", if chosen.contains(name) { "×" } else { " " }, name));
+                        let item = ListItem::new(format!("[{}] {}", chosen.iter().position(|v| v == name).map(|i| (i+1).to_string()).unwrap_or_else(|| " ".into()), name));
                         // While searching, members that do not match are dimmed rather than hidden.
                         if query.as_ref().is_some_and(|q| !name.to_lowercase().contains(q)) { item.style(Style::default().fg(Color::DarkGray)) } else { item }
                     });
@@ -451,7 +451,7 @@ impl Render for Editor {
                         Some(query) => format!("{} · /{}▏", t("Group members"), query),
                         None => t("Group members").to_owned(),
                     };
-                    let hint = if find.is_some() { t("Type to find · ↑↓ next match · Enter / Esc done") } else { t("j/k move · Space toggle · / find · Enter confirm · Esc cancel") };
+                    let hint = if find.is_some() { t("Type to find · ↑↓ next match · Enter / Esc done") } else { t("j/k move · Shift+↑/↓ order · Space toggle · Enter confirm · Esc cancel") };
                     frame.render_stateful_widget(List::new(items).highlight_symbol("› ").highlight_style(crate::theme::selected())
                         .block(Block::default().title(title).title_bottom(hint).borders(Borders::ALL)), popup, &mut state);
                 }

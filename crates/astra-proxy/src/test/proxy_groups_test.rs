@@ -131,7 +131,7 @@ async fn nested_groups_pin_the_outer_interface_and_isolate_pools() {
         assert_eq!(action, RouteAction::Proxy("node".into()));
         assert_eq!(lease.1.as_deref(), Some(expected));
     }
-    let adapter = |name| match app.native_for(Some(name)).get("node").unwrap() {
+    let adapter = |name| match app.native_for(Some(name)).get("node").unwrap().as_ref() {
         crate::native::NativeOutbound::Adapter(adapter) => adapter.clone(),
         _ => panic!("expected SOCKS adapter"),
     };
@@ -594,4 +594,29 @@ async fn manual_group_connects_selected_member_and_existing_stream_survives_new_
     let mut bytes = vec![];
     connection.read_to_end(&mut bytes).await.unwrap();
     assert!(bytes.ends_with(b"b"));
+}
+
+#[test]
+fn chain_preview_never_advances_load_balance_selection() {
+    let app = App::from_text(std::path::Path::new("preview-chain.toml"),
+        "standalone=true\nstandalone_outbound='exit'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='entry'\nserver='127.0.0.1:1'\n[[outbounds]]\nkind='socks5'\ntag='exit'\nserver='127.0.0.1:2'\ndialer_proxy='front'\n[proxy_groups.front]\nmode='load_balance'\nmembers=['entry']\n".into()).unwrap();
+    app.groups.write_selections().insert(
+        "front".into(),
+        Selection {
+            member: Some("entry".into()),
+            delays: vec![("entry".into(), Some(1))],
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        let previews = app.chain_telemetry();
+        assert_eq!(previews.previews["front"].status, "unresolved");
+    }
+    assert_eq!(app.groups.sequence.load(Ordering::Relaxed), 0);
+    let (_, lease) = app
+        .groups
+        .plan(&app, &RouteAction::Proxy("exit".into()), true)
+        .unwrap();
+    assert_eq!(lease.3, ["entry", "exit"]);
+    assert_eq!(app.groups.sequence.load(Ordering::Relaxed), 1);
 }

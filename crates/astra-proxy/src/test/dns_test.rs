@@ -294,6 +294,82 @@ fn local_lookups_use_an_encrypted_resolver_unless_plaintext_is_bypassed() {
     let app = app_with_service();
     assert!(app.lookup_dns.is_none() && app.resolver().is_some());
 }
+
+#[tokio::test]
+async fn proxy_server_dns_is_direct_with_unavailable_proxy_and_disabled_service() {
+    use meow_common::HostResolver;
+    let (direct_dns, queries) = udp_mock().await;
+    for enabled in [true, false] {
+        let source = format!("standalone=true\nstandalone_outbound='main'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='Node.Direct-Dns.Example:9'\n[proxy_groups.main]\nmembers=['node']\n[dns]\nenable={enabled}\nlisten=[]\nplaintext_bypass=true\nrespect_rules=true\nquery_timeout_ms=100\nnameserver=['tcp://127.0.0.1:9']\nproxy_server_nameserver=['udp://{direct_dns}']\nfake_ip=true\n[dns.nameserver_policy]\n'node.direct-dns.example'=['tcp://127.0.0.1:9']\n");
+        let app = Arc::new(
+            App::from_text(&std::env::temp_dir().join("direct-dns-test.toml"), source).unwrap(),
+        );
+        let hook = HostHook(Box::new({
+            let app = app.clone();
+            move || app.clone()
+        }));
+        assert_eq!(
+            hook.resolve_all("node.direct-dns.example").await.unwrap(),
+            ["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert!(hook
+            .resolve_all_nested("nested.direct-dns.example")
+            .await
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            app.lookup_real("node.direct-dns.example", 443)
+                .await
+                .unwrap()[0]
+                .port(),
+            443
+        );
+    }
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        4,
+        "each core has two direct lookups, and a cache hit"
+    );
+}
+
+#[tokio::test]
+async fn direct_dns_list_also_bypasses_rules_for_regular_queries_and_bootstrap() {
+    let (direct_dns, queries) = udp_mock().await;
+    let app = core(&format!("[dns]\nlisten=[]\nplaintext_bypass=true\nrespect_rules=true\nnameserver=['udp://dns-bootstrap.example:{}']\nproxy_server_nameserver=['udp://{direct_dns}']\n", direct_dns.port()));
+    // No rule core exists. Routing either bootstrap or this listed DNS through
+    // rules would fail; the configured direct server must remain reachable.
+    let query = wire::query("business.example", RecordType::A)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let listed = astra_dns::Upstream::parse(&format!("udp://{direct_dns}")).unwrap();
+    upstream::exchange(&app, &listed, query.clone())
+        .await
+        .unwrap();
+    // Hostname bootstrap must go to the dedicated literal server, even though
+    // the normal upstream itself cannot be reached through the missing proxy.
+    let _ = app.dns_answer(&query).await;
+    assert_eq!(queries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        app.resolver()
+            .unwrap()
+            .bootstrap_cached("dns-bootstrap.example"),
+        Some("127.0.0.1".parse().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn empty_proxy_dns_list_preserves_normal_rule_routing() {
+    let (upstream, queries) = udp_mock().await;
+    let app = core(&format!("[[outbounds]]\nkind='socks5'\ntag='node'\nserver='node.empty-direct-dns.example:9'\n[dns]\nlisten=[]\nplaintext_bypass=true\nrespect_rules=true\nnameserver=['udp://{upstream}']\n"));
+    assert!(
+        app.lookup_real("node.empty-direct-dns.example", 443)
+            .await
+            .is_err(),
+        "no rule core exists; an empty direct list must not bypass route selection"
+    );
+    assert_eq!(queries.load(Ordering::SeqCst), 0);
+}
 fn app_with_service() -> App {
     app("")
 }

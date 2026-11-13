@@ -366,6 +366,18 @@ impl Editor {
             }
             return Some(values);
         }
+        if matches!(key, "dialer_proxy" | "dialer-proxy") {
+            let own = table_at(doc.as_table(), path)
+                .and_then(|node| node.get("tag"))
+                .and_then(Item::as_str);
+            let mut values = vec![String::new()];
+            values.extend(
+                proxy_targets(doc)
+                    .into_iter()
+                    .filter(|name| Some(name.as_str()) != own),
+            );
+            return Some(values);
+        }
         if key == "selected" && proxy_group_name(path).is_some() {
             if let Ok(groups) = expanded_proxy_groups(doc, &self.subscription_nodes) {
                 if groups.contains_key(proxy_group_name(path).unwrap()) {
@@ -1189,6 +1201,10 @@ impl Editor {
         })
     }
     pub fn replace_outbound_fields(table: &mut dyn TableLike, input: &str) {
+        let dialer = table
+            .get("dialer_proxy")
+            .or_else(|| table.get("dialer-proxy"))
+            .cloned();
         let tag = table.get("tag").cloned();
         let replacement = outbound_template(input, "edge");
         let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
@@ -1197,6 +1213,9 @@ impl Editor {
         }
         for (k, v) in replacement.iter() {
             table.insert(k, v.clone());
+        }
+        if let Some(dialer) = dialer {
+            table.insert("dialer_proxy", dialer);
         }
         if let Some(tag) = tag {
             table.insert("tag", tag);
@@ -1295,6 +1314,19 @@ impl Editor {
         }
         let remove = input.is_empty() && !spec.required;
         let item = Self::field_item(&spec, &input, remove)?;
+        if key == "mode" && input == "relay" && proxy_group_name(&self.form.path).is_some() {
+            let group = table_at_mut(doc.as_table_mut(), &self.form.path)?;
+            for field in [
+                "selected",
+                "include_all",
+                "include_all_groups",
+                "filter",
+                "exclude_filter",
+            ] {
+                group.remove(field);
+            }
+        }
+
         if !remove
             && last_key(&self.form.path) == Some("tls")
             && table_at(doc.as_table(), &self.form.path).is_none()
@@ -1951,6 +1983,19 @@ impl Editor {
                     KeyCode::Esc => {
                         self.cancel_input();
                         return Ok(());
+                    }
+                    KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if let Some(index) = options
+                            .get(*cursor)
+                            .and_then(|name| chosen.iter().position(|v| v == name))
+                        {
+                            let next = if key.code == KeyCode::Up {
+                                index.saturating_sub(1)
+                            } else {
+                                (index + 1).min(chosen.len() - 1)
+                            };
+                            chosen.swap(index, next);
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         *cursor = (*cursor + 1).min(options.len().saturating_sub(1))

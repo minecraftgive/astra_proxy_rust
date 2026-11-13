@@ -108,7 +108,9 @@ async fn probe(
         outbound: outbound.clone(),
     })?;
     let mut connect_ms = None;
-    let end = deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+    let connect_timeout = Duration::from_secs(app.config.diagnostic_connect_timeout_secs);
+    let node_timeout = app.config.diagnostic_node_timeout();
+    let end = deadline.min(tokio::time::Instant::now() + node_timeout);
     let result = tokio::time::timeout_at(end, async {
         ensure!(
             tokio::time::Instant::now() < deadline,
@@ -119,11 +121,16 @@ async fn probe(
             port: 443,
         };
         let connection = tokio::time::timeout_at(
-            deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
-            app.connect(&target, &action),
+            deadline.min(tokio::time::Instant::now() + connect_timeout),
+            app.connect_with_timeout(&target, &action, None),
         )
         .await
-        .context("TCP/proxy handshake timed out after 3s")??;
+        .with_context(|| {
+            format!(
+                "TCP/proxy handshake timed out after {}s",
+                connect_timeout.as_secs()
+            )
+        })??;
         connect_ms = Some(start.elapsed().as_millis() as u64);
         emit(Event::Connected {
             outbound: outbound.clone(),
@@ -141,7 +148,9 @@ async fn probe(
     .await;
     let result = result.unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
-            "node test timed out (5s per node, 30s per batch)"
+            "node test timed out ({}s per node, {}s per batch)",
+            node_timeout.as_secs(),
+            app.config.diagnostic_batch_timeout().as_secs()
         ))
     });
     let (ip, error) = match result {
@@ -188,7 +197,7 @@ pub async fn serve(
             } else {
                 RouteAction::Proxy(request.outbound)
             };
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline = tokio::time::Instant::now() + app.config.diagnostic_node_timeout();
             probe(app, &connector, action, request.ip, deadline, &|_| Ok(())).await?
         } else {
             Probe {
@@ -217,7 +226,7 @@ async fn run_actions(
         url: URL.into(),
         running_config: false,
     })?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + app.config.diagnostic_batch_timeout();
     let connector = connector()?;
     let emit = &emit;
     let connector = &connector;

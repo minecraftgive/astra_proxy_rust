@@ -9,7 +9,14 @@ pub async fn trojan_tls(
     password: &str,
     target: &Target,
 ) -> Result<Stream> {
-    let mut tls = tls_connect(server, sni).await?;
+    let tls = tls_connect(server, sni).await?;
+    trojan_on(tls, password, target).await
+}
+pub(crate) async fn trojan_on(
+    mut tls: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    password: &str,
+    target: &Target,
+) -> Result<Stream> {
     let hash = hex::encode(Sha224::digest(password.as_bytes()));
     let header = request(&hash, 1, target)?;
     tls.write_all(&header).await?;
@@ -58,14 +65,14 @@ pub(crate) async fn trojan_stream(
         port,
         password_hash,
         transport,
+        dialer,
     } = outbound
     else {
         bail!("not a Trojan outbound");
     };
     use tokio::io::AsyncWriteExt;
-    let tcp = crate::egress::connect((server.as_str(), *port)).await?;
-    tcp.set_nodelay(true)?;
-    let mut stream = transport.connect(Box::new(tcp)).await?;
+    let tcp = dialer.dial(server, *port, false).await?;
+    let mut stream = transport.connect(tcp).await?;
     let header = request(password_hash, command, target)?;
     stream.write_all(&header).await?;
     stream.flush().await?;

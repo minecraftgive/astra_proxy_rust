@@ -31,6 +31,23 @@ pub(crate) struct Metrics {
     nodes: Mutex<BTreeMap<String, Arc<AtomicU64>>>,
 }
 impl Metrics {
+    pub(crate) fn chain_paths(&self) -> BTreeMap<u64, astra_model::runtime::ChainPath> {
+        self.flows()
+            .values()
+            .rev()
+            .filter_map(Weak::upgrade)
+            .take(128)
+            .filter(|flow| flow.connected.load(Ordering::Relaxed))
+            .filter_map(|flow| {
+                flow.path
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .map(|path| (flow.id, path))
+            })
+            .collect()
+    }
+
     pub(crate) fn node_totals(&self) -> BTreeMap<String, u64> {
         self.nodes
             .lock()
@@ -128,6 +145,7 @@ pub(crate) struct Flow {
     inbound: Inbound,
     network: Network,
     action: RouteAction,
+    path: Mutex<Option<astra_model::runtime::ChainPath>>,
     started: Instant,
     up: AtomicU64,
     down: AtomicU64,
@@ -138,6 +156,14 @@ pub(crate) struct Flow {
     cancel: tokio::sync::watch::Sender<bool>,
 }
 impl Traffic {
+    pub(crate) fn set_path(&self, path: astra_model::runtime::ChainPath) {
+        *self
+            .flow
+            .path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+    }
+
     pub(crate) fn new(
         metrics: &Arc<Metrics>,
         source: Option<SocketAddr>,
@@ -154,6 +180,7 @@ impl Traffic {
             inbound,
             network,
             action: action.clone(),
+            path: Mutex::new(None),
             started: Instant::now(),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),

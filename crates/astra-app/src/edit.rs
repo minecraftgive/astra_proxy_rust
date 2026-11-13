@@ -134,7 +134,16 @@ pub fn proxy_targets(doc: &DocumentMut) -> Vec<String> {
     tags
 }
 pub fn proxy_references(doc: &DocumentMut, target: &str) -> bool {
-    doc.get("standalone_outbound").and_then(Item::as_str) == Some(target)
+    doc.get("outbounds")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                ["dialer_proxy", "dialer-proxy"]
+                    .iter()
+                    .any(|key| node.get(key).and_then(Item::as_str) == Some(target))
+            })
+        })
+        || doc.get("standalone_outbound").and_then(Item::as_str) == Some(target)
         || doc
             .get("proxy_groups")
             .and_then(Item::as_table_like)
@@ -154,6 +163,19 @@ pub fn proxy_references(doc: &DocumentMut, target: &str) -> bool {
             })
 }
 pub fn rename_proxy_references(doc: &mut DocumentMut, previous: &str, next: &str) {
+    if let Some(nodes) = doc
+        .get_mut("outbounds")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for node in nodes.iter_mut() {
+            for key in ["dialer_proxy", "dialer-proxy"] {
+                if node.get(key).and_then(Item::as_str) == Some(previous) {
+                    node.insert(key, value(next));
+                }
+            }
+        }
+    }
+
     if doc.get("standalone_outbound").and_then(Item::as_str) == Some(previous) {
         replace_field(doc.as_table_mut(), "standalone_outbound", value(next));
     }

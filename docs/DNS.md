@@ -18,6 +18,7 @@ plaintext_bypass = false          # 默认：仅 DoH/DoT，绝不降级到明文
 plaintext_bypass_domains = ["+.lan"] # 仅这些域名的 nameserver_policy 可使用明文上游
 bootstrap = ["1.1.1.1", "8.8.8.8"]  # 仅 plaintext_bypass = true 时用于 UDP/53 引导
 respect_rules = false
+proxy_server_nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
 ipv6 = true
 hijack = true
 fake_ip = true
@@ -39,11 +40,25 @@ fake_ip_ttl = 60
 "+.lan" = ["udp://192.168.1.1:53"] # 已被 plaintext_bypass_domains 覆盖
 ```
 
+## 代理服务器解析 DNS（始终直连）
+
+在配置编辑器的 **DNS / Fake IP → 代理服务器解析 DNS** 中设置 `proxy_server_nameserver`。
+这组服务器用于解析节点地址和 DNS 上游的域名；连接始终直连，不受 `respect_rules`、代理组或
+路由规则影响。同一个服务器同时出现在普通 `nameserver` 中时，也始终直连。
+
+非空列表至少包含一个 IP 字面量上游，用于解析列表内及普通 DNS 的域名，避免启动依赖循环。
+支持 DoH/DoT；UDP/TCP 仍需显式开启 `plaintext_bypass`。选择本地网络可以直接访问的服务器。
+列表内按顺序故障切换，全部失败会报错，不会改用普通 DNS 或系统 DNS。
+节点解析返回真实 IP，并使用独立缓存；普通业务域名仍使用原来的 DNS 分流与缓存。
+设置在 `enable=false` 时仍对节点解析生效。留空（默认）保留原有解析策略。
+
+Mihomo 完整配置导入支持 `proxy-server-nameserver`，订阅节点更新仍不修改本地 DNS 设置。
+
 ## 加密强制（默认开启）
 
 默认 `plaintext_bypass = false`，DNS 只使用 DoT（`tls://`）和 DoH（`https://`）：
 
-- `nameserver` / `fallback` 中出现 `udp://`、`tcp://` 或裸 IP 时配置校验失败，错误信息指明
+- `nameserver` / `fallback` / `proxy_server_nameserver` 中出现 `udp://`、`tcp://` 或裸 IP 时配置校验失败，错误信息指明
   对应条目和放行开关。
 - `nameserver_policy` 的明文上游只有在其域名模式被 `plaintext_bypass_domains` 完整覆盖时才允许
   （`+.lan` 覆盖 `+.lan`、`*.x.lan`、`router.lan`；`*.lan` 不覆盖 `+.lan`，因为后者含 `lan` 本身）。
@@ -59,15 +74,15 @@ fake_ip_ttl = 60
 代理核心自身的域名解析同样默认加密，不走系统解析器（getaddrinfo）：
 
 - 直连出站的目标域名、节点服务器域名（Socks5/HTTP/Trojan/VLESS/TUIC 以及 meow 原生协议）
-  都经核心安装的解析钩子交给 DNS 模块解析，结果进入同一 TTL 缓存。
+  都经核心安装的解析钩子交给 DNS 模块解析；配置独立代理 DNS 时，节点解析使用独立缓存。
 - 未配置 `[dns]` 时使用默认加密上游建立一个只解析、不监听、不接管、不做 Fake IP 的内部解析器；
   `enable = false` 时同样按该表中的上游（及加密检查）解析，只是不提供 DNS 服务。
 - `localhost` 与 `*.localhost` 直接返回回环地址，IP 字面量不查询。
 - 命中 `plaintext_bypass_domains` 且没有对应 `nameserver_policy` 的域名交给系统解析器
   （可用于 `+.local` mDNS、公司内网分离 DNS 等）；有策略时按策略上游解析。
 - `respect_rules = true` 时，若 DNS 上游经代理节点连接而解析该节点域名又需要 DNS，嵌套解析
-  改为直连加密上游，不会回退到系统解析器。
-- 只有 `plaintext_bypass = true` 且未启用 DNS 服务时，才恢复使用系统解析器。
+  优先使用 `proxy_server_nameserver`；留空时改为直连普通上游，不会回退到系统解析器。
+- `plaintext_bypass = true` 且未启用 DNS 服务时恢复系统解析；已配置的独立代理 DNS 仍用于节点解析。
 
 注意：系统 hosts 文件与 mDNS 不经过加密解析；需要时把相应域名加入 `plaintext_bypass_domains`。
 `--nettool` 诊断工具和服务端（astra-server-core）的出站解析不受此设置影响。
@@ -75,7 +90,7 @@ fake_ip_ttl = 60
 上游支持 `tls://`（DoT）和 `https://`（DoH）；放行明文后还支持普通 IP / IP:端口、`udp://`、`tcp://`。
 DoH 使用 DNS wire-format POST，支持 HTTP/2 ALPN 与 HTTP/1.1；TLS 校验证书和服务器名称，
 不跳过验证。上游域名默认经 IP 直连的加密上游引导解析（见上节），不依赖系统 DNS；
-仅 plaintext_bypass=true 时改用 bootstrap 中的 IP 走 UDP/53。引导解析采用 A 记录，需要 IPv4 可达。
+仅 plaintext_bypass=true 时改用 bootstrap 中的 IP 走 UDP/53。配置 `proxy_server_nameserver` 时引导解析始终使用该列表内的 IP 字面量服务器。引导解析采用 A 记录，需要 IPv4 可达。
 
 nameserver 按列表顺序尝试；超时、连接失败、无效响应、SERVFAIL 和 REFUSED 会切换下一个，
 随后尝试 fallback。每个上游有 query_timeout_ms 的超时，整个失败切换有两倍该时间的截止。
@@ -192,4 +207,5 @@ Mihomo 字段参照[官方 DNS 配置](https://wiki.metacubex.one/config/dns/)�
 回归覆盖 Fake IP 稳定性、IPv4/IPv6、容量耗尽、热重载、过期/未知地址、缓存命中/过期、
 域名策略、失败切换、错误事务 ID、过滤和节点域名保护；内存中 TUN TCP 完整握手和负载、
 TUN DNS/UDP 回包还原、TCP/UDP 域名规则 IPC；本地 DoH/DoT TLS 交换及不可信证书拒绝。
+独立代理 DNS 覆盖规则绕过、不可用代理、关闭 DNS 服务、引导解析、独立缓存及失败不回退。
 这些验证不创建或修改用户当前的系统 TUN/网卡设置。

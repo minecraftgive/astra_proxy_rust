@@ -38,6 +38,7 @@ pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Val
             }
             "nameserver" => config.nameserver = strings(value)?,
             "fallback" => config.fallback = strings(value)?,
+            "proxy-server-nameserver" => config.proxy_server_nameserver = strings(value)?,
             "default-nameserver" => {
                 config.bootstrap = strings(value)?
                     .iter()
@@ -135,6 +136,11 @@ fn encrypted_only(
     };
     keep(&mut config.nameserver, "nameserver")?;
     keep(&mut config.fallback, "fallback")?;
+    let proxy_configured = !config.proxy_server_nameserver.is_empty();
+    keep(
+        &mut config.proxy_server_nameserver,
+        "proxy-server-nameserver",
+    )?;
     let mut empty = Vec::new();
     for (pattern, servers) in config.nameserver_policy.iter_mut() {
         keep(servers, &format!("nameserver-policy {pattern}"))?;
@@ -145,6 +151,12 @@ fn encrypted_only(
     for pattern in empty {
         config.nameserver_policy.remove(&pattern);
     }
+    if proxy_configured && config.proxy_bootstrap().is_empty() {
+        config
+            .proxy_server_nameserver
+            .extend(Config::default().nameserver);
+        warnings.push("DNS proxy-server-nameserver 无 IP 字面量加密上游，已补充默认直连加密上游用于节点和引导解析".into());
+    }
     if config.nameserver.is_empty() {
         config.nameserver = Config::default().nameserver;
         warnings.push(format!(
@@ -152,7 +164,7 @@ fn encrypted_only(
             config.nameserver.join(", ")
         ));
     }
-    if config.encrypted_bootstrap().is_empty() {
+    if config.encrypted_bootstrap().is_empty() && config.proxy_bootstrap().is_empty() {
         let defaults = Config::default().nameserver;
         warnings.push(format!(
             "DNS 上游均为域名，已追加 IP 直连加密上游 {} 用于加密引导解析",

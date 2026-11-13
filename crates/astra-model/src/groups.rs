@@ -12,6 +12,7 @@ pub enum Mode {
     Fallback,
     #[serde(alias = "load-balance")]
     LoadBalance,
+    Relay,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -129,6 +130,16 @@ pub fn expand(
         .flat_map(|g| g.members.iter().cloned())
         .collect();
     for (name, source) in groups {
+        if source.mode == Mode::Relay
+            && (source.include_all
+                || source.include_all_groups
+                || source.filter.is_some()
+                || source.exclude_filter.is_some()
+                || source.subscription.is_some()
+                || source.selected.is_some())
+        {
+            return Err(format!("relay {name}: use explicit ordered members; selection and dynamic membership are not supported"));
+        }
         let filter = pattern(&source.filter).map_err(|e| format!("proxy group {name}: {e}"))?;
         let exclude =
             pattern(&source.exclude_filter).map_err(|e| format!("proxy group {name}: {e}"))?;
@@ -208,6 +219,9 @@ pub fn member_path(
         let Some(group) = groups.get(&name) else {
             continue;
         };
+        if group.mode == Mode::Relay {
+            continue;
+        }
         if group.members.iter().any(|m| m == target) {
             let mut found = path;
             found.push(target.to_owned());
@@ -236,6 +250,9 @@ pub fn member_choices(groups: &BTreeMap<String, Group>, root: &str) -> Vec<Strin
             return;
         }
         if let Some(group) = groups.get(name) {
+            if group.mode == Mode::Relay {
+                return;
+            }
             for member in &group.members {
                 if seen.insert(member.clone()) {
                     output.push(member.clone());

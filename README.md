@@ -237,6 +237,8 @@ Unix 代理核心与托管工作进程启动时尝试将文件描述符软上限
 
 `connect_timeout_secs` 默认 8 秒，`decision_timeout_ms` 默认 500 毫秒，`shutdown_timeout_secs` 默认 2 秒。运行时可用 `RUST_LOG=debug` 查看会话错误；`--check` 只验证配置，不能证明节点可连接或凭据有效。
 
+节点诊断和出口探测的 TCP/代理握手超时由实例顶层配置 `diagnostic_connect_timeout_secs` 控制，默认 `3` 秒，可设为 `1..60` 秒。也可在实例配置编辑器修改“诊断 TCP/代理连接超时（秒）”。例如链式节点可设 `diagnostic_connect_timeout_secs = 15`；保存后，运行中的实例需重载配置（或重启）再测试。此项独立于普通流量的 `connect_timeout_secs`；单节点总预算为该值加 2 秒，批次预算为至少 30 秒，随较大的单节点预算延长。
+
 ## 验证
 
 ```sh
@@ -260,3 +262,42 @@ python3 scripts/tuic_regression.py
 ## 代码分层
 
 共享协议、proxy 核心和操作系统适配的目录及依赖规则见 [模块架构](docs/ARCHITECTURE.md)。运行 `python scripts/check_architecture.py` 检查模块边界。
+
+### 链式代理
+
+节点的 `dialer_proxy` 指定前置节点或代理组；`proxy_groups` 的 `relay` 模式按 `members` 的显式顺序连接。两种配置都会生成实际的 `entry → relay → … → exit` 路径。
+
+```toml
+standalone = true
+standalone_outbound = "chain"
+socks5_listen = "127.0.0.1:1080"
+
+[[outbounds]]
+tag = "entry"
+kind = "socks5"
+server = "127.0.0.1:1081"
+
+[[outbounds]]
+tag = "relay"
+kind = "socks5"
+server = "127.0.0.1:1082"
+
+[[outbounds]]
+tag = "exit"
+kind = "socks5"
+server = "127.0.0.1:1083"
+# 单独选择 exit 时，经 entry 连接；放在 relay 后续跳时，以组顺序为准。
+dialer_proxy = "entry"
+
+[proxy_groups.chain]
+mode = "relay"
+members = ["entry", "relay", "exit"]
+```
+
+- 前置代理可继续指定前置，relay 可以嵌套，也可以把普通选择组作为一跳。代理组的选择层级不计入实际代理跳数。
+- relay 的顺序优先：只应用实际首跳自身的前置链路，后续跳的 `dialer_proxy` 不重复应用。relay 不接受 `selected`、动态收集或过滤成员；需要动态选择时，引用普通代理组。
+- 支持现有 TCP 协议组合。native Trojan/VLESS/VMess 的 UDP 通过 TCP 链路传输；SOCKS5/SS 的 UDP 要求前置链路具备 UDP 能力。HTTP CONNECT 和旧格式 TCP 出口不支持 UDP。
+- Hysteria2/TUIC 仅可位于实际首跳；不支持的组合、循环引用、缺失节点及超过 32 跳的路径会报错。入口失败不会改为直连出口。
+- TUI 概览右栏“快照”内下方显示路径：连接焦点显示建立时记录的实际路线，代理组焦点显示预览。负载均衡预览提示按连接选择；长链和较小窗口会压缩显示。普通组标签不作为网络跳。
+- GUI 成员编辑器提供上下移动，TUI 成员编辑器用 `Shift+↑/↓` 调整顺序；Web 成员字段提供顺序按钮，修改后写入草稿。保存前可查看路径预览。
+- 链式测速、出口探测和订阅代理下载使用整条链路。单节点分享链接不能保存前置配置，请导出完整配置。独立详细网络诊断暂不支持链式出口，会明确拒绝执行。

@@ -18,8 +18,6 @@ use tokio::{
     sync::Semaphore,
 };
 
-/// A probe round waits at most this long for its core.
-const ROUND_LIMIT: Duration = Duration::from_secs(15);
 /// Longest idle period a client may ask a worker to survive.
 pub(crate) const MAX_KEEP_ALIVE: Duration = Duration::from_secs(2 * 3600);
 
@@ -127,6 +125,14 @@ impl Probes {
             .try_acquire()
             .context("Exit probes are busy; retry shortly")?;
         plan.refresh().await?;
+        let config: astra_model::config::proxy::ProxyConfig = toml::from_str(&plan.text)?;
+        // Validate the configurable bound before calculating watchdog deadlines.
+        anyhow::ensure!(
+            (1..=astra_model::diagnostics::MAX_CONNECT_TIMEOUT_SECS)
+                .contains(&config.diagnostic_connect_timeout_secs),
+            "diagnostic_connect_timeout_secs must be between 1 and 60"
+        );
+        let round_limit = config.diagnostic_node_timeout() + Duration::from_secs(10);
         let key = Key {
             executable: plan.executable.clone(),
             config_path: plan.config_path.clone(),
@@ -140,7 +146,7 @@ impl Probes {
                 worker.close().await?;
             }
         }
-        let result = tokio::time::timeout(ROUND_LIMIT, async {
+        let result = tokio::time::timeout(round_limit, async {
             if guard.worker.is_none() {
                 guard.worker = Some(Worker::spawn(&plan, key).await?);
                 // Store ownership before the first await that writes to the

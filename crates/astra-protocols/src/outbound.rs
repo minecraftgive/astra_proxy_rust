@@ -57,6 +57,12 @@ pub(crate) async fn tls_connect(
         .await
         .context("TLS endpoint TCP connect")?;
     tcp.set_nodelay(true)?;
+    tls_on(tcp, sni).await
+}
+pub(crate) async fn tls_on<S: AsyncRead + AsyncWrite + Unpin>(
+    tcp: S,
+    sni: &str,
+) -> Result<tokio_rustls::client::TlsStream<S>> {
     static TLS_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     let config = TLS_CONFIG.get_or_init(|| {
         let mut roots = RootCertStore::empty();
@@ -84,3 +90,40 @@ pub fn append_socks_address(out: &mut Vec<u8>, target: &Target) -> Result<()> {
 #[cfg(test)]
 #[path = "test/outbound_test.rs"]
 mod tests;
+
+/// All legacy handshakes use the supplied dialer; they cannot bypass a chain.
+pub async fn open_with_dialer(
+    target: &Target,
+    config: &OutboundConfig,
+    dialer: &dyn meow_proxy::dialer::TcpDialer,
+) -> Result<Stream> {
+    let server = match config {
+        OutboundConfig::Socks5 { server, .. }
+        | OutboundConfig::Http { server, .. }
+        | OutboundConfig::TrojanTls { server, .. }
+        | OutboundConfig::VlessTls { server, .. } => server,
+        _ => bail!("native outbound requires its compiled adapter"),
+    };
+    let endpoint = crate::http::authority_target(server)?;
+    let stream = dialer.dial(&endpoint.host, endpoint.port, false).await?;
+    match config {
+        OutboundConfig::Socks5 {
+            username, password, ..
+        } => {
+            crate::socks5::socks5_on(stream, username.as_deref(), password.as_deref(), target).await
+        }
+        OutboundConfig::Http {
+            username, password, ..
+        } => {
+            crate::http::http_connect_on(stream, username.as_deref(), password.as_deref(), target)
+                .await
+        }
+        OutboundConfig::TrojanTls { sni, password, .. } => {
+            crate::trojan::trojan_on(tls_on(stream, sni).await?, password, target).await
+        }
+        OutboundConfig::VlessTls { sni, uuid, .. } => {
+            crate::vless::vless_on(tls_on(stream, sni).await?, uuid, target).await
+        }
+        _ => unreachable!(),
+    }
+}

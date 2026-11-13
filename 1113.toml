@@ -1,0 +1,235 @@
+http_listen = "0.0.0.0:8080"
+rule_socket = "/tmp/astra-rule.sock"
+socks5_listen = "0.0.0.0:1080"
+watch_config = true
+mixed_listen = "0.0.0.0:7890"
+auto_start = false
+diagnostic_connect_timeout_secs = 10
+connect_timeout_secs = 15
+
+[[outbounds]]
+kind = "native"
+tag = "AEA-80-Direct-Vision"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.0rtt.22uIV64anE9P8RwrX7N-qX0lhpEFRo9ez5buVC3KL3Q"
+flow = "xtls-rprx-vision"
+port = 80
+protocol = "vless"
+server = "20.2.234.52"
+uuid = "4f316bdc-4abf-4999-aca4-37d67385b2a2"
+
+[outbounds.config.tls]
+cert_pin_sha256 = "abb94eb650b796a534b0f0bdd471a84e67f1ca92fdc5b2300b042d7eca161eb1"
+fingerprint = "chrome"
+server_name = "aea.misaka233.space"
+
+[outbounds.config.transport]
+kind = "xhttp"
+mode = "auto"
+path = "/nothing_qwq_passport"
+
+[[outbounds]]
+kind = "native"
+tag = "AJP-80-Direct-Vision"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.0rtt.22uIV64anE9P8RwrX7N-qX0lhpEFRo9ez5buVC3KL3Q"
+flow = "xtls-rprx-vision"
+port = 80
+protocol = "vless"
+server = "20.89.59.59"
+uuid = "4f316bdc-4abf-4999-aca4-37d67385b2a2"
+
+[outbounds.config.tls]
+cert_pin_sha256 = "bb749e8bd131ed8d9973f4619cba146c3bb3e5b210b444d70f3ba21cd0563fe8"
+fingerprint = "chrome"
+server_name = "ajp.misaka233.space"
+
+[outbounds.config.transport]
+kind = "xhttp"
+mode = "auto"
+path = "/nothing_qwq_passport"
+
+[[outbounds]]
+kind = "native"
+tag = "Lucky-52588-Vision-Pinned"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.0rtt.22uIV64anE9P8RwrX7N-qX0lhpEFRo9ez5buVC3KL3Q"
+flow = "xtls-rprx-vision"
+port = 52588
+protocol = "vless"
+server = "lucky.vpsnat.com"
+uuid = "4f316bdc-4abf-4999-aca4-37d67385b2a2"
+
+[outbounds.config.tls]
+cert_pin_sha256 = "bb749e8bd131ed8d9973f4619cba146c3bb3e5b210b444d70f3ba21cd0563fe8"
+server_name = "ajp.misaka233.space"
+
+[outbounds.config.transport]
+kind = "xhttp"
+mode = "auto"
+path = "/nothing_qwq_passport"
+
+[[outbounds]]
+kind = "native"
+tag = "HINET-XHTTP-Vision"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.0rtt.Z7H3xnLTxp0WHi5UcnGMlAIDShf-M-NTODjaAQPhEHY"
+flow = "xtls-rprx-vision"
+port = 52588
+protocol = "vless"
+server = "lucky.vpsnat.com"
+uuid = "1cc0647e-c63b-4d46-865e-5c584ac2b4bf"
+
+[outbounds.config.tls]
+server_name = "lucky.vpsnat.com"
+cert_pin_sha256 = "67F1CBBDC9D6C9BC88E0A79E6843C306DA8D50154B738EE9CC6AEAED7FE76EAB"
+
+[outbounds.config.transport]
+kind = "xhttp"
+mode = "auto"
+path = "/nothing_qwq_passport"
+
+[[outbounds]]
+kind = "native"
+tag = "SG-XHTTP-Vision"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.1rtt.z30leDHCiZR-lS1FHBdlslMjn-vH5R88R8t4lfSLA00"
+flow = "xtls-rprx-vision"
+port = 56560
+protocol = "vless"
+server = "45.128.12.66"
+uuid = "ec280f57-f817-46c1-87cc-530dacc23afb"
+
+[outbounds.config.tls]
+server_name = "xray.local"
+cert_pin_sha256 = "8E75FAAF98BD5B87453EFC2EE2613C0E0B47AEECFA59A601C7D670244B53C5C5"
+
+[outbounds.config.transport]
+kind = "xhttp"
+mode = "auto"
+path = "/proxy"
+
+[[outbounds]]
+kind = "native"
+tag = "SG-ISP-via-AJP"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.1rtt.FvVXEXGmekkaHoMLeLtUPfm4GZfKbfE4tBQsaZXovlw"
+flow = "xtls-rprx-vision"
+port = 80
+protocol = "vless"
+server = "20.89.59.59"
+uuid = "d3bebf53-4ad5-4d64-84b4-4a07d6267672"
+
+[outbounds.config.tls]
+fingerprint = "chrome"
+server_name = "ajp.misaka233.space"
+
+[outbounds.config.transport]
+host = "ajp.misaka233.space"
+kind = "xhttp"
+mode = "auto"
+path = "/sg_isp_d9ba89483684"
+
+[[outbounds]]
+kind = "native"
+tag = "SG-BROADBAND-via-AJP"
+
+[outbounds.config]
+encryption = "mlkem768x25519plus.native.1rtt.qK1mz-7xRQXT6nmIuyfVK1vZA1K7MVVS3RH5KfgrzX4"
+flow = "xtls-rprx-vision"
+port = 80
+protocol = "vless"
+server = "20.89.59.59"
+uuid = "dd70153f-069b-4803-ac21-1b4ff37cb90b"
+
+[outbounds.config.tls]
+fingerprint = "chrome"
+server_name = "ajp.misaka233.space"
+
+[outbounds.config.transport]
+host = "ajp.misaka233.space"
+kind = "xhttp"
+mode = "auto"
+path = "/sg_broadband_3f1c334c65d8"
+
+[proxy_groups]
+
+[proxy_groups.PROXY]
+mode = "select"
+members = ["AEA-80-Direct-Vision", "AJP-80-Direct-Vision", "Lucky-52588-Vision-Pinned", "no", "chain_tw"]
+include_all = true
+include_all_groups = true
+url = "https://www.gstatic.com/generate_204"
+interval = 30
+timeout_ms = 5000
+tolerance_ms = 200
+disconnect_on_auto = false
+disconnect_on_failure = true
+selected = "AJP-80-Direct-Vision"
+disconnect_on_manual = true
+
+[proxy_groups.no]
+include_in_proxy = true
+members = []
+mode = "select"
+subscription = "no"
+interval = 60
+timeout_ms = 5000
+tolerance_ms = 200
+disconnect_on_auto = false
+disconnect_on_failure = true
+
+[proxy_groups.DIRECT]
+mode = "select"
+members = ["DIRECT"]
+
+[proxy_groups.REJECT]
+mode = "select"
+members = ["REJECT"]
+
+[proxy_groups.chain_tw]
+mode = "relay"
+members = ["AJP-80-Direct-Vision", "HINET-XHTTP-Vision"]
+disconnect_on_manual = true
+
+[proxy_groups.chain_sg]
+mode = "relay"
+members = ["AJP-80-Direct-Vision", "SG-XHTTP-Vision"]
+disconnect_on_manual = true
+
+[proxy_groups.chain_jp]
+mode = "relay"
+members = ["AEA-80-Direct-Vision", "AJP-80-Direct-Vision"]
+disconnect_on_manual = true
+
+[subscriptions]
+
+[subscriptions.no]
+url = "https://m1.tohno-1.top/oosaka/1619e2d6c63b7d0e12f21aaa3482d8c5"
+interval = 3600
+import_groups = true
+
+[dns]
+enable = true
+listen = ["127.0.0.1:1053"]
+nameserver = ["https://1.1.1.1/dns-query","https://cloudflare-dns.com/dns-query","https://dns.google/dns-query"]
+ipv6 = false
+fake_ip = true
+respect_rules = true
+fallback = ["https://1.0.0.1/dns-query"]
+hijack = true
+route_system_dns = true
+proxy_server_nameserver = ["https://9.9.9.9/dns-query"]
+
+[tun]
+auto_interface = true
+auto_gateway = true
+interface = "en0"
+
+[system_proxy]

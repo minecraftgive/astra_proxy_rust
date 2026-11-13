@@ -33,6 +33,7 @@ async fn closing_socks_udp_closes_upstream_control_connection() {
             );
         });
         let configs = [OutboundConfig::Socks5 {
+            dialer_proxy: None,
             tag: "socks".into(),
             server: address.to_string(),
             username: None,

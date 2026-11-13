@@ -115,6 +115,7 @@ fn node(v: &Y, warnings: &mut Vec<String>) -> Result<Table> {
     let port = port(v, "port")?.context("缺少非零 port")?;
     let mut out = Table::new();
     put(&mut out, "tag", &tag);
+    copy(&mut out, v, "dialer-proxy", "dialer_proxy");
     if matches!(kind.as_str(), "socks5" | "http") {
         ensure!(!yes(v, "tls"), "上游 SOCKS/HTTP TLS 不支持");
         put(&mut out, "kind", kind);
@@ -322,7 +323,7 @@ impl Resolver<'_> {
         let group = self.groups.get(name)?;
         if !matches!(
             s(group, "type").as_deref(),
-            Some("select" | "url-test" | "fallback" | "load-balance")
+            Some("select" | "url-test" | "fallback" | "load-balance" | "relay")
         ) {
             return None;
         }
@@ -354,7 +355,7 @@ fn native_groups(
         .filter(|(_, g)| {
             matches!(
                 s(g, "type").as_deref(),
-                Some("select" | "url-test" | "fallback" | "load-balance")
+                Some("select" | "url-test" | "fallback" | "load-balance" | "relay")
             )
         })
         .map(|(name, _)| name.clone())
@@ -403,7 +404,9 @@ fn native_groups(
                 }
             };
             Ok(Group {
-                mode: if selected.is_some() || s(source, "type").as_deref() == Some("select") {
+                mode: if s(source, "type").as_deref() == Some("relay") {
+                    Mode::Relay
+                } else if selected.is_some() || s(source, "type").as_deref() == Some("select") {
                     Mode::Select
                 } else {
                     match s(source, "type").as_deref() {
@@ -950,6 +953,18 @@ pub fn convert(input: &str, options: &Options) -> Result<Converted> {
             }
         }
     }
+    let chain_nodes: Vec<astra_model::config::protocol::OutboundConfig> = outbounds
+        .iter()
+        .cloned()
+        .map(T::try_into)
+        .collect::<std::result::Result<_, _>>()?;
+    astra_model::chain::validate(
+        &proxy_groups,
+        &chain_nodes
+            .into_iter()
+            .map(|node| (node.tag().to_owned(), node))
+            .collect(),
+    )?;
     let node_count = outbounds.len();
     astra_model::groups::ensure_default(&mut proxy_groups, &nodes).map_err(anyhow::Error::msg)?;
     astra_model::groups::validate(&proxy_groups, &nodes).map_err(anyhow::Error::msg)?;

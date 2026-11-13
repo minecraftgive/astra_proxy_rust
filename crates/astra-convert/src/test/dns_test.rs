@@ -75,3 +75,30 @@ fn subscription_never_imports_dns_even_when_importing_groups() {
         assert_eq!(after["dns"], before["dns"]);
     }
 }
+
+#[test]
+fn proxy_server_dns_import_preserves_direct_encrypted_list_and_supplies_bootstrap() {
+    for value in [
+        "['tls://192.0.2.53']",
+        "['https://dns.example/dns-query']",
+        "['192.0.2.53']",
+    ] {
+        let converted = convert(
+            &format!("socks-port: 1080\ndns:\n  proxy-server-nameserver: {value}\n"),
+            &Options::default(),
+        )
+        .unwrap();
+        let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
+        let config: astra_model::config::dns::Config = document["dns"].clone().try_into().unwrap();
+        config.validate().unwrap();
+        assert!(!config.proxy_server_nameserver.is_empty());
+        assert!(!config.proxy_bootstrap().is_empty());
+        assert!(!converted
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("忽略不支持的 DNS 字段 proxy-server-nameserver")));
+        if value.contains("tls://192.0.2.53") {
+            assert_eq!(config.proxy_server_nameserver, ["tls://192.0.2.53"]);
+        }
+    }
+}

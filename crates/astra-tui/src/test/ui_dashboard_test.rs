@@ -880,6 +880,10 @@ fn dns_sample() -> Ui {
                 address: "tls://1.1.1.1:853".into(),
                 transport: "DoT".into(),
             }],
+            proxy_server_nameserver: vec![astra_model::runtime::DnsServer {
+                address: "https://192.0.2.53/dns-query".into(),
+                transport: "DoH".into(),
+            }],
             ..Default::default()
         })),
         dns: Some(Box::new(DnsQueryLog {
@@ -923,6 +927,8 @@ fn dns_query_form_keeps_input_local_and_displays_settings_errors_and_answers() {
         ui.key(key(KeyCode::Char('s')));
         let text = screen(&render(&ui, 100, 30));
         assert!(text.contains("DoT tls://1.1.1.1:853"));
+        assert!(text.contains("Proxy DNS (always direct)"));
+        assert!(text.contains("https://192.0.2.53/dns-query"));
         assert!(text.contains("127.0.0.1:1053"));
         ui.key(key(KeyCode::Esc));
         assert!(!ui.dns_state.status_open);
@@ -1154,5 +1160,50 @@ fn reordered_dns_page_keeps_shortcuts_tabs_palette_and_history_consistent() {
             .unwrap();
         ui.mouse(click(tab));
         assert_eq!(ui.page, DNS);
+    });
+}
+
+#[test]
+fn chain_snapshot_follows_focus_and_never_rewrites_captured_connections() {
+    use astra_model::runtime::{ChainHop, ChainPath, ChainTelemetry, Coverage, RuntimeTelemetry};
+    crate::i18n::with_language(crate::i18n::Language::English, || {
+        let mut ui = live_sample();
+        let path = |prefix: &str| ChainPath {
+            status: "proxy".into(),
+            hops: (0..4)
+                .map(|index| ChainHop {
+                    name: format!("{prefix}{index}"),
+                    protocol: "SOCKS5".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        ui.runtime_telemetry = Some(RuntimeTelemetry {
+            coverage: Coverage::Complete,
+            chains: Some(Box::new(ChainTelemetry {
+                connections: [(1, path("old"))].into(),
+                previews: [("PROXY".into(), path("new"))].into(),
+            })),
+            ..Default::default()
+        });
+        ui.select_connection_row_key(ConnectionRowKey::Connection(1));
+        ui.focus.region = focus::Region::Main;
+        let text = screen(&render(&ui, 150, 70));
+        assert!(text.contains("Actual connection"));
+        assert!(text.contains("entry  old0"));
+        assert!(text.contains("relay  old1"));
+        assert!(text.contains("relay  old2"));
+        assert!(text.contains("exit  old3"));
+        assert!(!text.contains("entry  new0"));
+        ui.focus.region = focus::Region::Secondary;
+        ui.select_proxy_group("PROXY");
+        let text = screen(&render(&ui, 150, 70));
+        assert!(text.contains("Path preview"));
+        assert!(text.contains("entry  new0"));
+        for (width, height) in [(120, 24), (140, 40), (70, 20), (20, 8)] {
+            let _ = render(&ui, width, height);
+        }
+        ui.runtime_telemetry = None;
+        assert!(screen(&render(&ui, 150, 70)).contains("Proxy path unavailable"));
     });
 }

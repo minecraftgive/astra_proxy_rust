@@ -3,7 +3,10 @@ use crate::{config::OutboundConfig, outbound::Stream};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use meow_common::{Metadata, ProxyAdapter};
-use meow_proxy::{dialer::DirectDialer, TransportChain};
+use meow_proxy::{
+    dialer::{DirectDialer, TcpDialer},
+    TransportChain,
+};
 use meow_transport::tls::{RealityConfig, TlsConfig, TlsLayer};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -13,79 +16,99 @@ pub use astra_model::config::protocol::{
 
 pub enum NativeOutbound {
     Tuic(crate::tuic::Client),
+    Legacy {
+        config: OutboundConfig,
+        dialer: Arc<dyn TcpDialer>,
+    },
     Adapter(Arc<dyn ProxyAdapter>),
     Trojan {
         server: String,
         port: u16,
         password_hash: String,
         transport: TransportChain,
+        dialer: Arc<dyn TcpDialer>,
     },
 }
-pub type Registry = HashMap<String, NativeOutbound>;
+pub type Registry = HashMap<String, Arc<NativeOutbound>>;
 
 pub fn compile(configs: &[OutboundConfig], base: &Path) -> Result<Registry> {
-    let mut registry = Registry::new();
-    for config in configs {
-        if let OutboundConfig::Socks5 {
+    configs
+        .iter()
+        .map(|config| {
+            Ok((
+                config.tag().to_owned(),
+                Arc::new(compile_one(config, base, Arc::new(DirectDialer))?),
+            ))
+        })
+        .collect()
+}
+
+pub fn compile_one(
+    config: &OutboundConfig,
+    base: &Path,
+    dialer: Arc<dyn TcpDialer>,
+) -> Result<NativeOutbound> {
+    if config.requires_direct_entry() && dialer.is_proxy() {
+        bail!("{}: QUIC nodes must be the first hop", config.tag());
+    }
+    match config {
+        OutboundConfig::Socks5 {
             tag,
             server,
             username,
             password,
-        } = config
-        {
-            let (host, port) = server
-                .rsplit_once(':')
-                .context("SOCKS5 server requires host:port")?;
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            let port: u16 = port.parse().context("invalid SOCKS5 server port")?;
-            if host.is_empty() || port == 0 {
-                bail!("invalid SOCKS5 server");
-            }
-            registry.insert(
-                tag.clone(),
-                NativeOutbound::Adapter(Arc::new(
-                    meow_proxy::Socks5Adapter::new(
-                        tag,
-                        host,
-                        port,
-                        username.clone().zip(password.clone()),
-                        false,
-                        false,
-                        Arc::new(DirectDialer),
-                    )
-                    .with_udp(true),
-                )),
-            );
-        }
-        if let OutboundConfig::Native { tag, config } = config {
-            validate_common(config).with_context(|| format!("outbound {tag}"))?;
-            let outbound = if matches!(config.protocol, Protocol::Tuic) {
-                NativeOutbound::Tuic(crate::tuic::Client::new(config, base)?)
-            } else if matches!(config.protocol, Protocol::Trojan) {
-                use sha2::{Digest, Sha224};
-                if config.tls.is_none() {
-                    bail!("Trojan requires TLS");
-                }
-                if config.mux.is_some() {
-                    bail!("Trojan mux is not yet supported");
-                }
-                NativeOutbound::Trojan {
-                    server: config.server.clone(),
-                    port: config.port,
-                    password_hash: hex::encode(Sha224::digest(
-                        required(&config.password, "password")?.as_bytes(),
-                    )),
-                    transport: transport(config, base)?,
-                }
-            } else {
-                NativeOutbound::Adapter(
-                    build(tag, config, base).with_context(|| format!("outbound {tag}"))?,
+            ..
+        } => {
+            let endpoint = crate::http::authority_target(server)?;
+            Ok(NativeOutbound::Adapter(Arc::new(
+                meow_proxy::Socks5Adapter::new(
+                    tag,
+                    &endpoint.host,
+                    endpoint.port,
+                    username.clone().zip(password.clone()),
+                    false,
+                    false,
+                    dialer,
                 )
-            };
-            registry.insert(tag.clone(), outbound);
+                .with_udp(true),
+            )))
         }
+        OutboundConfig::Native { tag, config, .. } => {
+            validate_common(config).with_context(|| format!("outbound {tag}"))?;
+            match config.protocol {
+                Protocol::Tuic => Ok(NativeOutbound::Tuic(crate::tuic::Client::new(
+                    config, base,
+                )?)),
+                Protocol::Trojan => {
+                    use sha2::{Digest, Sha224};
+                    anyhow::ensure!(config.tls.is_some(), "Trojan requires TLS");
+                    anyhow::ensure!(config.mux.is_none(), "Trojan mux is not yet supported");
+                    Ok(NativeOutbound::Trojan {
+                        server: config.server.clone(),
+                        port: config.port,
+                        password_hash: hex::encode(Sha224::digest(
+                            required(&config.password, "password")?.as_bytes(),
+                        )),
+                        transport: transport(config, base)?,
+                        dialer,
+                    })
+                }
+                _ => Ok(NativeOutbound::Adapter(build(tag, config, base, dialer)?)),
+            }
+        }
+        _ => Ok(NativeOutbound::Legacy {
+            config: config.clone(),
+            dialer,
+        }),
     }
-    Ok(registry)
+}
+
+pub fn supports_udp(outbound: &NativeOutbound) -> bool {
+    match outbound {
+        NativeOutbound::Adapter(adapter) => adapter.support_udp(),
+        NativeOutbound::Legacy { .. } => false,
+        NativeOutbound::Tuic(_) | NativeOutbound::Trojan { .. } => true,
+    }
 }
 
 pub async fn connect(outbound: &NativeOutbound, target: &astra_model::Target) -> Result<Stream> {
@@ -93,6 +116,9 @@ pub async fn connect(outbound: &NativeOutbound, target: &astra_model::Target) ->
     // meow transports (gRPC, h2) require identical bytes when a pending write is retried.
     match outbound {
         NativeOutbound::Tuic(client) => client.connect(target).await,
+        NativeOutbound::Legacy { config, dialer } => {
+            crate::outbound::open_with_dialer(target, config, dialer.as_ref()).await
+        }
         NativeOutbound::Adapter(adapter) => Ok(Box::new(StableWrite::new(
             adapter.dial_tcp(&metadata(target)).await?,
         ))),
@@ -108,6 +134,7 @@ pub async fn connect_udp(
 ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
     match outbound {
         NativeOutbound::Tuic(client) => client.connect_udp(target).await,
+        NativeOutbound::Legacy { .. } => bail!("outbound does not support UDP"),
         NativeOutbound::Adapter(adapter) => {
             if !adapter.support_udp() {
                 bail!("outbound does not support UDP");
@@ -184,8 +211,12 @@ fn validate_common(cfg: &NodeConfig) -> Result<()> {
     Ok(())
 }
 
-fn build(tag: &str, cfg: &NodeConfig, base: &Path) -> Result<Arc<dyn ProxyAdapter>> {
-    let dialer = Arc::new(DirectDialer);
+fn build(
+    tag: &str,
+    cfg: &NodeConfig,
+    base: &Path,
+    dialer: Arc<dyn TcpDialer>,
+) -> Result<Arc<dyn ProxyAdapter>> {
     let mux = cfg
         .mux
         .as_deref()

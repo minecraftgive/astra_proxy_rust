@@ -114,6 +114,7 @@ impl Fixture {
                     let _ = send(
                         &mut stream,
                         WorkerSample {
+                            chains: None,
                             snapshot: astra_model::runtime::Snapshot::default(),
                             node_totals: Some([("node".into(), id * 100)].into()),
                             dns: None,

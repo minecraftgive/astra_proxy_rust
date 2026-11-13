@@ -9,7 +9,7 @@ mod adapter {
         tag: &str,
         cfg: &NodeConfig,
         base: &Path,
-        dialer: Arc<meow_proxy::dialer::DirectDialer>,
+        dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
         mux: Option<meow_proxy::mux::MuxOptions>,
     ) -> Result<Arc<dyn ProxyAdapter>> {
         let id = uuid::Uuid::parse_str(required(&cfg.uuid, "uuid")?)?;

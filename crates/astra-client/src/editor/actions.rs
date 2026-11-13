@@ -520,6 +520,18 @@ impl Editor {
             Mode::Browse => Ok(()),
         }
     }
+    pub fn move_member(&mut self, name: &str, down: bool) {
+        if let Mode::Members { chosen, .. } = &mut self.form.mode {
+            if let Some(index) = chosen.iter().position(|value| value == name) {
+                let next = if down {
+                    (index + 1).min(chosen.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                };
+                chosen.swap(index, next);
+            }
+        }
+    }
     pub fn toggle_member(&mut self, index: usize) {
         if let Mode::Members {
             options,

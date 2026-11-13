@@ -1,5 +1,7 @@
 //! Result data shared by the core and manager; no credentials or configuration text.
 use serde::{Deserialize, Serialize};
+/// Bounds instance-configurable diagnostic waits, including client watchdogs.
+pub const MAX_CONNECT_TIMEOUT_SECS: u64 = 60;
 /// Stdin payload keeps large node selections within OS command-line limits.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {

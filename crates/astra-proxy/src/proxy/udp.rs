@@ -259,6 +259,9 @@ pub(crate) async fn open_action(
         Network::Udp,
         &action,
     );
+    if let Some(traffic) = &traffic {
+        traffic.set_path(app.describe_chain(&action, &lease));
+    }
     let result: Result<PacketTransport> =
         meow_common::outbound_iface::with_outbound_interface(interface, async {
             match action {
@@ -294,11 +297,10 @@ pub(crate) async fn open_action(
                 }
                 RouteAction::Proxy(tag) => {
                     let outbound = app
-                        .native_for(interface)
-                        .get(&tag)
-                        .with_context(|| format!("outbound {tag} does not support UDP"))?;
+                        .chain_adapter(&lease.3, interface, lease.epochs())
+                        .with_context(|| format!("outbound {tag} chain unavailable"))?;
                     Ok(PacketTransport::Proxy(
-                        crate::native::connect_udp(outbound, target).await?,
+                        crate::native::connect_udp(&outbound, target).await?,
                     ))
                 }
             }

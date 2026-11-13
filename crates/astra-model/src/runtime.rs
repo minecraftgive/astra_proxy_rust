@@ -136,6 +136,8 @@ pub struct RuntimeTelemetry {
     pub dns: Option<Box<DnsQueryLog>>,
     /// Effective resolver configuration of the active worker, not a saved draft.
     pub dns_resolver: Option<Box<DnsResolverStatus>>,
+    /// Actual captured paths and side-effect-free group previews. JSON-only.
+    pub chains: Option<Box<ChainTelemetry>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +150,7 @@ pub struct DnsResolverStatus {
     pub listen: Vec<std::net::SocketAddr>,
     pub nameservers: Vec<DnsServer>,
     pub fallback: Vec<DnsServer>,
+    pub proxy_server_nameserver: Vec<DnsServer>,
     pub policy_count: usize,
 }
 
@@ -190,6 +193,7 @@ impl DnsResolverStatus {
             listen: config.listen.clone(),
             nameservers: servers(&config.nameserver),
             fallback: servers(&config.fallback),
+            proxy_server_nameserver: servers(&config.proxy_server_nameserver),
             policy_count: config.nameserver_policy.len(),
         }
     }
@@ -248,4 +252,25 @@ pub struct GenerationTelemetry {
     pub generation: u64,
     pub sample_age_ms: Option<u64>,
     pub healthy: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChainTelemetry {
+    pub connections: BTreeMap<u64, ChainPath>,
+    pub previews: BTreeMap<String, ChainPath>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChainPath {
+    pub hops: Vec<ChainHop>,
+    pub groups: Vec<String>,
+    pub status: String,
+    pub issue: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChainHop {
+    pub name: String,
+    pub protocol: String,
 }

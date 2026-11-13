@@ -19,7 +19,8 @@ use tokio::{sync::mpsc, task::JoinHandle};
 /// After a failed round (manager busy, core restarting) try again this soon.
 const RETRY: Duration = Duration::from_secs(10);
 /// A round that never reports is abandoned after this long.
-const ROUND_LIMIT: Duration = Duration::from_secs(20);
+const ROUND_LIMIT: Duration =
+    Duration::from_secs(astra_model::diagnostics::MAX_CONNECT_TIMEOUT_SECS + 17);
 /// The probe core outlives the gap between rounds by this margin.
 const KEEP_ALIVE_MARGIN: Duration = Duration::from_secs(30);
 

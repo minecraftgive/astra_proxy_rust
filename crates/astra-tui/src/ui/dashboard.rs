@@ -353,11 +353,40 @@ impl Ui {
             );
             y += 1;
         }
+        let remaining = bottom.saturating_sub(y);
+        let group_rows = if self.overview_unfolded.is_some() {
+            self.overview_group_rows().len().min(8) as u16
+        } else {
+            2
+        };
+        let available = remaining.saturating_sub(group_rows);
+        let supported = self
+            .runtime_telemetry
+            .as_ref()
+            .is_some_and(|meta| meta.chains.is_some());
+        let path_height = if supported && available >= 3 {
+            available.min(11)
+        } else if remaining >= 3 {
+            1
+        } else {
+            0
+        };
         self.render_group_rows(
             f,
-            Rect::new(inner.x, y, inner.width, bottom.saturating_sub(y)),
+            Rect::new(
+                inner.x,
+                y,
+                inner.width,
+                remaining.saturating_sub(path_height),
+            ),
             0,
         );
+        if path_height > 0 {
+            self.render_chain(
+                f,
+                Rect::new(inner.x, bottom - path_height, inner.width, path_height),
+            );
+        }
         if footer {
             f.render_widget(
                 Paragraph::new(Span::styled(

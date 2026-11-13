@@ -141,6 +141,7 @@ async fn proxy_fixture(http: bool, dns: bool) -> (String, tokio::task::JoinHandl
 fn proxy(server: String, http: bool) -> OutboundConfig {
     if http {
         OutboundConfig::Http {
+            dialer_proxy: None,
             tag: "proxy".into(),
             server,
             username: None,
@@ -148,6 +149,7 @@ fn proxy(server: String, http: bool) -> OutboundConfig {
         }
     } else {
         OutboundConfig::Socks5 {
+            dialer_proxy: None,
             tag: "proxy".into(),
             server,
             username: None,
@@ -209,7 +211,7 @@ async fn ambiguous_bootstrap_and_unsupported_proxy_combinations_never_use_system
         request.probe=Probe::Dns {name:"business.invalid".into(),record:"A".into(),server:"udp://127.0.0.1:53".into()};
         assert!(run_context(&request, |_|Ok(())).await.unwrap_err().to_string().contains("UDP"));
         request.probe=Probe::Tcp {host:"business.invalid".into(),port:443};
-        pin(&mut request,Some(OutboundConfig::TrojanTls {tag:"x".into(),server:"127.0.0.1:443".into(),sni:"x".into(),password:"secret".into()}));
+        pin(&mut request,Some(OutboundConfig::TrojanTls {dialer_proxy: None,tag:"x".into(),server:"127.0.0.1:443".into(),sni:"x".into(),password:"secret".into()}));
         let error=run_context(&request, |_|Ok(())).await.unwrap_err().to_string();
         assert!(error.contains("Unsupported"));assert!(!error.contains("secret"));
         SYSTEM_LOOKUPS.with(|n|assert_eq!(n.get(),0));

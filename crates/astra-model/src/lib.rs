@@ -1,5 +1,6 @@
 //! Pure shared domain models. No I/O, runtime, or application dependencies.
 use serde::{Deserialize, Serialize};
+pub mod chain;
 pub mod config;
 pub mod groups;
 pub mod network_analysis;

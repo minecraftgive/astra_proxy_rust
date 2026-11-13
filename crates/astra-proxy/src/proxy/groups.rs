@@ -109,15 +109,14 @@ impl Groups {
         }
     }
     pub fn new(config: &crate::config::ProxyConfig) -> Result<Self> {
-        let order = astra_model::groups::validate(
+        let order = astra_model::chain::validate(
             &config.proxy_groups,
             &config
                 .outbounds
                 .iter()
-                .map(|node| node.tag().to_owned())
+                .map(|node| (node.tag().to_owned(), node.clone()))
                 .collect(),
-        )
-        .map_err(anyhow::Error::msg)?;
+        )?;
         Ok(Self {
             locks: order
                 .iter()
@@ -161,18 +160,6 @@ impl Groups {
         path.extend(members[..members.len() - 1].iter().cloned());
         Ok(target.clone())
     }
-    /// The group a route action starts in; direct and block go through their built-in groups.
-    fn entry(app: &App, action: &RouteAction) -> Option<String> {
-        let name = match action {
-            RouteAction::Proxy(name) => name.as_str(),
-            RouteAction::Direct => "DIRECT",
-            RouteAction::Block => "REJECT",
-        };
-        app.config
-            .proxy_groups
-            .contains_key(name)
-            .then(|| name.to_owned())
-    }
     /// DIRECT/REJECT end the walk when named by their own group or when no such group exists.
     fn terminal(app: &App, name: &str, parent: Option<&String>) -> Option<RouteAction> {
         let action = match name {
@@ -206,6 +193,9 @@ impl Groups {
                 );
                 return Ok((RouteAction::Proxy(name), path));
             };
+            if group.mode == Mode::Relay {
+                return Ok((RouteAction::Proxy(name), path));
+            }
             path.push(name.clone());
             name = if group.mode == Mode::Select {
                 Self::manual_target(app, &name, group, &mut path)?
@@ -224,35 +214,62 @@ impl Groups {
         action: &RouteAction,
     ) -> Result<(RouteAction, super::group_sessions::Lease)> {
         self.resolve(app, action).await?;
-        let Some(name) = Self::entry(app, action) else {
-            return Ok((action.clone(), self.sessions.lease(&[])));
+        self.plan(app, action, true)
+    }
+    /// A read-only preview never advances a balancing selector.
+    pub(crate) fn plan(
+        &self,
+        app: &App,
+        action: &RouteAction,
+        choose: bool,
+    ) -> Result<(RouteAction, super::group_sessions::Lease)> {
+        let root = match action {
+            RouteAction::Direct => "DIRECT",
+            RouteAction::Block => "REJECT",
+            RouteAction::Proxy(name) => name,
         };
-        // A switch cannot race subscription: refresh holds the selection write lock
-        // while it advances the cancellation epoch.
         let guard = self.read_selections();
-        let mut current = name;
-        let mut path: Vec<String> = Vec::new();
-        let resolved = loop {
-            if let Some(action) = Self::terminal(app, &current, path.last()) {
-                break action;
-            }
-            let Some(group) = app.config.proxy_groups.get(&current) else {
-                break RouteAction::Proxy(current);
-            };
-            ensure!(path.len() < 32, "proxy group nesting exceeds limit");
-            path.push(current.clone());
-            current = if group.mode == Mode::Select {
-                Self::manual_target(app, &current, group, &mut path)?
-            } else {
-                guard
-                    .get(&current)
-                    .and_then(|s| self.member(group.mode, s))
-                    .context("proxy group has no healthy members")?
-            };
+        let mut chosen = HashMap::<String, String>::new();
+        let path = astra_model::chain::resolve(
+            root,
+            &app.config.proxy_groups,
+            &app.outbounds,
+            |name, group| {
+                if let Some(member) = chosen.get(name) {
+                    return Ok(member.clone());
+                }
+                let member = if group.mode == Mode::Select {
+                    Self::manual_target(app, name, group, &mut Vec::new())?
+                } else {
+                    ensure!(
+                        choose || group.mode != Mode::LoadBalance,
+                        "{name}: selected per connection"
+                    );
+                    guard
+                        .get(name)
+                        .and_then(|selection| {
+                            if choose {
+                                self.member(group.mode, selection)
+                            } else {
+                                selection.member.clone()
+                            }
+                        })
+                        .with_context(|| format!("proxy group {name}: no healthy members"))?
+                };
+                chosen.insert(name.into(), member.clone());
+                Ok(member)
+            },
+        )?;
+        let mut lease = self.sessions.lease(&path.groups);
+        lease.1 = Self::interface_for_path(app, &path.groups);
+        lease.3 = path.nodes;
+        let resolved = if path.blocked {
+            RouteAction::Block
+        } else if let Some(exit) = lease.3.last() {
+            RouteAction::Proxy(exit.clone())
+        } else {
+            RouteAction::Direct
         };
-        let mut lease = self.sessions.lease(&path);
-        lease.1 = Self::interface_for_path(app, &path);
-        drop(guard);
         Ok((resolved, lease))
     }
     fn interface_for_path(app: &App, path: &[String]) -> Option<String> {
@@ -261,6 +278,8 @@ impl Groups {
     }
     pub fn inherit(&mut self, old: &App, config: &crate::config::ProxyConfig) {
         self.sessions = old.groups.sessions.clone();
+        let nodes_changed = serde_json::to_value(&old.config.outbounds).ok()
+            != serde_json::to_value(&config.outbounds).ok();
         let previous = old.groups.read_selections();
         let mut next = self.write_selections();
         for (name, group) in &config.proxy_groups {
@@ -278,7 +297,7 @@ impl Groups {
                         .is_none_or(|m| group.members.contains(m))
                     {
                         let mut selection = selection.clone();
-                        if old.config.proxy_groups.get(name) != Some(group) {
+                        if nodes_changed || old.config.proxy_groups.get(name) != Some(group) {
                             selection.checked = None;
                         }
                         next.insert(name.clone(), selection);
@@ -291,6 +310,18 @@ impl Groups {
         let _guard = old.groups.write_selections();
         old.groups.active.store(false, Ordering::Release);
         old.groups.stop_test();
+        let changed_nodes: HashSet<_> = old
+            .config
+            .outbounds
+            .iter()
+            .chain(config.outbounds.iter())
+            .map(|node| node.tag())
+            .filter(|tag| {
+                let before = old.config.outbounds.iter().find(|node| node.tag() == *tag);
+                let after = config.outbounds.iter().find(|node| node.tag() == *tag);
+                serde_json::to_value(before).ok() != serde_json::to_value(after).ok()
+            })
+            .collect();
         for (name, previous) in &old.config.proxy_groups {
             let next = config.proxy_groups.get(name);
             let policy = next.unwrap_or(previous);
@@ -303,11 +334,34 @@ impl Groups {
                         .or_else(|| previous.members.first())
                         != g.selected.as_ref().or_else(|| g.members.first())
             });
-            let structural = next.is_none_or(|g| {
-                g.mode != previous.mode
-                    || g.members != previous.members
-                    || g.interface != previous.interface
-            });
+            let mut pending = vec![name.as_str()];
+            let mut seen = HashSet::new();
+            let mut node_changed = false;
+            while let Some(dependency) = pending.pop() {
+                if !seen.insert(dependency) {
+                    continue;
+                }
+                node_changed |= changed_nodes.contains(dependency);
+                for source in [&old.config, config] {
+                    if let Some(group) = source.proxy_groups.get(dependency) {
+                        pending.extend(group.members.iter().map(String::as_str));
+                    }
+                    if let Some(front) = source
+                        .outbounds
+                        .iter()
+                        .find(|node| node.tag() == dependency)
+                        .and_then(|node| node.dialer_proxy())
+                    {
+                        pending.push(front);
+                    }
+                }
+            }
+            let structural = node_changed
+                || next.is_none_or(|g| {
+                    g.mode != previous.mode
+                        || g.members != previous.members
+                        || g.interface != previous.interface
+                });
             if (manual && policy.disconnect_on_manual)
                 || (structural && policy.disconnect_on_config_change)
             {
@@ -317,15 +371,22 @@ impl Groups {
         }
     }
     pub async fn resolve(&self, app: &App, action: &RouteAction) -> Result<RouteAction> {
-        let Some(name) = Self::entry(app, action) else {
-            return Ok(action.clone());
+        let root = match action {
+            RouteAction::Direct => "DIRECT",
+            RouteAction::Block => "REJECT",
+            RouteAction::Proxy(name) => name,
         };
-        let name = name.as_str();
+        let name = root;
         let mut reachable = HashSet::new();
         let mut pending = vec![name];
         while let Some(name) = pending.pop() {
             if !reachable.insert(name) {
                 continue;
+            }
+            if let Some(node) = app.outbounds.get(name) {
+                if let Some(front) = node.dialer_proxy() {
+                    pending.push(front);
+                }
             }
             if let Some(group) = app.config.proxy_groups.get(name) {
                 if group.mode == Mode::Select {
@@ -355,7 +416,9 @@ impl Groups {
     }
     async fn refresh(&self, app: &App, name: &str, force: bool) {
         let group = &app.config.proxy_groups[name];
-        if (group.mode == Mode::Select && !force) || !self.active.load(Ordering::Acquire) {
+        if (matches!(group.mode, Mode::Select | Mode::Relay) && !force)
+            || !self.active.load(Ordering::Acquire)
+        {
             return;
         }
         let _guard = self.locks[name].lock().await;
@@ -366,6 +429,28 @@ impl Groups {
                 .and_then(|s| s.checked)
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(group.interval))
         {
+            return;
+        }
+        if group.mode == Mode::Relay {
+            let start = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_millis(group.timeout_ms),
+                probe(
+                    app,
+                    &RouteAction::Proxy(name.into()),
+                    &group.url,
+                    group.interface.as_deref(),
+                ),
+            )
+            .await;
+            let delay = result
+                .ok()
+                .and_then(Result::ok)
+                .map(|_| start.elapsed().as_millis() as u64);
+            let mut selections = self.write_selections();
+            let selection = selections.entry(name.into()).or_default();
+            selection.checked = Some(Instant::now());
+            selection.delays = vec![(name.into(), delay)];
             return;
         }
         let results: Vec<_> = stream::iter(group.members.iter().cloned())
@@ -527,7 +612,9 @@ impl Groups {
             .take(64)
             .map(|(name, group)| {
                 let selection = selections.get(name);
-                let selected = if group.mode == Mode::Select {
+                let selected = if group.mode == Mode::Relay {
+                    None
+                } else if group.mode == Mode::Select {
                     Self::manual_target(app, name, group, &mut Vec::new()).ok()
                 } else {
                     selection.and_then(|s| s.member.clone())
@@ -541,6 +628,7 @@ impl Groups {
                         Mode::Auto => "url-test",
                         Mode::Fallback => "fallback",
                         Mode::LoadBalance => "load-balance",
+                        Mode::Relay => "relay",
                     }
                     .into(),
                     selected,

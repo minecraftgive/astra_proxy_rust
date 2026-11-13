@@ -143,6 +143,7 @@ async fn socks5_refusal_retains_protocol_error_kind() {
             interface_source: None,
             selection_chain: vec![],
             node: Some(astra_model::config::protocol::OutboundConfig::Socks5 {
+                dialer_proxy: None,
                 tag: "fixture".into(),
                 server: address.to_string(),
                 username: None,

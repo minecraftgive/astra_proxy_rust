@@ -6,7 +6,14 @@ use uuid::Uuid;
 mod stream;
 use stream::VlessStream;
 pub async fn vless_tls(server: &str, sni: &str, uuid: &str, target: &Target) -> Result<Stream> {
-    let mut tls = tls_connect(server, sni).await?;
+    let tls = tls_connect(server, sni).await?;
+    vless_on(tls, uuid, target).await
+}
+pub(crate) async fn vless_on(
+    mut tls: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    uuid: &str,
+    target: &Target,
+) -> Result<Stream> {
     let user = Uuid::parse_str(uuid).context("invalid VLESS UUID")?;
     let mut header = Vec::with_capacity(320);
     header.push(0); // protocol version
@@ -86,7 +93,7 @@ mod adapter {
         tag: &str,
         cfg: &NodeConfig,
         base: &Path,
-        dialer: Arc<meow_proxy::dialer::DirectDialer>,
+        dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
         mux: Option<meow_proxy::mux::MuxOptions>,
     ) -> Result<Arc<dyn ProxyAdapter>> {
         let id = uuid::Uuid::parse_str(required(&cfg.uuid, "uuid")?)?;

@@ -73,9 +73,6 @@ impl Ui {
         let Some(resolver) = self.dns_resolver() else {
             return vec![t("Current DNS settings unavailable").into()];
         };
-        if !resolver.enabled {
-            return vec![t("DNS is disabled for this profile").into()];
-        }
         let servers = |servers: &[astra_model::runtime::DnsServer]| {
             servers
                 .iter()
@@ -98,6 +95,16 @@ impl Ui {
             ),
             format!("{}: {}", t("Upstream"), servers(&resolver.nameservers)),
         ];
+        if !resolver.enabled {
+            lines = vec![t("DNS is disabled for this profile").into()];
+        }
+        if !resolver.proxy_server_nameserver.is_empty() {
+            lines.push(format!(
+                "{}: {}",
+                t("Proxy DNS (always direct)"),
+                servers(&resolver.proxy_server_nameserver)
+            ));
+        }
         if !resolver.fallback.is_empty() {
             lines.push(format!(
                 "{}: {}",

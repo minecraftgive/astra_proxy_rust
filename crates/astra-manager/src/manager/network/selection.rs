@@ -87,6 +87,10 @@ pub(super) fn rebuild(
             seen.insert(name.clone()),
             "Selection chain contains a cycle"
         );
+        anyhow::ensure!(
+            group.mode != Mode::Relay,
+            "Unsupported: detailed diagnostics do not support relay paths"
+        );
         anyhow::ensure!(group.mode != Mode::LoadBalance, "Load-balance group {name} has no fixed next-session member; choose a concrete node (the test will not represent the group)");
         let explicit_direct = runtime.is_none() && name == "DIRECT" && group.members == ["DIRECT"];
         let selected = if explicit_direct {
@@ -173,6 +177,13 @@ pub(super) fn rebuild(
     }
     let (effective_interface, interface_source) =
         binding.map_or((None, None), |(name, source)| (Some(name), Some(source)));
+    anyhow::ensure!(
+        !config
+            .outbounds
+            .iter()
+            .any(|node| node.tag() == name && node.dialer_proxy().is_some()),
+        "Unsupported: detailed diagnostics cannot bypass a proxy chain"
+    );
     Ok(PinnedEgress {
         version: 1,
         requested_tag: requested.into(),
@@ -190,6 +201,7 @@ fn mode(mode: Mode) -> &'static str {
         Mode::Auto => "url-test",
         Mode::Fallback => "fallback",
         Mode::LoadBalance => "load-balance",
+        Mode::Relay => "relay",
     }
 }
 

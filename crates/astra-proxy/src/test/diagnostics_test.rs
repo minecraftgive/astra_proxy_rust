@@ -41,6 +41,12 @@ async fn fast_peer_results_stream_before_stalled_first_node_and_collected_order_
     assert_eq!(finished[0].1.outbound, "fast");
     assert!(finished[0].0 < Duration::from_secs(2));
     assert_eq!(finished[1].1.outbound, "slow");
+    assert!(finished[1]
+        .1
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("timed out after 3s"));
     assert!(finished[1].0 < Duration::from_secs(4));
     assert_eq!(
         report
@@ -54,6 +60,79 @@ async fn fast_peer_results_stream_before_stalled_first_node_and_collected_order_
     assert!(matches!(events.last().unwrap().1, Event::Done));
     fast.await.unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_connect_timeout_reports_the_actual_limit_and_cancels_the_socket() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let node = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        socket.read_exact(&mut greeting).await.unwrap();
+        assert!(socket.read_u8().await.is_err());
+    });
+    let app = App::from_text(std::path::Path::new("timeout.toml"), format!("standalone=true\ndiagnostic_connect_timeout_secs=1\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='{address}'\n")).unwrap();
+    let report = selected(&app, &["node".into()]).await.unwrap();
+    let probe = &report.probes[0];
+    assert!(probe.connect_ms.is_none());
+    assert!(
+        probe
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("TCP/proxy handshake timed out after 1s"),
+        "{probe:?}"
+    );
+    assert!(
+        probe.elapsed_ms >= 900 && probe.elapsed_ms < 2500,
+        "{probe:?}"
+    );
+    node.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_diagnostic_budget_crosses_old_limits_without_changing_normal_connections() {
+    // Exercise both the streamed batch and the persistent exit-probe worker.
+    // Six seconds exceeds the previous 3s handshake and 5s per-node deadlines.
+    for persistent in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let node = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut head = [0; 5];
+            socket.read_exact(&mut head).await.unwrap();
+            let mut rest = vec![0; head[4] as usize + 2];
+            socket.read_exact(&mut rest).await.unwrap();
+            socket
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+        let app = App::from_text(std::path::Path::new("extended.toml"), format!("standalone=true\nconnect_timeout_secs=1\ndiagnostic_connect_timeout_secs=12\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='{address}'\n")).unwrap();
+        let probe = if persistent {
+            let requests = b"{\"outbound\":\"node\",\"ip\":false}\n";
+            let mut replies = Vec::new();
+            serve(&app, &requests[..], &mut replies).await.unwrap();
+            serde_json::from_slice::<Probe>(&replies).unwrap()
+        } else {
+            selected(&app, &["node".into()])
+                .await
+                .unwrap()
+                .probes
+                .remove(0)
+        };
+        node.await.unwrap();
+        assert!(probe.connect_ms.is_some_and(|ms| ms >= 5900), "{probe:?}");
+        if persistent {
+            assert!(probe.error.is_none(), "{probe:?}");
+        }
+        assert_eq!(app.config.connect_timeout_secs, 1);
+    }
 }
 #[tokio::test]
 async fn probe_uses_selected_proxy_and_distinguishes_connection_from_https_failure() {

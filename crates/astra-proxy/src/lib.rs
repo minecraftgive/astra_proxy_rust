@@ -91,6 +91,16 @@ impl Default for EgressSignal {
     }
 }
 
+async fn optional_timeout<F: std::future::Future>(
+    limit: Option<Duration>,
+    future: F,
+) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+    match limit {
+        Some(limit) => timeout(limit, future).await,
+        None => Ok(future.await),
+    }
+}
+
 pub struct App {
     // Documents and decision caches belong to the active App, not to an
     // admitted UDP association which may need to route additional targets.
@@ -114,12 +124,18 @@ pub struct RoutingContext {
     /// Lookup-only resolver used when the DNS service is absent or disabled,
     /// so local hostname resolution stays encrypted unless explicitly bypassed.
     lookup_dns: Option<astra_dns::Resolver>,
+    proxy_domains: std::collections::HashSet<String>,
     config: ProxyConfig,
     route_leases: Vec<Arc<tun::OwnedRoute>>,
     outbounds: HashMap<String, OutboundConfig>,
     groups: proxy::groups::Groups,
     rule_client: Option<rule_client::RuleClient>,
     standalone_action: Option<RouteAction>,
+    chain_base: std::path::PathBuf,
+    chain_cache: moka::sync::Cache<
+        (Vec<String>, Option<String>, Vec<(String, u64)>),
+        Arc<native::NativeOutbound>,
+    >,
     native: native::Registry,
     native_interfaces: HashMap<String, native::Registry>,
     udp_permits: Arc<limit::Limit>,
@@ -454,11 +470,14 @@ impl App {
             Network::Tcp,
             &resolved,
         );
+        if let Some(traffic) = &traffic {
+            traffic.set_path(self.describe_chain(&resolved, &lease));
+        }
         let connected = tokio::select! {
             biased;
             _ = lease.cancelled() => Err(anyhow::anyhow!("proxy group switched during connection")),
             _ = proxy::traffic::Traffic::cancelled(&traffic) => Err(anyhow::anyhow!("connection closed by user")),
-            result = self.connect_resolved_on(target, &resolved, lease.1.as_deref()) => result,
+            result = self.connect_planned(target, &resolved, &lease) => result,
         };
         match connected {
             Ok(inner) => {
@@ -480,13 +499,30 @@ impl App {
     }
 
     pub async fn connect(&self, target: &Target, action: &RouteAction) -> Result<outbound::Stream> {
+        self.connect_with_timeout(
+            target,
+            action,
+            Some(Duration::from_secs(self.config.connect_timeout_secs)),
+        )
+        .await
+    }
+    // Diagnostics own their end-to-end deadline; None avoids racing nested timers.
+    pub(crate) async fn connect_with_timeout(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        connect_timeout: Option<Duration>,
+    ) -> Result<outbound::Stream> {
         let restored = self.restore_fake_target(target)?;
         let target = &restored;
-        let (resolved, lease) = self.resolve_session(action).await?;
+        let (resolved, lease) =
+            optional_timeout(connect_timeout, self.groups.resolve_session(self, action))
+                .await
+                .context("proxy group selection timed out")??;
         let inner = tokio::select! {
             biased;
             _ = lease.cancelled() => bail!("proxy group switched during connection"),
-            result = self.connect_resolved_on(target, &resolved, lease.1.as_deref()) => result?,
+            result = self.connect_planned_with_timeout(target, &resolved, &lease, connect_timeout) => result?,
         };
         Ok(lease.wrap(inner))
     }
@@ -514,64 +550,174 @@ impl App {
             .and_then(|name| self.native_interfaces.get(name))
             .unwrap_or(&self.native)
     }
+    pub(crate) fn describe_chain(
+        &self,
+        action: &RouteAction,
+        lease: &proxy::group_sessions::Lease,
+    ) -> astra_model::runtime::ChainPath {
+        astra_model::runtime::ChainPath {
+            hops: lease
+                .3
+                .iter()
+                .map(|tag| astra_model::runtime::ChainHop {
+                    name: tag.clone(),
+                    protocol: self.outbounds[tag].protocol_name().into(),
+                })
+                .collect(),
+            groups: lease.4.clone(),
+            status: match action {
+                RouteAction::Direct => "direct",
+                RouteAction::Block => "blocked",
+                _ => "proxy",
+            }
+            .into(),
+            issue: None,
+        }
+    }
+    pub(crate) fn chain_telemetry(&self) -> astra_model::runtime::ChainTelemetry {
+        let previews = self
+            .config
+            .proxy_groups
+            .keys()
+            .take(128)
+            .map(|name| {
+                let path = match self
+                    .groups
+                    .plan(self, &RouteAction::Proxy(name.clone()), false)
+                {
+                    Ok((action, lease)) => self.describe_chain(&action, &lease),
+                    Err(error) => astra_model::runtime::ChainPath {
+                        status: "unresolved".into(),
+                        issue: Some(error.to_string()),
+                        ..Default::default()
+                    },
+                };
+                (name.clone(), path)
+            })
+            .collect();
+        astra_model::runtime::ChainTelemetry {
+            connections: self.metrics.chain_paths(),
+            previews,
+        }
+    }
+    pub(crate) fn chain_adapter(
+        &self,
+        nodes: &[String],
+        interface: Option<&str>,
+        epochs: Vec<(String, u64)>,
+    ) -> Result<Arc<native::NativeOutbound>> {
+        let first = nodes.first().context("empty proxy chain")?;
+        let key = (nodes.to_vec(), interface.map(str::to_owned), epochs);
+        if let Some(adapter) = self.chain_cache.get(&key) {
+            return Ok(adapter);
+        }
+        let mut adapter = self
+            .native_for(interface)
+            .get(first)
+            .with_context(|| format!("undefined outbound {first}"))?
+            .clone();
+        for (index, tag) in nodes.iter().enumerate().skip(1) {
+            adapter = Arc::new(
+                native::compile_one(
+                    &self.outbounds[tag],
+                    &self.chain_base,
+                    Arc::new(astra_protocols::chain::PrefixDialer(
+                        adapter,
+                        nodes[index - 1].clone(),
+                    )),
+                )
+                .with_context(|| format!("chain hop {} ({tag})", index + 1))?,
+            );
+        }
+        self.chain_cache.insert(key, adapter.clone());
+        Ok(adapter)
+    }
+    async fn connect_planned(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        lease: &proxy::group_sessions::Lease,
+    ) -> Result<outbound::Stream> {
+        self.connect_planned_with_timeout(
+            target,
+            action,
+            lease,
+            Some(Duration::from_secs(self.config.connect_timeout_secs)),
+        )
+        .await
+    }
+    async fn connect_planned_with_timeout(
+        &self,
+        target: &Target,
+        action: &RouteAction,
+        lease: &proxy::group_sessions::Lease,
+        connect_timeout: Option<Duration>,
+    ) -> Result<outbound::Stream> {
+        let interface = lease.1.as_deref().or_else(|| {
+            self.config
+                .tun
+                .as_ref()
+                .and_then(|tun| tun.interface.as_deref())
+        });
+        meow_common::outbound_iface::with_outbound_interface(interface, async {
+            if matches!(action, RouteAction::Proxy(_)) {
+                let adapter = self.chain_adapter(&lease.3, interface, lease.epochs())?;
+                return optional_timeout(connect_timeout, native::connect(&adapter, target))
+                    .await
+                    .context("chain connection timeout")?
+                    .with_context(|| format!("proxy chain {}", lease.3.join(" -> ")));
+            }
+            self.connect_resolved_inner(target, action, interface, connect_timeout)
+                .await
+        })
+        .await?
+    }
     async fn connect_resolved_on(
         &self,
         target: &Target,
         action: &RouteAction,
         interface: Option<&str>,
     ) -> Result<outbound::Stream> {
-        let interface = interface.or_else(|| {
-            self.config
-                .tun
-                .as_ref()
-                .and_then(|tun| tun.interface.as_deref())
-        });
-        meow_common::outbound_iface::with_outbound_interface(
-            interface,
-            self.connect_resolved_inner(target, action, interface),
-        )
-        .await?
+        let (resolved, mut lease) = self.groups.plan(self, action, true)?;
+        if interface.is_some() {
+            lease.1 = interface.map(str::to_owned);
+        }
+        self.connect_planned(target, &resolved, &lease).await
     }
     async fn connect_resolved_inner(
         &self,
         target: &Target,
         action: &RouteAction,
         interface: Option<&str>,
+        connect_timeout: Option<Duration>,
     ) -> Result<outbound::Stream> {
         if *action == RouteAction::Direct
             && (interface.is_some() || self.config.tun.is_some() || self.resolver().is_some())
         {
-            return timeout(
-                Duration::from_secs(self.config.connect_timeout_secs),
-                async {
-                    let mut last = None;
-                    for address in self.lookup_real(&target.host, target.port).await? {
-                        let literal = Target {
-                            host: address.ip().to_string(),
-                            port: address.port(),
-                        };
-                        match egress::connect(&literal, interface).await {
-                            Ok(stream) => return Ok(stream),
-                            Err(error) => last = Some(error),
-                        }
+            return optional_timeout(connect_timeout, async {
+                let mut last = None;
+                for address in self.lookup_real(&target.host, target.port).await? {
+                    let literal = Target {
+                        host: address.ip().to_string(),
+                        port: address.port(),
+                    };
+                    match egress::connect(&literal, interface).await {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => last = Some(error),
                     }
-                    Err(last.unwrap_or_else(|| {
-                        anyhow::anyhow!("direct DNS lookup returned no addresses")
-                    }))
-                },
-            )
+                }
+                Err(last
+                    .unwrap_or_else(|| anyhow::anyhow!("direct DNS lookup returned no addresses")))
+            })
             .await
             .context("direct egress timeout")?
             .map(|stream| Box::new(stream) as outbound::Stream);
         }
         if let RouteAction::Proxy(tag) = action {
             if let Some(adapter) = self.native_for(interface).get(tag) {
-                return timeout(
-                    Duration::from_secs(self.config.connect_timeout_secs),
-                    native::connect(adapter, target),
-                )
-                .await
-                .context("outbound connection timeout")?;
+                return optional_timeout(connect_timeout, native::connect(adapter, target))
+                    .await
+                    .context("outbound connection timeout")?;
             }
         }
         let selected = match action {
@@ -583,12 +729,9 @@ impl App {
                     .with_context(|| format!("undefined outbound tag {tag}"))?,
             ),
         };
-        timeout(
-            Duration::from_secs(self.config.connect_timeout_secs),
-            outbound::open(target, selected),
-        )
-        .await
-        .context("outbound connection timeout")?
+        optional_timeout(connect_timeout, outbound::open(target, selected))
+            .await
+            .context("outbound connection timeout")?
     }
 }
 
@@ -609,7 +752,8 @@ impl App {
                 && tun.ipv6_address.is_some()
                 && !tun.routes.iter().any(|route| route.contains(':'))
             {
-                tun.routes.extend(["::/1".to_owned(), "8000::/1".to_owned()]);
+                tun.routes
+                    .extend(["::/1".to_owned(), "8000::/1".to_owned()]);
             }
             if dns.enable && dns.fake_ip {
                 let range: ipnet::Ipv4Net = dns.fake_ip_range.parse()?;
@@ -676,6 +820,25 @@ impl App {
             .filter(|dns| dns.enable)
             .map(astra_dns::Resolver::new)
             .transpose()?;
+        let proxy_domains: std::collections::HashSet<String> = config
+            .outbounds
+            .iter()
+            .filter_map(|node| {
+                let server = match node {
+                    OutboundConfig::Native { config, .. } => {
+                        return Some(config.server.trim_end_matches('.').to_ascii_lowercase())
+                    }
+                    OutboundConfig::Socks5 { server, .. }
+                    | OutboundConfig::Http { server, .. }
+                    | OutboundConfig::TrojanTls { server, .. }
+                    | OutboundConfig::VlessTls { server, .. } => server,
+                };
+                url::Url::parse(&format!("tcp://{server}"))
+                    .ok()?
+                    .host_str()
+                    .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            })
+            .collect();
         if let Some(dns) = &mut dns {
             if let Some(tun) = &config.tun {
                 let subnet = ipnet::Ipv4Net::new(tun.address, tun.prefix)?;
@@ -691,22 +854,8 @@ impl App {
                     dns.reserve_address(subnet.network().into());
                 }
             }
-            for node in &config.outbounds {
-                let server = match node {
-                    OutboundConfig::Native { config, .. } => {
-                        dns.exclude_domain(&config.server);
-                        continue;
-                    }
-                    OutboundConfig::Socks5 { server, .. }
-                    | OutboundConfig::Http { server, .. }
-                    | OutboundConfig::TrojanTls { server, .. }
-                    | OutboundConfig::VlessTls { server, .. } => server,
-                };
-                if let Ok(uri) = url::Url::parse(&format!("tcp://{server}")) {
-                    if let Some(host) = uri.host_str() {
-                        dns.exclude_domain(host);
-                    }
-                }
+            for domain in &proxy_domains {
+                dns.exclude_domain(domain);
             }
             for subscription in config.subscription_sources().values() {
                 if let Ok(uri) = url::Url::parse(&subscription.url) {
@@ -730,6 +879,7 @@ impl App {
                 overrides: Arc::default(),
                 egress_signal: EgressSignal::default(),
                 lookup_dns: crate::dns::lookup_resolver(dns.is_some(), config.dns.as_ref())?,
+                proxy_domains,
                 dns,
                 groups: proxy::groups::Groups::new(&config)?,
                 standalone_action: config.standalone_tag()?.map(RouteAction::Proxy),
@@ -747,6 +897,11 @@ impl App {
                 route_leases: vec![],
                 config,
                 outbounds,
+                chain_base: path
+                    .parent()
+                    .context("configuration has no parent")?
+                    .to_owned(),
+                chain_cache: moka::sync::Cache::new(128),
                 native,
                 native_interfaces,
             }),
@@ -1090,3 +1245,7 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 #[path = "test/lib_recapture_test.rs"]
 mod recapture_tests;
+
+#[cfg(test)]
+#[path = "test/chain_test.rs"]
+mod chain_tests;

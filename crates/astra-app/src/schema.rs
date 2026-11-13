@@ -387,6 +387,13 @@ pub fn rows(
                 ),
                 number("connect_timeout_secs", t("连接超时（秒）"), 8, 1, i64::MAX),
                 number(
+                    "diagnostic_connect_timeout_secs",
+                    t("诊断 TCP/代理连接超时（秒）"),
+                    3,
+                    1,
+                    astra_model::diagnostics::MAX_CONNECT_TIMEOUT_SECS as i64,
+                ),
+                number(
                     "shutdown_timeout_secs",
                     t("停止等待时间（秒）"),
                     2,
@@ -517,7 +524,7 @@ pub fn rows(
                 "mode",
                 t("Group mode"),
                 "select",
-                &["select", "auto", "fallback", "load_balance"],
+                &["select", "auto", "fallback", "load_balance", "relay"],
                 true,
             ),
             Spec {
@@ -566,7 +573,7 @@ pub fn rows(
                 number("timeout_ms", t("Test timeout (ms)"), 5000, 100, 30000),
                 number("tolerance_ms", t("Switch tolerance (ms)"), 50, 0, 10000),
             ]);
-        } else {
+        } else if get("mode") != "relay" {
             fields.push(text("selected", t("Selected member"), "", false));
         }
         fields.extend(
@@ -589,6 +596,14 @@ pub fn rows(
                 ..text(key, t(label), "false", false)
             }),
         );
+        if get("mode") == "relay" {
+            fields.retain(|field| {
+                !matches!(
+                    field.key.as_str(),
+                    "include_all" | "include_all_groups" | "filter" | "exclude_filter"
+                )
+            });
+        }
         fields
     } else if path.len() == 2 && matches!(&path[0],Part::Key(key) if key=="rule_sets") {
         vec![
@@ -649,6 +664,15 @@ pub fn rows(
             Spec {
                 kind: Type::StringList,
                 ..text("fallback", "DNS 失败备用上游", "[]", false)
+            },
+            Spec {
+                kind: Type::StringList,
+                ..text(
+                    "proxy_server_nameserver",
+                    "代理服务器解析 DNS（始终直连，留空沿用原策略）",
+                    "[]",
+                    false,
+                )
             },
             Spec {
                 kind: Type::Boolean,
@@ -844,6 +868,16 @@ pub fn rows(
                 true,
             ),
             text("tag", t("节点标签"), "edge", true),
+            text(
+                if table.is_some_and(|table| table.contains_key("dialer-proxy")) {
+                    "dialer-proxy"
+                } else {
+                    "dialer_proxy"
+                },
+                t("前置代理（节点或代理组）"),
+                "",
+                false,
+            ),
         ];
         match get("kind") {
             "native" => {}
@@ -992,6 +1026,11 @@ pub fn rows(
     } else {
         vec![]
     };
+    let chain_preview = if is_proxy {
+        chain_preview(doc, path)
+    } else {
+        None
+    };
     for field in &mut fields {
         if field.key == "port" && last_key(path) == Some("config") {
             field.required = true;
@@ -1002,6 +1041,12 @@ pub fn rows(
             }
             "action" | "default_action" => {
                 t("Select direct / block / a proxy node; manual proxy:tag is supported").into()
+            }
+            "dialer_proxy" | "dialer-proxy" => {
+                "前置节点或代理组；relay 中仅首跳应用自身前置配置".into()
+            }
+            "members" if get("mode") == "relay" => {
+                "按 entry → relay → … → exit 顺序填写；中继可引用代理组".into()
             }
             "kind" if last_key(path) == Some("rules") => {
                 t("↑↓ 选择匹配类型；更改类型后请检查匹配内容；规则按列表顺序生效").into()
@@ -1037,6 +1082,14 @@ pub fn rows(
             _ if field.required => t("Enter edit · required").into(),
             _ => t("Enter edit · d reset to default").into(),
         };
+        if matches!(
+            field.key.as_str(),
+            "dialer_proxy" | "dialer-proxy" | "members"
+        ) {
+            if let Some(preview) = &chain_preview {
+                field.help.push_str(&format!(" · 路径预览: {preview}"));
+            }
+        }
     }
     let mut rows: Vec<Row> = fields
         .into_iter()
@@ -1127,4 +1180,54 @@ pub fn rows(
         }
     }
     rows
+}
+
+fn chain_preview(doc: &DocumentMut, path: &[Part]) -> Option<String> {
+    let table = table_at(doc.as_table(), path)?;
+    let root = proxy_group_name(path).or_else(|| table.get("tag").and_then(Item::as_str))?;
+    let mut config: astra_model::config::proxy::ProxyConfig =
+        toml::from_str(&doc.to_string()).ok()?;
+    let nodes: std::collections::HashMap<_, _> = config
+        .outbounds
+        .into_iter()
+        .map(|node| (node.tag().to_owned(), node))
+        .collect();
+    let tags = nodes.keys().cloned().collect();
+    astra_model::groups::ensure_default(&mut config.proxy_groups, &tags).ok()?;
+    let groups = astra_model::groups::expand(&config.proxy_groups, &tags).ok()?;
+    let route = astra_model::chain::resolve(root, &groups, &nodes, |name, group| {
+        anyhow::ensure!(
+            group.mode == astra_model::groups::Mode::Select,
+            "{name}: 等待运行时选择"
+        );
+        group
+            .selected
+            .as_ref()
+            .or_else(|| group.members.first())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{name}: 尚无成员"))
+    });
+    Some(match route {
+        Ok(route) if route.blocked => "REJECT".into(),
+        Ok(route) if route.nodes.is_empty() => "DIRECT".into(),
+        Ok(route) => route
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let role = if route.nodes.len() == 1 {
+                    "entry/exit"
+                } else if i == 0 {
+                    "entry"
+                } else if i + 1 == route.nodes.len() {
+                    "exit"
+                } else {
+                    "relay"
+                };
+                format!("{role} {name}")
+            })
+            .collect::<Vec<_>>()
+            .join(" → "),
+        Err(error) => error.to_string(),
+    })
 }

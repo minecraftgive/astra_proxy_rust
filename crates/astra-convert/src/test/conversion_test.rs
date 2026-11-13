@@ -778,3 +778,27 @@ fn mixed_authenticated_lan_and_new_group_modes_are_preserved() {
     );
     assert!(convert("lan-allowed-ips: ['invalid']", &Options::default()).is_err());
 }
+
+#[test]
+fn chains_preserve_front_references_and_relay_order() {
+    let converted = convert("mixed-port: 7890\nproxies:\n  - {name: entry, type: socks5, server: 127.0.0.1, port: 1081}\n  - {name: exit, type: socks5, server: 127.0.0.1, port: 1082, dialer-proxy: entry}\nproxy-groups:\n  - {name: chain, type: relay, proxies: [entry, exit]}\nrules: [MATCH,chain]\n", &Options::default()).unwrap();
+    let proxy = toml(&converted.proxy);
+    assert_eq!(
+        proxy["outbounds"][1]["dialer_proxy"].as_str(),
+        Some("entry")
+    );
+    assert_eq!(
+        proxy["proxy_groups"]["chain"]["mode"].as_str(),
+        Some("relay")
+    );
+    assert_eq!(
+        proxy["proxy_groups"]["chain"]["members"][0].as_str(),
+        Some("entry")
+    );
+    assert!(astra_convert::share::export_node(&proxy["outbounds"][1]).is_err());
+}
+
+#[test]
+fn chain_import_rejects_unknown_front_instead_of_discarding_it() {
+    assert!(convert("mixed-port: 7890\nproxies: [{name: exit, type: socks5, server: 127.0.0.1, port: 1082, dialer-proxy: missing}]\n", &Options::default()).is_err());
+}
