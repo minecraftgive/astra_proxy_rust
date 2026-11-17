@@ -179,11 +179,13 @@ pub fn bind_socket(socket: &impl AsRawSocket, interface: &str, ipv4: bool) -> Re
             std::mem::size_of_val(&value) as i32,
         )
     };
-    ensure!(
-        result != SOCKET_ERROR,
-        "bind Windows egress interface: {}",
-        std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
-    );
+    if result == SOCKET_ERROR {
+        let error = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        let family = if ipv4 { "IPv4" } else { "IPv6" };
+        return Err(error).with_context(|| {
+            format!("bind Windows egress interface {interface:?} (index {index}, {family})")
+        });
+    }
     Ok(())
 }
 

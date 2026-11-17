@@ -4,6 +4,14 @@ Based on the netstack-smoltcp 0.2.4 source used by this workspace, under its
 included MIT license. Kept locally through Cargo's crates.io patch mechanism.
 Existing window sizing, half-close and cooperative scheduling fixes are retained.
 
+The smoltcp dependency is upgraded from 0.12.0 to 0.13.1 (Rust 1.91 or later).
+This includes upstream [smoltcp #1079](https://github.com/smoltcp-rs/smoltcp/pull/1079),
+which clips incoming TCP data to the advertised receive window and prevents the
+`last_scaled_window()` sequence-number underflow that terminated TUN processing.
+`src/test/tcp_window_test.rs` exercises the failure through real TCP packets and
+the virtual device, including sequence wrap and retransmission of the clipped byte.
+Run vendor tests with `cargo test --locked --manifest-path vendor/netstack-smoltcp/Cargo.toml --lib`.
+
 Memory lifetime fixes:
 
 - Deduplicate initial SYNs by source/destination socket address; retransmissions

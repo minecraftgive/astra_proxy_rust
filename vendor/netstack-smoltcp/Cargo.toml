@@ -11,7 +11,7 @@
 
 [package]
 edition = "2021"
-rust-version = "1.75.0"
+rust-version = "1.91"
 name = "netstack-smoltcp"
 version = "0.2.4"
 authors = ["cavivie <cavivie@gmail.com>"]
@@ -65,7 +65,7 @@ version = "0.3"
 version = "0.8"
 
 [dependencies.smoltcp]
-version = "0.12"
+version = "0.13.1"
 features = [
     "std",
     "log",

@@ -632,3 +632,7 @@ impl AsyncWrite for TcpStream {
 #[cfg(test)]
 #[path = "test/tcp_staging_test.rs"]
 mod staging_tests;
+
+#[cfg(test)]
+#[path = "test/tcp_window_test.rs"]
+mod window_tests;
