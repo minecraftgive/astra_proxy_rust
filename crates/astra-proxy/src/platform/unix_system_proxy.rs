@@ -33,9 +33,50 @@ struct Check {
     query: Vec<String>,
     before: String,
     expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_id: Option<String>,
 }
-fn checks(changes: &[Change]) -> Result<Vec<Check>> {
-    checks_with(changes, command)
+impl Check {
+    fn verify_target(&self) -> Result<()> {
+        if let Some(_id) = &self.service_id {
+            #[cfg(target_os = "macos")]
+            ensure!(
+                self.query
+                    .first()
+                    .is_some_and(|p| p == "/usr/sbin/networksetup")
+                    && super::system_dns::mac_service_id(
+                        self.query.get(2).context("missing proxy service")?
+                    )? == *_id,
+                "proxy network service identity changed"
+            );
+            #[cfg(not(target_os = "macos"))]
+            bail!("macOS proxy snapshot belongs to a different platform");
+        }
+        Ok(())
+    }
+}
+fn property_query(a: &[String]) -> Result<Vec<String>> {
+    ensure!(a.len() >= 3, "invalid proxy operation");
+    Ok(if a.first().is_some_and(|v| v == "gsettings") {
+        vec![
+            a[0].clone(),
+            "get".into(),
+            a[2].clone(),
+            a.get(3).context("missing proxy property")?.clone(),
+        ]
+    } else {
+        let read = match a.get(1).map(String::as_str) {
+            Some("-setwebproxy" | "-setwebproxystate") => "-getwebproxy",
+            Some("-setsecurewebproxy" | "-setsecurewebproxystate") => "-getsecurewebproxy",
+            Some("-setsocksfirewallproxy" | "-setsocksfirewallproxystate") => {
+                "-getsocksfirewallproxy"
+            }
+            Some("-setautoproxystate") => "-getautoproxyurl",
+            Some("-setproxyautodiscovery") => "-getproxyautodiscovery",
+            _ => bail!("unknown system proxy operation"),
+        };
+        vec!["/usr/sbin/networksetup".into(), read.into(), a[2].clone()]
+    })
 }
 fn checks_with(
     changes: &[Change],
@@ -44,21 +85,7 @@ fn checks_with(
     let mut checks: Vec<Check> = vec![];
     for change in changes {
         let a = &change.apply;
-        let query = if a.first().is_some_and(|v| v == "gsettings") {
-            vec![a[0].clone(), "get".into(), a[2].clone(), a[3].clone()]
-        } else {
-            let read = match a.get(1).map(String::as_str) {
-                Some("-setwebproxy" | "-setwebproxystate") => "-getwebproxy",
-                Some("-setsecurewebproxy" | "-setsecurewebproxystate") => "-getsecurewebproxy",
-                Some("-setsocksfirewallproxy" | "-setsocksfirewallproxystate") => {
-                    "-getsocksfirewallproxy"
-                }
-                Some("-setautoproxystate") => "-getautoproxyurl",
-                Some("-setproxyautodiscovery") => "-getproxyautodiscovery",
-                _ => bail!("unknown system proxy operation"),
-            };
-            vec!["/usr/sbin/networksetup".into(), read.into(), a[2].clone()]
-        };
+        let query = property_query(a)?;
         let index = match checks.iter().position(|c| c.query == query) {
             Some(index) => index,
             None => {
@@ -67,6 +94,7 @@ fn checks_with(
                     query,
                     expected: before.clone(),
                     before,
+                    service_id: None,
                 });
                 checks.len() - 1
             }
@@ -160,14 +188,6 @@ fn command(args: &[String]) -> Result<String> {
 fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|v| (*v).to_owned()).collect()
 }
-fn is_own_proxy_endpoint(host: &str, port: &str, address: std::net::SocketAddr) -> bool {
-    port.trim().parse::<u16>().ok() == Some(address.port())
-        && (host.eq_ignore_ascii_case("localhost")
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host == address.ip().to_string())
-}
-
 fn plan(
     config: &ProxyConfig,
     mut query: impl FnMut(&[String]) -> Result<String>,
@@ -252,13 +272,6 @@ fn plan(
                     });
                     continue;
                 };
-                // Never snapshot Astra's own stranded endpoint from an unclean exit.
-                let (host, port, enabled) =
-                    if raw_enabled && is_own_proxy_endpoint(raw_host, raw_port, address) {
-                        ("", "0", false)
-                    } else {
-                        (raw_host, raw_port, raw_enabled)
-                    };
                 // networksetup enables the proxy while setting host/port. Undo order
                 // restores the endpoint first, then its original on/off state.
                 changes.push(Change {
@@ -273,18 +286,12 @@ fn plan(
                         "/usr/sbin/networksetup",
                         state,
                         &service,
-                        if enabled { "on" } else { "off" },
+                        if raw_enabled { "on" } else { "off" },
                     ]),
                 });
                 changes.push(Change {
                     apply: args(&["/usr/sbin/networksetup", state, &service, "on"]),
-                    restore: args(&[
-                        "/usr/sbin/networksetup",
-                        set,
-                        &service,
-                        if host.is_empty() { "" } else { host },
-                        port,
-                    ]),
+                    restore: args(&["/usr/sbin/networksetup", set, &service, raw_host, raw_port]),
                 });
             }
         }
@@ -336,11 +343,51 @@ impl Guard {
         }
         super::network_recovery::ensure()?;
         let lock = ownership_lock(None)?;
-        let changes = plan(config, command)?;
+        // Restore commands and ownership checks must describe the same read,
+        // including when another application edits a setting during startup.
+        let mut baseline = std::collections::HashMap::new();
+        #[cfg(target_os = "macos")]
+        let mut services = std::collections::HashMap::new();
+        let changes = plan(config, |query| {
+            #[cfg(target_os = "macos")]
+            if let Some(name) = query.get(2) {
+                if !services.contains_key(name) {
+                    services.insert(name.clone(), super::system_dns::mac_service_id(name)?);
+                }
+            }
+            let value = command(query)?;
+            baseline.insert(query.to_vec(), value.clone());
+            Ok(value)
+        })?;
         if changes.is_empty() {
             return Ok(Self::default());
         }
-        let checks = checks(&changes)?;
+        let checks = checks_with(&changes, |query| {
+            baseline
+                .get(query)
+                .cloned()
+                .context("missing proxy baseline")
+        })?;
+        #[cfg(target_os = "macos")]
+        let checks: Vec<_> = checks
+            .into_iter()
+            .map(|mut check| -> Result<_> {
+                check.service_id = Some(
+                    services
+                        .get(&check.query[2])
+                        .context("missing service identity")?
+                        .clone(),
+                );
+                Ok(check)
+            })
+            .collect::<Result<_>>()?;
+        for check in &checks {
+            check.verify_target()?;
+            ensure!(
+                command(&check.query)? == check.before,
+                "system proxy changed during preparation"
+            );
+        }
         let snapshot = Snapshot {
             changes: changes.clone(),
             checks: checks.clone(),
@@ -397,23 +444,7 @@ impl Guard {
         Ok(guard)
     }
     pub fn restore(&mut self) -> Result<()> {
-        for check in &self.checks {
-            validate_check(check)?;
-            let current = command(&check.query)?;
-            ensure!(
-                compatible(&current, &check.before, &check.expected),
-                "system proxy changed externally; recovery record retained"
-            );
-        }
-        let mut error = None;
-        for change in self.changes.iter().rev() {
-            if let Err(e) = command(&change.restore) {
-                error = Some(e);
-            }
-        }
-        if let Some(error) = error {
-            return Err(error);
-        }
+        restore_properties(&self.changes, &self.checks, command)?;
         if let Some(path) = &self.journal {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -441,6 +472,8 @@ impl Drop for Guard {
         if let Err(error) = self.restore() {
             if let Some(lease) = &self.lease {
                 lease.failed(&error);
+            } else if !super::network_recovery::enabled() {
+                super::network_recovery::unrecorded_failure(&error);
             }
             tracing::error!(%error, "failed to restore system proxy settings");
         }
@@ -522,14 +555,64 @@ fn restore_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
 pub(super) fn recover_owned(path: &Path) -> Result<()> {
     let bytes = super::network_recovery::read_private(path, 1024 * 1024)?;
     let snapshot: Snapshot = toml::from_str(std::str::from_utf8(&bytes)?)?;
-    ensure!(
-        !snapshot.checks.is_empty(),
-        "legacy proxy snapshot requires explicit --restore-system-proxy"
-    );
-    for check in &snapshot.checks {
+    recover_snapshot(path, &snapshot)
+}
+
+fn restore_properties(
+    changes: &[Change],
+    checks: &[Check],
+    mut execute: impl FnMut(&[String]) -> Result<String>,
+) -> Result<()> {
+    if checks.is_empty() {
+        // Only explicit recovery accepts pre-ownership-check snapshots.
+        for change in changes.iter().rev() {
+            execute(&change.restore)?;
+        }
+        return Ok(());
+    }
+    let mut groups = vec![Vec::new(); checks.len()];
+    for check in checks {
         validate_check(check)?;
     }
-    recover(path)
+    for change in changes.iter().rev() {
+        let property = property_query(&change.restore)?;
+        let index = checks
+            .iter()
+            .position(|check| check.query == property)
+            .context("system proxy snapshot missing property check")?;
+        groups[index].push(&change.restore);
+    }
+    let mut failures = Vec::new();
+    for (check, commands) in checks.iter().zip(groups).rev() {
+        let result: Result<()> = (|| {
+            check.verify_target()?;
+            let current = execute(&check.query)?;
+            if current == check.before {
+                return Ok(());
+            }
+            ensure!(
+                compatible(&current, &check.before, &check.expected),
+                "proxy setting changed externally"
+            );
+            for command in commands {
+                execute(command)?;
+            }
+            ensure!(
+                execute(&check.query)? == check.before,
+                "proxy restoration readback differs"
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failures.push(format!("{}: {error:#}", check.query.join(" ")));
+        }
+    }
+    ensure!(
+        failures.is_empty(),
+        "system proxy restoration incomplete: {}",
+        failures.join("; ")
+    );
+    Ok(())
 }
 
 fn compatible(current: &str, before: &str, expected: &str) -> bool {
@@ -589,6 +672,10 @@ pub(super) fn recover_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
     );
     for check in &snapshot.checks {
         validate_check(check)?;
+        ensure!(
+            check.query[0] != "/usr/sbin/networksetup" || check.service_id.is_some(),
+            "legacy proxy snapshot lacks macOS service identity; inspect it before explicit --restore-system-proxy"
+        );
     }
     restore_snapshot(path, snapshot)
 }

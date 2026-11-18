@@ -50,12 +50,26 @@ impl Drop for Monitor {
         }
     }
 }
+const PROXY_OPTIONS: [u32; 4] = [
+    INTERNET_PER_CONN_FLAGS,
+    INTERNET_PER_CONN_PROXY_SERVER,
+    INTERNET_PER_CONN_PROXY_BYPASS,
+    INTERNET_PER_CONN_AUTOCONFIG_URL,
+];
+fn matches_option(actual: &Settings, expected: &Settings, opt: u32) -> bool {
+    let (left, right) = match opt {
+        INTERNET_PER_CONN_FLAGS => return actual.flags == expected.flags,
+        INTERNET_PER_CONN_PROXY_SERVER => (&actual.server, &expected.server),
+        INTERNET_PER_CONN_PROXY_BYPASS => (&actual.bypass, &expected.bypass),
+        INTERNET_PER_CONN_AUTOCONFIG_URL => (&actual.auto_config_url, &expected.auto_config_url),
+        _ => unreachable!("unknown WinINet option"),
+    };
+    left.as_deref().unwrap_or("") == right.as_deref().unwrap_or("")
+}
 fn matches_expected(actual: &Settings, expected: &Settings) -> bool {
-    actual.flags == expected.flags
-        && actual.server.as_deref().unwrap_or("") == expected.server.as_deref().unwrap_or("")
-        && actual.bypass.as_deref().unwrap_or("") == expected.bypass.as_deref().unwrap_or("")
-        && actual.auto_config_url.as_deref().unwrap_or("")
-            == expected.auto_config_url.as_deref().unwrap_or("")
+    PROXY_OPTIONS
+        .iter()
+        .all(|&opt| matches_option(actual, expected, opt))
 }
 fn monitor(expected: Settings) -> Result<Monitor> {
     let (stop, receiver) = std::sync::mpsc::channel();
@@ -154,25 +168,29 @@ fn wide(value: &Option<String>) -> Result<Option<Vec<u16>>> {
         })
         .transpose()
 }
-fn write(settings: &Settings) -> Result<()> {
+fn write(settings: &Settings, only: Option<u32>) -> Result<()> {
     let mut strings = [
         wide(&settings.server)?,
         wide(&settings.bypass)?,
         wide(&settings.auto_config_url)?,
     ];
-    let mut options = [
-        option(INTERNET_PER_CONN_FLAGS),
-        option(INTERNET_PER_CONN_PROXY_SERVER),
-        option(INTERNET_PER_CONN_PROXY_BYPASS),
-        option(INTERNET_PER_CONN_AUTOCONFIG_URL),
-    ];
+    let mut options = PROXY_OPTIONS.map(option);
     options[0].Value.dwValue = settings.flags;
     for (option, value) in options[1..].iter_mut().zip(&mut strings) {
         option.Value.pszValue = value
             .as_mut()
             .map_or(std::ptr::null_mut(), |v| v.as_mut_ptr());
     }
-    let mut list = list(&mut options);
+    let selected = match only {
+        Some(opt) => std::slice::from_mut(
+            options
+                .iter_mut()
+                .find(|v| v.dwOption == opt)
+                .context("unknown WinINet option")?,
+        ),
+        None => &mut options[..],
+    };
+    let mut list = list(selected);
     let ok = unsafe {
         InternetSetOptionW(
             std::ptr::null(),
@@ -309,7 +327,7 @@ impl Guard {
         }
         lock.sync_all()?;
         guard.lock = Some(lock);
-        write(&expected)?;
+        write(&expected, None)?;
         if let Some(lease) = &guard.lease {
             lease.commit()?;
         }
@@ -319,17 +337,37 @@ impl Guard {
     pub fn restore(&mut self) -> Result<()> {
         drop(self.monitor.take());
         if let Some(original) = &self.original {
-            let actual =
-                query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS))?;
-            if !matches_expected(&actual, original) {
-                ensure!(
-                    self.expected
-                        .as_ref()
-                        .is_none_or(|expected| matches_expected(&actual, expected)),
-                    "Windows proxy changed externally; recovery record retained"
-                );
-                write(original)?;
+            let read =
+                || query(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| query(INTERNET_PER_CONN_FLAGS));
+            let mut failures = Vec::new();
+            for opt in PROXY_OPTIONS.into_iter().rev() {
+                let result: Result<()> = (|| {
+                    let actual = read()?;
+                    if matches_option(&actual, original, opt) {
+                        return Ok(());
+                    }
+                    ensure!(
+                        self.expected
+                            .as_ref()
+                            .is_none_or(|expected| matches_option(&actual, expected, opt)),
+                        "changed externally"
+                    );
+                    write(original, Some(opt))?;
+                    ensure!(
+                        matches_option(&read()?, original, opt),
+                        "restoration readback failed"
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    failures.push(format!("WinINet option {opt}: {error:#}"));
+                }
             }
+            ensure!(
+                failures.is_empty(),
+                "Windows proxy restoration incomplete: {}",
+                failures.join("; ")
+            );
             if let Some(lock) = &mut self.lock {
                 lock.set_len(0)?;
                 lock.sync_all()?;
@@ -357,6 +395,8 @@ impl Drop for Guard {
         if let Err(error) = self.restore() {
             if let Some(lease) = &self.lease {
                 lease.failed(&error);
+            } else if !super::network_recovery::enabled() {
+                super::network_recovery::unrecorded_failure(&error);
             }
             tracing::error!(%error, "Windows proxy recovery remains pending");
         }

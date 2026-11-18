@@ -48,8 +48,28 @@ fn loopback(host: &str) -> bool {
 
 /// Process-wide hostname hook for vendored protocol adapters. Every node
 /// server hostname resolved by meow/astra-protocols comes through here.
-pub(crate) struct HostHook(pub Box<dyn Fn() -> std::sync::Arc<App> + Send + Sync>);
+pub(crate) struct HostHook(pub Box<dyn Fn() -> Option<std::sync::Arc<App>> + Send + Sync>);
+/// Registration belongs to the runtime, including startup-error paths.
+pub(crate) struct HostResolverGuard;
+impl HostResolverGuard {
+    pub(crate) fn install(
+        get: impl Fn() -> Option<std::sync::Arc<App>> + Send + Sync + 'static,
+    ) -> Self {
+        meow_common::set_host_resolver(std::sync::Arc::new(HostHook(Box::new(get))));
+        Self
+    }
+}
+impl Drop for HostResolverGuard {
+    fn drop(&mut self) {
+        meow_common::clear_host_resolver();
+    }
+}
 impl HostHook {
+    fn app(&self) -> std::io::Result<std::sync::Arc<App>> {
+        (self.0)().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "proxy core stopped")
+        })
+    }
     fn addresses(result: Result<Vec<std::net::SocketAddr>>) -> std::io::Result<Vec<IpAddr>> {
         result
             .map(|addresses| addresses.into_iter().map(|a| a.ip()).collect())
@@ -71,11 +91,14 @@ impl meow_common::HostResolver for HostHook {
             })
     }
     async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
-        let app = (self.0)();
+        let app = self.app()?;
         Self::addresses(app.lookup_real(host, 0).await)
     }
     async fn resolve_all_nested(&self, host: &str) -> Option<std::io::Result<Vec<IpAddr>>> {
-        let app = (self.0)();
+        let app = match self.app() {
+            Ok(app) => app,
+            Err(error) => return Some(Err(error)),
+        };
         app.resolver()?;
         Some(Self::addresses(
             app.lookup_with(host, 0, LookupScope::Endpoint).await,

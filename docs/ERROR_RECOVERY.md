@@ -27,7 +27,11 @@ network_recovery = true
 
 恢复日志保存在运行目录的 `network-recovery/<运行ID>.json`；运行目录可由 `ASTRA_RUNTIME_DIR` 指定。日志按版本和类型记录原值、预期值、资源身份及提交状态。助手诊断输出在相邻的 `.log` 文件。文件为私有文件，不能删除尚未处理完成的记录。
 
-恢复包括系统代理、Astra 添加的接管及绕过路由，以及复用 Windows Wintun 时修改的地址、MTU 和 metric。共享路由的引用随候选配置、当前配置和仍有连接的旧代际保留，避免候选回滚删除旧连接使用的路由。
+恢复覆盖系统代理、系统 DNS 与搜索域、Astra 添加的接管和绕过路由，以及复用 Windows Wintun 时修改的地址、MTU 和 metric。停止接受新连接后，既有会话在配置的排空期内继续持有绕过路由。恢复助手关闭时，清理失败也会使核心返回非零退出码。
+
+DNS 按属性记录目标身份、原值和预期写入值。macOS 保留已有手动 DNS（包括本地或 Fake IP 网段地址）和搜索域，Linux 按网络命名空间和接口身份恢复，Windows 按网卡 GUID 恢复 IPv4 静态 DNS 列表或 DHCP。原值已恢复时跳过写入，当前值被外部改写时保留冲突并继续处理其他属性。实例在修改同一属性前取得系统范围的所有权锁。启用助手后，锁内的标识与恢复记录配对，未完成恢复前应保留锁文件。
+
+旧日志中的 `SystemDns` 项缺少资源身份和逐项进度。助手会保留该项，并在恢复结果中提示人工核对。可从 JSON 的 `changes` 查看当时保存的原值，结合当前网络服务核对；其中旧版 Windows 的 DHCP 恢复命令不能证明该网卡原先使用 DHCP。macOS 系统代理记录也会核对网络服务 ID，仅有服务名的旧记录需要人工核对。
 
 正常清理与助手恢复由独占锁串行化。助手确认核心死亡后逆序恢复；核心与助手同时退出或机器重启后，下次需要接管网络的启动先处理遗留记录。恢复失败不会覆盖旧记录或继续接管。
 
@@ -96,3 +100,22 @@ Linux 的两项既有进程归属测试在并行编译的高负载下触及查�
 新增故障注入覆盖重载等待期限、队列满日志、发布方 panic、锁中毒时的会话取消与清理、提交前取消、确认丢失、回滚失败、数据库锁竞争和无效文件保留。并行任务在同一工作区修改监控接口及运行构建，因此追加验证使用已经生成并确认包含对应测试的程序直接执行；重复排队的本任务构建已取消，不将其列为新的全工作区构建通过记录。
 
 发布前仍须在隔离 Windows、macOS、Linux 环境分别执行系统代理、真实 TUN、提权接管和故障检查点强杀测试，检查外部修改冲突和共享路由引用。掉电期间无法立即执行清理；恢复依赖幸存助手或下一次启动。
+
+### Linux 网络还原回归
+
+在具备 root、iproute2 和 util-linux 的 Linux 测试虚拟机内运行。脚本为每个场景创建独立的网络、挂载和 PID 命名空间。提供 systemd-resolved、resolvectl 和 dbus-daemon 时，还会用独立 DNS 服务检查原始服务器顺序、路由域、外部修改、分步写入时强杀和并发恢复。
+
+```sh
+sudo python3 scripts/network_recovery_linux.py --binary /absolute/path/to/astra-proxy \
+  --resolved /usr/lib/systemd/systemd-resolved --resolvectl /usr/bin/resolvectl
+```
+
+三平台原生验收完成前，崩溃恢复继续由 `experimental.network_recovery` 显式开启。
+
+### macOS 单服务验收
+
+在专用 macOS 测试机上，为一次性网络服务预设两条手动 DNS、一个搜索域，并启用指向 `127.0.0.1:37891` 的 HTTP 代理。将服务名放入 `ASTRA_TEST_MACOS_SERVICE`。具有该服务写权限的用户可运行以下两项原生测试，逐项核对退出前后的设置。测试会启动服务级接管，也会检查重复接管被拒绝。
+
+```sh
+cargo test --locked -p astra-proxy --lib -- macos_disposable_service --ignored --test-threads=1
+```

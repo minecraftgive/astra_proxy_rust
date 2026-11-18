@@ -239,6 +239,62 @@ pub fn validate_user_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
     ensure_user_object(&borrowed, path)
 }
 
+/// An elevated token normally creates Administrators-owned files in ProgramData.
+/// Give a fresh DNS ownership marker its caller's SID at creation so a second
+/// elevated process can validate it without trusting a user-supplied directory.
+pub fn open_dns_marker(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::OPEN_ALWAYS,
+    };
+    let user = user_sid()?;
+    let sddl = wide(OsStr::new(&format!("O:{user}D:P(A;;GA;;;{user})")))?;
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let name = wide(path.as_os_str());
+    let result = name.and_then(|name| {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let raw = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &attributes,
+                if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(raw) })
+    });
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
+}
+
 /// Force recovery may delete an abandoned foreign-owned marker, but only from
 /// an actual directory trusted for this user. Pin the parent against rename or
 /// replacement and compare resolved paths to the already-open marker.

@@ -62,7 +62,8 @@ fn linux_plan_uses_per_link_resolved_settings_and_requires_resolvectl() {
     let changes = plan(Os::Linux, "astra0", ADDRESS, None, |argv| {
         assert_eq!(argv[0], RESOLVECTL);
         Ok(match argv[1].as_str() {
-            "status" => String::new(),
+            "dns" => "Link 5 (astra0): 9.9.9.9 1.1.1.1".into(),
+            "default-route" => "Link 5 (astra0): no".into(),
             "domain" => "Link 5 (astra0):".into(),
             _ => unreachable!(),
         })
@@ -74,12 +75,13 @@ fn linux_plan_uses_per_link_resolved_settings_and_requires_resolvectl() {
         [
             s(&[RESOLVECTL, "domain", "astra0", "~."]),
             s(&[RESOLVECTL, "dns", "astra0", "198.18.0.2"]),
-            s(&[RESOLVECTL, "default-route", "astra0", "yes"]),
         ]
     );
+    assert_eq!(&changes[0].restore[3..], [""]);
+    assert_eq!(&changes[1].restore[3..], ["9.9.9.9", "1.1.1.1"]);
     assert!(changes
         .iter()
-        .all(|c| c.restore == s(&[RESOLVECTL, "revert", "astra0"])));
+        .all(|change| change.apply[1] != "default-route"));
     assert!(changes
         .iter()
         .all(|c| allowed(&c.apply) && allowed(&c.restore)));
@@ -94,13 +96,21 @@ fn linux_plan_uses_per_link_resolved_settings_and_requires_resolvectl() {
 }
 
 #[test]
-fn windows_plan_sets_static_dns_on_the_tun_adapter_and_restores_dhcp() {
-    let changes = plan(Os::Windows, "Astra TUN", ADDRESS, None, |_| unreachable!()).unwrap();
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].apply[5], "name=Astra TUN");
-    assert!(changes[0].apply.contains(&"address=198.18.0.2".to_owned()));
-    assert!(changes[0].restore.contains(&"source=dhcp".to_owned()));
-    assert!(allowed(&changes[0].apply) && allowed(&changes[0].restore));
+fn windows_plan_restores_manual_or_dhcp_by_guid() {
+    let id = "12345678-1234-4abc-8abc-123456789012";
+    for previous in [vec![], vec!["10.0.0.2", "10.0.0.1"]] {
+        let changes = plan(Os::Windows, "Astra TUN", ADDRESS, None, |cmd| {
+            assert_eq!(cmd, s(&[search::WIN_SERVERS_READ, "Astra TUN"]));
+            Ok(serde_json::to_string(&(id, &previous, ""))?)
+        })
+        .unwrap();
+        assert_eq!(
+            changes[0].apply,
+            s(&[search::WIN_SERVERS_SET, id, "198.18.0.2"])
+        );
+        assert_eq!(changes[0].restore[2..], previous);
+        assert!(allowed(&changes[0].apply) && allowed(&changes[0].restore));
+    }
 }
 
 #[test]
@@ -113,7 +123,7 @@ fn recovery_only_accepts_expected_resolver_commands() {
         s(&[RESOLVECTL, "dns", "astra0", "; rm -rf /"]),
         s(&[RESOLVECTL, "domain", "astra0", "--json=off"]),
         s(&[
-            NETSH,
+            "netsh",
             "interface",
             "ipv4",
             "set",
@@ -122,7 +132,7 @@ fn recovery_only_accepts_expected_resolver_commands() {
             "source=dhcp",
         ]),
         s(&[
-            NETSH,
+            "netsh",
             "interface",
             "ipv4",
             "set",
@@ -135,15 +145,6 @@ fn recovery_only_accepts_expected_resolver_commands() {
     ] {
         assert!(!allowed(&argv), "{argv:?}");
     }
-    let snapshot = Snapshot {
-        changes: vec![Change {
-            apply: s(&[RESOLVECTL, "dns", "astra0", "198.18.0.2"]),
-            restore: s(&["/bin/sh", "-c", "true"]),
-        }],
-    };
-    let json = serde_json::to_string(&snapshot).unwrap();
-    let parsed: Snapshot = serde_json::from_str(&json).unwrap();
-    assert!(recover(&parsed).is_err(), "edited snapshot must not run");
 }
 
 #[test]
@@ -316,7 +317,7 @@ fn local_takeover_plan_points_every_service_at_loopback() {
 }
 
 #[test]
-fn macos_plan_ignores_stranded_synthetic_tun_dns_servers() {
+fn macos_plan_preserves_existing_synthetic_tun_dns_servers() {
     let only_synthetic = plan(Os::MacOs, "utun9", ADDRESS, None, |argv| {
         Ok(match argv[1].as_str() {
             "-listallnetworkservices" => "header\nWi-Fi\n".into(),
@@ -326,7 +327,7 @@ fn macos_plan_ignores_stranded_synthetic_tun_dns_servers() {
     .unwrap();
     assert_eq!(
         only_synthetic[0].restore,
-        s(&[NETWORKSETUP, "-setdnsservers", "Wi-Fi", "Empty"])
+        s(&[NETWORKSETUP, "-setdnsservers", "Wi-Fi", "198.18.0.2"])
     );
     let mixed = plan(Os::MacOs, "utun9", ADDRESS, None, |argv| {
         Ok(match argv[1].as_str() {
@@ -337,7 +338,13 @@ fn macos_plan_ignores_stranded_synthetic_tun_dns_servers() {
     .unwrap();
     assert_eq!(
         mixed[0].restore,
-        s(&[NETWORKSETUP, "-setdnsservers", "Wi-Fi", "1.1.1.1"])
+        s(&[
+            NETWORKSETUP,
+            "-setdnsservers",
+            "Wi-Fi",
+            "198.18.0.2",
+            "1.1.1.1"
+        ])
     );
 }
 
@@ -351,7 +358,7 @@ fn magic_dns_mac_search_preserves_manual_and_dhcp_domains_and_skips_duplicates()
         |cmd| {
             Ok(match cmd[1].as_str() {
                 "-listallnetworkservices" => "header\nWi-Fi\nUSB LAN\nVPN".into(),
-                "-getdnsservers" => String::new(),
+                "-getdnsservers" => format!("There aren't any DNS Servers set on {}.", cmd[2]),
                 "-getsearchdomains" if cmd[2] == "Wi-Fi" => "corp.test\nlab.test".into(),
                 "-getsearchdomains" if cmd[2] == "VPN" => "ASTRA.HOME.ARPA.".into(),
                 "-getsearchdomains" => "There aren't any Search Domains set on USB LAN.".into(),
@@ -379,48 +386,6 @@ fn magic_dns_mac_search_preserves_manual_and_dhcp_domains_and_skips_duplicates()
     assert!(changes
         .iter()
         .all(|c| allowed(&c.apply) && allowed(&c.restore)));
-
-    // Simulate a failure after both search-domain changes. Normal rollback
-    // uses the applied prefix, while guardian replay reads a serialized snapshot.
-    let mut applied = 0;
-    let failed = apply_changes(&changes, &mut applied, |cmd| {
-        anyhow::ensure!(cmd[2] != "VPN", "simulated third-service failure");
-        Ok(String::new())
-    });
-    assert!(failed.is_err());
-    let mut rollback = Vec::new();
-    restore_changes(&changes[..applied], |cmd| {
-        rollback.push(cmd.to_vec());
-        Ok(String::new())
-    })
-    .unwrap();
-    assert_eq!(
-        rollback,
-        changes[..4]
-            .iter()
-            .rev()
-            .map(|change| change.restore.clone())
-            .collect::<Vec<_>>()
-    );
-    let serialized = serde_json::to_vec(&Snapshot {
-        changes: changes.clone(),
-    })
-    .unwrap();
-    let recovered: Snapshot = serde_json::from_slice(&serialized).unwrap();
-    let mut replay = Vec::new();
-    restore_changes(&recovered.changes, |cmd| {
-        replay.push(cmd.to_vec());
-        Ok(String::new())
-    })
-    .unwrap();
-    assert_eq!(
-        replay,
-        changes
-            .iter()
-            .rev()
-            .map(|change| change.restore.clone())
-            .collect::<Vec<_>>()
-    );
 }
 
 #[test]
@@ -431,7 +396,14 @@ fn magic_dns_linux_retains_search_and_route_domains() {
         "astra0",
         ADDRESS,
         Some("astra.home.arpa"),
-        |_| Ok(previous.into()),
+        |cmd| {
+            Ok(match cmd[1].as_str() {
+                "dns" => "Link 5 (astra0):",
+                "default-route" => "Link 5 (astra0): no",
+                _ => previous,
+            }
+            .into())
+        },
     )
     .unwrap();
     assert_eq!(
@@ -457,8 +429,12 @@ fn magic_dns_windows_restores_manual_or_automatic_suffix_by_guid() {
             ADDRESS,
             Some("astra.home.arpa"),
             |cmd| {
-                assert_eq!(cmd, s(&[search::WIN_READ, "Astra TUN"]));
-                Ok(serde_json::to_string(&(format!("{{{id}}}"), old))?)
+                assert_eq!(cmd, s(&[search::WIN_SERVERS_READ, "Astra TUN"]));
+                Ok(serde_json::to_string(&(
+                    format!("{{{id}}}"),
+                    Vec::<String>::new(),
+                    old,
+                ))?)
             },
         )
         .unwrap();
@@ -500,10 +476,71 @@ fn magic_dns_takeover_key_changes_only_when_the_system_suffix_changes() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn magic_dns_recovery_accepts_a_vanished_linux_link() {
-    // Longer than IFNAMSIZ, so this link cannot belong to the host.
-    let command = s(&[RESOLVECTL, "revert", "astra-magic-absent"]);
-    assert!(run_restore(&command).is_ok());
+fn resolved_dns_endpoints_preserve_ports_scopes_and_server_names() {
+    for value in [
+        "1.1.1.1:853#dns.example",
+        "[2001:db8::1]:9953%eth0#dns.example",
+        "fe80::53%eth0",
+    ] {
+        assert!(allowed(&s(&[RESOLVECTL, "dns", "astra0", value])));
+    }
+    for value in ["--help", "1.2.3.4#", "10.0.0.1:xyz", "10.0.0.1%bad name"] {
+        assert!(!allowed(&s(&[RESOLVECTL, "dns", "astra0", value])));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "read-only snapshot of enabled network services on a real macOS machine"]
+fn macos_native_plans_match_live_service_identity_and_values() {
+    let changes = plan(Os::MacOs, "", ADDRESS, Some("test.astra.invalid"), run).unwrap();
+    assert!(!changes.is_empty());
+    for change in changes {
+        let (id, _) = search::mac_service(&change.apply[2]).unwrap();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(change.current().unwrap().unwrap(), change.restore);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes only to the explicitly named disposable macOS network service"]
+fn macos_disposable_service_restores_dns_and_domains() -> Result<()> {
+    let service =
+        std::env::var("ASTRA_TEST_MACOS_SERVICE").context("set the disposable service name")?;
+    ensure!(
+        !service.is_empty() && !service.contains(['\r', '\n']) && !service.starts_with('*'),
+        "invalid service name"
+    );
+    let (id, _) = search::mac_service(&service)?;
+    let changes = plan(Os::MacOs, "", ADDRESS, Some("audit.astra.invalid"), |cmd| {
+        if cmd[1] == "-listallnetworkservices" {
+            return Ok(format!("test service\n{service}"));
+        }
+        run(cmd)
+    })?;
+    ensure!(
+        changes
+            .iter()
+            .any(|c| c.restore[1] == "-setdnsservers" && c.restore.len() >= 5)
+            && changes
+                .iter()
+                .any(|c| c.restore[1] == "-setsearchdomains" && c.restore[3] != "Empty"),
+        "fixture requires at least two manual DNS servers and a custom search domain"
+    );
+    let guard = Guard::apply_settings(changes.clone())?;
+    for change in &changes {
+        assert_eq!(change.current()?.unwrap(), change.apply);
+    }
+    assert!(
+        Guard::apply_settings(changes.clone()).is_err(),
+        "overlapping takeover accepted"
+    );
+    drop(guard);
+    assert_eq!(search::mac_service(&service)?.0, id);
+    for change in &changes {
+        assert_eq!(change.current()?.unwrap(), change.restore);
+    }
+    Ok(())
 }

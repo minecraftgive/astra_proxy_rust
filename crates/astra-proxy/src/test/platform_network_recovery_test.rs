@@ -11,7 +11,7 @@ fn disabled_recovery_records_nothing() {
     .unwrap();
     assert!(lease.id.is_none());
     lease.commit().unwrap();
-    lease.failed(&anyhow::anyhow!("ignored"));
+
     lease.complete().unwrap();
     assert!(owner().lock().unwrap().is_none());
     cleanup_status().unwrap();
@@ -296,4 +296,39 @@ fn failed_commit_or_release_checkpoint_retains_resource_ownership() {
     .unwrap();
     assert!(journal.resources.is_empty());
     assert!(journal.checkpoint_error.is_none());
+}
+
+#[test]
+fn legacy_dns_entry_remains_pending_without_running_old_commands() {
+    let directory = std::env::temp_dir().join(format!("astra-legacy-dns-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("run.json");
+    let mut journal = Journal {
+        version: 1,
+        run: "run".into(),
+        ..Default::default()
+    };
+    journal.resources.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "dns", "committed": true, "error": null,
+            "resource": {"kind": "SystemDns", "changes": [{
+                "apply": ["resolvectl","dns","old-link","198.18.0.2"],
+                "restore": ["resolvectl","revert","old-link"]
+            }]}
+        }))
+        .unwrap(),
+    );
+    save(&path, &journal).unwrap();
+    assert!(recover(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("legacy DNS journal"));
+    let pending: Journal = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(pending.resources.len(), 1);
+    assert!(pending.resources[0]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("manually"));
+    std::fs::remove_dir_all(directory).unwrap();
 }

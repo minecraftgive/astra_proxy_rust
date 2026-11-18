@@ -33,11 +33,14 @@ pub(crate) fn listener() -> io::Result<Option<LocalListener>> {
     Ok(Some(listener))
 }
 
-pub(crate) async fn serve(listener: Option<LocalListener>, current: Current) -> io::Result<()> {
+pub(crate) async fn serve(
+    listener: Option<LocalListener>,
+    current: Current,
+    sessions: &mut tokio::task::JoinSet<()>,
+) -> io::Result<()> {
     let Some(listener) = listener else {
         return std::future::pending().await;
     };
-    let mut sessions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
@@ -94,6 +97,7 @@ async fn session(mut stream: LocalStream, app: Arc<App>) -> Result<()> {
     .plan(&app, super::FlowPolicy::Bound(header.egress))
     .await?;
     let cancel = app.egress_signal.clone();
+    let _route_leases = app.route_leases.clone();
     match header.network {
         Network::Tcp => {
             let mut remote = session.connect_tcp(&app).await?;

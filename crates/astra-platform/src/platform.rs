@@ -134,6 +134,14 @@ pub fn home_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
+pub fn program_data_dir() -> io::Result<PathBuf> {
+    known_folder_dir(
+        &windows_sys::Win32::UI::Shell::FOLDERID_ProgramData,
+        "ProgramData",
+    )
+}
+
+#[cfg(windows)]
 fn known_folder_dir(folder: &windows_sys::core::GUID, name: &str) -> io::Result<PathBuf> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
     use windows_sys::Win32::{

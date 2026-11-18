@@ -452,11 +452,13 @@ async fn run_inner(
     // Node hostnames resolved inside protocol adapters follow the current
     // generation's encrypted resolver instead of the system resolver.
     let process_listener = crate::inbound::process::listener()?;
-    let process_ingress = crate::inbound::process::serve(process_listener, current.clone());
-    let hook_current = current.clone();
-    meow_common::set_host_resolver(Arc::new(crate::dns::HostHook(Box::new(move || {
-        hook_current.load_full()
-    }))));
+    let mut process_sessions = tokio::task::JoinSet::new();
+    let process_ingress =
+        crate::inbound::process::serve(process_listener, current.clone(), &mut process_sessions);
+    let hook_current = Arc::downgrade(&current);
+    let _resolver = crate::dns::HostResolverGuard::install(move || {
+        hook_current.upgrade().map(|current| current.load_full())
+    });
     let hosted = if std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL").is_some() {
         Some(crate::hosted::Host::start(path.clone(), &current).await?)
     } else {
@@ -882,16 +884,28 @@ async fn run_inner(
     state.listeners.clear();
     state.group_worker.take();
     state.current.load().groups.stop_test();
-    state.takeover = Default::default();
-    state.dns.take();
     let restore = state.system.restore();
     let app = current.load_full();
-    // Existing sessions retain their permits; drain the shared connection quota.
-    let _ = tokio::time::timeout(
+    // Keep existing TUN flows, DNS and bypass routes usable while draining.
+    // The limits are shared with older generations and block new admissions.
+    app.permits.resize(0);
+    app.udp_permits.resize(0);
+    if tokio::time::timeout(
         Duration::from_secs(app.config.shutdown_timeout_secs),
-        app.permits.idle(),
+        async {
+            tokio::join!(app.permits.idle(), app.udp_permits.idle());
+        },
     )
-    .await;
+    .await
+    .is_err()
+    {
+        app.egress_signal.send_replace(true);
+    }
+    process_sessions.shutdown().await;
+    state.takeover = Default::default();
+    state.dns.take();
+    // Both entry points drop the runtime (joining any remaining cancelled
+    // tasks) before finish() verifies platform cleanup and the recovery journal.
     match (result, restore) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error.into()),

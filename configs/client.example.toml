@@ -106,6 +106,7 @@ decision_cache_ttl_secs = 5
 # --switch 成功后记住新路径，之后的 SIGHUP/文件监测针对新文件；相对 CA 路径相对新配置所在目录。
 # 每个 core 使用不同 ASTRA_CONTROL_SOCKET；不要给同时启动双 core 的 Python 启动器统一设置同一个值。
 # 异常退出自动恢复网络设置为实验性功能，默认关闭（不写恢复记录）；开启需重启 core：
+# 正常停止会恢复已接管的设置。要在强杀后自动恢复，请在启动核心前开启助手。
 # [experimental]
 # network_recovery = true
 # 开启后系统代理异常退出恢复：确认旧 core 停止后执行：

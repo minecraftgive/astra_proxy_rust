@@ -10,16 +10,19 @@
 //! network recovery journal before it is applied, restored in reverse order
 //! when TUN stops, and replayed by crash recovery. Only the exact resolver
 //! commands below are accepted from a recovery document.
+mod ownership;
 mod search;
+#[cfg(target_os = "macos")]
+pub(super) use search::mac_service_id;
 use super::mode_config::Tun;
 use anyhow::{bail, ensure, Context, Result};
 use astra_model::config::dns::valid_search_domain;
+pub(super) use ownership::Setting;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 const RESOLVECTL: &str = "resolvectl";
-const NETSH: &str = "netsh";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Change {
@@ -53,10 +56,26 @@ fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| (*item).to_owned()).collect()
 }
 
-/// Build the apply/restore pairs. `query` only reads OS state.
-fn is_synthetic_tun_dns(ip: IpAddr, target: Ipv4Addr) -> bool {
-    ip == IpAddr::V4(target)
-        || matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+fn mac_values(service: &str, kind: &str, raw: &str) -> Result<Vec<String>> {
+    let raw = raw.trim();
+    if raw == format!("There aren't any {kind} set on {service}.") {
+        return Ok(vec!["Empty".into()]);
+    }
+    ensure!(!raw.is_empty(), "missing {kind} response for {service}");
+    Ok(raw.lines().map(|v| v.trim().to_owned()).collect())
+}
+
+fn resolved_values(raw: &str) -> Result<Vec<String>> {
+    let (_, values) = raw
+        .trim()
+        .split_once(':')
+        .context("invalid resolvectl link response")?;
+    let mut values: Vec<String> = values.split_whitespace().map(str::to_owned).collect();
+    // resolvectl uses a single empty argument to clear just this property.
+    if values.is_empty() {
+        values.push(String::new());
+    }
+    Ok(values)
 }
 
 pub(crate) fn plan(
@@ -66,7 +85,6 @@ pub(crate) fn plan(
     search_domain: Option<&str>,
     mut query: impl FnMut(&[String]) -> Result<String>,
 ) -> Result<Vec<Change>> {
-    let target_ip = address;
     let address = address.to_string();
     match os {
         Os::MacOs => {
@@ -84,21 +102,8 @@ pub(crate) fn plan(
             let mut changes = Vec::new();
             for service in services {
                 let before = query(&args(&[NETWORKSETUP, "-getdnsservers", &service]))?;
-                let old: Vec<String> = before
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| {
-                        line.parse::<IpAddr>()
-                            .is_ok_and(|ip| !is_synthetic_tun_dns(ip, target_ip))
-                    })
-                    .map(str::to_owned)
-                    .collect();
                 let mut restore = args(&[NETWORKSETUP, "-setdnsservers", &service]);
-                if old.is_empty() {
-                    restore.push("Empty".into());
-                } else {
-                    restore.extend(old);
-                }
+                restore.extend(mac_values(&service, "DNS Servers", &before)?);
                 changes.push(Change {
                     apply: args(&[NETWORKSETUP, "-setdnsservers", &service, &address]),
                     restore,
@@ -110,55 +115,63 @@ pub(crate) fn plan(
             Ok(changes)
         }
         Os::Linux => {
-            // Per-link settings on the TUN vanish with the link; revert covers
-            // a reload that keeps the device.
-            query(&args(&[RESOLVECTL, "status", interface]))
+            // The route-only root domain already selects this link for all
+            // unmatched names. Setting default-route explicitly would lose
+            // resolved's automatic/explicit distinction (its getter is bool).
+            let domains = search::linux(interface, search_domain, &mut query)
                 .context("system DNS takeover on Linux requires systemd-resolved (resolvectl)")?;
-            let revert = args(&[RESOLVECTL, "revert", interface]);
-            // Restore the saved link domains last, after revert resets all
-            // per-link overrides. This also covers a partially applied plan.
+            let mut restore = args(&[RESOLVECTL, "dns", interface]);
+            let raw = query(&restore)?;
+            restore.extend(resolved_values(&raw)?);
             Ok(vec![
-                search::linux(interface, search_domain, &mut query)?,
+                domains,
                 Change {
                     apply: args(&[RESOLVECTL, "dns", interface, &address]),
-                    restore: revert.clone(),
-                },
-                Change {
-                    apply: args(&[RESOLVECTL, "default-route", interface, "yes"]),
-                    restore: revert,
+                    restore,
                 },
             ])
         }
         Os::Windows => {
+            let raw = query(&args(&[search::WIN_SERVERS_READ, interface]))?;
+            let (guid, servers, old_suffix): (uuid::Uuid, Vec<Ipv4Addr>, String) =
+                serde_json::from_str(raw.trim())?;
+            let guid = guid.to_string();
+            // An empty manual list denotes automatic/DHCP. Preserve ordering.
+            let mut restore = args(&[search::WIN_SERVERS_SET, &guid]);
+            restore.extend(servers.iter().map(ToString::to_string));
             let mut changes = vec![Change {
-                apply: args(&[
-                    NETSH,
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "dnsservers",
-                    &format!("name={interface}"),
-                    "source=static",
-                    &format!("address={address}"),
-                    "register=none",
-                    "validate=no",
-                ]),
-                restore: args(&[
-                    NETSH,
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "dnsservers",
-                    &format!("name={interface}"),
-                    "source=dhcp",
-                ]),
+                apply: args(&[search::WIN_SERVERS_SET, &guid, &address]),
+                restore,
             }];
             if let Some(suffix) = search_domain {
-                changes.extend(search::windows(interface, suffix, &mut query)?);
+                changes.extend(search::windows(&guid, suffix, &old_suffix)?);
             }
             Ok(changes)
         }
     }
+}
+
+// resolved also supports a nonstandard DNS port, interface scope and TLS name.
+fn valid_resolved_server(value: &str) -> bool {
+    let (endpoint, tls) = value
+        .split_once('#')
+        .map_or((value, None), |(v, s)| (v, Some(s)));
+    if tls.is_some_and(|s| !valid_search_domain(s)) {
+        return false;
+    }
+    let (address, scope) = endpoint
+        .split_once('%')
+        .map_or((endpoint, None), |(v, s)| (v, Some(s)));
+    if scope.is_some_and(|s| {
+        s.is_empty()
+            || s.len() > 15
+            || s.bytes().any(|b| {
+                b.is_ascii_whitespace() || b.is_ascii_control() || matches!(b, b'%' | b'/' | b'#')
+            })
+    }) {
+        return false;
+    }
+    address.parse::<IpAddr>().is_ok() || address.parse::<std::net::SocketAddr>().is_ok()
 }
 
 /// Only these resolver commands may run from a (possibly edited) snapshot.
@@ -168,6 +181,7 @@ pub(crate) fn allowed(argv: &[String]) -> bool {
         Some(NETWORKSETUP) => match rest.as_slice() {
             ["-setdnsservers", service, values @ ..] => {
                 !service.is_empty()
+                    && !service.starts_with('-')
                     && !values.is_empty()
                     && (values == ["Empty"] || values.iter().all(|v| v.parse::<IpAddr>().is_ok()))
             }
@@ -185,31 +199,21 @@ pub(crate) fn allowed(argv: &[String]) -> bool {
         Some(search::WIN_SET) => {
             matches!(rest.as_slice(), [guid, domain] if uuid::Uuid::parse_str(guid).is_ok() && (domain.is_empty() || valid_search_domain(domain)))
         }
+        Some(search::WIN_SERVERS_SET) => {
+            matches!(rest.as_slice(), [guid, ips @ ..] if uuid::Uuid::parse_str(guid).is_ok() && ips.iter().all(|v| v.parse::<Ipv4Addr>().is_ok()))
+        }
         Some(RESOLVECTL) => match rest.as_slice() {
-            ["revert", link] => !link.is_empty(),
-            ["dns", link, ip] => !link.is_empty() && ip.parse::<IpAddr>().is_ok(),
-            ["domain", link, values @ ..] => {
-                !link.is_empty()
-                    && !link.starts_with('-')
-                    && !values.is_empty()
-                    && values.iter().all(|v| search::linux_domain(v))
+            [key, link, values @ ..]
+                if !link.is_empty() && !link.starts_with('-') && !values.is_empty() =>
+            {
+                match *key {
+                    "dns" => values == [""] || values.iter().all(|v| valid_resolved_server(v)),
+                    "domain" => values == [""] || values.iter().all(|v| search::linux_domain(v)),
+                    _ => false,
+                }
             }
-            ["default-route", link, "yes"] => !link.is_empty(),
             _ => false,
         },
-        Some(NETSH) => {
-            rest.len() >= 6
-                && rest[..4] == ["interface", "ipv4", "set", "dnsservers"]
-                && rest[4].starts_with("name=")
-                && rest[5..].iter().all(|value| {
-                    matches!(
-                        *value,
-                        "source=static" | "source=dhcp" | "register=none" | "validate=no"
-                    ) || value
-                        .strip_prefix("address=")
-                        .is_some_and(|ip| ip.parse::<IpAddr>().is_ok())
-                })
-        }
         _ => false,
     }
 }
@@ -218,15 +222,19 @@ fn run(argv: &[String]) -> Result<String> {
     ensure!(!argv.is_empty(), "empty system DNS command");
     #[cfg(target_os = "macos")]
     if argv[0] == search::MAC_DYNAMIC {
-        return search::mac_dynamic(&argv[1]);
+        return search::mac_service(&argv[1]).map(|(_, domains)| domains);
     }
-    let mut command = if matches!(argv[0].as_str(), search::WIN_READ | search::WIN_SET) {
+    let mut command = if matches!(
+        argv[0].as_str(),
+        search::WIN_SET | search::WIN_SERVERS_READ | search::WIN_SERVERS_SET | search::WIN_BY_GUID
+    ) {
         search::windows_command(argv)?
     } else {
         let mut command = std::process::Command::new(&argv[0]);
         command.args(&argv[1..]);
         command
     };
+    command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
     let output = astra_platform::command::output(&mut command)?;
     ensure!(
         output.status.success(),
@@ -256,119 +264,27 @@ fn flush() {
     }
 }
 
-/// Applied OS resolver settings; restored on drop.
 pub(crate) struct Guard {
-    changes: Vec<Change>,
-    applied: usize,
-    lease: Option<super::network_recovery::Lease>,
+    active: Vec<ownership::Active>,
 }
 impl Guard {
     pub(crate) fn apply(interface: &str, address: Ipv4Addr, domain: Option<&str>) -> Result<Self> {
-        let changes = plan(Os::current()?, interface, address, domain, run)?;
-        ensure!(
-            changes
-                .iter()
-                .all(|change| allowed(&change.apply) && allowed(&change.restore)),
-            "unexpected system DNS command"
-        );
-        let lease = super::network_recovery::Lease::prepare(
-            super::network_recovery::Resource::SystemDns(Snapshot {
-                changes: changes.clone(),
-            }),
-        )?;
-        let mut guard = Self {
-            changes,
-            applied: 0,
-            lease: Some(lease),
-        };
-        apply_changes(&guard.changes, &mut guard.applied, run)?;
-        flush();
-        if let Some(lease) = &guard.lease {
-            lease.commit()?;
-        }
-        if interface.is_empty() {
-            tracing::info!(%address, "system DNS now points at the local DNS listener");
-        } else {
-            tracing::info!(%interface, %address, "system DNS now points at the TUN");
-        }
-        Ok(guard)
+        Self::apply_settings(plan(Os::current()?, interface, address, domain, run)?)
     }
-    fn restore(&mut self) -> Result<()> {
-        let result = restore_changes(&self.changes[..self.applied], run_restore);
-        if self.applied > 0 {
-            flush();
+    fn apply_settings(changes: Vec<Change>) -> Result<Self> {
+        let mut guard = Self { active: Vec::new() };
+        for change in changes {
+            guard.active.push(ownership::Active::apply(change)?);
         }
-        result?;
-        if let Some(lease) = self.lease.take() {
-            lease.complete()?;
-        }
-        self.applied = 0;
-        self.changes.clear();
-        Ok(())
+        flush();
+        Ok(guard)
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Err(error) = self.restore() {
-            if let Some(lease) = &self.lease {
-                lease.failed(&error);
-            }
-            tracing::error!(%error, "failed to restore system DNS settings");
-        }
+        while self.active.pop().is_some() {}
+        flush();
     }
-}
-/// Crash recovery: replay restore commands, newest first. Restores are
-/// idempotent, so a partially applied snapshot is safe to replay.
-pub(super) fn recover(snapshot: &Snapshot) -> Result<()> {
-    restore_changes(&snapshot.changes, run_restore)?;
-    flush();
-    Ok(())
-}
-
-/// resolved removes all per-link settings when a nonpersistent TUN disappears.
-/// Other command failures remain retryable in the recovery journal.
-fn run_restore(argv: &[String]) -> Result<String> {
-    #[cfg(target_os = "linux")]
-    if argv.first().is_some_and(|program| program == RESOLVECTL) {
-        let name = std::ffi::CString::new(argv[2].as_str())?;
-        if unsafe { libc::if_nametoindex(name.as_ptr()) } == 0 {
-            let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::ENODEV | libc::ENXIO)) {
-                return Ok(String::new());
-            }
-            return Err(error.into());
-        }
-    }
-    run(argv)
-}
-
-fn apply_changes(
-    changes: &[Change],
-    applied: &mut usize,
-    mut execute: impl FnMut(&[String]) -> Result<String>,
-) -> Result<()> {
-    for (index, change) in changes.iter().enumerate() {
-        execute(&change.apply)?;
-        *applied = index + 1;
-    }
-    Ok(())
-}
-
-fn restore_changes(
-    changes: &[Change],
-    mut execute: impl FnMut(&[String]) -> Result<String>,
-) -> Result<()> {
-    ensure!(
-        changes.iter().all(|change| allowed(&change.restore)),
-        "unexpected system DNS recovery command"
-    );
-    let mut result = Ok(());
-    for change in changes.iter().rev() {
-        if let Err(error) = execute(&change.restore) {
-            result = Err(error);
-        }
-    }
-    result
 }
 
 /// The TUN-side address the OS resolver is pointed at: the first host of the

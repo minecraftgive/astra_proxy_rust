@@ -141,9 +141,8 @@ route_system_dns = true  # B：把接管前的系统 DNS 服务器以 /32、/128
   `198.18.0.2`），为它加一条进入 TUN 的主机路由，并从 Fake IP 地址池保留该地址。
   - macOS：对每个启用的网络服务执行 `networksetup -setdnsservers <服务> 198.18.0.2`，
     恢复原有手动 DNS 或 `Empty`（回到 DHCP），随后刷新 mDNSResponder 缓存。
-  - Linux：要求 systemd-resolved，在 TUN 链路上设置 `resolvectl dns/domain ~./default-route`，
-    恢复时 `resolvectl revert`；没有 resolvectl 时仅记录警告。
-  - Windows：把 TUN 网卡的 IPv4 DNS 设为该地址（TUN 网卡跃点数最低），恢复为 DHCP。
+  - Linux：要求 systemd-resolved，在 TUN 链路设置 DNS 和根路由域 `~.`，保留 `default-route` 的自动或显式设置。退出时逐项恢复原服务器顺序和搜索域，保留外部修改。
+  - Windows：把 TUN 网卡的 IPv4 DNS 设为该地址（TUN 网卡跃点数最低），退出时按网卡 GUID 恢复原静态服务器列表或 DHCP 模式。
     Windows 仍可能并行查询其他网卡，B 负责兜住发往原 DNS 服务器的查询。
 - **B（原系统 DNS 服务器路由进 TUN）**：接管前读取系统 DNS 服务器（`scutil --dns`、
   systemd-resolved、`Get-DnsClientServerAddress`），为每个服务器加一条进入 TUN 的主机路由，

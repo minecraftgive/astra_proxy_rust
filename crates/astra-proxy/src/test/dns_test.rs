@@ -355,7 +355,7 @@ async fn proxy_server_dns_is_direct_with_unavailable_proxy_and_disabled_service(
         );
         let hook = HostHook(Box::new({
             let app = app.clone();
-            move || app.clone()
+            move || Some(app.clone())
         }));
         assert_eq!(
             hook.resolve_all("node.direct-dns.example").await.unwrap(),
@@ -450,7 +450,7 @@ async fn protocol_egress_resolves_node_hostnames_through_the_host_hook() {
     )));
     let hook = crate::dns::HostHook(Box::new({
         let app = app.clone();
-        move || app.clone()
+        move || Some(app.clone())
     }));
     assert_eq!(
         hook.resolve_all("node.corp").await.unwrap(),

@@ -32,7 +32,8 @@ pub(super) enum Resource {
     WindowsAdapter(super::windows_network::AdapterSnapshot),
     #[cfg(not(windows))]
     UnixRoute(super::tun::RouteRecord),
-    SystemDns(super::system_dns::Snapshot),
+    SystemDns(super::system_dns::Snapshot), // legacy, lacks identity and progress
+    DnsSetting(super::system_dns::Setting),
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,7 +341,23 @@ fn change_journal(
     }
     Ok(())
 }
+static UNRECORDED_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+pub(super) fn unrecorded_failure(error: &anyhow::Error) {
+    UNRECORDED_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(|| format!("{error:#}"));
+}
+
 pub fn cleanup_status() -> Result<()> {
+    if let Some(error) = UNRECORDED_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        anyhow::bail!("network cleanup failed with recovery disabled: {error}");
+    }
     let guard = owner()
         .lock()
         .map_err(|_| anyhow::anyhow!("network recovery coordinator panicked"))?;
@@ -390,17 +407,25 @@ impl Lease {
             .as_mut()
             .context("network recovery guardian missing")?;
         let id = uuid::Uuid::new_v4().to_string();
-        owner.journal.resources.push(Item {
-            id: id.clone(),
-            committed: false,
-            resource,
-            error: None,
-        });
-        save(&owner.path, &owner.journal)?;
+        let path = owner.path.clone();
+        change_journal(
+            &mut owner.journal,
+            |journal| {
+                journal.resources.push(Item {
+                    id: id.clone(),
+                    committed: false,
+                    resource,
+                    error: None,
+                });
+                Ok(())
+            },
+            |journal| save(&path, journal),
+        )?;
         Ok(Self { id: Some(id) })
     }
     pub fn failed(&self, error: &anyhow::Error) {
         let Some(id) = &self.id else {
+            unrecorded_failure(error);
             return;
         };
         if let Ok(mut guard) = owner().lock() {
@@ -537,7 +562,10 @@ fn recover_locked(path: &Path) -> Result<()> {
         }
         #[cfg(not(windows))]
         Resource::UnixRoute(route) => super::tun::recover_route(route, item.committed),
-        Resource::SystemDns(snapshot) => super::system_dns::recover(snapshot),
+        Resource::SystemDns(_) => anyhow::bail!(
+            "legacy DNS journal lacks verified ownership; inspect the saved settings manually"
+        ),
+        Resource::DnsSetting(setting) => setting.recover(),
     });
     if let Err(primary) = restored {
         return match record_notice(path, &journal) {
