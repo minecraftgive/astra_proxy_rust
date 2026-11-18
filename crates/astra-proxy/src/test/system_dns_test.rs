@@ -299,3 +299,29 @@ fn local_takeover_plan_points_every_service_at_loopback() {
         .iter()
         .all(|c| allowed(&c.apply) && allowed(&c.restore)));
 }
+
+#[test]
+fn macos_plan_ignores_stranded_synthetic_tun_dns_servers() {
+    let only_synthetic = plan(Os::MacOs, "utun9", ADDRESS, |argv| {
+        Ok(match argv[1].as_str() {
+            "-listallnetworkservices" => "header\nWi-Fi\n".into(),
+            _ => "198.18.0.2\n".into(),
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        only_synthetic[0].restore,
+        s(&[NETWORKSETUP, "-setdnsservers", "Wi-Fi", "Empty"])
+    );
+    let mixed = plan(Os::MacOs, "utun9", ADDRESS, |argv| {
+        Ok(match argv[1].as_str() {
+            "-listallnetworkservices" => "header\nWi-Fi\n".into(),
+            _ => "198.18.0.2\n1.1.1.1\n".into(),
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        mixed[0].restore,
+        s(&[NETWORKSETUP, "-setdnsservers", "Wi-Fi", "1.1.1.1"])
+    );
+}

@@ -539,14 +539,20 @@ async fn run(device: Arc<tun_rs::AsyncDevice>, mtu: u16, current: Current) -> Re
         loop {
             // UDP replies are already complete host-bound IP packets. Writing
             // them back into the stack treats them as new inbound requests.
-            let packet = tokio::select! {
-                packet = packets.next() => packet.context("TUN output closed")??,
-                Some(packet) = raw_receive.recv() => packet,
+            let (packet, is_raw_udp) = tokio::select! {
+                packet = packets.next() => (packet.context("TUN output closed")??, false),
+                Some(packet) = raw_receive.recv() => (packet, true),
             };
-            ensure!(
-                device.send(&packet).await? == packet.len(),
-                "partial TUN write"
-            );
+            let len = packet.len();
+            match device.send(&packet).await {
+                Ok(sent) => ensure!(sent == len, "partial TUN write"),
+                Err(error)
+                    if is_raw_udp && is_transient_udp_send_error(&error, len, mtu) =>
+                {
+                    tracing::debug!(%error, len, mtu, "dropping oversized TUN UDP reply");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
@@ -634,12 +640,26 @@ async fn udp_dispatch(
     };
     let send = async {
         while let Some((body, source, destination)) = replies.recv().await {
-            raw.send(udp_packet(&body, source, destination)?).await?;
+            let packet = match udp_packet(&body, source, destination) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    tracing::debug!(%error, len = body.len(), "dropping unencodable TUN UDP reply");
+                    continue;
+                }
+            };
+            if raw.send(packet).await.is_err() {
+                break;
+            }
         }
         Ok::<_, anyhow::Error>(())
     };
     tokio::try_join!(receive, send)?;
     Ok(())
+}
+fn is_transient_udp_send_error(error: &std::io::Error, packet_len: usize, mtu: u16) -> bool {
+    packet_len > mtu as usize
+        || packet_len > 1500
+        || matches!(error.raw_os_error(), Some(40 | 90 | 10040))
 }
 fn udp_packet(
     body: &[u8],
@@ -647,7 +667,7 @@ fn udp_packet(
     destination: std::net::SocketAddr,
 ) -> Result<Vec<u8>> {
     use std::net::IpAddr;
-    let builder = match (source.ip(), destination.ip()) {
+    let builder = match (source.ip().to_canonical(), destination.ip().to_canonical()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             etherparse::PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
                 .udp(source.port(), destination.port())

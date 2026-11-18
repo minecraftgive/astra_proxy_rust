@@ -398,7 +398,14 @@ impl State {
             .config
             .proxy_groups
             .values()
-            .any(|g| g.mode == astra_model::groups::Mode::Auto)
+            .any(|g| {
+                matches!(
+                    g.mode,
+                    astra_model::groups::Mode::Auto
+                        | astra_model::groups::Mode::Fallback
+                        | astra_model::groups::Mode::LoadBalance
+                )
+            })
         {
             let app = self.current.load_full();
             self.group_worker = Some(GroupWorker(Task::spawn(

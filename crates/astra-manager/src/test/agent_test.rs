@@ -832,3 +832,41 @@ async fn shutdown_preserves_uncertainty_from_native_receipt_loss() {
     ));
     actor.abort();
 }
+
+#[test]
+fn maintenance_selected_overrides_keeps_only_select_groups() {
+    use astra_model::runtime::Group;
+    let groups = vec![
+        Group {
+            name: "PROXY".into(),
+            mode: "select".into(),
+            selected: Some("Auto".into()),
+            testing: false,
+            members: vec![],
+        },
+        Group {
+            name: "Auto".into(),
+            mode: "url-test".into(),
+            selected: Some("node-a".into()),
+            testing: false,
+            members: vec![],
+        },
+        Group {
+            name: "Fallback".into(),
+            mode: "fallback".into(),
+            selected: Some("node-b".into()),
+            testing: false,
+            members: vec![],
+        },
+        Group {
+            name: "LB".into(),
+            mode: "load-balance".into(),
+            selected: Some("node-c".into()),
+            testing: false,
+            members: vec![],
+        },
+    ];
+    let selected = maintenance::selected_overrides(groups);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected.get("PROXY").map(String::as_str), Some("Auto"));
+}

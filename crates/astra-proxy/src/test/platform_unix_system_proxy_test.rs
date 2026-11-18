@@ -26,6 +26,30 @@ fn system_settings_plan_restores_original_endpoint_and_enable_states() {
         .iter()
         .all(|change| change.restore.last().unwrap() == "on"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_plan_does_not_restore_stranded_self_endpoint() {
+    let config: ProxyConfig = toml::from_str(
+        "standalone=true\nmixed_listen='127.0.0.1:7891'\n[system_proxy]\nservices=['Wi-Fi']\n[[outbounds]]\nkind='socks5'\ntag='node'\nserver='127.0.0.1:7890'\n",
+    )
+    .unwrap();
+    let plan = plan(&config, |args| {
+        if args[1].ends_with("proxy") {
+            Ok(
+                "Enabled: Yes\nServer: 127.0.0.1\nPort: 7891\nAuthenticated Proxy Enabled: 0"
+                    .into(),
+            )
+        } else {
+            Ok("Enabled: Yes".into())
+        }
+    })
+    .unwrap();
+    for pair in plan[2..].as_chunks::<2>().0 {
+        assert_eq!(pair[0].restore.last().unwrap(), "off");
+        assert_eq!(&pair[1].restore[3..], &["", "0"]);
+    }
+}
 #[cfg(target_os = "linux")]
 #[test]
 fn gnome_snapshot_captures_restored_values_and_expected_overrides() {

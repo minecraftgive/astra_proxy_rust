@@ -216,3 +216,28 @@ async fn tcp_round_trip(fake: bool, payload: &[u8]) {
     .unwrap();
     proxy.abort();
 }
+
+#[test]
+fn udp_packet_canonicalizes_ipv4_mapped_ipv6_and_rejects_true_family_mismatch() {
+    let mapped = udp_packet(
+        b"reply",
+        "[::ffff:203.0.113.5]:53".parse().unwrap(),
+        "198.18.0.1:51234".parse().unwrap(),
+    )
+    .unwrap();
+    let parsed = etherparse::SlicedPacket::from_ip(&mapped).unwrap();
+    assert!(matches!(
+        parsed.net,
+        Some(etherparse::NetSlice::Ipv4(_))
+    ));
+    let Some(etherparse::TransportSlice::Udp(udp)) = parsed.transport else {
+        panic!("expected UDP");
+    };
+    assert_eq!(udp.payload(), b"reply");
+    assert!(udp_packet(
+        b"reply",
+        "[2001:db8::1]:53".parse().unwrap(),
+        "198.18.0.1:51234".parse().unwrap(),
+    )
+    .is_err());
+}

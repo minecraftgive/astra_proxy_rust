@@ -422,12 +422,24 @@ impl Groups {
             return;
         }
         let _guard = self.locks[name].lock().await;
+        const UNHEALTHY_RETRY_SECS: u64 = 5;
         if !force
             && self
                 .read_selections()
                 .get(name)
-                .and_then(|s| s.checked)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(group.interval))
+                .and_then(|s| {
+                    let has_healthy = match group.mode {
+                        Mode::LoadBalance => s.delays.iter().any(|(_, d)| d.is_some()),
+                        _ => s.member.is_some(),
+                    };
+                    let ttl = if has_healthy {
+                        group.interval
+                    } else {
+                        group.interval.min(UNHEALTHY_RETRY_SECS)
+                    };
+                    s.checked.filter(|t| t.elapsed() < Duration::from_secs(ttl))
+                })
+                .is_some()
         {
             return;
         }

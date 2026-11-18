@@ -620,3 +620,34 @@ fn chain_preview_never_advances_load_balance_selection() {
     assert_eq!(lease.3, ["entry", "exit"]);
     assert_eq!(app.groups.sequence.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn unhealthy_group_retries_quickly_instead_of_blackholing_for_full_interval() {
+    let a = stub(0, "a").await;
+    let b = stub(0, "b").await;
+    a.healthy.store(false, Ordering::SeqCst);
+    b.healthy.store(false, Ordering::SeqCst);
+    let app = App::from_text(
+        std::path::Path::new("fast-retry.toml"),
+        format!(
+            "standalone=true\nstandalone_outbound='main'\nsocks5_listen='127.0.0.1:1080'\n[[outbounds]]\nkind='http'\ntag='a'\nserver='{}'\n[[outbounds]]\nkind='http'\ntag='b'\nserver='{}'\n[proxy_groups.main]\nmode='fallback'\nmembers=['a','b']\nurl='http://example.test/204'\ninterval=300\ntimeout_ms=500\n",
+            a.address, b.address
+        ),
+    )
+    .unwrap();
+    let action = RouteAction::Proxy("main".into());
+    assert!(app.resolve_action(&action).await.is_err());
+
+    // Simulate 6 seconds elapsing while interval is 300s.
+    {
+        let mut selections = app.groups.write_selections();
+        let entry = selections.get_mut("main").unwrap();
+        assert!(entry.member.is_none());
+        entry.checked = Some(Instant::now().checked_sub(Duration::from_secs(6)).unwrap());
+    }
+    b.healthy.store(true, Ordering::SeqCst);
+    assert_eq!(
+        app.resolve_action(&action).await.unwrap(),
+        RouteAction::Proxy("b".into())
+    );
+}

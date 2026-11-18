@@ -160,6 +160,14 @@ fn command(args: &[String]) -> Result<String> {
 fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|v| (*v).to_owned()).collect()
 }
+fn is_own_proxy_endpoint(host: &str, port: &str, address: std::net::SocketAddr) -> bool {
+    port.trim().parse::<u16>().ok() == Some(address.port())
+        && (host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host == address.ip().to_string())
+}
+
 fn plan(
     config: &ProxyConfig,
     mut query: impl FnMut(&[String]) -> Result<String>,
@@ -229,9 +237,9 @@ fn plan(
                     get("Authenticated Proxy Enabled:") != Some("1"),
                     "cannot restore authenticated proxy on {service}; disable it first"
                 );
-                let host = get("Server:").context("missing proxy Server")?;
-                let port = get("Port:").context("missing proxy Port")?;
-                let enabled = get("Enabled:") == Some("Yes");
+                let raw_host = get("Server:").context("missing proxy Server")?;
+                let raw_port = get("Port:").context("missing proxy Port")?;
+                let raw_enabled = get("Enabled:") == Some("Yes");
                 let Some(address) = address else {
                     changes.push(Change {
                         apply: args(&["/usr/sbin/networksetup", state, &service, "off"]),
@@ -239,11 +247,18 @@ fn plan(
                             "/usr/sbin/networksetup",
                             state,
                             &service,
-                            if enabled { "on" } else { "off" },
+                            if raw_enabled { "on" } else { "off" },
                         ]),
                     });
                     continue;
                 };
+                // Never snapshot Astra's own stranded endpoint from an unclean exit.
+                let (host, port, enabled) =
+                    if raw_enabled && is_own_proxy_endpoint(raw_host, raw_port, address) {
+                        ("", "0", false)
+                    } else {
+                        (raw_host, raw_port, raw_enabled)
+                    };
                 // networksetup enables the proxy while setting host/port. Undo order
                 // restores the endpoint first, then its original on/off state.
                 changes.push(Change {

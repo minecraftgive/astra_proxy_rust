@@ -52,12 +52,18 @@ fn args(items: &[&str]) -> Vec<String> {
 }
 
 /// Build the apply/restore pairs. `query` only reads OS state.
+fn is_synthetic_tun_dns(ip: IpAddr, target: Ipv4Addr) -> bool {
+    ip == IpAddr::V4(target)
+        || matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+}
+
 pub(crate) fn plan(
     os: Os,
     interface: &str,
     address: Ipv4Addr,
     mut query: impl FnMut(&[String]) -> Result<String>,
 ) -> Result<Vec<Change>> {
+    let target_ip = address;
     let address = address.to_string();
     match os {
         Os::MacOs => {
@@ -78,7 +84,10 @@ pub(crate) fn plan(
                 let old: Vec<String> = before
                     .lines()
                     .map(str::trim)
-                    .filter(|line| line.parse::<IpAddr>().is_ok())
+                    .filter(|line| {
+                        line.parse::<IpAddr>()
+                            .is_ok_and(|ip| !is_synthetic_tun_dns(ip, target_ip))
+                    })
                     .map(str::to_owned)
                     .collect();
                 let mut restore = args(&[NETWORKSETUP, "-setdnsservers", &service]);

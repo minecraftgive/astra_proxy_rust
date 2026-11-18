@@ -100,11 +100,7 @@ impl AgentService {
                             serde_json::from_str(&reply.text)?;
                         Some(astra_model::runtime::Overrides {
                             mode: snapshot.mode,
-                            selected: snapshot
-                                .groups
-                                .into_iter()
-                                .filter_map(|g| g.selected.map(|s| (g.name, s)))
-                                .collect(),
+                            selected: selected_overrides(snapshot.groups),
                             system_proxy: Some(snapshot.system_proxy),
                             tun: Some(snapshot.tun),
                             allow_lan: Some(snapshot.allow_lan),
@@ -333,12 +329,23 @@ impl AgentService {
                         #[cfg(windows)]
                         commands.push(R::Tun(runtime.tun.unwrap_or(false)));
                         for command in commands {
-                            self.call(old::Action::Runtime {
-                                name: instance.name.clone(),
-                                command,
-                                expected_pid: None,
-                            })
-                            .await?;
+                            let is_select = matches!(command, R::Select { .. });
+                            if let Err(error) = self
+                                .call(old::Action::Runtime {
+                                    name: instance.name.clone(),
+                                    command,
+                                    expected_pid: None,
+                                })
+                                .await
+                            {
+                                if is_select
+                                    && format!("{error:#}")
+                                        .contains("only select groups accept manual choices")
+                                {
+                                    continue;
+                                }
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -438,4 +445,15 @@ pub(crate) fn managed_processes(
         "Managed web gateway is not running"
     );
     Ok(vec![identity])
+}
+
+/// Only `select` groups accept manual selection overrides during maintenance restore.
+pub(crate) fn selected_overrides(
+    groups: Vec<astra_model::runtime::Group>,
+) -> std::collections::BTreeMap<String, String> {
+    groups
+        .into_iter()
+        .filter(|g| g.mode == "select")
+        .filter_map(|g| g.selected.map(|s| (g.name, s)))
+        .collect()
 }

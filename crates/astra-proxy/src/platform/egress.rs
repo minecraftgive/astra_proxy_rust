@@ -195,28 +195,31 @@ pub async fn connect(
 ) -> Result<tokio::net::TcpStream> {
     // Literals short-circuit; hostnames use the installed resolver hook.
     let addresses = meow_common::resolve_host_all(&target.host, target.port).await?;
-    let mut last = None;
+    let mut last: Option<anyhow::Error> = None;
     for address in addresses {
-        let address = scoped_destination(address, interface)?;
-        let socket = if address.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        bind_interface(
-            &socket,
-            interface.filter(|_| !address.ip().is_loopback()),
-            address.is_ipv4(),
-        )?;
-        match socket.connect(address).await {
-            Ok(stream) => {
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
+        let attempt: Result<tokio::net::TcpStream> = async {
+            let address = scoped_destination(address, interface)?;
+            let socket = if address.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            bind_interface(
+                &socket,
+                interface.filter(|_| !address.ip().is_loopback()),
+                address.is_ipv4(),
+            )?;
+            let stream = socket.connect(address).await?;
+            stream.set_nodelay(true)?;
+            Ok(stream)
+        }
+        .await;
+        match attempt {
+            Ok(stream) => return Ok(stream),
             Err(error) => last = Some(error),
         }
     }
-    Err(last.context("no egress addresses")?.into())
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no egress addresses")))
 }
 
 #[cfg(test)]
