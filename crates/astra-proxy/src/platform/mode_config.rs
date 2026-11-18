@@ -68,23 +68,23 @@ pub fn validate(config: &crate::config::ProxyConfig) -> Result<()> {
         #[cfg(windows)]
         {
             ensure!(
-                tun.bypass.is_empty() || tun.interface.is_some(),
-                "Windows TUN bypass requires the original interface alias or index"
-            );
-            ensure!(
                 !tun.routes.iter().any(|v| v.contains(':')) || tun.ipv6_address.is_some(),
                 "Windows IPv6 TUN routes require tun.ipv6_address"
             );
             ensure!(tun.routes.iter().all(|v| v.parse::<ipnet::IpNet>().is_ok_and(|net| net.prefix_len() != 0)), "Use split default routes (0.0.0.0/1, 128.0.0.0/1 or ::/1, 8000::/1) on Windows to retain the physical default route");
+            let pending_gateway = tun.auto_gateway && tun.interface.is_none();
             for cidr in &tun.bypass {
                 ensure!(
                     !cidr.contains(':')
                         || !tun.gateway.is_some_and(|v| v.is_ipv4())
-                        || tun.gateway6.is_some(),
+                        || tun.gateway6.is_some()
+                        || pending_gateway,
                     "IPv6 TUN bypass with an IPv4 gateway requires tun.gateway6"
                 );
                 ensure!(
-                    cidr.contains(':') || !tun.gateway.is_some_and(|v| v.is_ipv6()),
+                    cidr.contains(':')
+                        || !tun.gateway.is_some_and(|v| v.is_ipv6())
+                        || pending_gateway,
                     "IPv4 TUN bypass requires an IPv4 tun.gateway"
                 );
             }

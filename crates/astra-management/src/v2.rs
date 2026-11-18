@@ -276,6 +276,11 @@ pub enum RuntimeCommand {
     Tun(bool),
     Reset,
     AllowLan(bool),
+    /// Ordered runtime relay. None restores the group's configured behavior.
+    SetChain {
+        group: String,
+        members: Option<Vec<String>>,
+    },
 }
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +371,7 @@ impl RuntimeCommand {
             Self::Tun(v) => C::Tun(v),
             Self::Reset => C::Reset,
             Self::AllowLan(v) => C::AllowLan(v),
+            Self::SetChain { group, members } => C::SetChain { group, members },
         })
     }
 }

@@ -34,6 +34,7 @@ pub struct Tun {
     pub bypass: Vec<String>,
     pub gateway: Option<IpAddr>,
     pub gateway6: Option<Ipv6Addr>,
+    #[serde(default, deserialize_with = "super::optional_interface")]
     pub interface: Option<String>,
     /// None infers auto when no interface is supplied; an explicit interface
     /// remains a manual choice unless auto_interface=true is requested.
@@ -103,7 +104,7 @@ pub struct Transparent {
 
 impl Tun {
     pub fn detects_interface(&self) -> bool {
-        self.auto_interface.unwrap_or(self.interface.is_none())
+        self.interface.is_none() || self.auto_interface == Some(true)
     }
     pub fn gateway_for(&self, cidr: &str) -> Option<IpAddr> {
         if cidr.contains(':') {
@@ -442,10 +443,6 @@ impl ProxyConfig {
         }
         if let Some(tun) = &self.tun {
             ensure!(
-                tun.auto_interface != Some(false) || tun.interface.is_some(),
-                "manual TUN egress requires tun.interface"
-            );
-            ensure!(
                 tun.prefix <= 32 && tun.ipv6_prefix <= 128 && (1280..=9000).contains(&tun.mtu),
                 "invalid TUN prefix/MTU (1280..9000)"
             );
@@ -460,18 +457,6 @@ impl ProxyConfig {
                     "invalid route prefix"
                 );
             }
-            ensure!(
-                tun.routes.is_empty() || tun.interface.is_some(),
-                "managed TUN routes require original egress interface (for direct connections)"
-            );
-            ensure!(
-                tun.bypass.is_empty() || tun.gateway.is_some() || tun.interface.is_some(),
-                "TUN bypass requires original gateway or interface"
-            );
-            ensure!(
-                tun.gateway6.is_none() || tun.interface.is_some(),
-                "tun.gateway6 requires the original egress interface"
-            );
         }
         Ok(())
     }

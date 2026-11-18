@@ -135,7 +135,7 @@ impl State {
         Ok(true)
     }
     async fn apply(&mut self, path: PathBuf, candidate: App) -> Result<()> {
-        self.apply_overrides(path, candidate, None).await
+        self.apply_overrides(path, candidate, None, None).await
     }
     async fn apply_subscription(
         &mut self,
@@ -154,6 +154,7 @@ impl State {
         path: PathBuf,
         mut candidate: App,
         overrides: Option<astra_model::runtime::Overrides>,
+        chains: Option<std::collections::BTreeMap<String, Vec<String>>>,
     ) -> Result<()> {
         if let Some(error) = self.consistency.get() {
             anyhow::bail!("{error}");
@@ -168,6 +169,10 @@ impl State {
         }
         astra_ipc::progress::report("Prepare runtime", path.display().to_string());
         let old = self.current.load_full();
+        let chains = chains
+            .or_else(|| (path == self.path).then(|| old.runtime_chains.clone()))
+            .unwrap_or_default();
+        candidate.apply_runtime_chains(chains)?;
         candidate.metrics = old.metrics.clone();
         candidate.overrides = if let Some(overrides) = overrides {
             Arc::new(ArcSwap::from_pointee(overrides))

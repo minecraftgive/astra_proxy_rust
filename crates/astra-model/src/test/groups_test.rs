@@ -139,3 +139,29 @@ fn references_cycles_and_selection_are_validated() {
     groups.get_mut("main").unwrap().selected = Some("b".into());
     assert!(validate(&groups, &nodes).is_err());
 }
+
+#[test]
+fn explicit_proxy_relay_keeps_subscription_hops_in_the_requested_order() {
+    let groups = BTreeMap::from([
+        (
+            "PROXY".into(),
+            Group {
+                mode: Mode::Relay,
+                members: vec!["managed".into(), "local".into()],
+                ..Default::default()
+            },
+        ),
+        (
+            "subscription".into(),
+            Group {
+                members: vec!["managed".into()],
+                subscription: Some("provider".into()),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let nodes = ["managed".into(), "local".into()].into_iter().collect();
+    let expanded = expand(&groups, &nodes).unwrap();
+    assert_eq!(expanded["PROXY"].members, ["managed", "local"]);
+    validate(&groups, &nodes).unwrap();
+}

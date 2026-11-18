@@ -91,6 +91,57 @@ pub(super) fn app_snapshot(app: &App) -> Snapshot {
     snapshot
 }
 
+impl App {
+    /// Called only on a fresh, unpublished candidate, before acquiring OS resources.
+    pub(super) fn apply_runtime_chains(
+        &mut self,
+        chains: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<()> {
+        if chains.is_empty() {
+            return Ok(());
+        }
+        let mut worker_source = self
+            .effective_text
+            .as_deref()
+            .map(toml::from_str::<toml::Table>)
+            .transpose()?;
+        for (name, members) in &chains {
+            let group = self
+                .config
+                .proxy_groups
+                .get_mut(name)
+                .with_context(|| format!("unknown proxy group {name}"))?;
+            anyhow::ensure!(
+                !astra_model::groups::builtin(name) && group.subscription.is_none(),
+                "choose a regular proxy group for the chain; subscription groups can be hops"
+            );
+            group.mode = astra_model::groups::Mode::Relay;
+            group.members = members.clone();
+            group.selected = None;
+            group.include_all = false;
+            group.include_all_groups = false;
+            group.filter = None;
+            group.exclude_filter = None;
+            if let Some(doc) = &mut worker_source {
+                doc.entry("proxy_groups")
+                    .or_insert_with(|| toml::Value::Table(Default::default()))
+                    .as_table_mut()
+                    .context("invalid proxy_groups")?
+                    .insert(name.clone(), toml::Value::try_from(&*group)?);
+            }
+        }
+        astra_model::groups::validate(
+            &self.config.proxy_groups,
+            &self.outbounds.keys().cloned().collect(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.groups = crate::proxy::groups::Groups::new(&self.config)?;
+        self.effective_text = worker_source.map(|doc| toml::to_string(&doc)).transpose()?;
+        self.runtime_chains = chains;
+        Ok(())
+    }
+}
+
 impl State {
     pub(super) fn begin_override_checkpoint(
         &self,
@@ -133,6 +184,8 @@ impl State {
         let previous = (*app.overrides.load_full()).clone();
         let mut next = previous.clone();
         let mut reapply = false;
+        let persist_overrides = !matches!(command, Command::SetChain { .. });
+        let mut chains = None;
         let mut disconnect = None;
         match command {
             Command::Snapshot => return Ok(self.runtime_snapshot()),
@@ -184,6 +237,27 @@ impl State {
                 }
                 next.selected.insert(group, member);
             }
+            Command::SetChain { group, members } => {
+                let mut updated = app.runtime_chains.clone();
+                if let Some(members) = members {
+                    anyhow::ensure!(
+                        (1..=astra_model::chain::MAX_HOPS).contains(&members.len()),
+                        "a runtime chain requires 1..=32 ordered members"
+                    );
+                    if updated.get(&group) == Some(&members) {
+                        return Ok(self.runtime_snapshot());
+                    }
+                    updated.insert(group, members);
+                } else if updated.remove(&group).is_none() {
+                    anyhow::ensure!(
+                        app.config.proxy_groups.contains_key(&group),
+                        "unknown proxy group {group}"
+                    );
+                    return Ok(self.runtime_snapshot());
+                }
+                chains = Some(updated);
+                reapply = true;
+            }
             Command::SystemProxy(enabled) => {
                 next.system_proxy = Some(enabled);
                 reapply = true;
@@ -194,6 +268,7 @@ impl State {
             }
             Command::Reset => {
                 next = Overrides::default();
+                chains = Some(Default::default());
                 reapply = true;
             }
         }
@@ -215,8 +290,13 @@ impl State {
         if let Some(candidate) = candidate {
             // Candidate preparation owns its overrides. Cancellation before the
             // final synchronous commit cannot change current routing or disk.
-            self.apply_overrides(self.path.clone(), candidate, Some(next.clone()))
-                .await?;
+            self.apply_overrides(
+                self.path.clone(),
+                candidate,
+                persist_overrides.then_some(next),
+                chains,
+            )
+            .await?;
         } else if let Some(host) = &app.hosted {
             // A lost worker reply may follow a successful worker-side commit.
             // Never claim a rollback by restoring only the host's copy.

@@ -141,7 +141,7 @@ impl Resolver {
     /// Remember an upstream hostname address; bounded by the configured
     /// upstream count and capped at five minutes.
     pub fn bootstrap_store(&self, host: &str, ip: IpAddr, ttl: u32) {
-        let ttl = Duration::from_secs(u64::from(ttl.clamp(1, 300)));
+        let ttl = Duration::from_secs(u64::from(ttl.min(300)));
         if let Ok(mut cache) = self.bootstrap.lock() {
             let now = Instant::now();
             cache.retain(|_, (_, expires)| *expires > now);
@@ -267,12 +267,7 @@ impl Resolver {
             trace.finish(result.as_ref().map(Some).map_err(|e| e.to_string()));
             match result {
                 Ok(reply) => {
-                    for record in reply.answers {
-                        let ip = match record.data {
-                            RData::A(A(ip)) => IpAddr::V4(ip),
-                            RData::AAAA(AAAA(ip)) => IpAddr::V6(ip),
-                            _ => continue,
-                        };
+                    for (ip, _) in wire::address_answers(&reply) {
                         if !self.is_fake(ip) && !addresses.contains(&ip) {
                             addresses.push(ip);
                         }

@@ -4,7 +4,8 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 pub(crate) async fn direct(app: &App, address: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
-    let address = egress::scoped_destination(address, interface(app))?;
+    let interface = interface(app);
+    let address = egress::scoped_destination(address, interface.as_deref())?;
     let socket = UdpSocket::bind(if address.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -13,7 +14,7 @@ pub(crate) async fn direct(app: &App, address: SocketAddr, query: &[u8]) -> Resu
     .await?;
     egress::bind_interface(
         &socket,
-        interface(app).filter(|_| !address.ip().is_loopback()),
+        interface.as_deref().filter(|_| !address.ip().is_loopback()),
         address.is_ipv4(),
     )?;
     socket.connect(address).await?;

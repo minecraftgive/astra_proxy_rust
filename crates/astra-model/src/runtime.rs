@@ -36,13 +36,21 @@ impl Default for Overrides {
 pub enum Command {
     Snapshot,
     SetMode(Mode),
-    Select { group: String, member: String },
+    Select {
+        group: String,
+        member: String,
+    },
     TestGroup(String),
     Disconnect(Option<u64>),
     SystemProxy(bool),
     Tun(bool),
     Reset,
     AllowLan(bool),
+    /// Ordered runtime relay. None restores the group's configured behavior.
+    SetChain {
+        group: String,
+        members: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

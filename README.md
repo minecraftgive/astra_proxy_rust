@@ -294,6 +294,15 @@ mode = "relay"
 members = ["entry", "relay", "exit"]
 ```
 
+运行中可在 Web 的「代理组 → 运行时组链」按入口到出口逐行填写节点或组名，也可通过核心管理套接字执行：
+
+```sh
+astra-proxy --runtime "$SOCKET" chain PROXY entry relay exit
+astra-proxy --runtime "$SOCKET" chain-clear PROXY
+```
+
+第一条命令把发往 `PROXY` 的新连接切到三跳链，第二条恢复该组的配置和选择。可替换普通组或已有 relay 组，订阅组可作为其中一跳。核心在切换前校验完整依赖图。临时组合随同一配置热重载保留，重启核心、切换配置文件或重置运行状态时清除。已有连接遵循组的配置变更断连策略。验证临时组合可查看运行时连接路径或执行该组的运行时测速；单独从配置文件启动的诊断进程使用已保存的链路。
+
 - 前置代理可继续指定前置，relay 可以嵌套，也可以把普通选择组作为一跳。代理组的选择层级不计入实际代理跳数。
 - relay 的顺序优先：只应用实际首跳自身的前置链路，后续跳的 `dialer_proxy` 不重复应用。relay 不接受 `selected`、动态收集或过滤成员；需要动态选择时，引用普通代理组。
 - 支持现有 TCP 协议组合。native Trojan/VLESS/VMess 的 UDP 通过 TCP 链路传输；SOCKS5/SS 的 UDP 要求前置链路具备 UDP 能力。HTTP CONNECT 和旧格式 TCP 出口不支持 UDP。

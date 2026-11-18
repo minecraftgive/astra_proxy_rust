@@ -996,7 +996,10 @@ export default function App() {
                           </div>
                         )}
                         {visibleGroups.map(({ group: g, members }) => (
-                          <section className="card card-pad" key={g.name}>
+                          <section
+                            className="card card-pad"
+                            key={JSON.stringify([agent, current.id, current.pid, g.name])}
+                          >
                             <div className="page-head">
                               <h2>{g.name}</h2>
                               <span className="pill">{g.mode}</span>
@@ -1014,6 +1017,55 @@ export default function App() {
                                 {g.testing ? "测试中…" : "测速"}
                               </button>
                             </div>
+                            {g.name !== "DIRECT" && g.name !== "REJECT" && (
+                              <details>
+                                <summary>运行时组链</summary>
+                                <form
+                                  className="toolbar"
+                                  onSubmit={(event) => {
+                                    event.preventDefault();
+                                    const text = new FormData(event.currentTarget).get("hops");
+                                    if (typeof text !== "string") return;
+                                    const hops = text
+                                      .split(/\r?\n/)
+                                      .map((line) => line.trim())
+                                      .filter(Boolean);
+                                    if (hops.length) {
+                                      void runtimeCommand({
+                                        SetChain: { group: g.name, members: hops },
+                                      });
+                                    }
+                                  }}
+                                >
+                                  <label>
+                                    从入口到出口，每行一个节点或组名
+                                    <textarea
+                                      key={JSON.stringify([g.mode, g.mode === "relay" && g.members.map((m) => m.name)])}
+                                      name="hops"
+                                      className="input"
+                                      rows={3}
+                                      required
+                                      defaultValue={g.mode === "relay" ? g.members.map((m) => m.name).join("\n") : ""}
+                                    />
+                                  </label>
+                                  <button className="btn sm" {...runtimeCap}>
+                                    应用到新连接
+                                  </button>
+                                  {g.mode === "relay" && (
+                                    <button
+                                      type="button"
+                                      className="btn sm"
+                                      {...runtimeCap}
+                                      onClick={() => void runtimeCommand({
+                                        SetChain: { group: g.name, members: null },
+                                      })}
+                                    >
+                                      恢复配置链路
+                                    </button>
+                                  )}
+                                </form>
+                              </details>
+                            )}
                             <div className="member-grid">
                               {members.map((m) => (
                                 <button

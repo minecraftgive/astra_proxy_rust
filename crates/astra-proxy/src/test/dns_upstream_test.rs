@@ -168,7 +168,7 @@ async fn strict_bootstrap_uses_encrypted_literal_upstream_and_caches() {
     let app = crate::dns::tests::app(&format!(
         "nameserver=['https://dns.example/dns-query']\nfallback=['tls://{address}']\nbootstrap=['192.0.2.1']\nquery_timeout_ms=1000"
     ));
-    let error = bootstrap(&app, "dns.example", false).await.unwrap_err();
+    let error = bootstrap(&app, "dns.example").await.unwrap_err();
     assert!(
         format!("{error:#}").contains("encrypted DNS bootstrap"),
         "{error:#}"
@@ -180,7 +180,47 @@ async fn strict_bootstrap_uses_encrypted_literal_upstream_and_caches() {
     let dns = app.dns.as_ref().unwrap();
     dns.bootstrap_store("dns.example", "192.0.2.53".parse().unwrap(), 60);
     assert_eq!(
-        bootstrap(&app, "dns.example", false).await.unwrap(),
+        bootstrap(&app, "dns.example").await.unwrap(),
         "192.0.2.53".parse::<IpAddr>().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn dedicated_tcp_bootstrap_reaches_ipv6_only_name_with_direct_group_blocked() {
+    use hickory_proto::rr::{rdata::AAAA, RData, Record};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let ip: std::net::Ipv6Addr = "2001:db8::53".parse().unwrap();
+    let app = crate::dns::tests::app(&format!(
+        "plaintext_bypass=true\nrespect_rules=true\nproxy_server_nameserver=['tcp://{address}']\n[proxy_groups.DIRECT]\nmembers=['REJECT']"
+    ));
+    let server = tokio::spawn(async move {
+        for kind in [RecordType::A, RecordType::AAAA] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut packet = vec![0; stream.read_u16().await.unwrap() as usize];
+            stream.read_exact(&mut packet).await.unwrap();
+            let query = Message::from_vec(&packet).unwrap();
+            assert_eq!(query.queries[0].query_type(), kind);
+            let mut reply = wire::response(&query, ResponseCode::NoError);
+            if kind == RecordType::AAAA {
+                reply.answers.push(Record::from_rdata(
+                    query.queries[0].name().clone(),
+                    60,
+                    RData::AAAA(AAAA(ip)),
+                ));
+            }
+            let bytes = reply.to_vec().unwrap();
+            stream.write_u16(bytes.len() as u16).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    assert_eq!(
+        bootstrap(&app, "dns.example").await.unwrap(),
+        IpAddr::V6(ip)
+    );
+    server.await.unwrap();
+    assert_eq!(
+        bootstrap(&app, "dns.example").await.unwrap(),
+        IpAddr::V6(ip)
     );
 }

@@ -106,6 +106,7 @@ pub struct App {
     // admitted UDP association which may need to route additional targets.
     source_text: String,
     effective_text: Option<String>,
+    runtime_chains: std::collections::BTreeMap<String, Vec<String>>,
     cache: Option<Cache<CacheKey, RouteAction>>,
     routing: Arc<RoutingContext>,
 }
@@ -175,6 +176,7 @@ impl App {
         Self {
             source_text: String::new(),
             effective_text: None,
+            runtime_chains: Default::default(),
             cache: None,
             routing,
         }
@@ -866,6 +868,7 @@ impl App {
             }
         }
         Ok(Self {
+            runtime_chains: Default::default(),
             // Hosted workers consume the validated expansion; ordinary cores
             // only need the editable source text.
             effective_text: std::env::var_os("ASTRA_HOSTED_EXPERIMENTAL")
@@ -1110,6 +1113,16 @@ pub async fn run() -> Result<()> {
             "select" => Command::Select {
                 group: args.next().context("select requires group")?,
                 member: args.next().context("select requires member")?,
+            },
+            "chain" => Command::SetChain {
+                group: args
+                    .next()
+                    .context("chain requires a group and ordered hops")?,
+                members: Some(args.by_ref().collect()),
+            },
+            "chain-clear" => Command::SetChain {
+                group: args.next().context("chain-clear requires a group")?,
+                members: None,
             },
             "test" => Command::TestGroup(args.next().context("test requires group")?),
             "close-all" => Command::Disconnect(None),

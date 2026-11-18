@@ -143,6 +143,7 @@ fn runtime(c: astra_model::runtime::Command) -> v::RuntimeCommand {
         C::Tun(x) => R::Tun(x),
         C::Reset => R::Reset,
         C::AllowLan(x) => R::AllowLan(x),
+        C::SetChain { group, members } => R::SetChain { group, members },
     }
 }
 // Translate actions before entering the async dispatcher: an await in every

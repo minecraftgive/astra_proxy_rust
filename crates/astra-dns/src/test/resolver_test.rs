@@ -659,3 +659,38 @@ fn bootstrap_cache_is_case_insensitive_and_expires() {
     std::thread::sleep(Duration::from_millis(1100));
     assert_eq!(resolver.bootstrap_cached("dns.example"), None);
 }
+
+#[test]
+fn dial_addresses_follow_cname_owner_family_and_lifetime() {
+    use hickory_proto::rr::{
+        rdata::{AAAA, CNAME},
+        Name,
+    };
+    let query = wire::query("ns.example", RecordType::AAAA).unwrap();
+    let name = |s: &str| Name::from_ascii(s).unwrap();
+    let mut reply = wire::response(&query, ResponseCode::NoError);
+    let ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+    reply.answers = vec![
+        Record::from_rdata(name("other.example."), 300, RData::AAAA(AAAA(ip))),
+        Record::from_rdata(
+            name("ns.example."),
+            300,
+            RData::A(A("192.0.2.1".parse().unwrap())),
+        ),
+        Record::from_rdata(name("target.example."), 300, RData::AAAA(AAAA(ip))),
+        Record::from_rdata(
+            name("ns.example."),
+            8,
+            RData::CNAME(CNAME(name("target.example."))),
+        ),
+    ];
+    assert_eq!(
+        wire::address_answers(&reply).collect::<Vec<_>>(),
+        [(ip.into(), 8)]
+    );
+    reply.metadata.response_code = ResponseCode::ServFail;
+    assert!(wire::address_answers(&reply).next().is_none());
+    let resolver = Resolver::new(Config::default()).unwrap();
+    resolver.bootstrap_store("ns.example", ip.into(), 0);
+    assert!(resolver.bootstrap_cached("ns.example").is_none());
+}

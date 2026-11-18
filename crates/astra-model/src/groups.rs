@@ -18,7 +18,11 @@ pub enum Mode {
 #[serde(default, deny_unknown_fields)]
 pub struct Group {
     /// Explicit per-group socket binding; absent means inherit the outer/default egress.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::config::optional_interface",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub interface: Option<String>,
     /// Subscription source whose nodes form this group's managed membership.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,9 @@ pub fn expand(
             if !seen.insert(member.clone()) {
                 return Err(format!("proxy group {name}: duplicate member {member}"));
             }
+        }
+        if source.mode == Mode::Relay {
+            continue;
         }
         let mut dynamic: Vec<_> = nodes
             .iter()

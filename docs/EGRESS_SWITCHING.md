@@ -36,7 +36,7 @@ gateway = "192.168.1.1" # 替换为该网卡实际网关
 # gateway6 = "fe80::1"
 ```
 
-省略 auto_interface 时，没有 interface 表示自动；已有 interface 表示手动，兼容旧配置。
+interface 省略、为空字符串或仅含空白时会自动探测，即使旧配置仍有 auto_interface=false。填写接口名称并省略 auto_interface 时按手动绑定处理。
 因此旧版自动识别后曾补写 interface 的文件，需要显式设置 auto_interface=true 才会重新跟随
 网络。auto_gateway 默认 true；使用自定义静态网关时显式关闭它。
 
@@ -81,8 +81,8 @@ interface = "Ethernet"
 缓存只包含接口和网关，不包含订阅或认证信息；它是诊断快照，不用于认领路由或在断网时
 强行采用过期网关。自动模式不再把检测结果补写成配置里的手动 interface。
 
-检测策略在共享层，网卡和路由 API 在平台适配层。Windows 使用 IP Helper，Linux 使用
-iproute2 的默认路由/物理设备信息，macOS 使用 route 默认网关查询；当前自动/手动切换的
+检测策略在共享层，网卡和路由 API 在平台适配层。Windows 使用 IP Helper，Linux 根据
+iproute2 的默认路由和底层物理设备识别以太网、VLAN、桥接和绑定接口，macOS 从 IPv4/IPv6 路由表中选择有效的默认出口；当前自动/手动切换的
 完整路由租约修复及发布验证针对 Windows。Linux/macOS 的同前缀路由迁移仍依赖各自的
 路由命令语义，不应把 Windows 的验证结果视为其他系统的验收。
 

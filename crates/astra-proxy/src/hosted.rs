@@ -1451,6 +1451,7 @@ pub async fn worker() -> Result<()> {
     let config: WorkerConfig = receive(&mut tokio::io::stdin()).await?;
     let mut app = App::from_text(&config.path, config.text)?;
     crate::platform::network_recovery::set_enabled(app.config.experimental.network_recovery);
+    crate::mode_config::runtime_modes(&mut app.config, &config.overrides);
     app.overrides.store(Arc::new(config.overrides));
     if let Some(tun) = &mut app.config.tun {
         tun.interface = config.interface.clone();

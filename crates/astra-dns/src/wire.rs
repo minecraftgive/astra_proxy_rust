@@ -1,7 +1,7 @@
 use anyhow::{ensure, Result};
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
-    rr::{DNSClass, Name, RecordType},
+    rr::{DNSClass, Name, RData, RecordType},
 };
 
 pub fn query(name: &str, kind: RecordType) -> Result<Message> {
@@ -61,6 +61,42 @@ pub fn validate_response(query: &Message, reply: &Message) -> Result<()> {
         "DNS upstream response does not match query"
     );
     Ok(())
+}
+/// Dial candidates must belong to the question or its CNAME target. Cache
+/// their addresses only as long as every link in the alias chain is valid.
+pub fn address_answers(reply: &Message) -> impl Iterator<Item = (std::net::IpAddr, u32)> + '_ {
+    let question = reply.queries.first();
+    let mut owner = question.map(|q| q.name());
+    let mut ttl = u32::MAX;
+    for _ in 0..16 {
+        let Some((alias, alias_ttl)) = reply.answers.iter().find_map(|record| {
+            if Some(&record.name) == owner && record.dns_class == DNSClass::IN {
+                if let RData::CNAME(alias) = &record.data {
+                    return Some((&alias.0, record.ttl));
+                }
+            }
+            None
+        }) else {
+            break;
+        };
+        owner = Some(alias);
+        ttl = ttl.min(alias_ttl);
+    }
+    reply.answers.iter().filter_map(move |record| {
+        if reply.metadata.response_code != ResponseCode::NoError
+            || reply.metadata.truncation
+            || Some(&record.name) != owner
+            || record.dns_class != DNSClass::IN
+        {
+            return None;
+        }
+        let ip = match (question?.query_type(), &record.data) {
+            (RecordType::A, RData::A(ip)) => ip.0.into(),
+            (RecordType::AAAA, RData::AAAA(ip)) => ip.0.into(),
+            _ => return None,
+        };
+        Some((ip, record.ttl.min(ttl)))
+    })
 }
 pub fn error(raw: &[u8]) -> Option<Vec<u8>> {
     let query = Message::from_vec(raw).ok()?;
