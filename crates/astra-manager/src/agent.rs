@@ -410,6 +410,14 @@ impl AgentService {
                 instance,
                 addresses,
             } => ResponseBody::FakeIpLookup(self.fake_ip_lookup(instance, addresses).await?),
+            Query::RunningProcesses { filter } => {
+                anyhow::ensure!(filter.len() <= 4096, "process search exceeds 4096 bytes");
+                let (programs, truncated) = tokio::task::spawn_blocking(move || {
+                    astra_process_routing::search_processes(&filter)
+                })
+                .await?;
+                ResponseBody::RunningProcesses { programs, truncated }
+            }
             Query::NetworkState => {
                 ResponseBody::NetworkState(self.network_state.sample(&self.identity.id).await)
             }
@@ -448,6 +456,7 @@ impl AgentService {
                     "artifacts".into(),
                     "tasks".into(),
                     NETWORK_DIAGNOSTICS_CAPABILITY.into(),
+                    "running_processes_v1".into(),
                     "network_state_v1".into(),
                     "core_network_v1".into(),
                     "network_diagnostics_system_tcp_dns_v1".into(),

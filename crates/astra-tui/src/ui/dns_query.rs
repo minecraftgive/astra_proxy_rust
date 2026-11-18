@@ -93,16 +93,20 @@ impl Ui {
                 t("DNS policies"),
                 resolver.policy_count
             ),
-            format!("{}: {}", t("Upstream"), servers(&resolver.nameservers)),
+            format!(
+                "{}: {}",
+                t("Proxy DNS upstream"),
+                servers(&resolver.proxy_nameserver)
+            ),
         ];
         if !resolver.enabled {
             lines = vec![t("DNS is disabled for this profile").into()];
         }
-        if !resolver.proxy_server_nameserver.is_empty() {
+        if !resolver.direct_nameserver.is_empty() {
             lines.push(format!(
                 "{}: {}",
-                t("Proxy DNS (always direct)"),
-                servers(&resolver.proxy_server_nameserver)
+                t("Direct DNS upstream"),
+                servers(&resolver.direct_nameserver)
             ));
         }
         if !resolver.fallback.is_empty() {

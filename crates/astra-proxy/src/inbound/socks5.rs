@@ -34,32 +34,29 @@ where
     .await
     .context("SOCKS5 handshake timeout")??;
     if command == 3 {
-        return crate::udp::associate_stream(client, target, app, source, local).await;
+        return super::socks_udp::associate_stream(client, target, app, source, local).await;
     }
-    let action = match app
-        .route_connection(
-            &target,
-            Inbound::Socks5,
-            astra_model::Network::Tcp,
-            Some(source),
-            Some(local),
-        )
-        .await
+    let session = match super::Flow::new(
+        &target,
+        Inbound::Socks5,
+        astra_model::Network::Tcp,
+        Some(source),
+        Some(local),
+    )
+    .plan(&app, super::FlowPolicy::Requested)
+    .await
     {
-        Ok(route) => route,
+        Ok(session) => session,
         Err(err) => {
             reply_socks5(&mut client, 1).await?;
             return Err(err);
         }
     };
-    if action == RouteAction::Block {
+    if session.action == RouteAction::Block {
         reply_socks5(&mut client, 2).await?;
         return Ok(());
     }
-    let mut upstream = match app
-        .connect_tracked(&target, &action, Inbound::Socks5, Some(source))
-        .await
-    {
+    let mut upstream = match session.connect_tcp(&app).await {
         Ok(s) => s,
         Err(err) => {
             reply_socks5(&mut client, 5).await?;

@@ -7,47 +7,29 @@ mod tests;
 mod upstream;
 use crate::App;
 use anyhow::Result;
-use astra_model::Target;
+use astra_dns::LookupScope;
+use astra_model::{Inbound, RouteAction, Target};
 pub(crate) use server::tcp;
 pub(crate) use server::{Guard, Prepared};
 use std::{future::Future, net::IpAddr, pin::Pin};
 pub(crate) use upstream::{framed, tls_connector};
 
-pub(super) struct Transport<'a>(pub &'a App);
+type DnsRoute = (RouteAction, crate::proxy::group_sessions::Lease);
+struct Transport<'a>(&'a App, Option<DnsRoute>);
 impl astra_dns::Transport for Transport<'_> {
     fn exchange<'a>(
         &'a self,
         upstream: &'a astra_dns::Upstream,
         query: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
-        Box::pin(upstream::exchange(self.0, upstream, query))
+        Box::pin(upstream::exchange(self.0, upstream, query, self.1.as_ref()))
     }
 }
-/// Ignores respect_rules: upstreams are dialed directly, so a lookup made
-/// while dialing a proxy cannot re-enter that proxy.
-struct DirectTransport<'a>(&'a App);
-impl astra_dns::Transport for DirectTransport<'_> {
-    fn exchange<'a>(
-        &'a self,
-        upstream: &'a astra_dns::Upstream,
-        query: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
-        Box::pin(upstream::exchange_direct(self.0, upstream, query))
-    }
-}
-
-/// Build the lookup-only resolver: none when the DNS service already exists
-/// or plaintext is allowed with no dedicated proxy DNS; otherwise use the
-/// configured (or default) upstreams without listener, hijack or Fake IP.
 pub(crate) fn lookup_resolver(
     service: bool,
     config: Option<&astra_dns::Config>,
 ) -> Result<Option<astra_dns::Resolver>> {
-    if service
-        || config.is_some_and(|config| {
-            config.plaintext_bypass && config.proxy_server_nameserver.is_empty()
-        })
-    {
+    if service {
         return Ok(None);
     }
     let mut config = config.cloned().unwrap_or_default();
@@ -95,17 +77,15 @@ impl meow_common::HostResolver for HostHook {
     async fn resolve_all_nested(&self, host: &str) -> Option<std::io::Result<Vec<IpAddr>>> {
         let app = (self.0)();
         app.resolver()?;
-        Some(Self::addresses(app.lookup_with(host, 0, true).await))
+        Some(Self::addresses(
+            app.lookup_with(host, 0, LookupScope::Endpoint).await,
+        ))
     }
 }
 impl App {
     pub(crate) fn synthetic_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ip) => {
-                u32::from(ip) & 0xfffe0000 == u32::from(std::net::Ipv4Addr::new(198, 18, 0, 0))
-            }
-            IpAddr::V6(_) => self.dns.as_ref().is_some_and(|dns| dns.is_fake(ip)),
-        }
+        matches!(ip, IpAddr::V4(address) if astra_model::config::dns::BENCHMARK_NET.contains(&address))
+            || self.dns.as_ref().is_some_and(|dns| dns.is_fake(ip))
     }
     pub(crate) fn restore_fake_target(&self, target: &Target) -> Result<Target> {
         if let Ok(ip) = target.host.parse::<IpAddr>() {
@@ -142,22 +122,21 @@ impl App {
         host: &str,
         port: u16,
     ) -> Result<Vec<std::net::SocketAddr>> {
-        let proxy = self
+        let scope = if self
             .proxy_domains
             .contains(&host.trim_end_matches('.').to_ascii_lowercase())
-            && self
-                .resolver()
-                .is_some_and(|dns| !dns.config.proxy_server_nameserver.is_empty());
-        self.lookup_with(host, port, proxy).await
+        {
+            LookupScope::Endpoint
+        } else {
+            LookupScope::Direct
+        };
+        self.lookup_with(host, port, scope).await
     }
-    /// Resolve for a local dial. The system resolver is used only when no
-    /// encrypted resolver exists (plaintext_bypass) or for a
-    /// plaintext_bypass_domains name without its own nameserver_policy.
     pub(crate) async fn lookup_with(
         &self,
         host: &str,
         port: u16,
-        direct: bool,
+        scope: LookupScope,
     ) -> Result<Vec<std::net::SocketAddr>> {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -172,28 +151,20 @@ impl App {
         let Some(dns) = self.resolver() else {
             return Ok(tokio::net::lookup_host((host, port)).await?.collect());
         };
-        if direct && !dns.config.proxy_server_nameserver.is_empty() {
-            return Ok(dns
-                .lookup_proxy(host, &DirectTransport(self))
-                .await?
-                .into_iter()
-                .map(|ip| std::net::SocketAddr::new(ip, port))
-                .collect());
-        }
-        if self.dns.is_none() && dns.config.plaintext_bypass {
-            return Ok(tokio::net::lookup_host((host, port)).await?.collect());
-        }
-        if !dns.config.plaintext_bypass
+        if scope != LookupScope::Endpoint
+            && !dns.config.plaintext_bypass
             && dns.config.plaintext_allowed(host)
             && !dns.config.has_policy(host)
         {
+            if let Some(local) = dns.lookup_magic(host) {
+                return Ok(local?
+                    .into_iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                    .collect());
+            }
             return Ok(tokio::net::lookup_host((host, port)).await?.collect());
         }
-        let addresses = if direct {
-            dns.lookup(host, &DirectTransport(self)).await
-        } else {
-            dns.lookup(host, &Transport(self)).await
-        };
+        let addresses = dns.lookup_with(host, &Transport(self, None), scope).await;
         Ok(addresses?
             .into_iter()
             .map(|ip| std::net::SocketAddr::new(ip, port))
@@ -207,7 +178,27 @@ impl App {
             .dns
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("DNS service disabled"))?;
-        dns.answer(raw, &Transport(self)).await
+        dns.answer_routed(raw, |domain| async move {
+            if self.proxy_domains.contains(&domain) {
+                return Ok((LookupScope::Endpoint, Transport(self, None)));
+            }
+            if !dns.config.respect_rules {
+                return Ok((LookupScope::Direct, Transport(self, None)));
+            }
+            let target = Target {
+                host: domain,
+                port: 443,
+            };
+            let action = self.policy_action(&target, Inbound::Tun, astra_model::Network::Tcp).await?;
+            let route = self.resolve_session(&action).await?;
+            let scope = match route.0 {
+                RouteAction::Block => anyhow::bail!("DNS query blocked by route"),
+                RouteAction::Direct => LookupScope::Direct,
+                RouteAction::Proxy(_) => LookupScope::Proxy,
+            };
+            Ok((scope, Transport(self, Some(route))))
+        })
+        .await
     }
     pub(crate) fn intercept_dns(&self, destination: std::net::SocketAddr) -> bool {
         self.dns

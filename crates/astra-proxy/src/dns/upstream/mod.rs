@@ -5,11 +5,11 @@ mod tcp;
 mod tests;
 mod tls;
 mod udp;
+use super::DnsRoute;
 use crate::App;
 use anyhow::{Context, Result};
 use astra_dns::{wire, Upstream};
 use astra_model::Inbound;
-use astra_model::Network;
 use astra_model::Target;
 use hickory_proto::{op::Message, rr::RecordType};
 use https::exchange as doh;
@@ -26,22 +26,24 @@ async fn bootstrap(app: &App, host: &str) -> Result<IpAddr> {
         return Ok(ip);
     }
     let dns = app.resolver().context("DNS disabled")?;
+    if let Some(local) = dns.lookup_magic(host) {
+        return local?
+            .into_iter()
+            .next()
+            .context("Magic DNS bootstrap has no usable address");
+    }
     if let Some(ip) = dns.bootstrap_cached(host) {
         return Ok(ip);
     }
     let config = &dns.config;
-    let (servers, label) = if !config.proxy_server_nameserver.is_empty() {
-        (config.proxy_bootstrap(), "proxy DNS bootstrap")
-    } else if config.plaintext_bypass {
-        let servers = config
+    let mut servers = config.direct_bootstrap();
+    if servers.is_empty() && config.plaintext_bypass {
+        servers = config
             .bootstrap
             .iter()
             .map(|ip| Upstream::parse(&ip.to_string()))
-            .collect::<Result<Vec<_>>>()?;
-        (servers, "plaintext DNS bootstrap")
-    } else {
-        (config.encrypted_bootstrap(), "encrypted DNS bootstrap")
-    };
+            .collect::<Result<_>>()?;
+    }
     // One unreachable bootstrap server must not consume the entire exchange
     // deadline when another literal server is available.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(config.query_timeout_ms);
@@ -60,7 +62,7 @@ async fn bootstrap(app: &App, host: &str) -> Result<IpAddr> {
     }
     Err(last
         .unwrap_or_else(|| anyhow::anyhow!("no bootstrap servers"))
-        .context(format!("{label} for {host} failed")))
+        .context(format!("direct DNS bootstrap for {host} failed")))
 }
 
 async fn bootstrap_from(
@@ -78,7 +80,7 @@ async fn bootstrap_from(
             break;
         }
         let query = wire::query(host, kind)?;
-        let bytes = exchange_at(app, server, literal, query.to_vec()?, None, true).await?;
+        let bytes = exchange_at(app, server, literal, query.to_vec()?, None, None).await?;
         let reply = Message::from_vec(&bytes)?;
         wire::validate_response(&query, &reply)?;
         anyhow::ensure!(
@@ -104,26 +106,31 @@ fn interface(app: &App) -> Option<std::sync::Arc<str>> {
             .map(Into::into)
     })
 }
-pub(super) async fn exchange(app: &App, upstream: &Upstream, query: Vec<u8>) -> Result<Vec<u8>> {
-    exchange_tls(app, upstream, query, None, false).await
-}
-/// Same as exchange() but never routes through proxies (respect_rules).
-pub(super) async fn exchange_direct(
+pub(super) async fn exchange(
     app: &App,
     upstream: &Upstream,
     query: Vec<u8>,
+    route: Option<&DnsRoute>,
 ) -> Result<Vec<u8>> {
-    exchange_tls(app, upstream, query, None, true).await
+    let exchange = exchange_tls(app, upstream, query, None, route);
+    match route {
+        Some((_, lease)) => tokio::select! {
+            biased;
+            _ = lease.cancelled() => anyhow::bail!("DNS route changed during query"),
+            result = exchange => result,
+        },
+        None => exchange.await,
+    }
 }
 async fn exchange_tls(
     app: &App,
     upstream: &Upstream,
     query: Vec<u8>,
     connector: Option<tokio_rustls::TlsConnector>,
-    direct: bool,
+    route: Option<&DnsRoute>,
 ) -> Result<Vec<u8>> {
     let ip = bootstrap(app, &upstream.host).await?;
-    exchange_at(app, upstream, ip, query, connector, direct).await
+    exchange_at(app, upstream, ip, query, connector, route).await
 }
 async fn exchange_at(
     app: &App,
@@ -131,40 +138,22 @@ async fn exchange_at(
     ip: IpAddr,
     query: Vec<u8>,
     connector: Option<tokio_rustls::TlsConnector>,
-    direct: bool,
+    route: Option<&DnsRoute>,
 ) -> Result<Vec<u8>> {
-    let dns = app.resolver().context("DNS disabled")?;
     let address = SocketAddr::new(ip, upstream.port);
-    // Route using upstream hostname, dial its bootstrapped literal IP. This
-    // avoids resolving the DNS server through itself.
-    let target = Target {
-        host: upstream.host.clone(),
-        port: upstream.port,
-    };
     let dial = Target {
         host: ip.to_string(),
         port: upstream.port,
     };
-    let network = if upstream.scheme == "udp" {
-        Network::Udp
-    } else {
-        Network::Tcp
-    };
-    let action = if dns.config.respect_rules && !direct && !dns.config.always_direct(upstream) {
-        Some(app.route_network(&target, Inbound::Tun, network).await?)
-    } else {
-        None
-    };
     if upstream.scheme == "udp" {
-        // The UDP helper routes once; to preserve hostname policy select an
-        // explicit action rather than resolving the literal address again.
-        let bytes = if let Some(action) = &action {
-            let connection = crate::udp::open_action(
+        let bytes = if let Some((action, lease)) = route {
+            let connection = crate::udp::open_planned(
                 app,
                 &dial,
                 Inbound::Tun,
                 "127.0.0.1:0".parse()?,
                 action.clone(),
+                lease.clone(),
             )
             .await?;
             connection.send(&query, address).await?;
@@ -180,8 +169,8 @@ async fn exchange_at(
         }
         // RFC 7766: retry truncated UDP responses using framed TCP.
     }
-    let stream: crate::outbound::Stream = match action {
-        Some(action) => app.connect(&dial, &action).await?,
+    let stream: crate::outbound::Stream = match route {
+        Some((action, lease)) => app.connect_planned(&dial, action, lease).await?,
         None => Box::new(crate::egress::connect(&dial, interface(app).as_deref()).await?),
     };
     match upstream.scheme.as_str() {

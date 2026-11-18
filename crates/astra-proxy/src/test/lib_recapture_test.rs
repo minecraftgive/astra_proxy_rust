@@ -1,4 +1,6 @@
 use super::*;
+use crate::inbound::{Flow, FlowPolicy};
+use astra_model::{Inbound, Network, ProcessInfo, RouteAction, Target};
 
 impl App {
     async fn connect_resolved(
@@ -57,23 +59,26 @@ async fn tun_rejects_recaptured_proxy_connections_even_in_standalone_mode() {
         path: "astra-proxy.exe".into(),
     };
     for network in [Network::Tcp, Network::Udp] {
-        let result = app
-            .route_with_process(&target, Inbound::Tun, network, Some(own.clone()))
+        let plan = |inbound| {
+            Flow::new(&target, inbound, network, None, None).plan(&app, FlowPolicy::Requested)
+        };
+        let result = hosted::INGRESS_PROCESS
+            .scope(Some(own.clone()), plan(Inbound::Tun))
             .await;
         assert!(
             result.is_err(),
             "recaptured {network:?} must not open another outbound"
         );
-        assert!(result.unwrap_err().to_string().contains("recaptured"));
+        assert!(result.err().unwrap().to_string().contains("recaptured"));
         let mut other = own.clone();
         other.pid = own.pid.wrapping_add(1);
-        assert!(app
-            .route_with_process(&target, Inbound::Tun, network, Some(other))
+        assert!(hosted::INGRESS_PROCESS
+            .scope(Some(other), plan(Inbound::Tun))
             .await
             .is_ok());
         // Explicit SOCKS use is not transparent recapture.
-        assert!(app
-            .route_with_process(&target, Inbound::Socks5, network, Some(own.clone()))
+        assert!(hosted::INGRESS_PROCESS
+            .scope(Some(own.clone()), plan(Inbound::Socks5))
             .await
             .is_ok());
     }
@@ -84,15 +89,15 @@ async fn tun_rejects_recaptured_proxy_connections_even_in_standalone_mode() {
         let destination = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(destination).await.unwrap();
         let (_server, _) = listener.accept().await.unwrap();
-        let result = app
-            .route_connection(
-                &target,
-                Inbound::Tun,
-                Network::Tcp,
-                Some(client.local_addr().unwrap()),
-                Some(destination),
-            )
-            .await;
-        assert!(result.unwrap_err().to_string().contains("recaptured"));
+        let result = Flow::new(
+            &target,
+            Inbound::Tun,
+            Network::Tcp,
+            Some(client.local_addr().unwrap()),
+            Some(destination),
+        )
+        .plan(&app, FlowPolicy::Requested)
+        .await;
+        assert!(result.err().unwrap().to_string().contains("recaptured"));
     }
 }

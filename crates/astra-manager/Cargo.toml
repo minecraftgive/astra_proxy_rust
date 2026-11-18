@@ -13,6 +13,7 @@ path = "src/host_main.rs"
 name = "astra-service"
 path = "src/service_main.rs"
 [dependencies]
+astra-process-routing = { path = "../astra-process-routing" }
 astra-platform = { path = "../astra-platform" }
 anyhow.workspace = true
 tokio.workspace = true

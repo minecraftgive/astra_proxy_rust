@@ -391,3 +391,34 @@ fn chain_editor_preserves_order_and_protects_front_references() {
         .unwrap();
     alias.validate_structure().unwrap();
 }
+
+#[test]
+fn editing_legacy_dns_migrates_both_pools_and_keeps_fallback_optional() {
+    let source =
+        "[dns]\nnameserver=['tls://192.0.2.1']\nproxy_server_nameserver=['tls://192.0.2.2']\nfallback=['tls://192.0.2.3']\n";
+    let mut doc = Document::parse(CoreKind::Proxy, source).unwrap();
+    let path = vec![Part::Key("dns".into())];
+    let schema = doc.schema(&path, Platform::current()).unwrap();
+    for key in ["proxy_nameserver", "direct_nameserver"] {
+        assert!(schema.rows.iter().any(|row| matches!(row, SchemaRow::Field { field } if field.key == key && field.value.is_some())));
+    }
+    doc.apply(EditCommand::SetField {
+        path,
+        key: "fallback".into(),
+        input: String::new(),
+    })
+    .unwrap();
+    let parsed: toml::Table = toml::from_str(doc.text()).unwrap();
+    let dns = parsed["dns"].as_table().unwrap();
+    assert!(
+        dns.get("fallback").is_none()
+            && dns.get("nameserver").is_none()
+            && dns.get("proxy_server_nameserver").is_none()
+    );
+    let config: astra_model::config::dns::Config = parsed["dns"].clone().try_into().unwrap();
+    assert_eq!(config.proxy_nameserver, ["tls://192.0.2.1"]);
+    assert_eq!(config.direct_nameserver, ["tls://192.0.2.2"]);
+    assert!(config.fallback.is_empty());
+    config.validate().unwrap();
+    assert!(toml::from_str::<astra_model::config::dns::Config>("typo_upstream=[]").is_err());
+}

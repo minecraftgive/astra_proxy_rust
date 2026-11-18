@@ -193,6 +193,21 @@ pub async fn connect(
     target: &astra_model::Target,
     interface: Option<&str>,
 ) -> Result<tokio::net::TcpStream> {
+    connect_inner(target, interface, false).await
+}
+
+pub(crate) async fn connect_bound(
+    target: &astra_model::Target,
+    interface: &str,
+) -> Result<tokio::net::TcpStream> {
+    connect_inner(target, Some(interface), true).await
+}
+
+async fn connect_inner(
+    target: &astra_model::Target,
+    interface: Option<&str>,
+    strict: bool,
+) -> Result<tokio::net::TcpStream> {
     // Literals short-circuit; hostnames use the installed resolver hook.
     let addresses = meow_common::resolve_host_all(&target.host, target.port).await?;
     let mut last: Option<anyhow::Error> = None;
@@ -206,7 +221,7 @@ pub async fn connect(
             };
             bind_interface(
                 &socket,
-                interface.filter(|_| !address.ip().is_loopback()),
+                interface.filter(|_| strict || !address.ip().is_loopback()),
                 address.is_ipv4(),
             )?;
             let stream = socket.connect(address).await?;

@@ -39,6 +39,7 @@ const LOCAL_METADATA_INPUTS: &[(&str, &[&str])] = &[
         "crates/astra-model",
         "crates/astra-observe",
         "crates/astra-platform",
+        "crates/astra-process-routing",
         "crates/astra-update",
     ]),
     ("astra-proxy", &[
@@ -50,6 +51,7 @@ const LOCAL_METADATA_INPUTS: &[(&str, &[&str])] = &[
         "crates/astra-model",
         "crates/astra-observe",
         "crates/astra-platform",
+        "crates/astra-process-routing",
         "crates/astra-protocols",
         "crates/astra-proxy",
         "vendor/meow-common",

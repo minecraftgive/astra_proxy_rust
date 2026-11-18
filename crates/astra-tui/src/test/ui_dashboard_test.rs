@@ -872,7 +872,7 @@ fn dns_sample() -> Ui {
             enabled: true,
             fake_ip: true,
             listen: vec!["127.0.0.1:1053".parse().unwrap()],
-            nameservers: vec![astra_model::runtime::DnsServer {
+            proxy_nameserver: vec![astra_model::runtime::DnsServer {
                 address: "https://resolver.example/dns-query".into(),
                 transport: "DoH".into(),
             }],
@@ -880,7 +880,7 @@ fn dns_sample() -> Ui {
                 address: "tls://1.1.1.1:853".into(),
                 transport: "DoT".into(),
             }],
-            proxy_server_nameserver: vec![astra_model::runtime::DnsServer {
+            direct_nameserver: vec![astra_model::runtime::DnsServer {
                 address: "https://192.0.2.53/dns-query".into(),
                 transport: "DoH".into(),
             }],
@@ -927,7 +927,7 @@ fn dns_query_form_keeps_input_local_and_displays_settings_errors_and_answers() {
         ui.key(key(KeyCode::Char('s')));
         let text = screen(&render(&ui, 100, 30));
         assert!(text.contains("DoT tls://1.1.1.1:853"));
-        assert!(text.contains("Proxy DNS (always direct)"));
+        assert!(text.contains("Direct DNS upstream"));
         assert!(text.contains("https://192.0.2.53/dns-query"));
         assert!(text.contains("127.0.0.1:1053"));
         ui.key(key(KeyCode::Esc));

@@ -1,10 +1,10 @@
 mod controls;
-use crate::{inbound, system_proxy, transparent, tun, App};
+use crate::{inbound, system_proxy, transparent, App};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use astra_model::Inbound;
 use astra_platform::supervision::Task;
-use meow_common::ErrorBackoff;
+use inbound::accept;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Mutex};
 
@@ -34,34 +34,13 @@ pub struct State {
     text: String,
     current: Current,
     listeners: HashMap<Key, Listener>,
-    /// Declared before `tunnel` so the OS resolver is restored first on drop.
-    system_dns: Option<crate::platform::system_dns::Takeover>,
-    tunnel: Option<tun::Guard>,
-    tproxy_udp: Option<transparent::UdpGuard>,
+    takeover: inbound::takeover::Takeover,
     dns: Option<crate::dns::Guard>,
     system: system_proxy::Guard,
     system_journal: PathBuf,
     group_worker: Option<GroupWorker>,
     outbound_interface: Option<meow_common::outbound_iface::OutboundIfaceGuard>,
     elevated_tun: bool,
-}
-fn failed_system_proxy_switch(
-    original: anyhow::Error,
-    rollback: Result<system_proxy::Guard>,
-    system: &mut system_proxy::Guard,
-    consistency: &std::sync::OnceLock<String>,
-) -> anyhow::Error {
-    match rollback {
-        Ok(previous) => {
-            *system = previous;
-            original
-        }
-        Err(rollback) => {
-            let message = format!("System proxy switch failed: {original:#}; previous system proxy restoration also failed: {rollback:#}; outcome unknown; controlled shutdown required");
-            let _ = consistency.set(message.clone());
-            anyhow::anyhow!(message)
-        }
-    }
 }
 impl State {
     async fn task_failure(&mut self) -> Option<String> {
@@ -88,17 +67,7 @@ impl State {
                 return Some(error);
             }
         }
-        if let Some(tunnel) = &mut self.tunnel {
-            if let Some(error) = tunnel.failure().await {
-                return Some(error);
-            }
-        }
-        if let Some(udp) = &mut self.tproxy_udp {
-            if let Some(error) = udp.failure().await {
-                return Some(error);
-            }
-        }
-        None
+        self.takeover.failure().await
     }
     async fn refresh_egress(
         &mut self,
@@ -183,7 +152,7 @@ impl State {
         };
         {
             let overrides = candidate.overrides.load_full();
-            crate::mode_config::runtime_modes(&mut candidate.config, &overrides);
+            candidate.apply_runtime_modes(&overrides)?;
         }
         let legacy_journal = path.with_extension("system-proxy-state.toml");
         anyhow::ensure!(candidate.config.system_proxy.is_none() || legacy_journal==self.system_journal || !legacy_journal.exists(),
@@ -285,40 +254,17 @@ impl State {
             "Prepare network modes",
             "Preparing TUN, DNS and system proxy resources",
         );
-        let replace_tun = candidate.config.tun != old.config.tun
-            || (candidate.config.tun.is_some() && self.tunnel.is_none());
-        let tunnel = if replace_tun {
-            match &candidate.config.tun {
-                Some(config) => Some(tun::prepare(config.clone(), self.tunnel.as_ref()).await?),
-                None => None,
-            }
-        } else {
-            None
-        };
-        let replace_udp = candidate.config.tproxy != old.config.tproxy
-            || (candidate.config.tproxy.is_some() && self.tproxy_udp.is_none());
-        let udp = if replace_udp {
-            match &candidate.config.tproxy {
-                Some(config) => Some(transparent::prepare_udp(config.listen)?),
-                None => None,
-            }
-        } else {
-            None
-        };
+        let takeover = self
+            .takeover
+            .prepare(&candidate.config, &old.config)
+            .await?;
         let system_listener_changed =
             crate::platform::system_listener_changed(&candidate.config, &old.config);
         let replace_system = candidate.config.system_proxy != old.config.system_proxy
             || (candidate.config.system_proxy.is_some()
                 && (self.listeners.is_empty() || system_listener_changed));
         let text = candidate.source_text.clone();
-        candidate.route_leases = if replace_tun {
-            tunnel
-                .as_ref()
-                .map(|prepared| prepared.bypass_leases())
-                .unwrap_or_default()
-        } else {
-            old.route_leases.clone()
-        };
+        candidate.route_leases = takeover.route_leases(&old);
         // This is the last await before publishing live state. In particular,
         // system settings, limits, session cancellation and group workers must
         // remain unchanged while admission is held by another host operation.
@@ -345,26 +291,19 @@ impl State {
             .map(meow_common::outbound_iface::install_outbound_interface)
             .transpose()?;
         if replace_system {
-            self.system
-                .restore()
-                .context("restore previous system proxy")?;
-            match system_proxy::Guard::apply(&candidate.config, &self.system_journal) {
-                Ok(guard) => self.system = guard,
-                Err(error) => {
-                    return Err(failed_system_proxy_switch(
-                        error,
-                        system_proxy::Guard::apply(&old.config, &self.system_journal),
-                        &mut self.system,
-                        &self.consistency,
-                    ));
-                }
-            }
+            inbound::takeover::switch_system_proxy(
+                &mut self.system,
+                &candidate.config,
+                &old.config,
+                &self.system_journal,
+                &self.consistency,
+            )?;
         }
         candidate.permits = old.permits.clone();
         candidate.udp_permits = old.udp_permits.clone();
         candidate.permits.resize(candidate.config.max_connections);
         candidate.udp_permits.resize(candidate.config.max_udp_flows);
-        if let Some(client) = &mut candidate.rule_client {
+        if let Some(client) = &mut candidate.rules.rule_client {
             client.start_observer();
         }
         // Prepare first; disconnect sessions only once the entire reload can commit.
@@ -397,21 +336,14 @@ impl State {
         }
         self.outbound_interface = outbound_interface;
         self.group_worker.take();
-        if self
-            .current
-            .load()
-            .config
-            .proxy_groups
-            .values()
-            .any(|g| {
-                matches!(
-                    g.mode,
-                    astra_model::groups::Mode::Auto
-                        | astra_model::groups::Mode::Fallback
-                        | astra_model::groups::Mode::LoadBalance
-                )
-            })
-        {
+        if self.current.load().config.proxy_groups.values().any(|g| {
+            matches!(
+                g.mode,
+                astra_model::groups::Mode::Auto
+                    | astra_model::groups::Mode::Fallback
+                    | astra_model::groups::Mode::LoadBalance
+            )
+        }) {
             let app = self.current.load_full();
             self.group_worker = Some(GroupWorker(Task::spawn(
                 "proxy group refresh",
@@ -437,25 +369,7 @@ impl State {
             );
         }
         self.listeners.retain(|key, _| keys.contains(key));
-        if replace_tun {
-            // Restore the OS resolver while the old TUN can still answer.
-            self.system_dns = None;
-            let previous = self.tunnel.take();
-            self.tunnel = tunnel.map(|prepared| prepared.start(self.current.clone(), previous));
-        }
-        let wanted = crate::platform::system_dns::Key::wanted(
-            &self.current.load().config,
-            self.tunnel.as_ref().and_then(|tunnel| tunnel.name().ok()),
-        );
-        if self.system_dns.as_ref().map(|takeover| &takeover.key) != wanted.as_ref() {
-            self.system_dns = None;
-            if let Some(key) = wanted {
-                self.system_dns = Some(crate::platform::system_dns::Takeover::start(key).await);
-            }
-        }
-        if replace_udp {
-            self.tproxy_udp = udp.map(|prepared| prepared.start(self.current.clone()));
-        }
+        self.takeover.activate(takeover, &self.current).await;
         if let Some(tun) = &self.current.load().config.tun {
             if let Err(error) = crate::egress::cache_interface(&path, tun) {
                 tracing::warn!(%error,"could not save diagnostic egress cache");
@@ -537,6 +451,8 @@ async fn run_inner(
     let current = Arc::new(ArcSwap::from_pointee(app));
     // Node hostnames resolved inside protocol adapters follow the current
     // generation's encrypted resolver instead of the system resolver.
+    let process_listener = crate::inbound::process::listener()?;
+    let process_ingress = crate::inbound::process::serve(process_listener, current.clone());
     let hook_current = current.clone();
     meow_common::set_host_resolver(Arc::new(crate::dns::HostHook(Box::new(move || {
         hook_current.load_full()
@@ -558,9 +474,7 @@ async fn run_inner(
         group_worker: None,
         outbound_interface: None,
         elevated_tun,
-        system_dns: None,
-        tunnel: None,
-        tproxy_udp: None,
+        takeover: Default::default(),
         dns: None,
         system: Default::default(),
     };
@@ -954,6 +868,7 @@ async fn run_inner(
         biased;
         reason = fatal.recv() => Err(std::io::Error::other(reason.unwrap_or_else(|| "runtime watchdog channel closed".into()))),
         result = service => result,
+        result = process_ingress => result,
         reason = watch.failure() => Err(std::io::Error::other(reason)),
         reason = subscription_worker.failure() => Err(std::io::Error::other(reason)),
         _ = lifeline_closed(&mut lifeline) => {
@@ -967,9 +882,7 @@ async fn run_inner(
     state.listeners.clear();
     state.group_worker.take();
     state.current.load().groups.stop_test();
-    state.system_dns.take();
-    state.tunnel.take();
-    state.tproxy_udp.take();
+    state.takeover = Default::default();
     state.dns.take();
     let restore = state.system.restore();
     let app = current.load_full();
@@ -990,97 +903,6 @@ async fn run_inner(
         )),
     }
 }
-async fn accept(
-    listener: Arc<TcpListener>,
-    inbound: Inbound,
-    current: Current,
-) -> std::io::Result<()> {
-    let mut backoff = ErrorBackoff::new();
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(value) => {
-                backoff.succeeded();
-                value
-            }
-            Err(error) => {
-                if !astra_platform::supervision::transient_io(&error) {
-                    return Err(error);
-                }
-                if backoff.failed(&error).await {
-                    tracing::warn!(%error, ?inbound, "TCP accept error");
-                } else {
-                    tracing::debug!(%error, ?inbound, "TCP accept error");
-                }
-                continue;
-            }
-        };
-        let app = current.load_full();
-        if matches!(
-            inbound,
-            Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed
-        ) && !app.inbound_allowed(peer.ip())
-        {
-            continue;
-        }
-        let Ok(permit) = app.permits.clone().acquire_owned().await else {
-            return Ok(());
-        };
-        let _ = stream.set_nodelay(true);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let cancellation = app.egress_signal.clone();
-            let session = async move {
-                if let Some(host) = app.hosted.clone() {
-                    drop(app);
-                    let local = stream.local_addr()?;
-                    let destination = match inbound {
-                        Inbound::Tproxy | Inbound::Redirect => {
-                            Some(transparent::destination(&stream, inbound)?)
-                        }
-                        _ => None,
-                    };
-                    let process = crate::platform::process::lookup(
-                        astra_model::Network::Tcp,
-                        peer,
-                        destination.unwrap_or(local),
-                    )
-                    .await;
-                    return host
-                        .relay(
-                            stream,
-                            crate::hosted::Metadata {
-                                flow_id: None,
-                                inbound,
-                                source: peer,
-                                local,
-                                destination,
-                                process,
-                            },
-                        )
-                        .await;
-                }
-                match inbound {
-                    Inbound::Socks5 => inbound::handle_socks5(stream, app).await,
-                    Inbound::HttpConnect => inbound::handle_http(stream, app).await,
-                    Inbound::Mixed => inbound::handle_mixed(stream, app).await,
-                    Inbound::Tproxy | Inbound::Redirect => {
-                        transparent::tcp(stream, app, inbound).await
-                    }
-                    Inbound::Tun => unreachable!(),
-                }
-            };
-            let result = tokio::select! {
-                biased;
-                _=cancellation.cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect session")),
-                result=session=>result,
-            };
-            if let Err(error) = result {
-                tracing::debug!(%peer, %error, "session ended");
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 #[path = "../../test/proxy_runtime_egress_test.rs"]
 mod egress_tests;

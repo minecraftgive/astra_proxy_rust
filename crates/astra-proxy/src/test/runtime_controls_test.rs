@@ -199,7 +199,7 @@ async fn ordinary_core_exposes_dns_telemetry_and_refreshes_it_after_reload() {
     assert_eq!(meta.sample_age_ms, 0);
     let resolver = meta.dns_resolver.as_ref().unwrap();
     assert!(resolver.enabled && resolver.fake_ip);
-    assert_eq!(resolver.nameservers[0].transport, "DoH");
+    assert_eq!(resolver.proxy_nameserver[0].transport, "DoH");
     assert_eq!(resolver.listen[0].port(), port);
     assert_eq!(
         meta.dns.as_ref().unwrap().records[0].domain,
@@ -233,7 +233,10 @@ async fn ordinary_core_exposes_dns_telemetry_and_refreshes_it_after_reload() {
     assert!(next.active_generation > meta.active_generation);
     assert!(next.sample_sequence > meta.sample_sequence);
     assert!(next.sample_elapsed_ms >= meta.sample_elapsed_ms);
-    assert_eq!(next.dns_resolver.unwrap().nameservers[0].transport, "TCP");
+    assert_eq!(
+        next.dns_resolver.unwrap().proxy_nameserver[0].transport,
+        "TCP"
+    );
 }
 struct Server {
     address: SocketAddr,

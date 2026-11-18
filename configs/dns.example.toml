@@ -4,11 +4,10 @@ auto_start = false
 [dns]
 enable = true
 listen = ["127.0.0.1:1053"]
-nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
-fallback = ["tls://8.8.8.8:853"]
-# Proxy endpoint and upstream hostname resolution; these servers always use DIRECT.
-# At least one IP-literal server is required when this list is nonempty.
-proxy_server_nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+proxy_nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+# fallback = ["tls://8.8.8.8:853"] # optional
+# DIRECT destinations, node addresses and DNS bootstrap use this list directly.
+direct_nameserver = ["https://223.6.6.6/dns-query", "https://223.5.5.5/dns-query"]
 # Encrypted-only by default; set true to allow udp:// / tcp:// upstreams (insecure).
 plaintext_bypass = false
 bootstrap = ["1.1.1.1", "8.8.8.8"]
@@ -17,3 +16,11 @@ fake_ip = false
 cache_capacity = 4096
 query_timeout_ms = 3000
 max_concurrent = 128
+
+# Set enable = true and replace the example addresses to use names like nas.
+[dns.magic_dns]
+enable = false
+domain = "astra.home.arpa"
+[dns.magic_dns.hosts]
+nas = ["192.168.1.20", "fd12:3456::20"]
+printer = ["192.168.1.30"]

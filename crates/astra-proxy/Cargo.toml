@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+astra-process-routing = { path = "../astra-process-routing" }
 mimalloc = "0.1"
 astra-model = { path = "../astra-model" }
 astra-observe = { path = "../astra-observe" }
@@ -49,8 +50,12 @@ serde_json = "1"
 url = "2"
 
 [dev-dependencies]
+astra-rule = { path = "../astra-rule" }
 socket2_05 = { package = "socket2", version = "0.5" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_WinInet", "Win32_System_IO", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Console"] }

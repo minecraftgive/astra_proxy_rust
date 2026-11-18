@@ -1,0 +1,39 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=01/01/2026,0.1.0.0
+CatalogFile=AstraRoute.cat
+PnpLockdown=1
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService=AstraRoute,0,DriverService
+
+[DriverService]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\AstraRoute.sys
+Dependencies=BFE
+
+[DestinationDirs]
+DriverFiles=13
+
+[DriverFiles]
+AstraRoute.sys
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+AstraRoute.sys=1
+
+[Strings]
+Provider="Astra"
+ServiceName="Astra Process Routing"
+DiskName="Astra Process Routing Driver"

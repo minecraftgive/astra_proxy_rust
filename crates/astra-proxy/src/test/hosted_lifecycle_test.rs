@@ -605,7 +605,7 @@ async fn fake_ip_queried_before_upgrade_is_resolved_by_new_worker() -> Result<()
         let (mut read, mut write) = socket.split();
         tokio::io::copy(&mut read, &mut write).await
     });
-    let mut core = Resident::start(&format!("[dns]\nlisten=['127.0.0.1:{dns_port}']\nfake_ip=true\nfake_ip_filter=[]\nipv6=false\nnameserver=['udp://{upstream_address}']\nplaintext_bypass=true")).await?;
+    let mut core = Resident::start(&format!("[dns]\nlisten=['127.0.0.1:{dns_port}']\nfake_ip=true\nfake_ip_range='172.24.90.9/24'\nfake_ip_filter=[]\nipv6=false\ndirect_nameserver=['udp://{upstream_address}']\nplaintext_bypass=true")).await?;
     let result = tokio::time::timeout(Duration::from_secs(45), async {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let query = astra_dns::wire::query("cached-generation.test", RecordType::A)?.to_vec()?;
@@ -622,7 +622,7 @@ async fn fake_ip_queried_before_upgrade_is_resolved_by_new_worker() -> Result<()
             })
             .context("missing Fake IP")?;
         anyhow::ensure!(
-            fake.octets()[..2] == [198, 18],
+            fake.octets() == [172, 24, 90, 2],
             "DNS did not allocate Fake IP"
         );
         let generation = core.prepare().await?;

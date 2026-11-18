@@ -22,6 +22,7 @@ pub enum Inbound {
     Tproxy,
     Redirect,
     Mixed,
+    ProcessCapture,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub struct RouteRequest {
 }
 
 /// Observed socket owner, supplied by the local proxy, never by client headers.
+#[cfg_attr(feature = "bindings", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct ProcessInfo {
     pub pid: u32,

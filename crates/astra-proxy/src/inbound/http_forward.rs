@@ -137,29 +137,26 @@ async fn forward(
     if target.host.is_empty() || target.port == 0 {
         return response(StatusCode::BAD_REQUEST, "Invalid destination");
     }
-    let action = match app
-        .route_connection(
-            &target,
-            Inbound::HttpConnect,
-            astra_model::Network::Tcp,
-            source,
-            destination,
-        )
-        .await
+    let session = match super::Flow::new(
+        &target,
+        Inbound::HttpConnect,
+        astra_model::Network::Tcp,
+        source,
+        destination,
+    )
+    .plan(&app, super::FlowPolicy::Requested)
+    .await
     {
-        Ok(RouteAction::Block) => {
+        Ok(session) if session.action == RouteAction::Block => {
             return response(StatusCode::FORBIDDEN, "Blocked by routing policy")
         }
-        Ok(action) => action,
+        Ok(session) => session,
         Err(error) => {
             tracing::debug!(%error, "HTTP forward routing failed");
             return response(StatusCode::SERVICE_UNAVAILABLE, "Routing unavailable");
         }
     };
-    let remote = match app
-        .connect_tracked(&target, &action, Inbound::HttpConnect, source)
-        .await
-    {
+    let remote = match session.connect_tcp(&app).await {
         Ok(remote) => remote,
         Err(error) => {
             tracing::debug!(%error, "HTTP forward connect failed");

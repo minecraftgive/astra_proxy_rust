@@ -12,7 +12,9 @@ fn mihomo_dns_and_fake_ip_convert_to_valid_native_settings() {
     let config: astra_model::config::dns::Config = document["dns"].clone().try_into().unwrap();
     config.validate().unwrap();
     assert!(config.fake_ip);
-    assert_eq!(config.nameserver.len(), 2);
+    assert_eq!(config.fake_ip_range.to_string(), "198.18.0.0/16");
+    assert_eq!(config.fake_ip_range6.unwrap().to_string(), "fdab::/64");
+    assert_eq!(config.proxy_nameserver.len(), 2);
     assert!(
         !config.nameserver_policy.contains_key("+.example.org"),
         "plaintext-only policy is dropped, not downgraded"
@@ -35,8 +37,8 @@ fn plaintext_only_mihomo_dns_converts_to_encrypted_defaults() {
     config.validate().unwrap();
     assert!(!config.plaintext_bypass);
     assert_eq!(
-        config.nameserver,
-        astra_model::config::dns::Config::default().nameserver
+        config.proxy_nameserver,
+        astra_model::config::dns::Config::default().proxy_nameserver
     );
     assert!(config
         .fallback
@@ -77,6 +79,19 @@ fn subscription_never_imports_dns_even_when_importing_groups() {
 }
 
 #[test]
+fn mihomo_split_pools_preserve_direct_precedence_and_omit_fallback() {
+    let converted = convert("socks-port: 1080\ndns:\n  nameserver: [tls://192.0.2.1]\n  direct-nameserver: [tls://192.0.2.2]\n  proxy-server-nameserver: [tls://192.0.2.3]\n", &Options::default()).unwrap();
+    let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
+    let dns = document["dns"].as_table().unwrap();
+    assert!(dns.get("fallback").is_none() && dns.get("nameserver").is_none());
+    assert_eq!(dns["proxy_nameserver"][0].as_str(), Some("tls://192.0.2.1"));
+    assert_eq!(
+        dns["direct_nameserver"][0].as_str(),
+        Some("tls://192.0.2.2")
+    );
+}
+
+#[test]
 fn proxy_server_dns_import_preserves_direct_encrypted_list_and_supplies_bootstrap() {
     for value in [
         "['tls://192.0.2.53']",
@@ -91,14 +106,14 @@ fn proxy_server_dns_import_preserves_direct_encrypted_list_and_supplies_bootstra
         let document: toml::Table = toml::from_str(&converted.proxy).unwrap();
         let config: astra_model::config::dns::Config = document["dns"].clone().try_into().unwrap();
         config.validate().unwrap();
-        assert!(!config.proxy_server_nameserver.is_empty());
-        assert!(!config.proxy_bootstrap().is_empty());
+        assert!(!config.direct_nameserver.is_empty());
+        assert!(!config.direct_bootstrap().is_empty());
         assert!(!converted
             .warnings
             .iter()
             .any(|warning| warning.contains("忽略不支持的 DNS 字段 proxy-server-nameserver")));
         if value.contains("tls://192.0.2.53") {
-            assert_eq!(config.proxy_server_nameserver, ["tls://192.0.2.53"]);
+            assert_eq!(config.direct_nameserver, ["tls://192.0.2.53"]);
         }
     }
 }

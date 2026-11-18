@@ -187,12 +187,12 @@ async fn missing_group_adapter_fails_closed_for_tcp_and_udp() {
     };
     let error = app.connect(&target, &action).await.err().unwrap();
     assert!(error.to_string().contains("does not exist"), "{error:#}");
-    let error = crate::udp::open_action(
+    let error = crate::inbound::socks_udp::open(
         &app,
         &target,
         astra_model::Inbound::Socks5,
         "127.0.0.1:12345".parse().unwrap(),
-        action,
+        "127.0.0.1:1080".parse().unwrap(),
     )
     .await
     .err()

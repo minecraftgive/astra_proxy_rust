@@ -279,7 +279,7 @@ impl State {
                 App::from_text(&path, text).map(|app| crate::subscription::cached_app(&path, app))
             })
             .await??;
-            crate::mode_config::runtime_modes(&mut candidate.config, &next);
+            candidate.apply_runtime_modes(&next)?;
             if candidate.config.system_proxy.is_some() {
                 crate::mode_config::system_proxy_address(&candidate.config)?;
             }

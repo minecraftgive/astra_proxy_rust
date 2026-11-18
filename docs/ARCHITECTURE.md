@@ -43,6 +43,17 @@ astra-tui ----------> Agent 私有 IPC
 
 依赖方向是从应用到能力库。model 不依赖 platform/ipc；platform 不依赖 ipc；management 不依赖 manager/core/tui；app 不依赖 management，避免文档 schema 与管理 DTO 互相引用。核心直接消费 model DTO 和 ipc framing，客户端 UI 不需要链接代理实现。
 
+## 客户端流量路径
+
+| 职责 | 所有者 |
+|---|---|
+| 应用接入 | `astra-proxy::inbound` 接收 SOCKS5、HTTP、TUN、透明代理和分应用流量，保留原始目标、来源和可用的进程身份。接管资源的准备、系统设置恢复及操作系统调用分别由接入层和平台适配层承担。 |
+| DNS 与 Fake IP | `astra-dns` 负责解析、上游策略及映射。代理核心的 DNS 适配层将查询交给所选出站。接入层从解析器获取 Fake IP 网段并设置 TUN 路由。 |
+| 规则 | `astra-proxy::rules` 根据模式、standalone 配置、缓存及 Rule Core 的 IPC 应答产出路由动作。规则匹配仍在 `astra-rule` 内完成。 |
+| 代理出站 | `astra-proxy::proxy` 选择代理组成员、持有会话租约并建立 TCP 或 UDP 出站。显式应用绑定直接交给出站层，可指定直连、拒绝、网卡或代理组。 |
+
+TUN 处理真实目标 IP 时可以用嗅探到的域名匹配规则，拨号仍使用原始 IP。Fake IP 流量则先恢复域名，再匹配规则和建立出站。每个 TCP 连接或 UDP 目的流持有选定的出口。运行时统一协调监听器、系统接管、DNS 和配置代之间的热切换与回滚。
+
 ## 配置处理的三个阶段
 
 1. 解析：带大小限制的 TOML 文档或类型反序列化。编辑草稿保留注释、格式和未知字段；不完整草稿也可保存为草稿。

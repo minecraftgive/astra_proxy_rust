@@ -154,24 +154,25 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             host: destination.ip().to_string(),
             port: destination.port(),
         };
-        let (target, dial) = if meta.inbound == Inbound::Tun {
-            crate::proxy::target::select(&app, &original, None)?
+        let flow = crate::inbound::Flow::new(
+            &original,
+            meta.inbound,
+            Network::Udp,
+            Some(meta.source),
+            Some(destination),
+        );
+        let policy = if meta.inbound == Inbound::Tun {
+            crate::inbound::FlowPolicy::RecoverName(None)
         } else {
-            (original.clone(), original)
+            crate::inbound::FlowPolicy::Requested
         };
-        let mapped = target.host != destination.ip().to_string();
-        let action = app
-            .route_with_context(
-                &target,
-                meta.inbound,
-                Network::Udp,
-                meta.process,
-                Some(destination.ip()).filter(|ip| !app.synthetic_ip(*ip)),
-            )
+        let session = super::INGRESS_PROCESS
+            .scope(meta.process, flow.plan(&app, policy))
             .await?;
+        let mapped = session.mapped;
         let connection = timeout(
             Duration::from_secs(app.config.connect_timeout_secs),
-            crate::udp::open_action(&app, &dial, meta.inbound, meta.source, action),
+            session.open_udp(&app),
         )
         .await
         .context("UDP open timeout")??;

@@ -3,30 +3,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn app() -> App {
     App::from_text(&std::env::temp_dir().join("astra-egress-session.toml"),"standalone=true\nstandalone_outbound='direct'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct]\nmembers=['DIRECT']\n".into()).unwrap()
 }
-#[test]
-fn failed_system_proxy_rollback_keeps_both_causes_and_requires_shutdown() {
-    let mut system = system_proxy::Guard::default();
-    let consistency = std::sync::OnceLock::new();
-    let error = failed_system_proxy_switch(
-        anyhow::anyhow!("candidate rejected"),
-        Ok(system_proxy::Guard::default()),
-        &mut system,
-        &consistency,
-    );
-    assert_eq!(error.to_string(), "candidate rejected");
-    assert!(consistency.get().is_none());
-    let error = failed_system_proxy_switch(
-        anyhow::anyhow!("candidate rejected"),
-        Err(anyhow::anyhow!("previous settings unavailable")),
-        &mut system,
-        &consistency,
-    );
-    let message = error.to_string();
-    assert!(message.contains("candidate rejected"));
-    assert!(message.contains("previous settings unavailable"));
-    assert!(message.contains("outcome unknown"));
-    assert_eq!(consistency.get(), Some(&message));
-}
 #[tokio::test]
 async fn runtime_reports_a_panicked_listener_instead_of_healthy_state() {
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -47,9 +23,7 @@ async fn runtime_reports_a_panicked_listener_instead_of_healthy_state() {
                 socket: listener,
             },
         )]),
-        system_dns: None,
-        tunnel: None,
-        tproxy_udp: None,
+        takeover: Default::default(),
         dns: None,
         system: Default::default(),
         system_journal: PathBuf::new(),
@@ -168,9 +142,7 @@ async fn unchanged_subscription_keeps_generation_and_connections() {
         text: original.source_text.clone(),
         current,
         listeners: HashMap::new(),
-        system_dns: None,
-        tunnel: None,
-        tproxy_udp: None,
+        takeover: Default::default(),
         dns: None,
         system: Default::default(),
         system_journal: PathBuf::new(),
@@ -196,42 +168,4 @@ async fn unchanged_subscription_keeps_generation_and_connections() {
             .await
             .is_err()
     );
-}
-
-#[test]
-fn borrowed_route_key_matches_owned_hash_and_all_route_context() {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let key = crate::CacheKey {
-        destination_ip: Some("203.0.113.1".parse().unwrap()),
-        target: astra_model::Target {
-            host: "example.org".into(),
-            port: 443,
-        },
-        revision: 9,
-        network: astra_model::Network::Tcp,
-        inbound: Inbound::Socks5,
-        process: None,
-    };
-    let borrowed = crate::CacheKeyRef {
-        destination_ip: key.destination_ip,
-        target: &key.target,
-        revision: key.revision,
-        network: key.network,
-        inbound: key.inbound,
-        process: key.process.as_ref(),
-    };
-    let mut owned_hash = DefaultHasher::new();
-    let mut borrowed_hash = DefaultHasher::new();
-    key.hash(&mut owned_hash);
-    borrowed.hash(&mut borrowed_hash);
-    assert_eq!(owned_hash.finish(), borrowed_hash.finish());
-    let cache = moka::sync::Cache::new(2);
-    cache.insert(key.clone(), astra_model::RouteAction::Direct);
-    assert_eq!(cache.get(&borrowed), Some(astra_model::RouteAction::Direct));
-    assert!(cache
-        .get(&crate::CacheKeyRef {
-            revision: 10,
-            ..borrowed
-        })
-        .is_none());
 }

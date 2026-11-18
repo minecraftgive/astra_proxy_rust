@@ -12,17 +12,17 @@ Windows、Linux、macOS 共用实现。
 [dns]
 enable = true
 listen = ["127.0.0.1:1053"] # 同时监听 UDP 和 TCP；空列表仅提供 TUN 内部接管
-nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
-fallback = ["tls://8.8.8.8:853"]
+proxy_nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+# fallback = ["tls://8.8.8.8:853"]  # 可省略或设为 []
 plaintext_bypass = false          # 默认：仅 DoH/DoT，绝不降级到明文
 plaintext_bypass_domains = ["+.lan"] # 仅这些域名的 nameserver_policy 可使用明文上游
 bootstrap = ["1.1.1.1", "8.8.8.8"]  # 仅 plaintext_bypass = true 时用于 UDP/53 引导
-respect_rules = false
-proxy_server_nameserver = ["https://1.1.1.1/dns-query", "tls://1.0.0.1:853"]
+respect_rules = true
+direct_nameserver = ["https://223.6.6.6/dns-query", "https://223.5.5.5/dns-query"]
 ipv6 = true
 hijack = true
 fake_ip = true
-fake_ip_range = "198.18.0.0/16"
+fake_ip_range = "198.18.0.0/16" # 也可填写专用私网段，如 10.84.9.1/24
 # fake_ip_range6 = "fdab::/64" # 配合 TUN 时还需配置 tun.ipv6_address
 fake_ip_filter_mode = "blacklist"
 fake_ip_filter = ["+.lan", "+.local", "localhost"]
@@ -40,29 +40,53 @@ fake_ip_ttl = 60
 "+.lan" = ["udp://192.168.1.1:53"] # 已被 plaintext_bypass_domains 覆盖
 ```
 
-## 代理服务器解析 DNS（始终直连）
+## 用 Magic DNS 访问设备
 
-在配置编辑器的 **DNS / Fake IP → 代理服务器解析 DNS** 中设置 `proxy_server_nameserver`。
-这组服务器用于解析节点地址和 DNS 上游的域名；连接始终直连，不受 `respect_rules`、代理组或
-路由规则影响。同一个服务器同时出现在普通 `nameserver` 中时，也始终直连。
+在客户端配置里登记设备地址，把示例 IP 换成 NAS 和打印机在当前网络上可达的地址，保存并重载配置。
 
-非空列表至少包含一个 IP 字面量上游，用于解析列表内及普通 DNS 的域名，避免启动依赖循环。
-支持 DoH/DoT；UDP/TCP 仍需显式开启 `plaintext_bypass`。选择本地网络可以直接访问的服务器。
-列表内按顺序故障切换，全部失败会报错，不会改用普通 DNS 或系统 DNS。
-节点解析返回真实 IP，并使用独立缓存；普通业务域名仍使用原来的 DNS 分流与缓存。
-设置在 `enable=false` 时仍对节点解析生效。留空（默认）保留原有解析策略。
+```toml
+[dns.magic_dns]
+enable = true
+domain = "astra.home.arpa"
 
-Mihomo 完整配置导入支持 `proxy-server-nameserver`，订阅节点更新仍不修改本地 DNS 设置。
+[dns.magic_dns.hosts]
+nas = ["192.168.1.20", "fd12:3456::20"]
+printer = ["192.168.1.30"]
+```
+
+1. 在已有的 `[dns]` 中启用 DNS 并设置 `listen = ["127.0.0.1:1053"]`。可用 `dig @127.0.0.1 -p 1053 nas A +short` 和 `dig @127.0.0.1 -p 1053 nas.astra.home.arpa AAAA +short` 核对地址。查询日志的来源为 `magic_dns`。
+2. 要让系统自动补全短名，开启客户端的 TUN 模式，并启用 `dns.hijack` 与 `dns.system_takeover`。macOS 也支持下面的无 TUN 接管选项。Astra 接管系统 DNS 时会添加设备搜索域，切换后缀时更新，停止接管时恢复原设置。
+3. 通过系统解析器验证短名。macOS 可用 `dscacheutil -q host -a name nas`，Linux 可用 `getent ahosts nas`，Windows PowerShell 可用 `[System.Net.Dns]::GetHostAddresses("nas")`。确认结果后即可使用 `ssh nas`。Windows 组策略若指定了全局搜索列表，可直接使用 `ssh nas.astra.home.arpa`。
+
+Magic DNS 默认关闭。启用时默认管理 `astra.home.arpa`，设备名使用单个 DNS 标签，查询忽略大小写并支持末尾的点。`localhost` 保留给本机。设备地址不能落入 `198.18.0.0/15` 或启用的 Fake IP 地址池。连接仍使用现有路由。
+
+已登记设备的 A/AAAA 记录在本地回答，TTL 为 60 秒。已登记设备缺少所查询的记录类型时返回空答案。关闭 `dns.ipv6` 时 AAAA 也返回空答案。域内未知名称返回 `NXDOMAIN`，未登记的裸短名和域外名称继续按已有 DNS 配置处理。热重载后新查询即使用新记录，应用缓存的地址可能保留至 TTL 到期。
+
+## 按出口选择上游
+
+| 查询场景 | 使用的配置 | DNS 连接出口 |
+| --- | --- | --- |
+| DIRECT 出站目标、节点地址、上游域名引导 | `direct_nameserver` | 直连 |
+| DNS 监听或接管的真实查询，规则选择代理 | `proxy_nameserver` | 本次选中的代理链 |
+| DNS 监听或接管的真实查询，规则选择 DIRECT | `direct_nameserver` | 本次选中的直连出口 |
+
+`respect_rules = true` 时，DNS 请求缺少后续连接的端口，按被查询域名、TCP/443、TUN 入站匹配规则。
+选择拦截时真实查询失败。关闭该选项时，独立 DNS 查询使用直连上游。Fake IP 合成继续在本地完成。
+两组主上游各自按顺序尝试，缓存按用途隔离。`fallback` 可省略或留空，配置后仅在主上游失败时通过本次查询的出口尝试。
+业务域名可用 `nameserver_policy` 覆盖主上游。节点和引导解析始终使用直连路径。
+
+旧配置的 `nameserver` 读入代理上游，非空的 `proxy_server_nameserver` 读入直连上游。
+仅有旧 `nameserver` 时，其值初始化两组上游。编辑器在编辑 DNS 字段时写出新字段名。
 
 ## 加密强制（默认开启）
 
 默认 `plaintext_bypass = false`，DNS 只使用 DoT（`tls://`）和 DoH（`https://`）：
 
-- `nameserver` / `fallback` / `proxy_server_nameserver` 中出现 `udp://`、`tcp://` 或裸 IP 时配置校验失败，错误信息指明
+- `proxy_nameserver` / `direct_nameserver` / `fallback` 中出现 `udp://`、`tcp://` 或裸 IP 时配置校验失败，错误信息指明
   对应条目和放行开关。
 - `nameserver_policy` 的明文上游只有在其域名模式被 `plaintext_bypass_domains` 完整覆盖时才允许
   （`+.lan` 覆盖 `+.lan`、`*.x.lan`、`router.lan`；`*.lan` 不覆盖 `+.lan`，因为后者含 `lan` 本身）。
-- 上游域名（如 `https://dns.google/dns-query`）通过 nameserver/fallback 中 **IP 直连的 DoH/DoT**
+- 上游域名（如 `https://dns.google/dns-query`）通过 direct_nameserver/fallback 中 **IP 直连的 DoH/DoT**
   上游加密引导解析，不再经 `bootstrap` 的明文 UDP/53；因此使用域名上游时至少需要一个 IP 直连
   加密上游（如 `https://1.1.1.1/dns-query`）。引导结果按 TTL 缓存，最长 5 分钟。
 - 上游失败、超时或证书校验失败只会切换到下一个加密上游，不会回退到明文；运行时对明文上游另有
@@ -74,15 +98,13 @@ Mihomo 完整配置导入支持 `proxy-server-nameserver`，订阅节点更新�
 代理核心自身的域名解析同样默认加密，不走系统解析器（getaddrinfo）：
 
 - 直连出站的目标域名、节点服务器域名（Socks5/HTTP/Trojan/VLESS/TUIC 以及 meow 原生协议）
-  都经核心安装的解析钩子交给 DNS 模块解析；配置独立代理 DNS 时，节点解析使用独立缓存。
+  都经核心安装的解析钩子交给 DNS 模块解析；节点解析使用独立缓存。
 - 未配置 `[dns]` 时使用默认加密上游建立一个只解析、不监听、不接管、不做 Fake IP 的内部解析器；
   `enable = false` 时同样按该表中的上游（及加密检查）解析，只是不提供 DNS 服务。
 - `localhost` 与 `*.localhost` 直接返回回环地址，IP 字面量不查询。
 - 命中 `plaintext_bypass_domains` 且没有对应 `nameserver_policy` 的域名交给系统解析器
   （可用于 `+.local` mDNS、公司内网分离 DNS 等）；有策略时按策略上游解析。
-- `respect_rules = true` 时，若 DNS 上游经代理节点连接而解析该节点域名又需要 DNS，嵌套解析
-  优先使用 `proxy_server_nameserver`；留空时改为直连普通上游，不会回退到系统解析器。
-- `plaintext_bypass = true` 且未启用 DNS 服务时恢复系统解析；已配置的独立代理 DNS 仍用于节点解析。
+- 节点与嵌套引导使用直连上游，关闭 DNS 监听后仍按配置解析。
 
 注意：系统 hosts 文件与 mDNS 不经过加密解析；需要时把相应域名加入 `plaintext_bypass_domains`。
 `--nettool` 诊断工具和服务端（astra-server-core）的出站解析不受此设置影响。
@@ -90,9 +112,9 @@ Mihomo 完整配置导入支持 `proxy-server-nameserver`，订阅节点更新�
 上游支持 `tls://`（DoT）和 `https://`（DoH）；放行明文后还支持普通 IP / IP:端口、`udp://`、`tcp://`。
 DoH 使用 DNS wire-format POST，支持 HTTP/2 ALPN 与 HTTP/1.1；TLS 校验证书和服务器名称，
 不跳过验证。上游域名默认经 IP 直连的加密上游引导解析（见上节），不依赖系统 DNS；
-仅 plaintext_bypass=true 时改用 bootstrap 中的 IP 走 UDP/53。配置 `proxy_server_nameserver` 时引导解析始终使用该列表内的 IP 字面量服务器。引导解析采用 A 记录，需要 IPv4 可达。
+启用 plaintext_bypass 且直连与备用列表均无 IP 字面量时，使用 bootstrap 中的 IP 走 UDP/53。
 
-nameserver 按列表顺序尝试；超时、连接失败、无效响应、SERVFAIL 和 REFUSED 会切换下一个，
+选中的主上游按列表顺序尝试；超时、连接失败、无效响应、SERVFAIL 和 REFUSED 会切换下一个，
 随后尝试 fallback。每个上游有 query_timeout_ms 的超时，整个失败切换有两倍该时间的截止。
 UDP 响应标记 TC 时自动改用 TCP 重试。TTL 缓存包含有 SOA 的 NXDOMAIN / NODATA 负缓存；
 返回缓存时更新事务 ID 并扣减 TTL。缓存还受固定 16 MiB 报文预算约束。
@@ -101,8 +123,7 @@ nameserver_policy 优先选择最长匹配：普通域名精确匹配，`+.examp
 `*.example.org` 仅匹配子域。blacklist 表示匹配项使用真实解析，whitelist 表示只有匹配项使用 Fake IP。
 节点服务器、订阅服务器及 DNS 上游域名自动排除在 Fake IP 之外。
 
-respect_rules=false 时 DNS 上游使用物理直连出口；true 时上游连接按 DNS 服务器的域名/IP
-参与现有路由和代理组选择。引导解析始终直连。TUN 接管全局路由时，节点和引导 DNS 的绕行仍需
+引导解析始终直连。TUN 接管全局路由时，节点和引导 DNS 的绕行仍需
 按原有 TUN 配置正确设置，避免系统 DNS/节点解析的循环。
 
 ## 系统 DNS 接管（TUN 期间，默认开启）
@@ -128,7 +149,7 @@ route_system_dns = true  # B：把接管前的系统 DNS 服务器以 /32、/128
   systemd-resolved、`Get-DnsClientServerAddress`），为每个服务器加一条进入 TUN 的主机路由，
   即使应用直接向局域网 DNS（如 `192.168.1.53`）发包也会被 53 端口接管。以下地址跳过：
   物理网关（`tun.gateway`/`gateway6`，路由网关会破坏默认路由）、回环、链路本地、组播、
-  TUN 子网、198.18.0.0/15、`tun.bypass` 中的网段，以及 TUN 没有 IPv6 地址时的 IPv6 服务器。
+  TUN 子网、198.18.0.0/15、已启用的 Fake IP 地址池、`tun.bypass` 中的网段，以及 TUN 没有 IPv6 地址时的 IPv6 服务器。
   **路由器本身就是 DNS 时（最常见）B 会跳过它**，此时依靠 A。
 - **D（IPv6）**：配置了 `tun.ipv6_address` 且 `tun.routes` 中没有任何 IPv6 路由时，自动追加
   `::/1` 与 `8000::/1`，IPv6 流量（包括 IPv6 DNS）也进入 TUN；B 同时路由 IPv6 DNS 服务器。
@@ -159,8 +180,11 @@ TUN 关闭时，核心额外在 `0.0.0.0:53` 监听 DNS（普通用户在 macOS 
 UDP 回包保持原 DNS 服务器地址。hijack=false 可继续采用普通转发。
 应用自身的 DoH/DoT 流量不会被 53 端口接管识别。
 
-Fake IP 的 A/AAAA 回答分别来自配置的地址池。IPv4 地址池限定在 198.18.0.0/15 内；
-IPv6 地址池限定 ULA。保留地址池的网络地址、首个主机、末端地址及 TUN 的地址和子网端点。
+Fake IP 的 A/AAAA 回答分别来自配置的地址池。IPv4 可用 `198.18.0.0/15` 或 RFC 1918 私网
+（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）内的 CIDR。IPv6 可用 `fc00::/7` 内的 ULA 子网。
+每个地址池至少包含四个地址。带主机位的 CIDR 自动对齐，例如 `10.84.9.13/28` 使用 `10.84.9.0/28`，
+从 `10.84.9.2` 开始分配。请选与实际 LAN、VPN 和 DNS 服务器不重叠的专用网段，池内地址按 Fake IP 处理。
+保留地址池的网络地址、首个主机、末端地址及 TUN 的地址和子网端点。
 没有配置 IPv6 地址池时，Fake IP 域名的 AAAA 返回空答案；HTTPS/SVCB 返回空答案，
 避免实际 IP hints 绕过域名还原。
 
@@ -187,7 +211,7 @@ Fake IP 表有容量上限，满时返回 SERVFAIL，不提前回收仍有效的
 ## Mihomo 导入
 
 使用 `astra-convert --include-config` 完整转换时支持 dns：enable、listen、ipv6、respect-rules、nameserver、
-fallback、default-nameserver（普通 IP UDP/53）、enhanced-mode、fake-ip-range、fake-ip-range6、
+direct-nameserver、proxy-server-nameserver、fallback、default-nameserver（普通 IP UDP/53）、enhanced-mode、fake-ip-range、fake-ip-range6、
 fake-ip-ttl、fake-ip-filter、blacklist/whitelist filter-mode、cache-size 和域名 nameserver-policy。
 导入时明文上游（裸 IP、udp://、tcp://）会被丢弃并给出警告；nameserver 为空时使用默认加密上游，
 仅剩明文上游的 nameserver-policy 条目整条移除；如需保留明文请导入后手动设置 plaintext_bypass。
@@ -207,5 +231,5 @@ Mihomo 字段参照[官方 DNS 配置](https://wiki.metacubex.one/config/dns/)�
 回归覆盖 Fake IP 稳定性、IPv4/IPv6、容量耗尽、热重载、过期/未知地址、缓存命中/过期、
 域名策略、失败切换、错误事务 ID、过滤和节点域名保护；内存中 TUN TCP 完整握手和负载、
 TUN DNS/UDP 回包还原、TCP/UDP 域名规则 IPC；本地 DoH/DoT TLS 交换及不可信证书拒绝。
-独立代理 DNS 覆盖规则绕过、不可用代理、关闭 DNS 服务、引导解析、独立缓存及失败不回退。
+独立代理 DNS 覆盖规则绕过、不可用代理、关闭 DNS 服务、引导解析、独立缓存及可选备用上游。
 这些验证不创建或修改用户当前的系统 TUN/网卡设置。

@@ -1,6 +1,29 @@
 use super::*;
 
 #[tokio::test]
+async fn remote_process_picker_reads_target_agent_and_filters_before_limiting() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = AgentService::new(ManagerConfig {
+        state_dir: root.path().join("state"),
+        config_dir: root.path().join("config"),
+        ..Default::default()
+    }).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut request = Request::new("picker", RequestBody::Query(Query::RunningProcesses {
+        filter: exe.file_name().unwrap().to_string_lossy().into_owned(),
+    }));
+    request.agent_id = Some(agent.identity.id.clone());
+    let Ok(ResponseBody::RunningProcesses { programs, .. }) = agent.handle_remote(request.clone()).await.result else {
+        panic!("expected executable identities from the selected Agent");
+    };
+    assert!(programs.len() <= 128);
+    let own = programs.iter().find(|p| p.pid == std::process::id()).unwrap();
+    assert_eq!(Path::new(&own.path).canonicalize().unwrap(), exe.canonicalize().unwrap());
+    request.agent_id = Some("different-host".into());
+    assert!(matches!(agent.handle_remote(request).await.result, Err(ApiError { code: ErrorCode::NotFound, .. })));
+}
+
+#[tokio::test]
 async fn installation_capability_is_read_only_and_remote_helpers_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let agent = AgentService::new(ManagerConfig {

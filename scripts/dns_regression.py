@@ -85,7 +85,7 @@ def main():
         try:
             port = dns_port()
             config = directory/'real.toml'
-            config.write_text(f'[dns]\nlisten=["127.0.0.1:{port}"]\nnameserver=["udp://127.0.0.1:{upstream.server_address[1]}"]\n', encoding='utf-8')
+            config.write_text(f'[dns]\nlisten=["127.0.0.1:{port}"]\nplaintext_bypass=true\ndirect_nameserver=["udp://127.0.0.1:{upstream.server_address[1]}"]\n', encoding='utf-8')
             subprocess.run([str(core), '--check', str(config)], check=True, capture_output=True)
             with running(core, config, directory/'real-control', directory) as (child, log, _env):
                 wait_port(port, child, log)
@@ -98,17 +98,25 @@ def main():
             port = dns_port()
             config = directory/'fake.toml'
             control = directory/'fake-control'
-            source = f'[dns]\nlisten=["127.0.0.1:{port}"]\nfake_ip=true\nmapping_capacity=4\n'
-            config.write_text(source, encoding='utf-8')
+            source = f'[dns]\nlisten=["127.0.0.1:{port}"]\nfake_ip=true\nfake_ip_range="172.23.45.77/27"\nmapping_capacity=4\n'
+            magic = '\n[dns.magic_dns]\nenable=true\n[dns.magic_dns.hosts]\nnas=["192.168.1.20"]\n'
+            config.write_text(source + magic, encoding='utf-8')
             with running(core, config, control, directory) as (child, log, env):
                 wait_port(port, child, log)
+                assert lookup(port, 'NAS', 197) == '192.168.1.20'
+                assert lookup(port, 'nas.astra.home.arpa', 198, tcp=True) == '192.168.1.20'
                 address = lookup(port, 'fake.example', 200)
-                assert address.startswith('198.18.'), address
+                assert address == '172.23.45.66', address
                 for ident in range(201, 401):
                     assert lookup(port, 'fake.example', ident, tcp=bool(ident % 2)) == address
-                config.write_text(source+'cache_capacity=16\n', encoding='utf-8')
+                config.write_text(source.replace('172.23.45.77/27', '172.23.45.64/27')+'cache_capacity=16\n'+magic.replace('.1.20', '.1.21'), encoding='utf-8')
                 subprocess.run([str(core), '--reload', str(control)], env=env, check=True, capture_output=True)
                 assert lookup(port, 'fake.example', 401, tcp=True) == address
+                assert lookup(port, 'nas', 403) == '192.168.1.21'
+                config.write_text(source + magic.replace('192.168.1.20', '172.23.45.70'), encoding='utf-8')
+                rejected = subprocess.run([str(core), '--reload', str(control)], env=env, capture_output=True)
+                assert rejected.returncode != 0 and b'nas' in rejected.stderr, rejected.stderr
+                assert lookup(port, 'nas.astra.home.arpa', 404) == '192.168.1.21'
                 config.write_text(source.replace('fake_ip=true', 'fake_ip=false'), encoding='utf-8')
                 result = subprocess.run([str(core), '--reload', str(control)], env=env, capture_output=True)
                 assert result.returncode != 0, 'unsafe fake range shutdown was allowed during reload'
@@ -118,12 +126,15 @@ def main():
             output = directory/'imported'
             subprocess.run([str(binaries/executable('astra-convert')), str(yaml), '--include-config', '-o', str(output)], check=True, capture_output=True)
             imported = output/'proxy.toml'
-            assert tomllib.loads(imported.read_text(encoding='utf-8'))['dns']['fake_ip'] is True
+            dns = tomllib.loads(imported.read_text(encoding='utf-8'))['dns']
+            assert dns['fake_ip'] is True
+            assert dns['proxy_nameserver'] == ['tls://1.1.1.1'] and dns['direct_nameserver']
+            assert 'nameserver' not in dns and 'fallback' not in dns
             subprocess.run([str(core), '--check', str(imported)], check=True, capture_output=True)
         finally:
             upstream.shutdown()
             thread.join(timeout=2)
-    print('PASS DNS UDP/TCP, transaction IDs, TTL cache, Fake IP stability, atomic reload and Mihomo import')
+    print('PASS DNS UDP/TCP, transaction IDs, TTL cache, Fake IP stability, Magic DNS devices, atomic reload and Mihomo import')
 
 
 if __name__ == '__main__':

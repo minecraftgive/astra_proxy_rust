@@ -73,11 +73,11 @@ fn runtime_wire_fixture() -> astra_model::runtime::RuntimeView {
                 fake_ip: true,
                 listen: vec!["127.0.0.1:1053".parse().unwrap()],
                 policy_count: 12,
-                nameservers: vec![DnsServer {
+                proxy_nameserver: vec![DnsServer {
                     address: "https://resolver.example/dns-query".into(),
                     transport: "DoH".into(),
                 }],
-                proxy_server_nameserver: vec![DnsServer {
+                direct_nameserver: vec![DnsServer {
                     address: "tls://192.0.2.53".into(),
                     transport: "DoT".into(),
                 }],

@@ -1,4 +1,4 @@
-use super::{mapping::Mappings, wire, Config, LocalMappingStore, MappingStore, Upstream};
+use super::{wire, Config, LocalMappingStore, MappingStore, Upstream};
 use anyhow::{bail, Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
@@ -25,6 +25,53 @@ pub trait Transport: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 }
 
+impl Transport for &dyn Transport {
+    fn exchange<'a>(
+        &'a self,
+        upstream: &'a Upstream,
+        query: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        (**self).exchange(upstream, query)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LookupScope {
+    Proxy,
+    Direct,
+    Endpoint,
+}
+
+enum MagicName<'a> {
+    Missing,
+    Records(&'a [IpAddr]),
+}
+
+impl MagicName<'_> {
+    fn answer(&self, query: &Message, ipv6: bool) -> Message {
+        let code = match self {
+            Self::Missing => ResponseCode::NXDomain,
+            Self::Records(_) => ResponseCode::NoError,
+        };
+        let mut reply = wire::response(query, code);
+        reply.metadata.authoritative = true;
+        if let Self::Records(addresses) = self {
+            let q = &query.queries[0];
+            for ip in *addresses {
+                let data = match (q.query_type(), ip) {
+                    (RecordType::A, IpAddr::V4(ip)) => RData::A(A(*ip)),
+                    (RecordType::AAAA, IpAddr::V6(ip)) if ipv6 => RData::AAAA(AAAA(*ip)),
+                    _ => continue,
+                };
+                reply
+                    .answers
+                    .push(Record::from_rdata(q.name().clone(), 60, data));
+            }
+        }
+        reply
+    }
+}
+
 pub struct Resolver {
     excluded: std::collections::HashSet<String>,
     reserved: std::collections::HashSet<IpAddr>,
@@ -41,14 +88,20 @@ impl Resolver {
     pub fn new(config: Config) -> Result<Self> {
         Self::with_mapping_store(config, Arc::new(LocalMappingStore::default()))
     }
-    pub fn with_mapping_store(config: Config, mappings: Arc<dyn MappingStore>) -> Result<Self> {
+    pub fn with_mapping_store(mut config: Config, mappings: Arc<dyn MappingStore>) -> Result<Self> {
         config.validate()?;
+        let magic = &mut config.magic_dns;
+        magic.domain = magic.domain.trim_end_matches('.').to_ascii_lowercase();
+        magic.hosts = std::mem::take(&mut magic.hosts)
+            .into_iter()
+            .map(|(name, ips)| (name.to_ascii_lowercase(), ips))
+            .collect();
         mappings.configure(&config, &Default::default())?;
         let excluded = config
-            .nameserver
+            .proxy_nameserver
             .iter()
             .chain(&config.fallback)
-            .chain(&config.proxy_server_nameserver)
+            .chain(&config.direct_nameserver)
             .chain(config.nameserver_policy.values().flatten())
             .filter_map(|raw| {
                 Upstream::parse(raw)
@@ -128,7 +181,9 @@ impl Resolver {
         Ok(())
     }
     pub fn is_fake(&self, ip: IpAddr) -> bool {
-        self.config.fake_ip && Mappings::contains_fake(&self.config, ip)
+        self.config
+            .active_fake_ranges()
+            .any(|net| net.contains(&ip))
     }
     /// Cached bootstrap address of an upstream hostname, if still fresh.
     pub fn bootstrap_cached(&self, host: &str) -> Option<IpAddr> {
@@ -154,10 +209,21 @@ impl Resolver {
         self.query_log.snapshot()
     }
     pub async fn answer(&self, raw: &[u8], transport: &dyn Transport) -> Result<Vec<u8>> {
+        self.answer_routed(raw, |_| {
+            std::future::ready(Ok((LookupScope::Direct, transport)))
+        })
+        .await
+    }
+
+    pub async fn answer_routed<T: Transport, F: Future<Output = Result<(LookupScope, T)>>>(
+        &self,
+        raw: &[u8],
+        select: impl FnOnce(String) -> F,
+    ) -> Result<Vec<u8>> {
         let operation = astra_observe::operation!("dns.answer", "DNS 应答");
         let query = Message::from_vec(raw).map_err(Into::into);
         let mut trace = super::query_log::Query::new(&self.query_log, query.as_ref().ok());
-        let result = match self.answer_inner(query, transport, &mut trace).await {
+        let result = match self.answer_inner(query, select, &mut trace).await {
             Ok(message) => {
                 let result = message.to_vec().map_err(anyhow::Error::from);
                 trace.finish(
@@ -176,10 +242,10 @@ impl Resolver {
         operation.finish(result.is_ok());
         result
     }
-    async fn answer_inner(
+    async fn answer_inner<T: Transport, F: Future<Output = Result<(LookupScope, T)>>>(
         &self,
         query: Result<Message>,
-        transport: &dyn Transport,
+        select: impl FnOnce(String) -> F,
         trace: &mut super::query_log::Query,
     ) -> Result<Message> {
         let _request = self
@@ -199,6 +265,10 @@ impl Resolver {
             .to_ascii()
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        if let Some(local) = self.magic_name(&domain) {
+            trace.source("magic_dns");
+            return Ok(local.answer(&query, self.config.ipv6));
+        }
         if q.query_type() == RecordType::AAAA && !self.config.ipv6 {
             trace.source("ipv6_disabled");
             return Ok(wire::response(&query, ResponseCode::NoError));
@@ -237,23 +307,81 @@ impl Resolver {
                 return Ok(reply);
             }
         }
-        self.real(&query, transport, trace, false).await
+        let (scope, transport) = select(domain).await?;
+        self.real(&query, &transport, trace, scope).await
+    }
+    // Both the zone and the input to this function are canonical lowercase names.
+    fn magic_name(&self, name: &str) -> Option<MagicName<'_>> {
+        let magic = &self.config.magic_dns;
+        if !magic.enable {
+            return None;
+        }
+        if name == magic.domain {
+            return Some(MagicName::Records(&[]));
+        }
+        if let Some(label) = name
+            .strip_suffix(&magic.domain)
+            .and_then(|s| s.strip_suffix('.'))
+        {
+            return Some(
+                magic
+                    .hosts
+                    .get(label)
+                    .map_or(MagicName::Missing, |ips| MagicName::Records(ips)),
+            );
+        }
+        magic.hosts.get(name).map(|ips| MagicName::Records(ips))
+    }
+
+    /// Classify before using the OS resolver or bootstrapping an upstream.
+    /// Some(Err) is a final local negative answer and must never fall through.
+    pub fn lookup_magic(&self, name: &str) -> Option<Result<Vec<IpAddr>>> {
+        if !self.config.magic_dns.enable {
+            return None;
+        }
+        let normalized = name.trim_end_matches('.').to_ascii_lowercase();
+        self.magic_name(&normalized).map(|entry| {
+            let mut addresses = Vec::new();
+            for kind in [RecordType::A, RecordType::AAAA] {
+                if kind == RecordType::AAAA && !self.config.ipv6 {
+                    continue;
+                }
+                let query = wire::query(name, kind)?;
+                let reply = entry.answer(&query, self.config.ipv6);
+                let mut trace = super::query_log::Query::new(&self.query_log, Some(&query));
+                trace.source("magic_dns");
+                trace.finish(Ok(Some(&reply)));
+                if reply.metadata.response_code == ResponseCode::NXDomain {
+                    bail!("unknown Magic DNS device {name}");
+                }
+                addresses.extend(wire::address_answers(&reply).map(|(ip, _)| ip));
+            }
+            anyhow::ensure!(
+                !addresses.is_empty(),
+                "Magic DNS device {name} has no usable addresses"
+            );
+            Ok(addresses)
+        })
     }
     pub async fn lookup(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
-        self.lookup_with(name, transport, false).await
+        self.lookup_with(name, transport, LookupScope::Proxy).await
     }
     /// Real answers from the dedicated direct list, with a separate cache scope.
     pub async fn lookup_proxy(&self, name: &str, transport: &dyn Transport) -> Result<Vec<IpAddr>> {
-        self.lookup_with(name, transport, true).await
+        self.lookup_with(name, transport, LookupScope::Endpoint)
+            .await
     }
-    async fn lookup_with(
+    pub async fn lookup_with(
         &self,
         name: &str,
         transport: &dyn Transport,
-        proxy: bool,
+        scope: LookupScope,
     ) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = name.parse() {
             return Ok(vec![ip]);
+        }
+        if let Some(local) = self.lookup_magic(name) {
+            return local;
         }
         let mut addresses = Vec::new();
         let mut last = None;
@@ -263,7 +391,7 @@ impl Resolver {
             }
             let query = wire::query(name, kind)?;
             let mut trace = super::query_log::Query::new(&self.query_log, Some(&query));
-            let result = self.real(&query, transport, &mut trace, proxy).await;
+            let result = self.real(&query, transport, &mut trace, scope).await;
             trace.finish(result.as_ref().map(Some).map_err(|e| e.to_string()));
             match result {
                 Ok(reply) => {
@@ -289,10 +417,10 @@ impl Resolver {
         query: &Message,
         transport: &dyn Transport,
         trace: &mut super::query_log::Query,
-        proxy: bool,
+        scope: LookupScope,
     ) -> Result<Message> {
         let operation = astra_observe::operation!("dns.resolve", "DNS 真实解析（含缓存）");
-        let result = self.real_inner(query, transport, trace, proxy).await;
+        let result = self.real_inner(query, transport, trace, scope).await;
         operation.finish(result.is_ok());
         result
     }
@@ -301,13 +429,12 @@ impl Resolver {
         query: &Message,
         transport: &dyn Transport,
         trace: &mut super::query_log::Query,
-        proxy: bool,
+        scope: LookupScope,
     ) -> Result<Message> {
         let mut normalized = query.clone();
         normalized.metadata.id = 0;
-        let dedicated = proxy && !self.config.proxy_server_nameserver.is_empty();
         let mut key = normalized.to_vec()?;
-        key.push(u8::from(dedicated));
+        key.push(scope as u8);
         self.maintenance.start(&self.cache);
         let cached = self.cache.lock().unwrap().get(&key, Instant::now());
         if let Some((wire, age)) = cached {
@@ -344,17 +471,16 @@ impl Resolver {
         // Each upstream gets its own deadline; the entire ordered failover list
         // is also bounded so an unreachable list cannot multiply user wait time.
         let exchange = async {
-            let servers = if dedicated {
-                self.config.proxy_server_nameserver.as_slice()
+            let servers = if scope == LookupScope::Endpoint {
+                self.config.direct_nameserver.as_slice()
             } else {
-                self.config.servers(&domain)
+                self.config.servers(&domain, scope == LookupScope::Direct)
             };
-            let fallback = if dedicated {
-                &[][..]
-            } else {
-                self.config.fallback.as_slice()
-            };
-            for raw in servers.iter().chain(fallback) {
+            let upstreams = servers.iter().chain(&self.config.fallback);
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(self.config.query_timeout_ms * 2);
+            let count = servers.len() + self.config.fallback.len();
+            for (index, raw) in upstreams.enumerate() {
                 let upstream = Upstream::parse(raw)?;
                 // Defense in depth for configs built without validate(): an
                 // encrypted-only resolver never downgrades to plaintext.
@@ -373,7 +499,10 @@ impl Resolver {
                 let packet = query.to_vec()?;
                 let attempt = astra_observe::operation!("dns.upstream", "DNS 上游交换");
                 let result = match tokio::time::timeout(
-                    Duration::from_millis(self.config.query_timeout_ms),
+                    Duration::from_millis(self.config.query_timeout_ms).min(
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                            / (count - index) as u32,
+                    ),
                     transport.exchange(&upstream, packet),
                 )
                 .await

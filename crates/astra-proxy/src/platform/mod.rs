@@ -3,7 +3,7 @@ pub(crate) mod file_limit;
 pub mod mode_config;
 pub mod network_recovery;
 pub(crate) mod privilege;
-pub(crate) mod process;
+pub(crate) use astra_process_routing::owner as process;
 pub(crate) mod system_dns;
 #[cfg(not(windows))]
 #[path = "unix_system_proxy.rs"]
@@ -19,6 +19,22 @@ mod unix_network;
 #[cfg(windows)]
 pub mod windows_network;
 pub(crate) mod worker;
+
+/// Unix capture helpers must run as the core's user or root. On Windows the
+/// private pipe DACL checks the client at connection time.
+pub(crate) fn capture_peer_allowed(stream: &astra_platform::platform::LocalStream) -> bool {
+    #[cfg(unix)]
+    {
+        stream
+            .peer_cred()
+            .is_ok_and(|peer| peer.uid() == 0 || peer.uid() == unsafe { libc::geteuid() })
+    }
+    #[cfg(windows)]
+    {
+        let _ = stream;
+        true
+    }
+}
 
 pub(crate) fn system_listener_changed(
     new: &crate::config::ProxyConfig,

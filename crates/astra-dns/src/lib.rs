@@ -8,4 +8,4 @@ mod resolver;
 pub mod wire;
 pub use config::{Config, Upstream};
 pub use mapping::{LocalMappingStore, MappingStore};
-pub use resolver::{Resolver, Transport};
+pub use resolver::{LookupScope, Resolver, Transport};

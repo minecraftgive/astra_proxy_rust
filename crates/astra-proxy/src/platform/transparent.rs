@@ -39,18 +39,16 @@ pub async fn tcp(mut stream: TcpStream, app: Arc<App>, inbound: Inbound) -> Resu
         host: destination.ip().to_string(),
         port: destination.port(),
     };
-    let action = app
-        .route_connection(
-            &target,
-            inbound,
-            astra_model::Network::Tcp,
-            stream.peer_addr().ok(),
-            Some(destination),
-        )
-        .await?;
-    let mut remote = app
-        .connect_tracked(&target, &action, inbound, stream.peer_addr().ok())
-        .await?;
+    let session = crate::inbound::Flow::new(
+        &target,
+        inbound,
+        astra_model::Network::Tcp,
+        stream.peer_addr().ok(),
+        Some(destination),
+    )
+    .plan(&app, crate::inbound::FlowPolicy::Requested)
+    .await?;
+    let mut remote = session.connect_tcp(&app).await?;
     let _route_leases = app.route_leases.clone();
     drop(app);
     crate::proxy::relay::relay(&mut stream, &mut remote).await?;

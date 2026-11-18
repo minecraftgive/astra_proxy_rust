@@ -127,7 +127,7 @@ async fn dot_and_doh_exchange_over_verified_tls_and_reject_untrusted_certificate
                 &upstream,
                 query.to_vec().unwrap(),
                 Some(connector.clone()),
-                false,
+                None,
             ),
         )
         .await
@@ -149,7 +149,8 @@ async fn dot_and_doh_exchange_over_verified_tls_and_reject_untrusted_certificate
         wire::query("untrusted.example", RecordType::A)
             .unwrap()
             .to_vec()
-            .unwrap()
+            .unwrap(),
+        None
     )
     .await
     .is_err());
@@ -170,7 +171,7 @@ async fn strict_bootstrap_uses_encrypted_literal_upstream_and_caches() {
     ));
     let error = bootstrap(&app, "dns.example").await.unwrap_err();
     assert!(
-        format!("{error:#}").contains("encrypted DNS bootstrap"),
+        format!("{error:#}").contains("direct DNS bootstrap"),
         "{error:#}"
     );
     tokio::time::timeout(Duration::from_secs(2), worker)
@@ -191,8 +192,8 @@ async fn dedicated_tcp_bootstrap_reaches_ipv6_only_name_with_direct_group_blocke
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let ip: std::net::Ipv6Addr = "2001:db8::53".parse().unwrap();
-    let app = crate::dns::tests::app(&format!(
-        "plaintext_bypass=true\nrespect_rules=true\nproxy_server_nameserver=['tcp://{address}']\n[proxy_groups.DIRECT]\nmembers=['REJECT']"
+    let app = crate::dns::tests::core(&format!(
+        "[dns]\nplaintext_bypass=true\nrespect_rules=true\ndirect_nameserver=['tcp://{address}']\n[proxy_groups.DIRECT]\nmembers=['REJECT']"
     ));
     let server = tokio::spawn(async move {
         for kind in [RecordType::A, RecordType::AAAA] {
@@ -223,4 +224,27 @@ async fn dedicated_tcp_bootstrap_reaches_ipv6_only_name_with_direct_group_blocke
         bootstrap(&app, "dns.example").await.unwrap(),
         IpAddr::V6(ip)
     );
+}
+
+#[tokio::test]
+async fn magic_dns_is_final_before_bootstrap_cache_and_system_bypass() {
+    let app = super::super::tests::app(
+        "plaintext_bypass_domains=['+.astra.home.arpa']\n[dns.magic_dns]\nenable=true\n[dns.magic_dns.hosts]\nnas=['192.168.1.20']",
+    );
+    app.resolver()
+        .unwrap()
+        .bootstrap_store("nas", "192.0.2.3".parse().unwrap(), 60);
+    assert_eq!(
+        bootstrap(&app, "nas").await.unwrap().to_string(),
+        "192.168.1.20"
+    );
+    assert!(bootstrap(&app, "bad.astra.home.arpa").await.is_err());
+    let local = app.lookup_real("NAS.ASTRA.HOME.ARPA.", 22).await.unwrap();
+    assert_eq!(local[0].to_string(), "192.168.1.20:22");
+    assert!(app
+        .lookup_real("bad.astra.home.arpa", 22)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unknown Magic DNS"));
 }

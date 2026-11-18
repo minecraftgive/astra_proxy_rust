@@ -36,9 +36,17 @@ pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Val
                     .as_bool()
                     .context("dns.respect-rules must be boolean")?
             }
-            "nameserver" => config.nameserver = strings(value)?,
+            "nameserver" => config.proxy_nameserver = strings(value)?,
             "fallback" => config.fallback = strings(value)?,
-            "proxy-server-nameserver" => config.proxy_server_nameserver = strings(value)?,
+            "direct-nameserver" => config.direct_nameserver = strings(value)?,
+            "proxy-server-nameserver"
+                if !map.contains_key(Y::String("direct-nameserver".into())) =>
+            {
+                config.direct_nameserver = strings(value)?;
+            }
+            "proxy-server-nameserver" => {
+                warnings.push("节点与 DIRECT 共用直连 DNS，已采用 direct-nameserver".into())
+            }
             "default-nameserver" => {
                 config.bootstrap = strings(value)?
                     .iter()
@@ -61,11 +69,20 @@ pub(crate) fn convert(value: &Y, warnings: &mut Vec<String>) -> Result<toml::Val
                 config.fake_ip = mode == "fake-ip";
             }
             "fake-ip-range" => {
-                config.fake_ip_range = value.as_str().context("invalid fake-ip-range")?.into()
+                config.fake_ip_range = value
+                    .as_str()
+                    .context("invalid fake-ip-range")?
+                    .parse::<ipnet::Ipv4Net>()?
+                    .trunc()
             }
             "fake-ip-range6" => {
-                config.fake_ip_range6 =
-                    Some(value.as_str().context("invalid fake-ip-range6")?.into())
+                config.fake_ip_range6 = Some(
+                    value
+                        .as_str()
+                        .context("invalid fake-ip-range6")?
+                        .parse::<ipnet::Ipv6Net>()?
+                        .trunc(),
+                )
             }
             "fake-ip-ttl" => {
                 config.fake_ip_ttl = u32::try_from(value.as_u64().context("invalid fake-ip-ttl")?)?
@@ -134,13 +151,9 @@ fn encrypted_only(
         *list = kept;
         Ok(())
     };
-    keep(&mut config.nameserver, "nameserver")?;
+    keep(&mut config.proxy_nameserver, "nameserver")?;
     keep(&mut config.fallback, "fallback")?;
-    let proxy_configured = !config.proxy_server_nameserver.is_empty();
-    keep(
-        &mut config.proxy_server_nameserver,
-        "proxy-server-nameserver",
-    )?;
+    keep(&mut config.direct_nameserver, "direct-nameserver")?;
     let mut empty = Vec::new();
     for (pattern, servers) in config.nameserver_policy.iter_mut() {
         keep(servers, &format!("nameserver-policy {pattern}"))?;
@@ -151,26 +164,21 @@ fn encrypted_only(
     for pattern in empty {
         config.nameserver_policy.remove(&pattern);
     }
-    if proxy_configured && config.proxy_bootstrap().is_empty() {
+    if config.direct_nameserver.is_empty() || config.direct_bootstrap().is_empty() {
         config
-            .proxy_server_nameserver
-            .extend(Config::default().nameserver);
-        warnings.push("DNS proxy-server-nameserver 无 IP 字面量加密上游，已补充默认直连加密上游用于节点和引导解析".into());
+            .direct_nameserver
+            .extend(Config::default().direct_nameserver);
+        warnings.push(
+            "DNS direct-nameserver 无 IP 字面量加密上游，已补充默认直连加密上游用于节点和引导解析"
+                .into(),
+        );
     }
-    if config.nameserver.is_empty() {
-        config.nameserver = Config::default().nameserver;
+    if config.proxy_nameserver.is_empty() {
+        config.proxy_nameserver = Config::default().proxy_nameserver;
         warnings.push(format!(
             "DNS nameserver 无可用加密上游，已使用默认 {}",
-            config.nameserver.join(", ")
+            config.proxy_nameserver.join(", ")
         ));
-    }
-    if config.encrypted_bootstrap().is_empty() && config.proxy_bootstrap().is_empty() {
-        let defaults = Config::default().nameserver;
-        warnings.push(format!(
-            "DNS 上游均为域名，已追加 IP 直连加密上游 {} 用于加密引导解析",
-            defaults.join(", ")
-        ));
-        config.fallback.extend(defaults);
     }
     Ok(())
 }

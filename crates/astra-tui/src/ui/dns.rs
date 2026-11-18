@@ -18,6 +18,7 @@ fn time(ms: u64) -> String {
 fn source(row: &DnsQuery) -> &str {
     t(match row.source.as_str() {
         "cache" => "Cache",
+        "magic_dns" => "Magic DNS",
         "fake_ip" => "Fake IP",
         "ipv6_disabled" => "IPv6 disabled",
         _ => "Upstream",

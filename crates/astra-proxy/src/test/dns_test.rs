@@ -165,7 +165,7 @@ async fn tun_dns_interception_and_fake_udp_direct_egress_preserve_virtual_source
         echo.send_to(&bytes[..size], peer).await.unwrap();
     });
     // Use a manual DIRECT group to avoid requiring a separate rule process.
-    let source=format!("standalone=true\nstandalone_outbound='direct-group'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct-group]\nmembers=['DIRECT']\n[dns]\nlisten=[]\nfake_ip=true\nnameserver=['udp://{upstream_address}']\nplaintext_bypass=true\n");
+    let source=format!("standalone=true\nstandalone_outbound='direct-group'\nsocks5_listen='127.0.0.1:1080'\n[proxy_groups.direct-group]\nmembers=['DIRECT']\n[dns]\nlisten=[]\nfake_ip=true\nfake_ip_range='10.84.9.13/28'\ndirect_nameserver=['udp://{upstream_address}']\nplaintext_bypass=true\n");
     let source = format!("max_udp_flows=1\nudp_targets_per_association=1\n{source}");
     let app = App::from_text(&std::env::temp_dir().join("astra-dns-udp.toml"), source).unwrap();
     let current = Arc::new(arc_swap::ArcSwap::from_pointee(app));
@@ -195,6 +195,7 @@ async fn tun_dns_interception_and_fake_udp_direct_egress_preserve_virtual_source
         panic!()
     };
     let fake = std::net::SocketAddr::new(ip.0.into(), echo_port);
+    assert_eq!(ip.0, std::net::Ipv4Addr::new(10, 84, 9, 2));
     send.send((b"fake-udp-echo".to_vec(), source, fake))
         .await
         .unwrap();
@@ -248,7 +249,7 @@ async fn tun_dns_interception_and_fake_udp_direct_egress_preserve_virtual_source
 }
 
 use std::net::SocketAddr;
-fn core(extra: &str) -> App {
+pub(super) fn core(extra: &str) -> App {
     App::from_text(
         &std::env::temp_dir().join("astra-dns-lookup-test.toml"),
         format!("rule_socket='unused'\nsocks5_listen='127.0.0.1:1080'\n{extra}"),
@@ -272,27 +273,75 @@ async fn udp_mock() -> (SocketAddr, Arc<AtomicUsize>) {
 }
 
 #[test]
-fn local_lookups_use_an_encrypted_resolver_unless_plaintext_is_bypassed() {
+fn local_lookups_use_the_configured_resolver_even_without_a_listener() {
     // No [dns]: lookups still get the default encrypted resolver.
     let app = core("");
     assert!(app.dns.is_none());
     let resolver = app.resolver().expect("lookup-only resolver");
     assert!(resolver
         .config
-        .nameserver
+        .direct_nameserver
         .iter()
         .all(|raw| astra_dns::Upstream::parse(raw).unwrap().is_encrypted()));
     assert!(!resolver.config.fake_ip && resolver.config.listen.is_empty());
     // Disabled service: lookups keep the configured encrypted upstreams.
     let app = core("[dns]\nenable=false\nnameserver=['tls://9.9.9.9']\n");
     assert!(app.dns.is_none());
-    assert_eq!(app.resolver().unwrap().config.nameserver, ["tls://9.9.9.9"]);
-    // Explicit bypass with a disabled service: the system resolver is allowed.
+    assert_eq!(
+        app.resolver().unwrap().config.direct_nameserver,
+        ["tls://9.9.9.9"]
+    );
     let app = core("[dns]\nenable=false\nplaintext_bypass=true\n");
-    assert!(app.resolver().is_none());
+    assert!(app.resolver().is_some());
     // An enabled service answers lookups itself.
     let app = app_with_service();
     assert!(app.lookup_dns.is_none() && app.resolver().is_some());
+}
+
+#[tokio::test]
+async fn proxy_dns_uses_the_selected_tunnel_and_direct_dials_use_their_own_answers() {
+    let (direct, direct_queries) = udp_mock().await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = core(&format!("standalone=true\nstandalone_outbound='node'\n[[outbounds]]\nkind='http'\ntag='node'\nserver='{}'\n[dns]\nlisten=[]\nrespect_rules=true\nplaintext_bypass=true\nipv6=false\nproxy_nameserver=['tcp://192.0.2.53:53']\ndirect_nameserver=['udp://{direct}']", proxy.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+            assert!(headers.len() < 4096);
+        }
+        assert!(headers.starts_with(b"CONNECT 192.0.2.53:53 "));
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        let mut packet = vec![0; stream.read_u16().await.unwrap() as usize];
+        stream.read_exact(&mut packet).await.unwrap();
+        let query = Message::from_vec(&packet).unwrap();
+        let mut reply = wire::response(&query, ResponseCode::NoError);
+        reply.answers.push(Record::from_rdata(
+            query.queries[0].name().clone(),
+            60,
+            RData::A(A("192.0.2.123".parse().unwrap())),
+        ));
+        let bytes = reply.to_vec().unwrap();
+        stream.write_u16(bytes.len() as u16).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let host = "split.example";
+    let query = wire::query(host, RecordType::A).unwrap().to_vec().unwrap();
+    let answer = Message::from_vec(&app.dns_answer(&query).await.unwrap()).unwrap();
+    assert_eq!(
+        answer.answers[0].data,
+        RData::A(A("192.0.2.123".parse().unwrap()))
+    );
+    server.await.unwrap();
+    assert_eq!(direct_queries.load(Ordering::SeqCst), 0);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = Target {
+        host: host.into(),
+        port: listener.local_addr().unwrap().port(),
+    };
+    app.connect(&target, &RouteAction::Direct).await.unwrap();
+    assert_eq!(direct_queries.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -333,22 +382,14 @@ async fn proxy_server_dns_is_direct_with_unavailable_proxy_and_disabled_service(
 }
 
 #[tokio::test]
-async fn direct_dns_list_also_bypasses_rules_for_regular_queries_and_bootstrap() {
+async fn direct_query_bootstraps_its_upstream_without_a_rule_core() {
     let (direct_dns, queries) = udp_mock().await;
-    let app = core(&format!("[dns]\nlisten=[]\nplaintext_bypass=true\nrespect_rules=true\nnameserver=['udp://dns-bootstrap.example:{}']\nproxy_server_nameserver=['udp://{direct_dns}']\n", direct_dns.port()));
-    // No rule core exists. Routing either bootstrap or this listed DNS through
-    // rules would fail; the configured direct server must remain reachable.
+    let app = core(&format!("[dns]\nlisten=[]\nplaintext_bypass=true\ndirect_nameserver=['udp://dns-bootstrap.example:{}','udp://{direct_dns}']\n", direct_dns.port()));
     let query = wire::query("business.example", RecordType::A)
         .unwrap()
         .to_vec()
         .unwrap();
-    let listed = astra_dns::Upstream::parse(&format!("udp://{direct_dns}")).unwrap();
-    upstream::exchange(&app, &listed, query.clone())
-        .await
-        .unwrap();
-    // Hostname bootstrap must go to the dedicated literal server, even though
-    // the normal upstream itself cannot be reached through the missing proxy.
-    let _ = app.dns_answer(&query).await;
+    app.dns_answer(&query).await.unwrap();
     assert_eq!(queries.load(Ordering::SeqCst), 2);
     assert_eq!(
         app.resolver()
@@ -359,16 +400,13 @@ async fn direct_dns_list_also_bypasses_rules_for_regular_queries_and_bootstrap()
 }
 
 #[tokio::test]
-async fn empty_proxy_dns_list_preserves_normal_rule_routing() {
+async fn legacy_nameserver_supplies_direct_lookup_when_no_dedicated_list() {
     let (upstream, queries) = udp_mock().await;
     let app = core(&format!("[[outbounds]]\nkind='socks5'\ntag='node'\nserver='node.empty-direct-dns.example:9'\n[dns]\nlisten=[]\nplaintext_bypass=true\nrespect_rules=true\nnameserver=['udp://{upstream}']\n"));
-    assert!(
-        app.lookup_real("node.empty-direct-dns.example", 443)
-            .await
-            .is_err(),
-        "no rule core exists; an empty direct list must not bypass route selection"
-    );
-    assert_eq!(queries.load(Ordering::SeqCst), 0);
+    app.lookup_real("node.empty-direct-dns.example", 443)
+        .await
+        .unwrap();
+    assert_eq!(queries.load(Ordering::SeqCst), 1);
 }
 fn app_with_service() -> App {
     app("")
@@ -408,7 +446,7 @@ async fn protocol_egress_resolves_node_hostnames_through_the_host_hook() {
     use meow_common::HostResolver;
     let (upstream, queries) = udp_mock().await;
     let app = Arc::new(core(&format!(
-        "[dns]\nenable=false\nplaintext_bypass_domains=['+.corp']\n[dns.nameserver_policy]\n'+.corp'=['udp://{upstream}']\n"
+        "[dns]\nenable=false\nplaintext_bypass=true\ndirect_nameserver=['udp://{upstream}']\n"
     )));
     let hook = crate::dns::HostHook(Box::new({
         let app = app.clone();
@@ -419,12 +457,6 @@ async fn protocol_egress_resolves_node_hostnames_through_the_host_hook() {
         ["127.0.0.1".parse::<IpAddr>().unwrap()]
     );
     assert!(hook.resolve_all_nested("node.corp").await.unwrap().is_ok());
-    let bypass = Arc::new(core("[dns]\nenable=false\nplaintext_bypass=true\n"));
-    let open = crate::dns::HostHook(Box::new(move || bypass.clone()));
-    assert!(
-        open.resolve_all_nested("node.corp").await.is_none(),
-        "without an encrypted resolver nested lookups keep the legacy fallback"
-    );
 
     // End to end through the vendored hook. The installed hook is
     // process-global, so it only claims `.corp` names; everything else keeps
@@ -455,8 +487,7 @@ async fn protocol_egress_resolves_node_hostnames_through_the_host_hook() {
     dial.unwrap();
     dial_text.unwrap();
     listener.accept().await.unwrap();
-    // node.corp + proxy-node.corp; the second dial is a cache hit.
-    assert_eq!(queries.load(Ordering::SeqCst), 2);
+    assert_eq!(queries.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -496,10 +527,70 @@ async fn ipv6_tun_takeover_adds_split_routes_and_reserves_the_tun_dns_address() 
         other => panic!("{other:?}"),
     }
 }
+#[tokio::test]
+async fn private_pool_routes_and_restoration_use_the_canonical_prefix() {
+    let text = "rule_socket='unused'\n[tun]\ninterface='en0'\nipv6_address='fdfe:dcba:9876::1'\n[dns]\nlisten=[]\nfake_ip=true\nfake_ip_range='192.168.73.99/25'\nfake_ip_range6='fdac:1234:5678::ff/48'\n";
+    let app = core_text(text);
+    let routes = &app.config.tun.as_ref().unwrap().routes;
+    for cidr in ["192.168.73.0/25", "fdac:1234:5678::/48"] {
+        assert!(routes.iter().any(|route| route == cidr));
+    }
+    for (kind, address) in [
+        (RecordType::A, "192.168.73.2"),
+        (RecordType::AAAA, "fdac:1234:5678::2"),
+    ] {
+        let query = wire::query("private-pool.example", kind).unwrap();
+        let answer =
+            Message::from_vec(&app.dns_answer(&query.to_vec().unwrap()).await.unwrap()).unwrap();
+        let ip: IpAddr = address.parse().unwrap();
+        assert_eq!(wire::address_answers(&answer).next().unwrap().0, ip);
+        let target = Target {
+            host: address.into(),
+            port: 443,
+        };
+        let (route, dial) = crate::inbound::target::select(&app, &target, None).unwrap();
+        assert_eq!(route.host, "private-pool.example");
+        assert_eq!(dial, route);
+        assert_eq!(dial.port, 443);
+    }
+    let unknown = Target {
+        host: "192.168.73.3".into(),
+        port: 80,
+    };
+    assert!(app.restore_fake_target(&unknown).is_err());
+    let lan = Target {
+        host: "192.168.73.128".into(),
+        port: 80,
+    };
+    assert_eq!(app.restore_fake_target(&lan).unwrap(), lan);
+    let disabled = core_text(&text.replace("fake_ip=true", "fake_ip=false"));
+    assert_eq!(disabled.restore_fake_target(&unknown).unwrap(), unknown);
+}
+
 fn core_text(text: &str) -> App {
     App::from_text(
         &std::env::temp_dir().join("astra-dns-takeover-test.toml"),
         text.to_owned(),
     )
     .unwrap()
+}
+
+#[test]
+fn enabling_tun_without_a_table_installs_the_private_pool_route_once() {
+    let mut app = core("[dns]\nlisten=[]\nfake_ip=true\nfake_ip_range='10.61.37.3/24'");
+    let enabled = astra_model::runtime::Overrides {
+        tun: Some(true),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        app.apply_runtime_modes(&enabled).unwrap();
+    }
+    let routes = &app.config.tun.as_ref().unwrap().routes;
+    assert_eq!(
+        routes
+            .iter()
+            .filter(|cidr| cidr.as_str() == "10.61.37.0/24")
+            .count(),
+        1
+    );
 }

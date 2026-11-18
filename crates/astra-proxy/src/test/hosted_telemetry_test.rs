@@ -148,7 +148,7 @@ plaintext_bypass=true
     assert!(resolver.enabled && resolver.fake_ip);
     assert_eq!(
         resolver
-            .nameservers
+            .proxy_nameserver
             .iter()
             .map(|s| s.transport.as_str())
             .collect::<Vec<_>>(),
@@ -167,7 +167,7 @@ plaintext_bypass=true
     let telemetry = decoded.telemetry.unwrap();
     let resolver = telemetry.dns_resolver.unwrap();
     assert_eq!(resolver.listen[0].to_string(), "127.0.0.1:1053");
-    assert_eq!(resolver.nameservers[3].transport, "DoH");
+    assert_eq!(resolver.proxy_nameserver[3].transport, "DoH");
     let log = telemetry.dns.unwrap();
     assert_eq!(log.records.len(), 1);
     assert_eq!(log.records[0].domain, "telemetry.example");

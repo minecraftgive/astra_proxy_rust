@@ -43,7 +43,7 @@ pub struct LocalMappingStore {
 #[derive(Default)]
 struct SharedMappings {
     mappings: Mappings,
-    fake_ranges: Option<(String, Option<String>)>,
+    fake_ranges: Option<(ipnet::Ipv4Net, Option<ipnet::Ipv6Net>)>,
     reserved: HashSet<IpAddr>,
     validated: Option<Config>,
 }
@@ -72,7 +72,7 @@ impl SharedMappings {
             );
         }
         if config.enable && config.fake_ip && self.fake_ranges.is_none() {
-            self.fake_ranges = Some((config.fake_ip_range.clone(), config.fake_ip_range6.clone()));
+            self.fake_ranges = Some((config.fake_ip_range, config.fake_ip_range6));
         }
         self.reserved.extend(reserved);
         if self.validated.as_ref() != Some(config) {
@@ -199,19 +199,6 @@ impl Mappings {
             }
         }
     }
-    pub fn contains_fake(config: &Config, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ip) => config
-                .fake_ip_range
-                .parse::<ipnet::Ipv4Net>()
-                .is_ok_and(|net| net.contains(&ip)),
-            IpAddr::V6(ip) => config
-                .fake_ip_range6
-                .as_ref()
-                .and_then(|raw| raw.parse::<ipnet::Ipv6Net>().ok())
-                .is_some_and(|net| net.contains(&ip)),
-        }
-    }
     pub fn allocate(
         &mut self,
         config: &Config,
@@ -243,7 +230,7 @@ impl Mappings {
             .saturating_add(3)
         {
             let ip = if ipv6 {
-                let net: ipnet::Ipv6Net = config.fake_ip_range6.as_ref().unwrap().parse()?;
+                let net = config.fake_ip_range6.unwrap();
                 let count = 1u128 << (128 - net.prefix_len());
                 if self.next6 >= count - 1 {
                     self.next6 = 2;
@@ -252,7 +239,7 @@ impl Mappings {
                 self.next6 += 1;
                 ip
             } else {
-                let net: ipnet::Ipv4Net = config.fake_ip_range.parse()?;
+                let net = config.fake_ip_range;
                 let count = 1u32 << (32 - net.prefix_len());
                 if self.next4 >= count - 1 {
                     self.next4 = 2;
@@ -285,7 +272,7 @@ impl Mappings {
     }
     pub fn reverse(&self, config: &Config, ip: IpAddr) -> Result<Option<String>> {
         let now = Instant::now();
-        if config.fake_ip && Self::contains_fake(config, ip) {
+        if config.active_fake_ranges().any(|net| net.contains(&ip)) {
             return self
                 .fake
                 .get(&ip)
@@ -302,7 +289,7 @@ impl Mappings {
             .and_then(|entry| entry.domain.as_ref().map(ToString::to_string)))
     }
     pub fn observe(&mut self, config: &Config, domain: &str, ip: IpAddr, ttl: u32) {
-        if ttl == 0 || Self::contains_fake(config, ip) {
+        if ttl == 0 || config.active_fake_ranges().any(|net| net.contains(&ip)) {
             return;
         }
         let now = Instant::now();

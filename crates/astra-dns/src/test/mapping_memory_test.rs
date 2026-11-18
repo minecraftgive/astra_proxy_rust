@@ -4,7 +4,7 @@ use crate::maintenance::Maintain;
 fn renewals_keep_single_expiry_and_shared_domain_and_reclaim_after_twenty_cycles() {
     let config = Config {
         fake_ip: true,
-        fake_ip_range6: Some("fdab::/64".into()),
+        fake_ip_range6: Some("fdab::/64".parse().unwrap()),
         ..Default::default()
     };
     let mut state = SharedMappings::default();

@@ -1,7 +1,6 @@
 use crate::{mode_config::Tun, runtime::Current};
 use anyhow::{ensure, Context, Result};
 use astra_model::Inbound;
-use astra_model::Target;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(not(windows))]
 use std::process::Command;
@@ -576,13 +575,12 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
         tokio::select! {
             Some(_) = streams.join_next(), if !streams.is_empty() => {}
             item = listener.next() => {
-                let Some((mut stream, source, destination)) = item else { break; };
+                let Some((stream, source, destination)) = item else { break; };
                 let app = current.load_full();
                 // Avoid unbounded tasks waiting for permits under SYN floods.
                 let Ok(permit) = app.permits.clone().try_acquire_owned() else { continue; };
                 streams.spawn(async move {
                     let _permit = permit;
-                    let target = Target {host: destination.ip().to_string(), port: destination.port()};
                     let cancellation = app.egress_signal.clone();
                     let session = async move {
                         if app.intercept_dns(destination) {
@@ -593,18 +591,7 @@ async fn tcp_dispatch(mut listener: netstack_smoltcp::TcpListener, current: Curr
                             let process = super::process::lookup(astra_model::Network::Tcp,source,destination).await;
                             return host.relay(stream,crate::hosted::Metadata { flow_id:None,inbound: Inbound::Tun, source, local:destination, destination:Some(destination), process }).await;
                         }
-                        let sniff=app.config.tun.as_ref().is_none_or(|tun|tun.sniff) && matches!(destination.port(),80|443|8080|8443);
-                        let (prefix,hostname)=if sniff {crate::proxy::target::preface(&mut stream).await?}else{(vec![],None)};
-                        let (route,dial)=crate::proxy::target::select(&app,&target,hostname)?;
-                        let action = app.route_connection(&route, Inbound::Tun, astra_model::Network::Tcp, Some(source), Some(destination)).await?;
-                        tracing::debug!(target:"astra_route",phase="destination",original=%target.host,host=%route.host,dial=%dial.host,%destination,"TUN routing name and dial address");
-                        let mut remote = app.connect_tracked(&dial, &action, Inbound::Tun, Some(source)).await?;
-                        let _route_leases = app.route_leases.clone();
-                        drop(app);
-                        tokio::io::AsyncWriteExt::write_all(&mut remote,&prefix).await?;
-                        drop(prefix);
-                        crate::proxy::relay::relay(&mut stream, &mut remote).await?;
-                        Ok(())
+                        crate::inbound::transparent_stream(stream, app, Inbound::Tun, source, destination).await
                     };
                     let result:Result<()>=tokio::select! {
                         _=cancellation.cancelled()=>Err(anyhow::anyhow!("physical egress changed; reconnect TUN session")),

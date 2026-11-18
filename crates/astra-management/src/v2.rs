@@ -64,6 +64,11 @@ pub enum Query {
     ProgramInfo,
     /// Read-only OS snapshot from the target Agent, never the frontend host.
     NetworkState,
+    /// On-demand executable picker, evaluated on the selected Agent.
+    RunningProcesses {
+        #[serde(default)]
+        filter: String,
+    },
     InstallationStatus,
     Agents,
     Instances,
@@ -517,6 +522,10 @@ pub enum ResponseBody {
     NetTool(Vec<serde_json::Value>),
     NetworkReport(NetworkReport),
     NetworkState(astra_model::network_state::Snapshot),
+    RunningProcesses {
+        programs: Vec<astra_model::ProcessInfo>,
+        truncated: bool,
+    },
     LogLevel(
         #[cfg_attr(
             feature = "bindings",

@@ -4,7 +4,6 @@ use crate::platform::worker::WorkerChild;
 use crate::{runtime::Current, App};
 use anyhow::{bail, ensure, Context, Result};
 use astra_model::Inbound;
-use astra_model::Target;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -1451,7 +1450,7 @@ pub async fn worker() -> Result<()> {
     let config: WorkerConfig = receive(&mut tokio::io::stdin()).await?;
     let mut app = App::from_text(&config.path, config.text)?;
     crate::platform::network_recovery::set_enabled(app.config.experimental.network_recovery);
-    crate::mode_config::runtime_modes(&mut app.config, &config.overrides);
+    app.apply_runtime_modes(&config.overrides)?;
     app.overrides.store(Arc::new(config.overrides));
     if let Some(tun) = &mut app.config.tun {
         tun.interface = config.interface.clone();
@@ -1471,7 +1470,7 @@ pub async fn worker() -> Result<()> {
             dns.set_mapping_store(Arc::new(routing.worker_host.as_ref().unwrap().clone()))?;
         }
     }
-    if let Some(rule) = &mut app.rule_client {
+    if let Some(rule) = &mut app.rules.rule_client {
         rule.start_observer();
     }
     let app = Arc::new(app);
@@ -1517,7 +1516,7 @@ pub async fn worker() -> Result<()> {
                         match auth.command {
                             WorkerRequest::Ready => {
                                 let result = async {
-                                    if app.rule_client.is_some() {
+                                    if app.rules.rule_client.is_some() {
                                         let mut rule = astra_platform::platform::connect_trusted(&app.config.rule_socket).await?;
                                         astra_ipc::exchange_core_info(&mut rule,env!("CARGO_PKG_VERSION")).await?;
                                     }
@@ -1567,7 +1566,7 @@ pub async fn worker() -> Result<()> {
                                 let stream = astra_ipc::host::HostStream::new(stream);
                                 INGRESS_PROCESS.scope(meta.process.clone(),async move { match meta.inbound {
                                     Inbound::Socks5 | Inbound::HttpConnect | Inbound::Mixed => crate::inbound::handle_stream(stream,app,meta.inbound,meta.source,meta.local).await,
-                                    _ => transparent_stream(stream,app,meta).await,
+                                    _ => crate::inbound::transparent_stream(stream,app,meta.inbound,meta.source,meta.destination.context("transparent ingress requires original destination")?).await,
                                 }}).await
                             }
                             WorkerRequest::Udp(meta) => udp::serve(stream, app, meta).await,
@@ -1583,47 +1582,6 @@ pub async fn worker() -> Result<()> {
     while tasks.join_next().await.is_some() {}
     outcome
 }
-async fn transparent_stream<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
-    app: Arc<App>,
-    meta: Metadata,
-) -> Result<()> {
-    let destination = meta
-        .destination
-        .context("transparent ingress requires original destination")?;
-    let original = Target {
-        host: destination.ip().to_string(),
-        port: destination.port(),
-    };
-    let sniff = meta.inbound == Inbound::Tun
-        && app.config.tun.as_ref().is_none_or(|tun| tun.sniff)
-        && matches!(destination.port(), 80 | 443 | 8080 | 8443);
-    let (prefix, hostname) = if sniff {
-        crate::proxy::target::preface(&mut stream).await?
-    } else {
-        (vec![], None)
-    };
-    let (target, dial) = crate::proxy::target::select(&app, &original, hostname)?;
-    let action = app
-        .route_with_context(
-            &target,
-            meta.inbound,
-            astra_model::Network::Tcp,
-            meta.process,
-            Some(destination.ip()).filter(|ip| !app.synthetic_ip(*ip)),
-        )
-        .await?;
-    let mut remote = app
-        .connect_tracked(&dial, &action, meta.inbound, Some(meta.source))
-        .await?;
-    let _route_leases = app.route_leases.clone();
-    drop(app);
-    remote.write_all(&prefix).await?;
-    drop(prefix);
-    crate::proxy::relay::relay(&mut stream, &mut remote).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 #[path = "test/hosted_monitor_test.rs"]
 mod monitor_tests;

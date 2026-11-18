@@ -19,6 +19,7 @@ pub(crate) const COPY_BUFFER_SIZE: usize = 32 * 1024;
 
 #[derive(Default)]
 pub(crate) struct Sessions(Mutex<HashMap<String, watch::Sender<u64>>>);
+#[derive(Clone)]
 pub(crate) struct Lease(
     Vec<(watch::Receiver<u64>, u64)>,
     pub Option<String>,

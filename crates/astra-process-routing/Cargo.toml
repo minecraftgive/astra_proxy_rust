@@ -1,0 +1,22 @@
+[package]
+name = "astra-process-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+astra-model = { path = "../astra-model" }
+arc-swap = "1.9.3"
+tokio.workspace = true
+sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc", "Win32_Security"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.13.1"
+libc = "0.2"
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

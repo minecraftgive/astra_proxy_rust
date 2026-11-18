@@ -156,9 +156,11 @@ pub struct DnsResolverStatus {
     pub ipv6: bool,
     pub respect_rules: bool,
     pub listen: Vec<std::net::SocketAddr>,
-    pub nameservers: Vec<DnsServer>,
+    #[serde(alias = "nameservers")]
+    pub proxy_nameserver: Vec<DnsServer>,
     pub fallback: Vec<DnsServer>,
-    pub proxy_server_nameserver: Vec<DnsServer>,
+    #[serde(alias = "proxy_server_nameserver")]
+    pub direct_nameserver: Vec<DnsServer>,
     pub policy_count: usize,
 }
 
@@ -199,9 +201,9 @@ impl DnsResolverStatus {
             ipv6: config.ipv6,
             respect_rules: config.respect_rules,
             listen: config.listen.clone(),
-            nameservers: servers(&config.nameserver),
+            proxy_nameserver: servers(&config.proxy_nameserver),
             fallback: servers(&config.fallback),
-            proxy_server_nameserver: servers(&config.proxy_server_nameserver),
+            direct_nameserver: servers(&config.direct_nameserver),
             policy_count: config.nameserver_policy.len(),
         }
     }

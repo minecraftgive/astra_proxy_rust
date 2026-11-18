@@ -655,24 +655,24 @@ pub fn rows(
             Spec {
                 kind: Type::StringList,
                 ..text(
-                    "nameserver",
-                    "DNS 上游（默认仅 DoH/DoT）",
+                    "proxy_nameserver",
+                    "代理 DNS 上游（DoH/DoT）",
                     "[\"https://1.1.1.1/dns-query\",\"tls://1.0.0.1:853\"]",
                     false,
                 )
             },
             Spec {
                 kind: Type::StringList,
-                ..text("fallback", "DNS 失败备用上游", "[]", false)
+                ..text(
+                    "direct_nameserver",
+                    "直连 DNS 上游（DIRECT、节点和引导解析）",
+                    "[\"https://223.6.6.6/dns-query\",\"https://223.5.5.5/dns-query\"]",
+                    false,
+                )
             },
             Spec {
                 kind: Type::StringList,
-                ..text(
-                    "proxy_server_nameserver",
-                    "代理服务器解析 DNS（始终直连，留空沿用原策略）",
-                    "[]",
-                    false,
-                )
+                ..text("fallback", "备用 DNS 上游（可选）", "[]", false)
             },
             Spec {
                 kind: Type::Boolean,
@@ -703,7 +703,12 @@ pub fn rows(
             },
             Spec {
                 kind: Type::Boolean,
-                ..text("respect_rules", "DNS 上游连接遵循路由规则", "false", false)
+                ..text(
+                    "respect_rules",
+                    "真实 DNS 查询按目标域名选择直连或代理",
+                    "false",
+                    false,
+                )
             },
             Spec {
                 kind: Type::Boolean,
@@ -744,7 +749,12 @@ pub fn rows(
                 kind: Type::Boolean,
                 ..text("fake_ip", "启用 Fake IP", "false", false)
             },
-            text("fake_ip_range", "Fake IPv4 地址池", "198.18.0.0/16", false),
+            text(
+                "fake_ip_range",
+                "Fake IPv4 地址池（基准测试网段或 RFC 1918 私网 CIDR）",
+                "198.18.0.0/16",
+                false,
+            ),
             text("fake_ip_range6", "Fake IPv6 地址池（可选 ULA）", "", false),
             choice(
                 "fake_ip_filter_mode",

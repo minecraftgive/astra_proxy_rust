@@ -236,7 +236,7 @@ fn cache_survives_replacement_and_is_ignored_after_config_changes_or_corruption(
     let app = cached_app(&config, original);
     assert!(app.outbounds.contains_key("cached-node"));
     assert_eq!(
-        app.standalone_action,
+        app.rules.standalone_action,
         Some(astra_model::RouteAction::Proxy("PROXY".into()))
     );
     assert_eq!(

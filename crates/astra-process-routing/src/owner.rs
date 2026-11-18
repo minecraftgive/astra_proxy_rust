@@ -34,17 +34,17 @@ fn workers() -> &'static Workers {
     static WORKERS: OnceLock<Workers> = OnceLock::new();
     WORKERS.get_or_init(Default::default)
 }
-pub(crate) fn register_worker(pid: u32) {
+pub fn register_worker(pid: u32) {
     workers().register(pid);
 }
-pub(crate) fn unregister_worker(pid: u32) {
+pub fn unregister_worker(pid: u32) {
     workers().unregister(pid);
 }
-pub(crate) fn own_process(pid: u32) -> bool {
+pub fn own_process(pid: u32) -> bool {
     pid == std::process::id() || workers().contains(pid)
 }
 
-pub(crate) async fn lookup(
+pub async fn lookup(
     network: Network,
     source: SocketAddr,
     destination: SocketAddr,
@@ -57,7 +57,7 @@ pub(crate) async fn lookup(
 /// forces a fresh dump per packet. A socket opened since the last snapshot
 /// can be missed; routing then rejects that recaptured connection after
 /// its own, fresh lookup.
-pub(crate) async fn is_self(network: Network, source: SocketAddr, destination: SocketAddr) -> bool {
+pub async fn is_self(network: Network, source: SocketAddr, destination: SocketAddr) -> bool {
     bounded_lookup(
         network,
         source,
@@ -435,6 +435,7 @@ mod linux {
         } else {
             "udp"
         };
+        let sampled_at = Instant::now();
         let mut table = SocketTable::new();
         for suffix in ["", "6"] {
             let Ok(text) = fs::read_to_string(format!("/proc/net/{base}{suffix}")) else {
@@ -445,7 +446,7 @@ mod linux {
             }
         }
         let table = Arc::new(table);
-        tables[index] = Some((Instant::now(), table.clone()));
+        tables[index] = Some((sampled_at, table.clone()));
         Some(table)
     }
     fn matching_inodes(
@@ -531,6 +532,7 @@ mod linux {
             }
             _ => {}
         }
+        let sampled_at = Instant::now();
         let mut owners = Owners::new();
         // Do not keep a partially scanned ownership table: a later process
         // could share an inode already seen.
@@ -541,7 +543,7 @@ mod linux {
             Some(()) => OwnerSnapshot::Table(Arc::new(owners)),
             None => OwnerSnapshot::Overflow,
         };
-        *snapshot = Some((Instant::now(), owners.clone()));
+        *snapshot = Some((sampled_at, owners.clone()));
         Some(owners)
     }
     /// Uncached lookup that records only the requested inodes, for hosts whose
@@ -625,5 +627,5 @@ mod linux {
 }
 
 #[cfg(test)]
-#[path = "../test/platform_process_test.rs"]
+#[path = "test/platform_process_test.rs"]
 mod tests;

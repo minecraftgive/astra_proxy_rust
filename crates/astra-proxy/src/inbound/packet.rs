@@ -1,5 +1,5 @@
 //! Shared bounded UDP flow dispatch for packet-oriented TUN and TPROXY inbounds.
-use crate::{runtime::Current, udp, App};
+use crate::{runtime::Current, App};
 use anyhow::{Context, Result};
 use astra_model::Inbound;
 use astra_model::Target;
@@ -96,24 +96,23 @@ async fn flow(
         host: destination.ip().to_string(),
         port: destination.port(),
     };
-    let (target, dial) = if inbound == Inbound::Tun {
-        super::target::select(&app, &original, None)?
+    let flow = crate::inbound::Flow::new(
+        &original,
+        inbound,
+        astra_model::Network::Udp,
+        Some(source),
+        Some(destination),
+    );
+    let policy = if inbound == Inbound::Tun {
+        crate::inbound::FlowPolicy::RecoverName(None)
     } else {
-        (original.clone(), original)
+        crate::inbound::FlowPolicy::Requested
     };
-    let mapped = target.host != destination.ip().to_string();
-    let action = app
-        .route_connection(
-            &target,
-            inbound,
-            astra_model::Network::Udp,
-            Some(source),
-            Some(destination),
-        )
-        .await?;
+    let session = flow.plan(&app, policy).await?;
+    let mapped = session.mapped;
     let connection = timeout(
         Duration::from_secs(app.config.connect_timeout_secs),
-        udp::open_action(&app, &dial, inbound, source, action),
+        session.open_udp(&app),
     )
     .await
     .context("UDP open timeout")??;

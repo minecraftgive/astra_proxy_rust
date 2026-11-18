@@ -32,7 +32,7 @@ where
             .await
             .context("HTTP handshake timeout")??;
         if client.buffer[..8] != *b"CONNECT " {
-            return crate::http_forward::handle_stream(client, app, source, local).await;
+            return crate::inbound::http_forward::handle_stream(client, app, source, local).await;
         }
     }
     let users = app.authentication(Some(source.ip()));
@@ -52,17 +52,17 @@ where
             }
         }
     };
-    let action = match app
-        .route_connection(
-            &target,
-            Inbound::HttpConnect,
-            astra_model::Network::Tcp,
-            Some(source),
-            Some(local),
-        )
-        .await
+    let session = match super::Flow::new(
+        &target,
+        Inbound::HttpConnect,
+        astra_model::Network::Tcp,
+        Some(source),
+        Some(local),
+    )
+    .plan(&app, super::FlowPolicy::Requested)
+    .await
     {
-        Ok(route) => route,
+        Ok(session) => session,
         Err(err) => {
             client
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
@@ -70,16 +70,13 @@ where
             return Err(err);
         }
     };
-    if action == RouteAction::Block {
+    if session.action == RouteAction::Block {
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await?;
         return Ok(());
     }
-    let mut upstream = match app
-        .connect_tracked(&target, &action, Inbound::HttpConnect, Some(source))
-        .await
-    {
+    let mut upstream = match session.connect_tcp(&app).await {
         Ok(s) => s,
         Err(err) => {
             client

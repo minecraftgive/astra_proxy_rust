@@ -1,20 +1,132 @@
 use anyhow::{ensure, Result};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+
+pub const BENCHMARK_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+const IPV4_POOLS: [Ipv4Net; 4] = [
+    BENCHMARK_NET,
+    Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+pub struct MagicDns {
+    pub enable: bool,
+    pub domain: String,
+    #[serde(deserialize_with = "read_magic_hosts")]
+    pub hosts: BTreeMap<String, Vec<IpAddr>>,
+}
+
+fn read_magic_hosts<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<BTreeMap<String, Vec<IpAddr>>, D::Error> {
+    let hosts = BTreeMap::<String, Vec<String>>::deserialize(input)?;
+    hosts
+        .into_iter()
+        .map(|(name, values)| {
+            let ips = values
+                .into_iter()
+                .map(|value| {
+                    value.parse().map_err(|_| {
+                        serde::de::Error::custom(format!(
+                            "Magic DNS device {name} has invalid IP address {value}"
+                        ))
+                    })
+                })
+                .collect::<Result<_, D::Error>>()?;
+            Ok((name, ips))
+        })
+        .collect()
+}
+
+impl Default for MagicDns {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            domain: "astra.home.arpa".into(),
+            hosts: BTreeMap::new(),
+        }
+    }
+}
+
+fn valid_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+}
+
+pub fn valid_search_domain(domain: &str) -> bool {
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+    domain.len() <= 253 && domain.split('.').all(valid_label)
+}
+
+impl MagicDns {
+    fn is_default(&self) -> bool {
+        !self.enable && self.domain == "astra.home.arpa" && self.hosts.is_empty()
+    }
+
+    pub fn search_domain(&self) -> Option<String> {
+        self.enable
+            .then(|| self.domain.trim_end_matches('.').to_ascii_lowercase())
+    }
+
+    fn validate(&self, config: &Config) -> Result<()> {
+        let domain = self.domain.trim_end_matches('.').to_ascii_lowercase();
+        ensure!(
+            valid_search_domain(&self.domain)
+                && domain.parse::<IpAddr>().is_err()
+                && domain != "empty"
+                && domain != "localhost"
+                && !domain.ends_with(".localhost"),
+            "invalid dns.magic_dns.domain: {}",
+            self.domain
+        );
+        let mut names = BTreeSet::new();
+        for (name, ips) in &self.hosts {
+            ensure!(
+                valid_label(name)
+                    && name.len() + 1 + domain.len() <= 253
+                    && !name.eq_ignore_ascii_case("localhost")
+                    && !name.eq_ignore_ascii_case(&domain),
+                "invalid Magic DNS device name: {name}"
+            );
+            ensure!(
+                names.insert(name.to_ascii_lowercase()),
+                "duplicate Magic DNS device: {name}"
+            );
+            ensure!(!ips.is_empty(), "Magic DNS device {name} has no addresses");
+            for ip in ips {
+                ensure!(
+                    !matches!(ip, IpAddr::V4(v4) if BENCHMARK_NET.contains(v4))
+                        && !config.active_fake_ranges().any(|range| range.contains(ip)),
+                    "Magic DNS device {name} address {ip} conflicts with Fake IP space"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(remote = "Self", default, deny_unknown_fields)]
 pub struct Config {
     pub enable: bool,
+    #[serde(skip_serializing_if = "MagicDns::is_default")]
+    pub magic_dns: MagicDns,
     pub listen: Vec<SocketAddr>,
-    pub nameserver: Vec<String>,
+    pub proxy_nameserver: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<String>,
-    /// Dedicated resolvers for proxy endpoints and DNS hostname bootstrap.
-    /// Always dialed directly. Empty preserves the existing resolver policy.
-    pub proxy_server_nameserver: Vec<String>,
+    pub direct_nameserver: Vec<String>,
     pub nameserver_policy: BTreeMap<String, Vec<String>>,
     pub bootstrap: Vec<IpAddr>,
     pub respect_rules: bool,
@@ -26,8 +138,8 @@ pub struct Config {
     pub max_concurrent: usize,
     pub hijack: bool,
     pub fake_ip: bool,
-    pub fake_ip_range: String,
-    pub fake_ip_range6: Option<String>,
+    pub fake_ip_range: Ipv4Net,
+    pub fake_ip_range6: Option<Ipv6Net>,
     pub fake_ip_filter: Vec<String>,
     pub fake_ip_filter_mode: String,
     pub fake_ip_ttl: u32,
@@ -56,17 +168,68 @@ pub struct Config {
     /// because it binds port 53 and changes system settings.
     pub system_takeover_without_tun: bool,
 }
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Config::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            nameserver: Option<Vec<String>>,
+            proxy_server_nameserver: Option<Vec<String>>,
+            direct_nameserver: Option<Vec<String>>,
+            proxy_nameserver: Option<Vec<String>>,
+            #[serde(flatten, deserialize_with = "Config::deserialize")]
+            settings: Config,
+        }
+        let input = Input::deserialize(deserializer)?;
+        let mut config = input.settings;
+        if input.nameserver.is_some() && input.proxy_nameserver.is_some()
+            || input.proxy_server_nameserver.is_some() && input.direct_nameserver.is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "conflicting legacy and split DNS upstream fields",
+            ));
+        }
+        if let Some(direct) = input
+            .direct_nameserver
+            .or_else(|| {
+                input
+                    .proxy_server_nameserver
+                    .filter(|servers| !servers.is_empty())
+            })
+            .or_else(|| input.nameserver.clone())
+        {
+            config.direct_nameserver = direct;
+        }
+        if let Some(proxy) = input.proxy_nameserver.or(input.nameserver) {
+            config.proxy_nameserver = proxy;
+        }
+        config.fake_ip_range = config.fake_ip_range.trunc();
+        config.fake_ip_range6 = config.fake_ip_range6.map(|net| net.trunc());
+        Ok(config)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             enable: true,
+            magic_dns: Default::default(),
             listen: vec!["127.0.0.1:1053".parse().unwrap()],
-            nameserver: vec![
+            proxy_nameserver: vec![
                 "https://1.1.1.1/dns-query".into(),
                 "tls://1.0.0.1:853".into(),
             ],
             fallback: vec![],
-            proxy_server_nameserver: vec![],
+            direct_nameserver: vec![
+                "https://223.6.6.6/dns-query".into(),
+                "https://223.5.5.5/dns-query".into(),
+            ],
             nameserver_policy: BTreeMap::new(),
             bootstrap: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
             respect_rules: false,
@@ -78,7 +241,7 @@ impl Default for Config {
             max_concurrent: 128,
             hijack: true,
             fake_ip: false,
-            fake_ip_range: "198.18.0.0/16".into(),
+            fake_ip_range: Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 16),
             fake_ip_range6: None,
             fake_ip_filter: vec!["+.lan".into(), "+.local".into(), "localhost".into()],
             fake_ip_filter_mode: "blacklist".into(),
@@ -94,14 +257,23 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn active_fake_ranges(&self) -> impl Iterator<Item = IpNet> + '_ {
+        std::iter::once(IpNet::V4(self.fake_ip_range))
+            .chain(self.fake_ip_range6.map(IpNet::V6))
+            .filter(|_| self.enable && self.fake_ip)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.magic_dns.validate(self)?;
         ensure!(
             self.listen.len() <= 16 && self.listen.iter().all(|a| a.port() != 0),
             "DNS listen requires nonzero ports, at most 16 listeners"
         );
         ensure!(
-            !self.nameserver.is_empty() && self.nameserver.len() <= 16 && self.fallback.len() <= 16,
-            "DNS requires 1..16 nameservers and at most 16 fallbacks"
+            !self.proxy_nameserver.is_empty()
+                && self.proxy_nameserver.len() <= 16
+                && self.fallback.len() <= 16,
+            "DNS requires 1..16 proxy_nameserver entries and at most 16 fallback entries"
         );
         ensure!(
             !self.bootstrap.is_empty()
@@ -113,12 +285,9 @@ impl Config {
             "DNS bootstrap requires 1..8 literal IP addresses"
         );
         ensure!(
-            self.proxy_server_nameserver.len() <= 16,
-            "DNS proxy_server_nameserver accepts at most 16 upstreams"
+            (1..=16).contains(&self.direct_nameserver.len()),
+            "DNS direct_nameserver requires 1..16 upstreams"
         );
-        if !self.proxy_server_nameserver.is_empty() {
-            ensure!(!self.proxy_bootstrap().is_empty(), "DNS proxy_server_nameserver requires at least one IP-literal upstream for direct bootstrap");
-        }
         ensure!(
             self.cache_capacity <= 65536 && (1..=65536).contains(&self.mapping_capacity),
             "DNS cache/mapping capacity exceeds limit"
@@ -142,20 +311,16 @@ impl Config {
             matches!(self.fake_ip_filter_mode.as_str(), "blacklist" | "whitelist"),
             "unsupported fake_ip_filter_mode"
         );
-        let range: ipnet::Ipv4Net = self.fake_ip_range.parse()?;
+        let range = self.fake_ip_range;
         ensure!(
-            range.prefix_len() >= 15
-                && range.prefix_len() <= 30
-                && ipnet::Ipv4Net::new("198.18.0.0".parse()?, 15)?.contains(&range),
-            "fake_ip_range must be inside 198.18.0.0/15, prefix 15..30"
+            range.prefix_len() <= 30 && IPV4_POOLS.iter().any(|pool| pool.contains(&range)),
+            "fake_ip_range must be a subnet of 198.18.0.0/15 or RFC 1918 private space, with at least four addresses"
         );
-        if let Some(range) = &self.fake_ip_range6 {
-            let range: ipnet::Ipv6Net = range.parse()?;
+        if let Some(range) = self.fake_ip_range6 {
             ensure!(
-                range.prefix_len() >= 64
-                    && range.prefix_len() <= 126
+                range.prefix_len() <= 126
                     && ipnet::Ipv6Net::new("fc00::".parse()?, 7)?.contains(&range),
-                "fake_ip_range6 must be a ULA subnet with prefix 64..126"
+                "fake_ip_range6 must be a ULA subnet with prefix 7..126"
             );
         }
         ensure!(
@@ -181,10 +346,10 @@ impl Config {
         }
         self.validate_encryption()?;
         for raw in self
-            .nameserver
+            .proxy_nameserver
             .iter()
             .chain(&self.fallback)
-            .chain(&self.proxy_server_nameserver)
+            .chain(&self.direct_nameserver)
             .chain(self.nameserver_policy.values().flatten())
         {
             let upstream = Upstream::parse(raw)?;
@@ -209,10 +374,10 @@ impl Config {
             return Ok(());
         }
         for raw in self
-            .nameserver
+            .proxy_nameserver
             .iter()
             .chain(&self.fallback)
-            .chain(&self.proxy_server_nameserver)
+            .chain(&self.direct_nameserver)
         {
             ensure!(
                 Upstream::parse(raw)?.is_encrypted(),
@@ -234,18 +399,16 @@ impl Config {
             }
         }
         let needs_bootstrap = self
-            .nameserver
+            .proxy_nameserver
             .iter()
+            .chain(&self.direct_nameserver)
             .chain(&self.fallback)
             .chain(self.nameserver_policy.values().flatten())
-            .any(|raw| Upstream::parse(raw).is_ok_and(|u| u.host.parse::<IpAddr>().is_err()));
-        ensure!(
-            !needs_bootstrap
-                || !self.encrypted_bootstrap().is_empty()
-                || !self.proxy_bootstrap().is_empty(),
-            "DNS upstream hostnames need an IP-literal DoH/DoT upstream in nameserver or \
-             fallback (e.g. https://1.1.1.1/dns-query) for encrypted bootstrap"
-        );
+            .any(|raw| {
+                Upstream::parse(raw).is_ok_and(|upstream| upstream.host.parse::<IpAddr>().is_err())
+            });
+        ensure!(!needs_bootstrap || !self.direct_bootstrap().is_empty(),
+            "DNS upstream hostnames need an IP-literal direct_nameserver or fallback for encrypted bootstrap");
         Ok(())
     }
     /// Whether a plaintext upstream may answer `domain`.
@@ -256,28 +419,13 @@ impl Config {
                 .iter()
                 .any(|pattern| matches_domain(pattern, domain))
     }
-    /// IP-literal DoH/DoT upstreams used to resolve upstream hostnames when
-    /// plaintext bootstrap is not allowed.
-    pub fn encrypted_bootstrap(&self) -> Vec<Upstream> {
-        self.nameserver
+    pub fn direct_bootstrap(&self) -> Vec<Upstream> {
+        self.direct_nameserver
             .iter()
             .chain(&self.fallback)
             .filter_map(|raw| Upstream::parse(raw).ok())
-            .filter(|u| u.is_encrypted() && u.host.parse::<IpAddr>().is_ok())
-            .collect()
-    }
-    pub fn proxy_bootstrap(&self) -> Vec<Upstream> {
-        self.proxy_server_nameserver
-            .iter()
-            .filter_map(|raw| Upstream::parse(raw).ok())
             .filter(|upstream| upstream.host.parse::<IpAddr>().is_ok())
             .collect()
-    }
-    pub fn always_direct(&self, upstream: &Upstream) -> bool {
-        self.proxy_server_nameserver
-            .iter()
-            .filter_map(|raw| Upstream::parse(raw).ok())
-            .any(|server| server == *upstream)
     }
     /// Whether a nameserver_policy entry applies to `domain`.
     pub fn has_policy(&self, domain: &str) -> bool {
@@ -285,13 +433,17 @@ impl Config {
             .keys()
             .any(|pattern| matches_domain(pattern, domain))
     }
-    pub fn servers(&self, domain: &str) -> &[String] {
+    pub fn servers(&self, domain: &str, direct: bool) -> &[String] {
         self.nameserver_policy
             .iter()
             .filter(|(pattern, _)| matches_domain(pattern, domain))
             .max_by_key(|(pattern, _)| pattern.len())
             .map(|(_, servers)| servers.as_slice())
-            .unwrap_or(&self.nameserver)
+            .unwrap_or(if direct {
+                &self.direct_nameserver
+            } else {
+                &self.proxy_nameserver
+            })
     }
     pub fn use_fake(&self, domain: &str) -> bool {
         let matched = self

@@ -26,18 +26,18 @@ struct Mock {
 #[test]
 fn proxy_dns_requires_independent_bootstrap_and_obeys_encryption_and_loop_checks() {
     let mut config = Config::default();
-    config.proxy_server_nameserver = vec!["https://dns.example/dns-query".into()];
+    config.direct_nameserver = vec!["https://dns.example/dns-query".into()];
     assert!(config.validate().is_err());
     config
-        .proxy_server_nameserver
+        .direct_nameserver
         .push("https://192.0.2.53/dns-query".into());
-    config.nameserver = vec!["https://other.example/dns-query".into()];
+    config.proxy_nameserver = vec!["https://other.example/dns-query".into()];
     config.validate().unwrap();
-    config.proxy_server_nameserver = vec!["udp://192.0.2.53".into()];
+    config.direct_nameserver = vec!["udp://192.0.2.53".into()];
     assert!(config.validate().is_err());
     config.plaintext_bypass = true;
     config.validate().unwrap();
-    config.proxy_server_nameserver = vec!["udp://127.0.0.1:1053".into()];
+    config.direct_nameserver = vec!["udp://127.0.0.1:1053".into()];
     assert!(
         config.validate().is_err(),
         "must not point back to its own DNS listener"
@@ -45,9 +45,9 @@ fn proxy_dns_requires_independent_bootstrap_and_obeys_encryption_and_loop_checks
 }
 
 #[tokio::test]
-async fn proxy_dns_ignores_business_policy_has_separate_cache_and_never_uses_regular_fallback() {
+async fn endpoint_lookup_isolates_cache_and_uses_optional_fallback() {
     let config = Config {
-        proxy_server_nameserver: vec!["tls://192.0.2.1".into(), "tls://192.0.2.53".into()],
+        direct_nameserver: vec!["tls://192.0.2.1".into(), "tls://192.0.2.53".into()],
         nameserver_policy: [("node.example".into(), vec!["tls://192.0.2.99".into()])]
             .into_iter()
             .collect(),
@@ -68,19 +68,19 @@ async fn proxy_dns_ignores_business_policy_has_separate_cache_and_never_uses_reg
         ["192.0.2.99", "192.0.2.1", "192.0.2.53"]
     );
     let mut failed = config;
-    failed.proxy_server_nameserver.pop();
+    failed.direct_nameserver.pop();
     failed.fallback = vec!["tls://192.0.2.100".into()];
     let resolver = Resolver::new(failed).unwrap();
     let mock = Mock::default();
-    assert!(resolver.lookup_proxy("node.example", &mock).await.is_err());
-    assert_eq!(*mock.servers.lock().unwrap(), ["192.0.2.1"]);
+    resolver.lookup_proxy("node.example", &mock).await.unwrap();
+    assert_eq!(*mock.servers.lock().unwrap(), ["192.0.2.1", "192.0.2.100"]);
 }
 
 #[tokio::test]
 async fn shared_mapping_store_preserves_ownership_and_reservations_across_generations() {
     let config = Config {
         fake_ip: true,
-        fake_ip_range6: Some("fdab::/64".into()),
+        fake_ip_range6: Some("fdab::/64".parse().unwrap()),
         mapping_capacity: 4,
         ..Config::default()
     };
@@ -109,7 +109,7 @@ async fn shared_mapping_store_preserves_ownership_and_reservations_across_genera
     assert_eq!(new.restore(ipv6).unwrap().as_deref(), Some("old.example"));
     assert!(new.try_reserve_address(first).is_err());
     let changed = Config {
-        fake_ip_range: "198.19.0.0/16".into(),
+        fake_ip_range: "198.19.0.0/16".parse().unwrap(),
         ..config.clone()
     };
     assert!(Resolver::with_mapping_store(changed, host.clone()).is_err());
@@ -349,7 +349,7 @@ fn address(message: &Message) -> std::net::IpAddr {
 async fn fake_ip_is_stable_unique_bounded_and_survives_reload() {
     let config = Config {
         fake_ip: true,
-        fake_ip_range6: Some("fdab::/64".into()),
+        fake_ip_range6: Some("fdab::/64".parse().unwrap()),
         mapping_capacity: 3,
         ..Config::default()
     };
@@ -383,7 +383,7 @@ async fn fake_ip_is_stable_unique_bounded_and_survives_reload() {
     reload.inherit(&resolver).unwrap();
     assert_eq!(reload.restore(a).unwrap(), resolver.restore(a).unwrap());
     let mut changed = Resolver::new(Config {
-        fake_ip_range: "198.19.0.0/16".into(),
+        fake_ip_range: "198.19.0.0/16".parse().unwrap(),
         ..config
     })
     .unwrap();
@@ -527,11 +527,43 @@ fn validates_upstreams_and_domain_patterns() {
         "*.example.com",
         "example.com"
     ));
-    assert!(Resolver::new(Config {
-        fake_ip_range: "10.0.0.0/8".into(),
-        ..Config::default()
-    })
-    .is_err());
+}
+
+#[test]
+fn fake_pools_must_fit_wholly_inside_private_or_benchmark_space() {
+    for (cidr, valid) in [
+        ("10.0.0.0/8", true),
+        ("172.16.0.0/12", true),
+        ("192.168.255.252/30", true),
+        ("198.18.0.0/15", true),
+        ("10.1.2.3/7", false),
+        ("172.31.0.1/11", false),
+        ("192.168.0.1/15", false),
+        ("198.18.0.0/14", false),
+        ("8.8.8.0/24", false),
+        ("127.0.0.0/8", false),
+        ("192.168.1.0/31", false),
+    ] {
+        let config = Config {
+            fake_ip_range: cidr.parse().unwrap(),
+            ..Config::default()
+        };
+        assert_eq!(config.validate().is_ok(), valid, "{cidr}");
+    }
+    for (cidr, valid) in [
+        ("fc00::/7", true),
+        ("fd12:3456::/48", true),
+        ("fd00::/126", true),
+        ("fc00::/6", false),
+        ("2001:db8::/64", false),
+        ("fd00::/127", false),
+    ] {
+        let config = Config {
+            fake_ip_range6: Some(cidr.parse().unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(config.validate().is_ok(), valid, "{cidr}");
+    }
 }
 
 #[tokio::test]
@@ -572,7 +604,7 @@ fn encrypted_only_is_default_and_plaintext_needs_explicit_bypass() {
     defaults.validate().unwrap();
     assert!(!defaults.plaintext_bypass);
     assert!(defaults
-        .nameserver
+        .proxy_nameserver
         .iter()
         .all(|raw| Upstream::parse(raw).unwrap().is_encrypted()));
     let with = |edit: fn(&mut Config)| {
@@ -580,20 +612,20 @@ fn encrypted_only_is_default_and_plaintext_needs_explicit_bypass() {
         edit(&mut config);
         config.validate()
     };
-    let error = with(|c| c.nameserver = vec!["udp://1.1.1.1:53".into()]).unwrap_err();
+    let error = with(|c| c.proxy_nameserver = vec!["udp://1.1.1.1:53".into()]).unwrap_err();
     assert!(error.to_string().contains("plaintext_bypass"), "{error}");
-    assert!(with(|c| c.nameserver = vec!["8.8.8.8".into()]).is_err());
+    assert!(with(|c| c.proxy_nameserver = vec!["8.8.8.8".into()]).is_err());
     assert!(with(|c| c.fallback = vec!["tcp://8.8.8.8:53".into()]).is_err());
     with(|c| {
         c.plaintext_bypass = true;
-        c.nameserver = vec!["udp://1.1.1.1:53".into()];
+        c.proxy_nameserver = vec!["udp://1.1.1.1:53".into()];
         c.fallback = vec!["tcp://8.8.8.8".into()];
     })
     .unwrap();
     // Hostname upstreams need an IP-literal encrypted upstream to bootstrap.
-    assert!(with(|c| c.nameserver = vec!["https://dns.example/dns-query".into()]).is_err());
+    assert!(with(|c| c.direct_nameserver = vec!["https://dns.example/dns-query".into()]).is_err());
     with(|c| {
-        c.nameserver = vec!["https://dns.example/dns-query".into()];
+        c.proxy_nameserver = vec!["https://dns.example/dns-query".into()];
         c.fallback = vec!["tls://1.1.1.1".into()];
     })
     .unwrap();
@@ -631,7 +663,7 @@ fn encrypted_only_is_default_and_plaintext_needs_explicit_bypass() {
 #[tokio::test]
 async fn bypass_domains_use_plaintext_policy_while_other_names_stay_encrypted() {
     let mut config = Config {
-        nameserver: vec!["https://1.1.1.1/dns-query".into()],
+        direct_nameserver: vec!["https://1.1.1.1/dns-query".into()],
         ..Config::default()
     };
     config
@@ -693,4 +725,156 @@ fn dial_addresses_follow_cname_owner_family_and_lifetime() {
     let resolver = Resolver::new(Config::default()).unwrap();
     resolver.bootstrap_store("ns.example", ip.into(), 0);
     assert!(resolver.bootstrap_cached("ns.example").is_none());
+}
+
+fn magic_config() -> Config {
+    let mut config = Config::default();
+    config.magic_dns.enable = true;
+    config.magic_dns.domain = "AsTrA.Home.Arpa.".into();
+    config.magic_dns.hosts.insert(
+        "NaS".into(),
+        vec![
+            "192.168.1.20".parse().unwrap(),
+            "fd12:3456::20".parse().unwrap(),
+        ],
+    );
+    config.fake_ip = true;
+    config
+}
+
+#[tokio::test]
+async fn magic_dns_answers_locally_before_routing_fake_ip_and_upstreams() {
+    let resolver = Resolver::new(magic_config()).unwrap();
+    let mock = Mock::default();
+    for name in ["nas", "NAS.", "nas.astra.home.arpa", "NAS.ASTRA.HOME.ARPA."] {
+        for (kind, expected) in [
+            (RecordType::A, "192.168.1.20"),
+            (RecordType::AAAA, "fd12:3456::20"),
+        ] {
+            let msg = answer(&resolver, &mock, name, kind).await;
+            assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+            assert!(msg.metadata.authoritative);
+            assert_eq!(address(&msg).to_string(), expected);
+            assert_eq!(msg.answers[0].ttl, 60);
+        }
+        let ips = resolver.lookup_proxy(name, &mock).await.unwrap();
+        assert_eq!(ips.len(), 2);
+        assert!(answer(&resolver, &mock, name, RecordType::HTTPS)
+            .await
+            .answers
+            .is_empty());
+    }
+    for name in ["typo.astra.home.arpa", "nested.nas.astra.home.arpa"] {
+        assert_eq!(
+            answer(&resolver, &mock, name, RecordType::TXT)
+                .await
+                .metadata
+                .response_code,
+            ResponseCode::NXDomain
+        );
+        assert!(resolver.lookup(name, &mock).await.is_err());
+    }
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+    assert!(resolver
+        .query_log()
+        .records
+        .iter()
+        .all(|r| r.source == "magic_dns" && r.upstream.is_none()));
+    for name in [
+        "unknown",
+        "nas.notastra.home.arpa",
+        "nas.astra.home.arpa.example",
+    ] {
+        assert!(resolver.is_fake(address(
+            &answer(&resolver, &mock, name, RecordType::A).await
+        )));
+    }
+}
+
+#[tokio::test]
+async fn magic_dns_reload_replaces_records_and_honors_address_families() {
+    let mut config = magic_config();
+    let old = Resolver::new(config.clone()).unwrap();
+    let mock = Mock::default();
+    assert_eq!(
+        address(&answer(&old, &mock, "nas", RecordType::A).await).to_string(),
+        "192.168.1.20"
+    );
+    config.ipv6 = false;
+    config.magic_dns.domain = "lab.home.arpa".into();
+    config.magic_dns.hosts.get_mut("NaS").unwrap()[0] = "192.168.1.21".parse().unwrap();
+    let mut next = Resolver::new(config.clone()).unwrap();
+    next.inherit(&old).unwrap();
+    assert_eq!(
+        address(&answer(&next, &mock, "nas.lab.home.arpa", RecordType::A).await).to_string(),
+        "192.168.1.21"
+    );
+    let nodata = answer(&next, &mock, "nas", RecordType::AAAA).await;
+    assert!(nodata.answers.is_empty());
+    assert_eq!(nodata.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        answer(&next, &mock, "unknown.lab.home.arpa", RecordType::AAAA)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::NXDomain
+    );
+    config.ipv6 = true;
+    config
+        .magic_dns
+        .hosts
+        .get_mut("NaS")
+        .unwrap()
+        .retain(|ip| ip.is_ipv4());
+    let mut v4 = Resolver::new(config.clone()).unwrap();
+    v4.inherit(&next).unwrap();
+    let nodata = answer(&v4, &mock, "nas", RecordType::AAAA).await;
+    assert_eq!(nodata.metadata.response_code, ResponseCode::NoError);
+    assert!(nodata.answers.is_empty());
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+    config.magic_dns.enable = false;
+    let disabled = Resolver::new(config).unwrap();
+    assert!(disabled.is_fake(address(
+        &answer(&disabled, &mock, "nas", RecordType::A).await
+    )));
+}
+
+#[test]
+fn magic_dns_rejects_ambiguous_names_and_synthetic_addresses() {
+    for (key, addresses) in [
+        ("nas", vec!["192.0.2.2"]),
+        ("a.b", vec!["192.0.2.2"]),
+        ("-bad", vec!["192.0.2.2"]),
+        ("empty", vec![]),
+        ("v4", vec!["198.19.0.1"]),
+        ("pool", vec!["10.1.2.3"]),
+        ("v6", vec!["fdab::20"]),
+    ] {
+        let mut config = magic_config();
+        config.fake_ip_range = "10.1.0.0/16".parse().unwrap();
+        config.fake_ip_range6 = Some("fdab::/64".parse().unwrap());
+        config.magic_dns.hosts.insert(
+            key.into(),
+            addresses.iter().map(|v| v.parse().unwrap()).collect(),
+        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(key));
+    }
+    for suffix in [
+        "",
+        ".",
+        "a..b",
+        "*.home.arpa",
+        "x..",
+        "-invalid",
+        "127.0.0.1",
+    ] {
+        let mut config = magic_config();
+        config.magic_dns.domain = suffix.into();
+        assert!(config.validate().is_err(), "{suffix}");
+    }
 }

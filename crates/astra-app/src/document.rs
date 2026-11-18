@@ -79,7 +79,12 @@ impl Document {
         true
     }
     pub fn schema(&self, path: &[Part], platform: Platform) -> Result<Schema> {
-        let doc = self.editable()?;
+        let mut doc = self.editable()?;
+        if self.kind == CoreKind::Proxy
+            && matches!(path.first(), Some(Part::Key(key)) if key == "dns")
+        {
+            migrate_dns_upstreams(&mut doc);
+        }
         let rows = schema::rows_for(&doc, path, self.kind, platform, |s| s)
             .into_iter()
             .map(|row| match row {
@@ -144,6 +149,11 @@ impl Document {
         // their source representation, comments and unknown extension values.
         match &command {
             EditCommand::SetField { path, .. } | EditCommand::RemoveField { path, .. } => {
+                if self.kind == CoreKind::Proxy
+                    && matches!(path.first(), Some(Part::Key(key)) if key == "dns")
+                {
+                    migrate_dns_upstreams(&mut doc);
+                }
                 normalize_path(doc.as_table_mut(), path, false)?
             }
             EditCommand::AppendEntry { path }
@@ -162,6 +172,14 @@ impl Document {
         match command {
             EditCommand::SetField { path, key, input } => {
                 ensure!(!key.is_empty(), "field key is empty");
+                if self.kind == CoreKind::Proxy
+                    && matches!(path.as_slice(), [Part::Key(group)] if group == "dns")
+                    && key == "fallback"
+                    && input.trim().is_empty()
+                {
+                    table_at_mut(doc.as_table_mut(), &path)?.remove("fallback");
+                    return Ok(self.commit(doc.to_string()));
+                }
                 let spec = schema::rows_for(&doc, &path, self.kind, Platform::current(), |s| s)
                     .into_iter()
                     .find_map(|r| match r {
@@ -422,6 +440,26 @@ impl Document {
         true
     }
 }
+fn migrate_dns_upstreams(doc: &mut DocumentMut) {
+    let Some(dns) = doc.get_mut("dns").and_then(Item::as_table_like_mut) else {
+        return;
+    };
+    let legacy = dns.remove("nameserver");
+    let endpoints = dns
+        .remove("proxy_server_nameserver")
+        .filter(|item| !item.as_array().is_some_and(|array| array.is_empty()));
+    if !dns.contains_key("direct_nameserver") {
+        if let Some(value) = endpoints.or_else(|| legacy.clone()) {
+            dns.insert("direct_nameserver", value);
+        }
+    }
+    if !dns.contains_key("proxy_nameserver") {
+        if let Some(value) = legacy {
+            dns.insert("proxy_nameserver", value);
+        }
+    }
+}
+
 fn parse(text: &str) -> Result<DocumentMut> {
     ensure!(text.len() <= DOCUMENT_LIMIT, "configuration exceeds 1 MiB");
     text.parse().context("invalid TOML configuration")

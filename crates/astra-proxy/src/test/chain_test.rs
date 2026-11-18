@@ -1,13 +1,16 @@
 use super::*;
+use astra_model::{Inbound, Network, RouteAction, Target};
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Mutex};
+use tokio::time::timeout;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-struct Server {
-    addr: SocketAddr,
-    targets: Arc<Mutex<Vec<Target>>>,
+pub(crate) struct Server {
+    pub(crate) addr: SocketAddr,
+    pub(crate) targets: Arc<Mutex<Vec<Target>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -15,7 +18,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-async fn socks_server() -> Server {
+pub(crate) async fn socks_server() -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let targets = Arc::new(Mutex::new(Vec::new()));
@@ -42,7 +45,8 @@ async fn socks_server() -> Server {
                 };
                 log.lock().unwrap().push(target.clone());
                 if command == 3 {
-                    let _ = proxy::udp::associate_stream(stream, target, app, peer, addr).await;
+                    let _ =
+                        inbound::socks_udp::associate_stream(stream, target, app, peer, addr).await;
                 } else {
                     let mut remote = TcpStream::connect((target.host.as_str(), target.port))
                         .await
@@ -61,7 +65,7 @@ async fn socks_server() -> Server {
         task,
     }
 }
-fn node(name: &str, server: SocketAddr, front: Option<&str>) -> String {
+pub(crate) fn node(name: &str, server: SocketAddr, front: Option<&str>) -> String {
     format!(
         "\n[[outbounds]]\nkind='socks5'\ntag='{name}'\nserver='{server}'\n{}",
         front
@@ -102,15 +106,17 @@ async fn chain_four_hops_and_relay_preserve_actual_path() {
             "[proxy_groups.chain]\nmode='relay'\nmembers=['entry','r1','r2','exit']\n",
         );
         for action in ["exit", "chain"] {
-            let mut stream = app
-                .connect_tracked(
-                    &target,
-                    &RouteAction::Proxy(action.into()),
-                    Inbound::Socks5,
-                    None,
-                )
-                .await
-                .unwrap();
+            let session =
+                inbound::Flow::new(&target, Inbound::ProcessCapture, Network::Tcp, None, None)
+                    .plan(
+                        &app,
+                        inbound::FlowPolicy::Bound(proxy::session::Binding::Proxy {
+                            tag: action.into(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            let mut stream = session.connect_tcp(&app).await.unwrap();
             stream.write_all(b"chain!").await.unwrap();
             let mut bytes = [0; 6];
             stream.read_exact(&mut bytes).await.unwrap();
@@ -172,12 +178,12 @@ async fn chain_udp_uses_front_for_control_and_datagrams() {
             host: addr.ip().to_string(),
             port: addr.port(),
         };
-        let conn = proxy::udp::open_action(
+        let conn = inbound::socks_udp::open(
             &app,
             &target,
             Inbound::Socks5,
             "127.0.0.1:1".parse().unwrap(),
-            RouteAction::Proxy("exit".into()),
+            "127.0.0.1:1080".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -256,7 +262,7 @@ async fn chain_vless_udp_crosses_a_tcp_only_http_entry() {
         });
         let app = app(&format!("[[outbounds]]\nkind='http'\ntag='entry'\nserver='{entry}'\n[[outbounds]]\nkind='native'\ntag='exit'\ndialer_proxy='entry'\n[outbounds.config]\nprotocol='vless'\nserver='127.0.0.1'\nport={}\nuuid='00000000-0000-4000-8000-000000000001'\n", exit.port()), "");
         let target = Target { host: "remote-only.invalid".into(), port: 53 };
-        let conn = proxy::udp::open_action(&app, &target, Inbound::Socks5, "127.0.0.1:1".parse().unwrap(), RouteAction::Proxy("exit".into())).await.unwrap();
+        let conn = inbound::socks_udp::open(&app, &target, Inbound::Socks5, "127.0.0.1:1".parse().unwrap(), "127.0.0.1:1080".parse().unwrap()).await.unwrap();
         conn.send(b"remote-domain", "0.0.0.0:53".parse().unwrap()).await.unwrap();
         let mut bytes = [0; 64]; let (n, _) = conn.recv(&mut bytes).await.unwrap(); assert_eq!(&bytes[..n], b"remote-domain");
         drop(conn); server.await.unwrap();
