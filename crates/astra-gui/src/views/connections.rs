@@ -13,7 +13,7 @@ use gpui_component::{
     button::Button,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
-    ActiveTheme,
+    ActiveTheme, Disableable,
 };
 use std::sync::Arc;
 
@@ -230,6 +230,7 @@ impl Render for View {
                         .items_center()
                         .gap_3()
                         .px_3()
+                        .cursor_pointer()
                         .border_b_1()
                         .border_color(theme.border)
                         .bg(if chosen {
@@ -363,6 +364,12 @@ impl Render for View {
                         t("Outbound"),
                         connection.outbound
                     )))
+                    .child(div().text_sm().child(format!(
+                        "↑ {} · ↓ {} · {}",
+                        astra_client::live::bytes(connection.upload),
+                        astra_client::live::bytes(connection.download),
+                        astra_client::format::duration(connection.elapsed_ms / 1000)
+                    )))
                     .child(
                         div()
                             .flex()
@@ -370,6 +377,7 @@ impl Render for View {
                             .child(
                                 Button::new("close-connection")
                                     .label(t("Close connection"))
+                                    .disabled(close_target.is_none())
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(target) = close_target.clone() {
                                             view.close(target, cx)

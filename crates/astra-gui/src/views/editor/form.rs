@@ -74,7 +74,42 @@ impl View {
             let key = meta.spec.key.clone();
             let list = matches!(meta.spec.kind, Type::StringList);
             self.field_subscriptions.push(cx.subscribe_in(&input, window, move |view, input, event, window, cx| {
-                if list { return; }
+                if list {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        if !view.commit_pending(window, cx) {
+                            return;
+                        }
+                        let item = input.read(cx).value().trim().to_owned();
+                        if !item.is_empty() {
+                            if let Some(field) = view
+                                .fields
+                                .iter()
+                                .find(|field| field.meta.path == path && field.meta.spec.key == key)
+                                .cloned()
+                            {
+                                let mut values = view
+                                    .model
+                                    .read(cx)
+                                    .client
+                                    .editor
+                                    .as_ref()
+                                    .and_then(|editor| editor.presentation().ok())
+                                    .and_then(|presentation| {
+                                        presentation
+                                            .fields
+                                            .into_iter()
+                                            .find(|meta| meta.path == path && meta.spec.key == key)
+                                    })
+                                    .map(|meta| meta.list)
+                                    .unwrap_or_else(|| field.meta.list.clone());
+                                values.push(item);
+                                view.set_list(&field, values, cx);
+                                input.update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                        }
+                    }
+                    return;
+                }
                 match event {
                     InputEvent::Focus => {
                         let pending = view.model.read(cx).client.editor.as_ref().and_then(|editor| match &editor.form.mode {
@@ -166,7 +201,8 @@ impl View {
             .id("editor-form")
             .flex_1()
             .min_w_0()
-            .h(px(470.))
+            .h_full()
+            .min_h(px(280.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -273,10 +309,10 @@ impl View {
                 row = row.child(Select::new(select).placeholder(meta.spec.label.clone()));
                 // References may accept an explicit tag outside the loaded catalogue.
                 if !matches!(meta.spec.kind, Type::Choice(_)) {
-                    row = row.child(Input::new(&field.input));
+                    row = row.child(Input::new(&field.input).when(meta.spec.secret(), Input::mask_toggle));
                 }
             } else {
-                row = row.child(Input::new(&field.input));
+                row = row.child(Input::new(&field.input).when(meta.spec.secret(), Input::mask_toggle));
             }
             if !meta.spec.help.is_empty() {
                 row = row.child(

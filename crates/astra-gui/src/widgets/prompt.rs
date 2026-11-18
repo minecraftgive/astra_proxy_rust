@@ -99,7 +99,7 @@ impl PromptHost {
     ) -> Self {
         init(cx);
         let input = cx.new(|cx| InputState::new(window, cx));
-        let multiline = cx.new(|cx| TextareaState::new(window, cx).submit_on_enter(true));
+        let multiline = cx.new(|cx| TextareaState::new(window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search")));
         let mut host = Self {
             model: model.clone(),
@@ -132,7 +132,9 @@ impl PromptHost {
                 window,
                 |host, state, event, window, cx| match event {
                     InputEvent::Change => host.edit(state.read(cx).value().to_string(), cx),
-                    InputEvent::PressEnter { .. } => host.submit(false, window, cx),
+                    InputEvent::PressEnter { secondary, .. } if *secondary => {
+                        host.submit(false, window, cx)
+                    }
                     _ => {}
                 },
             ),
@@ -524,6 +526,19 @@ impl Render for PromptHost {
                 match event.keystroke.key.as_str() {
                     "escape" => host.cancel(window, cx),
                     "enter" => {
+                        let multiline_prompt = host
+                            .model
+                            .read(cx)
+                            .client
+                            .prompt
+                            .as_ref()
+                            .is_some_and(is_multiline);
+                        if multiline_prompt
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.platform
+                        {
+                            return;
+                        }
                         let accepted = host.model.read(cx).client.confirmation_accept;
                         host.submit(accepted, window, cx);
                     }

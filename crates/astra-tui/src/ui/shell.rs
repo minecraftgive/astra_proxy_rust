@@ -119,30 +119,15 @@ impl Ui {
         entries
     }
     fn palette_matches(&self) -> Vec<Entry> {
-        use astra_client::i18n::{language, translate, Language};
-        let query = self
-            .palette
-            .as_ref()
-            .map_or("", |p| p.query.as_str())
-            .to_lowercase();
+        use astra_client::i18n::{language, Language};
+        let query = self.palette.as_ref().map_or("", |p| p.query.as_str());
         let current = language();
-        let matches = |entry: &Entry, language| {
-            format!(
-                "{} {} {}",
-                translate(entry.scope, language),
-                entry.label,
-                entry.key
-            )
-            .to_lowercase()
-            .contains(&query)
-        };
-        self.palette_entries_in(current, self.palette_mode())
-            .into_iter()
-            .zip(self.palette_entries_in(Language::English, self.palette_mode()))
-            .filter_map(|(entry, english)| {
-                (matches(&entry, current) || matches(&english, Language::English)).then_some(entry)
-            })
-            .collect()
+        let entries = self.palette_entries_in(current, self.palette_mode());
+        if query.trim().is_empty() {
+            return entries;
+        }
+        let english_entries = self.palette_entries_in(Language::English, self.palette_mode());
+        astra_client::palette::filter_and_rank_entries(entries, english_entries, current, query)
     }
     pub(super) fn command_help(&self) -> String {
         self.help_override.clone().unwrap_or_else(|| {

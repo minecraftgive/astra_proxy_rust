@@ -240,7 +240,9 @@ impl View {
                 })
                 .collect::<Vec<_>>()
         })
-        .h(px(470.))
+        .flex_none()
+        .h_full()
+        .min_h(px(280.))
         .w(px(370.))
         .into_any_element()
     }

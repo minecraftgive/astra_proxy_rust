@@ -8,7 +8,19 @@ fn every_shared_spec_shortcut_has_a_gpui_action(cx: &mut TestAppContext) {
             .iter()
             .map(|spec| spec.key.split(" / ").filter(|key| !key.is_empty()).count())
             .sum();
-        assert_eq!(keys.len(), count + 13 + PLATFORM_CHORDS.len()); // `7` is supplied by Settings.
+        assert_eq!(
+            keys.len(),
+            count - GUI_EXCLUDED_CHORDS.len() + 13 + PLATFORM_CHORDS.len()
+        ); // `7` is supplied by Settings.
+        let ctrl_c = Keystroke::parse("ctrl-c").unwrap();
+        assert!(keys.iter().all(|binding| {
+            binding.match_keystrokes(std::slice::from_ref(&ctrl_c)) != Some(false)
+                || !binding
+                    .action()
+                    .as_any()
+                    .downcast_ref::<Command>()
+                    .is_some_and(|command| command.0 == Id::Quit)
+        }));
         for (index, binding) in keys.iter().enumerate() {
             assert!(keys[..index]
                 .iter()

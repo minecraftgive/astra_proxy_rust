@@ -835,6 +835,7 @@ impl AppModel {
                 }
             }
             BackendEvent::Rows(reply) => {
+                let was_offline = !self.online;
                 self.online = true;
                 self.connection_errors.remove("Manager");
                 self.client.update_rows(*reply);
@@ -854,6 +855,9 @@ impl AppModel {
                 } else {
                     key
                 };
+                if was_offline && key.is_none() {
+                    self.client.runtime_error.clear();
+                }
                 let old = self
                     .client
                     .runtime_snapshot

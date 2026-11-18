@@ -12,7 +12,10 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{
+    button::{Button, ButtonVariants},
+    Disableable,
+};
 pub struct View {
     model: Entity<AppModel>,
     focus: FocusHandle,
@@ -87,6 +90,7 @@ impl Render for View {
                 match event.keystroke.key.as_str() {
                     "t" | "enter" => view.operation(Operation::Explain, cx),
                     "e" => view.operation(Operation::Edit, cx),
+                    "r" => view.operation(Operation::Reload, cx),
                     "/" => view.dispatch(Client::rule_search, cx),
                     _ => return,
                 };
@@ -94,6 +98,7 @@ impl Render for View {
             }));
         if let Some(summary) = summary {
             let details = summary.details.clone();
+            let running = summary.row.pid.is_some();
             content = content.child(super::profiles::instance_card(summary, cx));
             // The rule set card carries its own actions, like the web UI's card tools.
             let card = Card::new(t("Rules"))
@@ -109,6 +114,14 @@ impl Render for View {
                     Button::new("rule-logs").ghost().label(t("Logs")).on_click(
                         cx.listener(|view, _, _, cx| view.operation(Operation::Logs, cx)),
                     ),
+                )
+                .action(
+                    Button::new("rule-reload")
+                        .label(t("Reload"))
+                        .disabled(!running)
+                        .on_click(
+                            cx.listener(|view, _, _, cx| view.operation(Operation::Reload, cx)),
+                        ),
                 )
                 .action(
                     Button::new("rule-edit").label(t("Edit rules")).on_click(

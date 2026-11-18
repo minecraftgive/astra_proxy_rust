@@ -15,9 +15,19 @@ pub struct Page {
 }
 
 #[cfg(target_os = "macos")]
-pub const PLATFORM_CHORDS: &[(&str, Id)] = &[("cmd-k", Id::Palette)];
+pub const PLATFORM_CHORDS: &[(&str, Id)] = &[
+    ("cmd-k", Id::Palette),
+    ("cmd-p", Id::Profiles),
+    ("cmd-f", Id::Search),
+    ("cmd-s", Id::Save),
+    ("cmd-z", Id::Undo),
+    ("cmd-shift-z", Id::Redo),
+    ("cmd-,", Id::Settings),
+];
 #[cfg(not(target_os = "macos"))]
 pub const PLATFORM_CHORDS: &[(&str, Id)] = &[];
+
+pub const GUI_EXCLUDED_CHORDS: &[(Id, &str)] = &[(Id::Quit, "ctrl-c")];
 
 pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     let context = |source| {
@@ -42,6 +52,9 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
     for spec in SPECS {
         for chord in spec.key.split(" / ").filter(|key| !key.is_empty()) {
             let chord = chord.to_ascii_lowercase();
+            if GUI_EXCLUDED_CHORDS.contains(&(spec.id, chord.as_str())) {
+                continue;
+            }
             let nettools_reserved = chord.split('-').next_back().is_some_and(|key| {
                 key.strip_prefix('f')
                     .and_then(|n| n.parse::<u8>().ok())
@@ -94,19 +107,17 @@ pub fn bindings(cx: &gpui::App) -> Vec<KeyBinding> {
             );
         }
     }
-    // Spotlight's chord on macOS, alongside the shared Ctrl-K / F2; it works from
-    // any screen, including inside text fields and the editor.
+    // Native macOS chords alongside the shared Ctrl/function shortcuts.
     for (chord, id) in PLATFORM_CHORDS {
+        let context = match *id {
+            Id::Save | Id::Undo | Id::Redo => editor.clone(),
+            Id::Profiles => outside_nettools.clone(),
+            Id::Search => non_input.clone(),
+            _ => application.clone(),
+        };
         bindings.push(
-            KeyBinding::load(
-                chord,
-                Box::new(Command(*id)),
-                application.clone(),
-                false,
-                None,
-                cx,
-            )
-            .expect("platform chord"),
+            KeyBinding::load(chord, Box::new(Command(*id)), context, false, None, cx)
+                .expect("platform chord"),
         );
     }
     bindings

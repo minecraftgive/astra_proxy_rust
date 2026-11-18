@@ -122,6 +122,12 @@ impl Render for View {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entries = Arc::new(self.entries(cx));
         self.selected = self.selected.min(entries.len().saturating_sub(1));
+        let active_proxy = self
+            .model
+            .read(cx)
+            .client
+            .active_proxy()
+            .map(|row| row.instance.name.clone());
         let pal = crate::theme::palette(cx);
         let mono = crate::theme::mono(cx);
         div()
@@ -156,6 +162,13 @@ impl Render for View {
                         range
                             .map(|index| {
                                 let entry = &entries[index];
+                                let is_active = matches!(
+                                    &entry.run,
+                                    astra_client::palette::Intent::Activate {
+                                        name,
+                                        kind: astra_client::protocol::Kind::Proxy,
+                                    } if active_proxy.as_deref() == Some(name.as_str())
+                                );
                                 div()
                                     .id(("entry", index))
                                     .h(px(48.))
@@ -164,6 +177,7 @@ impl Render for View {
                                     .flex_col()
                                     .justify_center()
                                     .rounded_md()
+                                    .when(entry.unavailable.is_none(), |row| row.cursor_pointer())
                                     .when(index == this.selected, |row| {
                                         row.bg(crate::theme::palette(cx).accent_soft)
                                     })
@@ -177,6 +191,15 @@ impl Render for View {
                                             .flex()
                                             .items_center()
                                             .gap_2()
+                                            .when(is_active, |row| {
+                                                row.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(pal.accent)
+                                                        .child("●"),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .flex_none()

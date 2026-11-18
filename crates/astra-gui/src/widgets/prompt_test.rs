@@ -5,7 +5,7 @@ use astra_client::{
     state::{Input as ClientInput, Prompt},
 };
 use gpui::{
-    div, AppContext, Context, Entity, IntoElement, ParentElement, Render, Subscription,
+    div, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Subscription,
     TestAppContext, Window, WindowHandle,
 };
 use gpui_component::Root;
@@ -166,4 +166,33 @@ fn stale_native_file_choice_cannot_replace_a_new_prompt(cx: &mut TestAppContext)
         assert!(model.client.input.is_empty());
         assert!(matches!(&model.client.prompt, Some(Prompt::AddPath(name)) if name == "new"));
     });
+}
+
+#[gpui::test]
+fn multiline_prompt_keeps_plain_enter_for_newlines_and_submits_with_secondary_enter(
+    cx: &mut TestAppContext,
+) {
+    let (model, host, window, events) = fixture(
+        cx,
+        Prompt::ImportNode(astra_client::import::MergeMode::Append),
+    );
+    cx.simulate_keystrokes(window.into(), "vless enter");
+    assert!(events.borrow().is_empty());
+    model.read_with(cx, |model, _| {
+        assert!(matches!(model.client.prompt, Some(Prompt::ImportNode(_))));
+    });
+    window
+        .update(cx, |_, window, cx| {
+            assert!(host.read_with(cx, |host, cx| host
+                .multiline
+                .focus_handle(cx)
+                .is_focused(window)));
+        })
+        .unwrap();
+    #[cfg(target_os = "macos")]
+    let submit_stroke = "cmd-enter";
+    #[cfg(not(target_os = "macos"))]
+    let submit_stroke = "ctrl-enter";
+    cx.simulate_keystrokes(window.into(), submit_stroke);
+    assert!(!events.borrow().is_empty() || host.read_with(cx, |host, _| host.error.is_some()));
 }

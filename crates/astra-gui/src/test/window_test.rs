@@ -453,9 +453,21 @@ fn palette_floats_over_any_screen_and_escape_closes_only_the_palette(cx: &mut Te
         assert!(app.palette_view.is_none());
         assert_eq!(app.panel, Some(Panel::Tasks));
     });
-    for chord in super::keys::PLATFORM_CHORDS.iter().map(|(chord, _)| *chord) {
+    for chord in super::keys::PLATFORM_CHORDS
+        .iter()
+        .filter(|(_, id)| *id == Id::Palette)
+        .map(|(chord, _)| *chord)
+    {
         cx.simulate_keystrokes(handle.into(), chord);
         app.read_with(cx, |app, _| assert!(app.palette_view.is_some(), "{chord}"));
         cx.simulate_keystrokes(handle.into(), "escape");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        cx.simulate_keystrokes(handle.into(), "cmd-,");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.page, Some(6));
+            assert!(app.panel.is_none());
+        });
     }
 }

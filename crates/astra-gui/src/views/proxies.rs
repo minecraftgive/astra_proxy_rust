@@ -15,7 +15,7 @@ use gpui::{
 use gpui_component::{
     button::Button,
     input::{Input, InputEvent, InputState},
-    ActiveTheme,
+    ActiveTheme, Disableable,
 };
 use std::sync::Arc;
 
@@ -95,7 +95,17 @@ impl View {
         }
     }
     pub fn choose(&mut self, group: String, member: String, cx: &mut Context<Self>) {
-        self.dispatch(|client| client.select_proxy_member(&group, &member), cx);
+        self.dispatch(
+            |client| {
+                let input = client.select_proxy_member(&group, &member);
+                if matches!(input, ClientInput::Idle) {
+                    let message = client.message.clone();
+                    client.tasks.notice_result(&message, true);
+                }
+                input
+            },
+            cx,
+        );
     }
     fn select(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(
@@ -116,20 +126,29 @@ impl View {
             return;
         }
         match event.keystroke.key.as_str() {
-            "up" => self.dispatch(
-                |client| {
-                    client.move_proxy_group(-1);
-                    ClientInput::Idle
-                },
-                cx,
-            ),
-            "down" => self.dispatch(
-                |client| {
-                    client.move_proxy_group(1);
-                    ClientInput::Idle
-                },
-                cx,
-            ),
+            "up" | "down" => {
+                let step: isize = if event.keystroke.key == "up" { -1 } else { 1 };
+                let query = self.search.read(cx).value().to_string();
+                self.dispatch(
+                    move |client| {
+                        let groups = client.proxy_groups(&query);
+                        if !groups.is_empty() {
+                            let current = client
+                                .selected_proxy_group()
+                                .and_then(|group| {
+                                    groups.iter().position(|item| item.name == group.name)
+                                })
+                                .unwrap_or(0);
+                            let next = (current as isize + step)
+                                .clamp(0, groups.len() as isize - 1)
+                                as usize;
+                            client.select_proxy_group(&groups[next].name);
+                        }
+                        ClientInput::Idle
+                    },
+                    cx,
+                );
+            }
             "t" if !event.is_held => self.dispatch(Client::test_selected_group, cx),
             "/" => self.search.update(cx, |input, cx| input.focus(window, cx)),
             _ => return,
@@ -164,6 +183,7 @@ impl Render for View {
                 .map(|index| {
                     let group = &groups[index];
                     let name = group.name.clone();
+                    let mode = group.mode.clone();
                     let selected = group_name.as_ref() == Some(&name);
                     let entity = entity.clone();
                     div()
@@ -172,16 +192,39 @@ impl Render for View {
                         .p_3()
                         .border_b_1()
                         .border_color(theme.border)
+                        .cursor_pointer()
                         .bg(if selected {
                             pal.accent_soft
                         } else {
                             pal.surface
                         })
-                        .child(div().text_sm().child(name.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(mode),
+                                ),
+                        )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
+                                .truncate()
                                 .child(group.selected.clone().unwrap_or_else(|| "—".into())),
                         )
                         .on_click(move |_, window, cx| {
@@ -220,6 +263,7 @@ impl Render for View {
         if let Some(group) = group {
             let title = group.name.clone();
             let testing = group.testing;
+            let selectable = group.mode == "select";
             member_panel = member_panel.child(
                 div()
                     .flex()
@@ -235,6 +279,7 @@ impl Render for View {
                     .child(div().flex_1())
                     .child(
                         Button::new("test-proxy-group")
+                            .disabled(testing)
                             .label(if testing {
                                 t("Testing…")
                             } else {
@@ -275,10 +320,12 @@ impl Render for View {
                                         .p_3()
                                         .rounded_md()
                                         .border_1()
-                                        .cursor_pointer()
+                                        .when(selectable, |tile| tile.cursor_pointer())
                                         .border_color(if chosen { pal.accent } else { pal.border })
                                         .bg(if chosen { pal.accent_soft } else { pal.surface })
-                                        .when(!chosen, |tile| tile.hover(move |s| s.bg(hover)))
+                                        .when(selectable && !chosen, |tile| {
+                                            tile.hover(move |s| s.bg(hover))
+                                        })
                                         .child(
                                             div()
                                                 .text_sm()
@@ -293,14 +340,16 @@ impl Render for View {
                                                     name.clone()
                                                 }),
                                         )
-                                        .child(
-                                            div().flex().child(DelayChip::new(
+                                        .child(div().flex().child(if member.alive == Some(false) {
+                                            DelayChip::failed()
+                                        } else {
+                                            DelayChip::new(
                                                 member
                                                     .alive
                                                     .filter(|alive| *alive)
                                                     .and(member.delay_ms),
-                                            )),
-                                        )
+                                            )
+                                        }))
                                         .on_click(move |_, _, cx| {
                                             let _ = entity.update(cx, |view, cx| {
                                                 view.choose(target.clone(), name.clone(), cx)

@@ -176,6 +176,7 @@ impl AppWindow {
                     | Id::ExternalEditor
                     | Id::ReadExternal
                     | Id::CompareDraft
+                    | Id::OverwriteConflict
                     | Id::Undo
                     | Id::Redo
                     | Id::Discard
@@ -201,6 +202,9 @@ impl AppWindow {
         ) && !self.leave_editor(window, cx)
         {
             return;
+        }
+        if id == Id::Settings {
+            self.panel = None;
         }
         window.focus(&self.focus, cx);
         self.palette = false;

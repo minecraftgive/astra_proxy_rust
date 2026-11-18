@@ -211,8 +211,14 @@ impl Render for View {
         let client = &self.model.read(cx).client;
         let kind = client.kind;
         let selected = client.selected().map(|row| row.instance.name.clone());
-        let rows: Arc<[_]> = client
+        let rows: Arc<[(_, Vec<Operation>)]> = client
             .profile_rows(self.search.read(cx).value().as_ref())
+            .into_iter()
+            .map(|row| {
+                let operations = client.operations_for(&row);
+                (row, operations)
+            })
+            .collect::<Vec<_>>()
             .into();
         let row_count = rows.len();
         let summary = client.selected_summary();
@@ -251,7 +257,8 @@ impl Render for View {
         let everyday = |operation: Operation| {
             matches!(
                 operation,
-                Operation::Start
+                Operation::Activate
+                    | Operation::Start
                     | Operation::Stop
                     | Operation::Restart
                     | Operation::Reload
@@ -314,7 +321,7 @@ impl Render for View {
         let list = uniform_list("profile-table", rows.len(), move |range, _, _| {
             range
                 .map(|index| {
-                    let row = rows[index].clone();
+                    let (row, operations) = rows[index].clone();
                     let name = row.instance.name.clone();
                     let select_name = name.clone();
                     let menu_name = name.clone();
@@ -322,7 +329,6 @@ impl Render for View {
                     let select_entity = entity.clone();
                     let menu_entity = entity.clone();
                     let selected = selected.as_ref() == Some(&name);
-                    let operations = astra_client::intents::row_operations(&row);
                     div()
                         .id(("profile-row", index))
                         .w_full()
@@ -331,6 +337,7 @@ impl Render for View {
                         .items_center()
                         .gap_3()
                         .px_3()
+                        .cursor_pointer()
                         .border_b_1()
                         .border_color(theme.border)
                         .bg(if selected {
@@ -353,9 +360,30 @@ impl Render for View {
                                 .w(px(100.))
                                 .child(astra_client::format::duration(row.uptime)),
                         )
-                        .on_click(move |_, window, cx| {
+                        .on_click(move |event: &gpui::ClickEvent, window, cx| {
+                            let activate = event.click_count() == 2 && kind == Kind::Proxy;
                             let _ = select_entity.update(cx, |view, cx| {
-                                view.select(kind, select_name.clone(), window, cx)
+                                view.select(kind, select_name.clone(), window, cx);
+                                if activate {
+                                    let name = select_name.clone();
+                                    view.dispatch(
+                                        move |client| {
+                                            if client
+                                                .active_proxy()
+                                                .is_some_and(|row| row.instance.name == name)
+                                            {
+                                                ClientInput::Idle
+                                            } else {
+                                                client.named_profile_action(
+                                                    kind,
+                                                    &name,
+                                                    ProfileAction::Operation(Operation::Activate),
+                                                )
+                                            }
+                                        },
+                                        cx,
+                                    );
+                                }
                             });
                         })
                         .context_menu(move |mut menu, _, _| {

@@ -15,7 +15,10 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{
+    button::{Button, ButtonVariants},
+    Disableable,
+};
 use std::sync::Arc;
 
 pub struct View {
@@ -169,8 +172,21 @@ impl View {
     }
     /// Picks a node and folds the group back up, like choosing from a menu.
     pub fn choose(&mut self, group: String, member: String, cx: &mut Context<Self>) {
-        self.dispatch(|client| client.select_proxy_member(&group, &member), cx);
-        if self.expanded.as_deref() == Some(group.as_str()) {
+        let mut applied = false;
+        self.dispatch(
+            |client| {
+                let input = client.select_proxy_member(&group, &member);
+                if matches!(input, ClientInput::Idle) {
+                    let message = client.message.clone();
+                    client.tasks.notice_result(&message, true);
+                } else {
+                    applied = true;
+                }
+                input
+            },
+            cx,
+        );
+        if applied && self.expanded.as_deref() == Some(group.as_str()) {
             self.expanded = None;
         }
         cx.notify();
@@ -320,6 +336,8 @@ impl Render for View {
         let paused = client.connections_paused();
         let health = client.runtime_health();
         let row = client.active_proxy().cloned();
+        let proxy_dirty = row.as_ref().is_some_and(|r| r.changed && r.pid.is_some());
+        let rule_dirty = client.active_rule().is_some_and(|r| r.changed && r.pid.is_some());
         let listeners = row
             .as_ref()
             .and_then(|row| client.details.get(&row.instance.name))
@@ -427,6 +445,30 @@ impl Render for View {
                 Severity::Error => Tone::Err,
             };
             content = content.child(NoticeBar::new(message, tone));
+        }
+        if proxy_dirty || rule_dirty {
+            let mut apply = div().flex().flex_wrap().gap_2();
+            if proxy_dirty {
+                apply = apply.child(
+                    Button::new("overview-apply-proxy")
+                        .primary()
+                        .label(t("Apply proxy changes"))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.dispatch(|client| client.active_operation(Operation::Reload), cx)
+                        })),
+                );
+            }
+            if rule_dirty {
+                apply = apply.child(
+                    Button::new("overview-reload-rule")
+                        .primary()
+                        .label(t("Reload rule core"))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.dispatch(|client| client.rule_operation(Operation::Reload), cx)
+                        })),
+                );
+            }
+            content = content.child(apply);
         }
 
         // Metrics: the web UI's four-tile row, with live rate sparklines.
@@ -784,9 +826,13 @@ impl Render for View {
                                         member.name.clone()
                                     }),
                             )
-                            .child(DelayChip::new(
-                                member.alive.filter(|alive| *alive).and(member.delay_ms),
-                            ))
+                            .child(if member.alive == Some(false) {
+                                DelayChip::failed()
+                            } else {
+                                DelayChip::new(
+                                    member.alive.filter(|alive| *alive).and(member.delay_ms),
+                                )
+                            })
                             .on_click(cx.listener({
                                 let group = name.clone();
                                 move |view, _, _, cx| {
@@ -808,6 +854,7 @@ impl Render for View {
                         .child(
                             Button::new(("overview-test-group", index))
                                 .ghost()
+                                .disabled(group.testing)
                                 .label(if group.testing {
                                     t("Testing…")
                                 } else {

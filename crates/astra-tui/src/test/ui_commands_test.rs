@@ -309,3 +309,32 @@ fn command_registry_has_unique_ids_and_consistent_repeat_policy() {
         KeyModifiers::CONTROL
     )));
 }
+
+#[test]
+fn f2_inside_editor_field_toggles_secret_reveal_instead_of_opening_palette() {
+    let mut ui = Ui::new(Session::default());
+    let mut editor = Editor::new(
+        "draft".into(),
+        "standalone=true\n[[outbounds]]\ntag='n1'\nkind='vless'\nserver='1.1.1.1:443'\nuuid='secret'\n".into(),
+    );
+    editor.form.path = vec![
+        astra_model::document::PathPart::Key("outbounds".into()),
+        astra_model::document::PathPart::Index(0),
+    ];
+    let doc = editor.document().unwrap();
+    let path = editor.form.path.clone();
+    editor.focus_field(&doc, &path, "uuid");
+    editor
+        .key(astra_client::input::Key::new(
+            astra_client::input::KeyCode::Enter,
+            astra_client::input::KeyModifiers::NONE,
+        ))
+        .unwrap();
+    ui.editor = Some(editor);
+    press(&mut ui, KeyCode::F(2));
+    assert!(ui.palette.is_none());
+    assert!(matches!(
+        &ui.editor.as_ref().unwrap().form.mode,
+        crate::editor::Mode::Field { reveal: true, .. }
+    ));
+}

@@ -108,6 +108,25 @@ impl View {
                     Some("AstraEditor && !Input && !AstraDialog"),
                 ),
             ]);
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([
+                KeyBinding::new("cmd-s", SaveSource, Some("AstraEditor > Input")),
+                KeyBinding::new(
+                    "cmd-i",
+                    ImportNodes,
+                    Some("AstraEditor && !Input && !AstraDialog"),
+                ),
+                KeyBinding::new(
+                    "cmd-e",
+                    ExportNodes,
+                    Some("AstraEditor && !Input && !AstraDialog"),
+                ),
+                KeyBinding::new(
+                    "cmd-shift-e",
+                    ExportLinks,
+                    Some("AstraEditor && !Input && !AstraDialog"),
+                ),
+            ]);
         }
         let (source, source_marks) = raw::create(window, cx);
         let mode_input = cx.new(|cx| InputState::new(window, cx));
@@ -250,7 +269,12 @@ impl View {
     pub fn command(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(
             id,
-            Id::Save | Id::Import | Id::ExternalEditor | Id::ReadExternal | Id::CompareDraft
+            Id::Save
+                | Id::Import
+                | Id::ExternalEditor
+                | Id::ReadExternal
+                | Id::CompareDraft
+                | Id::OverwriteConflict
         ) && !self.commit_pending(window, cx)
         {
             return;
@@ -632,6 +656,14 @@ impl Render for View {
                             .flex()
                             .gap_2()
                             .child(
+                                Button::new("editor-overwrite-conflict")
+                                    .primary()
+                                    .label(t("Overwrite disk with current draft"))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.command(Id::OverwriteConflict, window, cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new("editor-compare")
                                     .label(t("Compare with disk"))
                                     .on_click(cx.listener(|view, _, window, cx| {
@@ -686,7 +718,8 @@ impl Render for View {
         if self.source_visible {
             body = body.child(
                 CodeEditor::new(&self.source)
-                    .h(px(520.))
+                    .flex_1()
+                    .min_h(px(320.))
                     .aria_label(t("TOML source")),
             );
             if let Some(error) = &self.source_error {

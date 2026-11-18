@@ -122,6 +122,24 @@ impl Ui {
         if ctrl && key.code == KeyCode::Char('c') {
             return Some(self.run_command(Id::Quit));
         }
+        if key.code == KeyCode::F(2)
+            && key.modifiers.is_empty()
+            && self.palette.is_none()
+            && self.help_scroll.is_none()
+            && !self.client.tasks.showing_details()
+            && self.tui_viewer.is_none()
+            && self.monitor.is_none()
+            && self.prompt.is_none()
+            && self.binding_picker.is_none()
+            && self.menu.is_none()
+            && self.recovery.is_none()
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|e| matches!(e.form.mode, crate::editor::Mode::Field { .. }))
+        {
+            return None;
+        }
         if let Some(
             id @ (Id::Help | Id::Palette | Id::Profiles | Id::Tasks | Id::Logs | Id::Monitor),
         ) = shortcut(key)

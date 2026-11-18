@@ -310,7 +310,7 @@ impl Render for View {
         root = root.child(toolbar);
         let Some(viewer) = client.log_viewer(self.frontend) else {
             self.presentation = Default::default();
-            return root.child(Empty::new(t("Logs"), t("连接中")));
+            return root.child(Empty::new(t("Logs"), t("Connecting…")));
         };
         self.presentation.update(viewer);
         let rows = self.presentation.rows.clone();

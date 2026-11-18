@@ -316,7 +316,11 @@ impl AppWindow {
             .children(tools)
             .child(
                 widgets::NavItem::new("tool-palette", t("Command palette"))
-                    .shortcut("Ctrl-K")
+                    .shortcut(if cfg!(target_os = "macos") {
+                        "⌘K"
+                    } else {
+                        "Ctrl-K"
+                    })
                     .active(self.palette)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.execute(Id::Palette, window, cx)),
@@ -386,7 +390,16 @@ impl AppWindow {
                             .unwrap_or_else(|| t("No profile yet").into()),
                     ),
             )
-            .child(div().text_xs().text_color(p.faint).child("▾"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(p.faint)
+                    .child(if cfg!(target_os = "macos") {
+                        "⌘P ▾"
+                    } else {
+                        "Ctrl-P ▾"
+                    }),
+            )
             .on_click(cx.listener(|this, _, window, cx| this.execute(Id::Profiles, window, cx)));
         div()
             .h(px(56.))
