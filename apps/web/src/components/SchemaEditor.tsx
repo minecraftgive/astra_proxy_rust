@@ -7,6 +7,135 @@ import type {
   Schema,
 } from "../generated/management";
 
+function parseTomlStringValue(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith('"')) {
+    let out = "";
+    for (let i = 1; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === "\\" && i + 1 < trimmed.length) {
+        out += trimmed[++i];
+      } else if (ch === '"') {
+        return out;
+      } else {
+        out += ch;
+      }
+    }
+    return undefined;
+  }
+  if (trimmed.startsWith("'")) {
+    const end = trimmed.indexOf("'", 1);
+    return end >= 1 ? trimmed.slice(1, end) : undefined;
+  }
+  const value = trimmed.split("#")[0]?.trim();
+  return value || undefined;
+}
+
+export function summarizeEntry(
+  sourceText: string | undefined,
+  collectionPath: PathPart[],
+  index: number,
+): string {
+  const fallback = `条目 ${index + 1}`;
+  if (!sourceText) return fallback;
+  const last = collectionPath[collectionPath.length - 1];
+  if (!last || !("Key" in last)) return fallback;
+  const targetCollection = last.Key;
+  const parentListener =
+    targetCollection === "users" &&
+    collectionPath.length >= 3 &&
+    "Key" in collectionPath[0] &&
+    collectionPath[0].Key === "listeners" &&
+    "Index" in collectionPath[1]
+      ? collectionPath[1].Index
+      : null;
+
+  const entries: Record<string, string>[] = [];
+  let listenerIndex = -1;
+  let activeCollection = "";
+  let current: Record<string, string> | null = null;
+
+  for (const rawLine of sourceText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("[[") && line.endsWith("]]")) {
+      const header = line.slice(2, -2).trim();
+      if (header === "listeners") listenerIndex++;
+      activeCollection = header;
+      const matchesTarget =
+        (parentListener !== null &&
+          header === "listeners.users" &&
+          listenerIndex === parentListener) ||
+        (parentListener === null && header === targetCollection);
+      if (matchesTarget) {
+        current = {};
+        entries.push(current);
+      } else {
+        current = null;
+      }
+      continue;
+    }
+    if (line.startsWith("[") && line.endsWith("]")) {
+      const header = line.slice(1, -1).trim();
+      if (
+        !current ||
+        (parentListener === null &&
+          header !== activeCollection &&
+          !header.startsWith(`${activeCollection}.`)) ||
+        (parentListener !== null && !header.startsWith("listeners.users."))
+      ) {
+        current = null;
+      }
+      continue;
+    }
+    if (!current) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (
+      ![
+        "tag",
+        "kind",
+        "protocol",
+        "value",
+        "action",
+        "listen",
+        "name",
+      ].includes(key)
+    ) {
+      continue;
+    }
+    const val = parseTomlStringValue(line.slice(eq + 1));
+    if (val && !(key in current)) current[key] = val;
+  }
+
+  const entry = entries[index];
+  if (!entry) return fallback;
+
+  let detail = "";
+  if (targetCollection === "outbounds") {
+    const proto =
+      entry.kind === "native" && entry.protocol
+        ? entry.protocol
+        : entry.protocol || entry.kind;
+    detail = [entry.tag, proto ? `[${proto}]` : ""]
+      .filter(Boolean)
+      .join(" ");
+  } else if (targetCollection === "rules") {
+    const lhs = [entry.kind, entry.value].filter(Boolean).join(" ");
+    detail = entry.action ? `${lhs}${lhs ? " " : ""}→ ${entry.action}` : lhs;
+  } else if (targetCollection === "listeners") {
+    const head = [entry.tag, entry.listen].filter(Boolean).join(" ");
+    detail = [head, entry.protocol ? `[${entry.protocol}]` : ""]
+      .filter(Boolean)
+      .join(" ");
+  } else {
+    detail = entry.name || entry.tag || "";
+  }
+  return detail ? `${fallback} · ${detail}` : fallback;
+}
+
 export default function SchemaEditor({
   agent,
   draft,
@@ -62,90 +191,111 @@ export default function SchemaEditor({
       {!schema ? (
         <p className="muted">正在读取节点提供的字段描述…</p>
       ) : (
-        <>
-          {schema.rows.map((row, index) =>
-            row.kind === "field" ? (
-              <FieldEditor
-                key={`${JSON.stringify(path)}/${row.field.key}/${draft.revision}`}
-                field={row.field}
-                busy={busy}
-                apply={(input) =>
-                  onCommand({
-                    command: "set_field",
-                    path,
-                    key: row.field.key,
-                    input,
-                  })
-                }
-                remove={() =>
-                  onCommand({
-                    command: "remove_field",
-                    path,
-                    key: row.field.key,
-                  })
-                }
-              />
-            ) : row.kind === "group" ? (
-              <button
-                key={row.key}
-                className="schema-group btn"
-                disabled={busy}
-                onClick={() => navigate([...path, { Key: row.key }])}
-              >
-                {row.label} →
-              </button>
-            ) : (
-              <div className="schema-entry toolbar" key={row.index}>
-                <button
-                  className="btn"
-                  disabled={busy}
-                  onClick={() => navigate([...path, { Index: row.index }])}
-                >
-                  条目 {row.index + 1} →
-                </button>
-                <button
-                  className="btn sm"
-                  disabled={busy || index === 0}
-                  onClick={() =>
-                    void onCommand({
-                      command: "move_entry",
-                      path,
-                      from: row.index,
-                      to: row.index - 1,
-                    })
-                  }
-                >
-                  上移
-                </button>
-                <button
-                  className="btn sm danger"
-                  disabled={busy}
-                  onClick={() => {
-                    if (
-                      window.confirm("删除此草稿条目？引用保护仍由节点检查。")
-                    )
-                      void onCommand({
-                        command: "remove_entry",
+        (() => {
+          const entryCount = schema.rows.filter(
+            (row) => row.kind === "entry",
+          ).length;
+          return (
+            <>
+              {schema.rows.map((row) =>
+                row.kind === "field" ? (
+                  <FieldEditor
+                    key={`${JSON.stringify(path)}/${row.field.key}/${draft.revision}`}
+                    field={row.field}
+                    busy={busy}
+                    apply={(input) =>
+                      onCommand({
+                        command: "set_field",
                         path,
-                        index: row.index,
-                      });
-                  }}
+                        key: row.field.key,
+                        input,
+                      })
+                    }
+                    remove={() =>
+                      onCommand({
+                        command: "remove_field",
+                        path,
+                        key: row.field.key,
+                      })
+                    }
+                  />
+                ) : row.kind === "group" ? (
+                  <button
+                    key={row.key}
+                    className="schema-group btn"
+                    disabled={busy}
+                    onClick={() => navigate([...path, { Key: row.key }])}
+                  >
+                    {row.label} →
+                  </button>
+                ) : (
+                  <div className="schema-entry toolbar" key={row.index}>
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      onClick={() => navigate([...path, { Index: row.index }])}
+                    >
+                      {summarizeEntry(draft.text, path, row.index)} →
+                    </button>
+                    <button
+                      className="btn sm"
+                      disabled={busy || row.index === 0}
+                      onClick={() =>
+                        void onCommand({
+                          command: "move_entry",
+                          path,
+                          from: row.index,
+                          to: row.index - 1,
+                        })
+                      }
+                    >
+                      上移
+                    </button>
+                    <button
+                      className="btn sm"
+                      disabled={busy || row.index >= entryCount - 1}
+                      onClick={() =>
+                        void onCommand({
+                          command: "move_entry",
+                          path,
+                          from: row.index,
+                          to: row.index + 1,
+                        })
+                      }
+                    >
+                      下移
+                    </button>
+                    <button
+                      className="btn sm danger"
+                      disabled={busy}
+                      onClick={() => {
+                        if (
+                          window.confirm("删除此草稿条目？引用保护仍由节点检查。")
+                        )
+                          void onCommand({
+                            command: "remove_entry",
+                            path,
+                            index: row.index,
+                          });
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ),
+              )}
+              {"collection" in schema && schema.collection === true && (
+                <button
+                  className="btn primary"
+                  disabled={busy}
+                  onClick={() => void onCommand({ command: "append_entry", path })}
                 >
-                  删除
+                  新增条目
                 </button>
-              </div>
-            ),
-          )}
-          {"collection" in schema && schema.collection === true && (
-            <button
-              className="btn primary"
-              disabled={busy}
-              onClick={() => void onCommand({ command: "append_entry", path })}
-            >
-              新增条目
-            </button>
-          )}
-        </>
+              )}
+            </>
+          );
+        })()
       )}
     </div>
   );
@@ -162,6 +312,7 @@ function FieldEditor({
   remove: () => Promise<void>;
 }) {
   const [input, setInput] = useState(field.value ?? "");
+  const [revealed, setRevealed] = useState(false);
   const kind = field.field_type;
   let members: string[] = [];
   if (field.key === "members") {
@@ -253,7 +404,9 @@ function FieldEditor({
             {...common}
             type={
               field.secret
-                ? "password"
+                ? revealed
+                  ? "text"
+                  : "password"
                 : kind.kind === "number"
                   ? "number"
                   : "text"
@@ -263,6 +416,16 @@ function FieldEditor({
             placeholder={field.default ? `默认：${field.default}` : "未设置"}
             autoComplete="off"
           />
+        )}
+        {field.secret && (
+          <button
+            type="button"
+            className="btn sm"
+            disabled={busy}
+            onClick={() => setRevealed((v) => !v)}
+          >
+            {revealed ? "隐藏" : "显示"}
+          </button>
         )}
         <button
           className="btn sm"

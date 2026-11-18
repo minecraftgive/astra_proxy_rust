@@ -326,4 +326,25 @@ describe("document concurrency and recovery", () => {
     expect((input as HTMLTextAreaElement).value).toBe("# node b\n");
     expect(props.onError).not.toHaveBeenCalled();
   });
+  it("highlights save button and warns on unload when draft has unsaved changes", async () => {
+    vi.mocked(API.draftCommand).mockResolvedValue(response(initial));
+    render(
+      <Editor
+        agent="agent-a"
+        instance={instance}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+    const input = await screen.findByRole("textbox");
+    const saveButton = screen.getByRole("button", { name: "保存并应用" });
+    expect(saveButton.className).not.toContain("primary");
+
+    fireEvent.change(input, { target: { value: "# edited\n" } });
+    expect(saveButton.className).toContain("primary");
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+  });
 });

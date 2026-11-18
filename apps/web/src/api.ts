@@ -23,10 +23,35 @@ export class ApiError extends Error {
     super(message);
   }
 }
-let session: string | null = null;
-export const signedIn = () => session !== null;
+const SESSION_KEY = "astra.web.session";
+function loadSession(): string | null {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      return sessionStorage.getItem(SESSION_KEY);
+    }
+  } catch {
+    // Ignore storage read errors in restricted environments.
+  }
+  return null;
+}
+function setSession(token: string | null) {
+  session = token;
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      if (token) sessionStorage.setItem(SESSION_KEY, token);
+      else sessionStorage.removeItem(SESSION_KEY);
+    }
+  } catch {
+    // Ignore storage write errors in restricted environments.
+  }
+}
+let session: string | null = loadSession();
+export const signedIn = () => {
+  if (session === null) session = loadSession();
+  return session !== null;
+};
 export const forgetSession = () => {
-  session = null;
+  setSession(null);
 };
 export async function login(password: string) {
   const r = await fetch("/api/v2/login", {
@@ -48,7 +73,7 @@ export async function login(password: string) {
     );
   if (typeof data?.token !== "string" || !data.token)
     throw new ApiError("login_failed", "登录响应缺少有效会话，请重新登录。");
-  session = data.token;
+  setSession(data.token);
 }
 export async function logout() {
   try {
@@ -57,7 +82,7 @@ export async function logout() {
       headers: { Authorization: `Bearer ${session}` },
     });
   } finally {
-    session = null;
+    setSession(null);
   }
 }
 export async function request<T = unknown>(
@@ -100,7 +125,7 @@ export async function request<T = unknown>(
     throw uncertain();
   }
   if (r.status === 401) {
-    session = null;
+    setSession(null);
     throw new ApiError("unauthorized", "登录已失效，请重新登录。");
   }
   // A gateway/server failure cannot prove that an accepted mutation rolled back.
@@ -293,7 +318,7 @@ export async function watch(
         cache: "no-store",
       });
       if (r.status === 401) {
-        session = null;
+        setSession(null);
         onStatus("登录已过期");
         return;
       }
@@ -314,7 +339,7 @@ export async function watch(
             throw new Error("事件超出大小限制");
           for (const event of parsed.events) {
             if (event.event === "expired") {
-              session = null;
+              setSession(null);
               onStatus("登录已过期");
               return;
             }

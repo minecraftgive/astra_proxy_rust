@@ -204,4 +204,36 @@ describe("management identity", () => {
         .operation_id,
     ).toBe("stable-operation");
   });
+  it("persists session token in sessionStorage across login and clears on 401 or forgetSession", async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => store.set(key, value),
+      removeItem: (key: string) => store.delete(key),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ token: "persisted-token" }))),
+    );
+    await login("secret");
+    expect(store.get("astra.web.session")).toBe("persisted-token");
+    expect(signedIn()).toBe(true);
+
+    forgetSession();
+    expect(store.has("astra.web.session")).toBe(false);
+    expect(signedIn()).toBe(false);
+
+    store.set("astra.web.session", "restored-token");
+    expect(signedIn()).toBe(true);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("Unauthorized", { status: 401 })),
+    );
+    await expect(query(null, "agents")).rejects.toMatchObject({
+      code: "unauthorized",
+    });
+    expect(store.has("astra.web.session")).toBe(false);
+    expect(signedIn()).toBe(false);
+  });
 });

@@ -335,11 +335,44 @@ function DocumentEditor({
       if (mounted.current) setBusy(false);
     }
   };
+  const dirty = Boolean(draft && text !== draft.original);
+  useEffect(() => {
+    if (!dirty && !pendingSave) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty, pendingSave]);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+      const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "s") {
         e.preventDefault();
         void save();
+        return;
+      }
+      if (mode === "fields") {
+        const target = e.target as HTMLElement | null;
+        const inField =
+          target &&
+          (target.tagName === "INPUT" ||
+            target.tagName === "TEXTAREA" ||
+            target.tagName === "SELECT" ||
+            target.isContentEditable);
+        if (!inField) {
+          if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "z") {
+            e.preventDefault();
+            history(true);
+          } else if (
+            ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "z") ||
+            (e.ctrlKey && key === "y")
+          ) {
+            e.preventDefault();
+            history(false);
+          }
+        }
       }
     };
     window.addEventListener("keydown", handler);
@@ -406,7 +439,7 @@ function DocumentEditor({
           字段编辑
         </button>
         <button
-          className="btn"
+          className={`btn ${dirty ? "primary" : ""}`}
           disabled={!draft || busy || !!pendingSave}
           onClick={() => void save()}
         >
@@ -468,7 +501,7 @@ function DocumentEditor({
         <span className="muted">
           {busy
             ? "正在保存…"
-            : draft && text !== draft.original
+            : dirty
               ? "草稿有改动"
               : "与源文件一致"}
         </span>

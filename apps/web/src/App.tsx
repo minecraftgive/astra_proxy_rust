@@ -67,7 +67,9 @@ export default function App() {
   const [events, setEvents] = useState<API.ManagementEvent[]>([]);
   const [tasks, setTasks] = useState<API.Task[]>([]);
   const [editing, setEditing] = useState<API.Instance | null>(null);
-  const [search, setSearch] = useState("");
+  const [proxySearch, setProxySearch] = useState("");
+  const [connectionSearch, setConnectionSearch] = useState("");
+  const [logSearch, setLogSearch] = useState("");
   const [paused, setPaused] = useState(false);
   const [logs, setLogs] = useState("");
   const [route, setRoute] = useState("");
@@ -126,7 +128,9 @@ export default function App() {
     setTasks([]);
     setEditing(null);
     setResult(null);
-    setSearch("");
+    setProxySearch("");
+    setConnectionSearch("");
+    setLogSearch("");
     setPaused(false);
     setLogs("");
     setStatus("连接中");
@@ -346,6 +350,36 @@ export default function App() {
     document.documentElement.dataset.theme = theme === "system" ? "" : theme;
     retainTheme(theme);
   }, [theme]);
+  useEffect(() => {
+    if (!authenticated || editing || creating) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const index =
+        event.key === "0"
+          ? 9
+          : event.key >= "1" && event.key <= "9"
+            ? Number(event.key) - 1
+            : -1;
+      const next = pages[index]?.[0];
+      if (!next) return;
+      event.preventDefault();
+      setPage(next);
+      setEditing(null);
+      setResult(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [authenticated, editing, creating]);
   const run = async (type: string, data?: unknown, danger?: string) => {
     if (!agent || !online) return;
     if (danger && !window.confirm(`${node?.name ?? agent}\n${danger}`)) return;
@@ -432,11 +466,17 @@ export default function App() {
         ? "节点离线"
         : undefined,
   });
-  const connections = ((runtime?.connections ?? []) as Row[]).filter((r) =>
-    Object.values(r).some((v) =>
-      fmt(v).toLowerCase().includes(search.toLowerCase()),
-    ),
-  );
+  const connections = ((runtime?.connections ?? []) as Row[])
+    .filter((r) =>
+      Object.values(r).some((v) =>
+        fmt(v).toLowerCase().includes(connectionSearch.toLowerCase()),
+      ),
+    )
+    .map((r) => ({
+      ...r,
+      upload: bytes(r.upload),
+      download: bytes(r.download),
+    }));
   const groups = (runtime?.groups ?? []) as {
     name: string;
     mode: string;
@@ -507,7 +547,7 @@ export default function App() {
             }}
           >
             <span>{label}</span>
-            <span className="key">{i + 1}</span>
+            <span className="key">{i === 9 ? 0 : i + 1}</span>
           </button>
         ))}
         <div className="spacer" />
@@ -831,124 +871,222 @@ export default function App() {
                     </form>
                   )}
                   <Table
-                    rows={instances as unknown as Row[]}
+                    rows={
+                      instances.map((i) => ({
+                        ...i,
+                        displayName:
+                          i.id === selected ? `${i.name} · 当前` : i.name,
+                        kindLabel: kindName[i.kind],
+                      })) as unknown as Row[]
+                    }
                     columns={[
-                      ["name", "名称"],
-                      ["kind", "种类"],
+                      ["displayName", "名称"],
+                      ["kindLabel", "种类"],
                       ["state", "状态"],
                       ["pid", "进程"],
                       ["config", "配置路径"],
                     ]}
-                    action={(row) => (
-                      <div className="toolbar">
-                        <button
-                          className="btn sm"
-                          {...capability(
-                            "document",
-                            instances.find((i) => i.id === row.id),
+                    action={(row) => {
+                      const instance = instances.find((i) => i.id === row.id);
+                      const running = Boolean(row.pid);
+                      const active = row.id === selected;
+                      return (
+                        <div className="toolbar">
+                          <button
+                            className="btn sm"
+                            disabled={active}
+                            onClick={() => {
+                              setSelected(String(row.id));
+                              setEditing(null);
+                            }}
+                          >
+                            {active ? "当前" : "切换"}
+                          </button>
+                          <button
+                            className="btn sm"
+                            {...capability(running ? "stop" : "start", instance)}
+                            onClick={() =>
+                              void run(
+                                running ? "stop" : "start",
+                                { instance: row.id },
+                                running ? `停止 ${row.name}？` : undefined,
+                              )
+                            }
+                          >
+                            {running ? "停止" : "启动"}
+                          </button>
+                          {running && (
+                            <button
+                              className="btn sm"
+                              {...capability("reload", instance)}
+                              onClick={() =>
+                                void run("reload", { instance: row.id })
+                              }
+                            >
+                              重载
+                            </button>
                           )}
-                          onClick={() => {
-                            setSelected(String(row.id));
-                            setEditing(instances.find((i) => i.id === row.id)!);
-                          }}
-                        >
-                          编辑
-                        </button>
-                        <button
-                          className="btn sm danger"
-                          disabled={Boolean(row.pid) || busy || !online}
-                          onClick={() =>
-                            void run(
-                              "remove",
-                              { instance: row.id },
-                              `移除 ${row.name} 的管理登记？`,
-                            )
-                          }
-                        >
-                          移除
-                        </button>
-                      </div>
-                    )}
+                          <button
+                            className="btn sm"
+                            {...capability("document", instance)}
+                            onClick={() => {
+                              if (!instance) return;
+                              setSelected(String(row.id));
+                              setEditing(instance);
+                            }}
+                          >
+                            编辑
+                          </button>
+                          <button
+                            className="btn sm danger"
+                            disabled={running || busy || !online}
+                            onClick={() =>
+                              void run(
+                                "remove",
+                                { instance: row.id },
+                                `移除 ${row.name} 的管理登记？`,
+                              )
+                            }
+                          >
+                            移除
+                          </button>
+                        </div>
+                      );
+                    }}
                   />
                 </>
               )}
               {page === "proxies" &&
                 (current?.kind === "proxy" ? (
-                  <>
-                    {groups.map((g) => (
-                      <section className="card card-pad" key={g.name}>
-                        <div className="page-head">
-                          <h2>{g.name}</h2>
-                          <span className="pill">{g.mode}</span>
-                          <button
-                            className="btn sm"
-                            {...capability("runtime")}
-                            disabled={
-                              capability("runtime").disabled || g.testing
-                            }
-                            onClick={() =>
-                              void runtimeCommand({ TestGroup: g.name })
-                            }
-                          >
-                            {g.testing ? "测试中…" : "测速"}
-                          </button>
-                        </div>
-                        <div className="member-grid">
-                          {g.members.map((m) => (
-                            <button
-                              key={m.name}
-                              className={`member-choice ${g.selected === m.name ? "selected" : ""}`}
-                              {...capability("runtime")}
-                              onClick={() =>
-                                void runtimeCommand({
-                                  Select: { group: g.name, member: m.name },
-                                })
-                              }
-                            >
-                              <strong>{m.name}</strong>
-                              <span
-                                className={
-                                  m.alive === false ? "error-message" : "muted"
+                  (() => {
+                    const q = proxySearch.trim().toLowerCase();
+                    const visibleGroups = groups
+                      .map((g) => ({
+                        group: g,
+                        members:
+                          !q || g.name.toLowerCase().includes(q)
+                            ? g.members
+                            : g.members.filter((m) =>
+                                m.name.toLowerCase().includes(q),
+                              ),
+                      }))
+                      .filter(
+                        ({ members }) => members.length > 0 || !q,
+                      );
+                    const runtimeCap = capability("runtime");
+                    return (
+                      <>
+                        {groups.length > 0 && (
+                          <div className="toolbar">
+                            <input
+                              className="input"
+                              aria-label="筛选节点"
+                              placeholder="筛选代理组或节点名称"
+                              value={proxySearch}
+                              onChange={(e) => setProxySearch(e.target.value)}
+                            />
+                            {proxySearch && (
+                              <button
+                                className="btn sm"
+                                onClick={() => setProxySearch("")}
+                              >
+                                清空
+                              </button>
+                            )}
+                          </div>
+                        )}
+                        {visibleGroups.map(({ group: g, members }) => (
+                          <section className="card card-pad" key={g.name}>
+                            <div className="page-head">
+                              <h2>{g.name}</h2>
+                              <span className="pill">{g.mode}</span>
+                              <span className="muted">
+                                {g.members.length} 个节点
+                              </span>
+                              <button
+                                className="btn sm"
+                                {...runtimeCap}
+                                disabled={runtimeCap.disabled || g.testing}
+                                onClick={() =>
+                                  void runtimeCommand({ TestGroup: g.name })
                                 }
                               >
-                                {m.alive === false
-                                  ? "不可用"
-                                  : m.delay_ms
-                                    ? `${m.delay_ms} ms`
-                                    : "尚未测试"}
-                              </span>
-                            </button>
-                          ))}
+                                {g.testing ? "测试中…" : "测速"}
+                              </button>
+                            </div>
+                            <div className="member-grid">
+                              {members.map((m) => (
+                                <button
+                                  key={m.name}
+                                  className={`member-choice ${g.selected === m.name ? "selected" : ""}`}
+                                  disabled={
+                                    runtimeCap.disabled || g.mode !== "select"
+                                  }
+                                  title={
+                                    runtimeCap.title ??
+                                    (g.mode !== "select"
+                                      ? `当前组模式为 ${g.mode}，由核心自动选择节点`
+                                      : undefined)
+                                  }
+                                  onClick={() =>
+                                    void runtimeCommand({
+                                      Select: { group: g.name, member: m.name },
+                                    })
+                                  }
+                                >
+                                  <strong>{m.name}</strong>
+                                  <span
+                                    className={
+                                      m.alive === false
+                                        ? "error-message"
+                                        : "muted"
+                                    }
+                                  >
+                                    {m.alive === false
+                                      ? "不可用"
+                                      : m.delay_ms
+                                        ? `${m.delay_ms} ms`
+                                        : "尚未测试"}
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          </section>
+                        ))}
+                        {groups.length === 0 && (
+                          <Empty>当前实例没有代理组数据。</Empty>
+                        )}
+                        {groups.length > 0 && visibleGroups.length === 0 && (
+                          <Empty>没有匹配的代理组或节点。</Empty>
+                        )}
+                        <div className="toolbar">
+                          <button
+                            className="btn"
+                            {...capability("subscriptions")}
+                            onClick={() =>
+                              void run("update_subscriptions", {
+                                instance: current.id,
+                              })
+                            }
+                          >
+                            更新订阅
+                          </button>
+                          <button
+                            className="btn"
+                            {...capability("diagnostics")}
+                            onClick={() =>
+                              void run("diagnostics", {
+                                instance: current.id,
+                                targets: null,
+                              })
+                            }
+                          >
+                            连接诊断
+                          </button>
                         </div>
-                      </section>
-                    ))}
-                    {groups.length === 0 && (
-                      <Empty>当前实例没有代理组数据。</Empty>
-                    )}
-                    <button
-                      className="btn"
-                      {...capability("subscriptions")}
-                      onClick={() =>
-                        void run("update_subscriptions", {
-                          instance: current.id,
-                        })
-                      }
-                    >
-                      更新订阅
-                    </button>
-                    <button
-                      className="btn"
-                      {...capability("diagnostics")}
-                      onClick={() =>
-                        void run("diagnostics", {
-                          instance: current.id,
-                          targets: null,
-                        })
-                      }
-                    >
-                      连接诊断
-                    </button>
-                  </>
+                      </>
+                    );
+                  })()
                 ) : (
                   <Empty>代理组属于代理客户端。请切换实例。</Empty>
                 ))}
@@ -959,9 +1097,18 @@ export default function App() {
                       className="input"
                       aria-label="筛选连接"
                       placeholder="筛选主机、出站或协议"
-                      value={search}
-                      onChange={(e) => setSearch(e.target.value)}
+                      value={connectionSearch}
+                      onChange={(e) => setConnectionSearch(e.target.value)}
                     />
+                    {connectionSearch && (
+                      <button
+                        className="btn sm"
+                        onClick={() => setConnectionSearch("")}
+                      >
+                        清空
+                      </button>
+                    )}
+                    <span className="muted">{connections.length} 条连接</span>
                     <button className="btn" onClick={() => setPaused(!paused)}>
                       {paused ? "恢复实时显示" : "暂停显示"}
                     </button>
@@ -1055,48 +1202,72 @@ export default function App() {
                   </p>
                 </>
               )}
-              {page === "logs" && (
-                <>
-                  <div className="toolbar">
-                    <select
-                      className="input"
-                      aria-label="日志会话"
-                      value={logSession}
-                      onChange={(e) => setLogSession(e.target.value)}
-                    >
-                      <option value="">本次会话</option>
-                      {logSessions
-                        .filter((session) => !session.current)
-                        .map((session) => (
-                          <option value={session.id} key={session.id}>
-                            {new Date(
-                              Number(session.started_ms),
-                            ).toLocaleString()}{" "}
-                            · {formatBytes(Number(session.size))}
-                          </option>
-                        ))}
-                    </select>
-                    <input
-                      className="input"
-                      aria-label="筛选日志"
-                      placeholder="筛选日志"
-                      value={search}
-                      onChange={(e) => setSearch(e.target.value)}
-                    />
-                    <button className="btn" onClick={() => setPaused(!paused)}>
-                      {paused ? "恢复显示" : "暂停显示"}
-                    </button>
-                  </div>
-                  <pre className="log-view">
-                    {logs
-                      .split("\n")
-                      .filter((l) =>
-                        l.toLowerCase().includes(search.toLowerCase()),
-                      )
-                      .join("\n") || "尚无日志"}
-                  </pre>
-                </>
-              )}
+              {page === "logs" &&
+                (() => {
+                  const filteredLogs = logs
+                    .split("\n")
+                    .filter((l) =>
+                      l.toLowerCase().includes(logSearch.toLowerCase()),
+                    )
+                    .join("\n");
+                  return (
+                    <>
+                      <div className="toolbar">
+                        <select
+                          className="input"
+                          aria-label="日志会话"
+                          value={logSession}
+                          onChange={(e) => setLogSession(e.target.value)}
+                        >
+                          <option value="">本次会话</option>
+                          {logSessions
+                            .filter((session) => !session.current)
+                            .map((session) => (
+                              <option value={session.id} key={session.id}>
+                                {new Date(
+                                  Number(session.started_ms),
+                                ).toLocaleString()}{" "}
+                                · {formatBytes(Number(session.size))}
+                              </option>
+                            ))}
+                        </select>
+                        <input
+                          className="input"
+                          aria-label="筛选日志"
+                          placeholder="筛选日志"
+                          value={logSearch}
+                          onChange={(e) => setLogSearch(e.target.value)}
+                        />
+                        {logSearch && (
+                          <button
+                            className="btn sm"
+                            onClick={() => setLogSearch("")}
+                          >
+                            清空
+                          </button>
+                        )}
+                        <button
+                          className="btn"
+                          onClick={() => setPaused(!paused)}
+                        >
+                          {paused ? "恢复显示" : "暂停显示"}
+                        </button>
+                        <button
+                          className="btn"
+                          disabled={!filteredLogs}
+                          onClick={() =>
+                            void navigator.clipboard?.writeText(filteredLogs)
+                          }
+                        >
+                          复制日志
+                        </button>
+                      </div>
+                      <pre className="log-view">
+                        {filteredLogs || "尚无日志"}
+                      </pre>
+                    </>
+                  );
+                })()}
               {page === "tasks" && (
                 <>
                   {tasks.map((task) => (
