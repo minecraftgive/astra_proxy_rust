@@ -23,6 +23,7 @@ pub enum Id {
     ReadExternal,
     Discard,
     CompareDraft,
+    OverwriteConflict,
     Undo,
     Redo,
     Pause,
@@ -186,6 +187,13 @@ pub const SPECS: &[Spec] = &[
     Spec {
         id: Id::CompareDraft,
         label: "Compare draft with observed disk",
+        key: "",
+        scope: Scope::Editor,
+        repeat: Repeat::Once,
+    },
+    Spec {
+        id: Id::OverwriteConflict,
+        label: "Overwrite disk with current draft",
         key: "",
         scope: Scope::Editor,
         repeat: Repeat::Once,

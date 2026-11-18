@@ -322,7 +322,7 @@ pub fn parse_editor_document(
         .parse()
         .context(t("配置格式无法解析。原草稿已保留，请修复配置后重新打开"))?;
     // Both [[rules]] and rules = [{...}] are valid core configurations.
-    for key in ["rules", "outbounds"] {
+    for key in ["rules", "outbounds", "listeners"] {
         if let Some(array) = doc.get(key).and_then(Item::as_array) {
             let mut tables = ArrayOfTables::new();
             for item in array.iter() {
@@ -334,6 +334,25 @@ pub fn parse_editor_document(
                 );
             }
             doc[key] = Item::ArrayOfTables(tables);
+        }
+    }
+    if let Some(listeners) = doc
+        .get_mut("listeners")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for listener in listeners.iter_mut() {
+            if let Some(array) = listener.get("users").and_then(Item::as_array) {
+                let mut tables = ArrayOfTables::new();
+                for item in array.iter() {
+                    tables.push(
+                        item.as_inline_table()
+                            .context(t("列表中需要参数条目"))?
+                            .clone()
+                            .into_table(),
+                    );
+                }
+                listener["users"] = Item::ArrayOfTables(tables);
+            }
         }
     }
     if is_proxy {

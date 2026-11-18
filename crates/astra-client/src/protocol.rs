@@ -462,7 +462,14 @@ fn reply(r: v::ResponseBody) -> Result<Reply> {
             serde_json::to_string(&x)?
         }),
         R::Document(d) => Reply::text(d.text),
-        R::Draft(_) => Reply::text("Validated and saved; configuration applied where supported"),
+        R::Draft(d) => Reply::text(
+            d.last_save
+                .filter(|s| !s.message.is_empty())
+                .map(|s| s.message)
+                .unwrap_or_else(|| {
+                    "Validated and saved; configuration applied where supported".into()
+                }),
+        ),
         R::Logs { text } | R::Done { message: text } => Reply::text(text),
         R::Runtime(v::RuntimeSnapshot::Client(x))
         | R::Diagnostics(x)

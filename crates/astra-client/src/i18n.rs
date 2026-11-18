@@ -1542,6 +1542,13 @@ const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("Domain", "Domain", "域名", "網域名稱"),
     ("Current DNS · s details", "Current DNS · s details", "当前 DNS · s 详情", "目前 DNS · s 詳情"),
     ("Current DNS · ↑↓ scroll · Esc close", "Current DNS · ↑↓ scroll · Esc close", "当前 DNS · ↑↓ 滚动 · Esc 关闭", "目前 DNS · ↑↓ 捲動 · Esc 關閉"),
+    ("Overwrite disk with current draft", "Overwrite disk with current draft", "用当前草稿覆盖磁盘", "以目前草稿覆寫磁碟"),
+    ("No external conflict on current draft", "No external conflict on current draft", "当前草稿没有外部冲突", "目前草稿沒有外部衝突"),
+    ("Use as active profile", "Use as active profile", "设为当前活动配置", "設為目前使用設定檔"),
+    ("Active profile switched to {}", "Active profile switched to {}", "已切换当前配置为 {}", "已切換目前設定檔為 {}"),
+    ("Save subscription changes (Ctrl-S) before updating", "Save subscription changes (Ctrl-S) before updating", "请先按 Ctrl-S 保存订阅配置，再手动更新", "請先按 Ctrl-S 儲存訂閱設定後再手動更新"),
+    ("Apply proxy changes", "Apply proxy changes", "应用代理配置改动", "套用代理設定變更"),
+    ("Reload rule core", "Reload rule core", "重载规则核心", "重載規則核心"),
 ];
 
 #[cfg(test)]

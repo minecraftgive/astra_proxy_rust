@@ -67,6 +67,17 @@ impl OperationInput {
         if let Some(saved) = draft {
             let mut saved = saved.clone();
             saved.path = target.path;
+            if !saved.editor.is_dirty() && !saved.conflict {
+                saved.editor = Editor::new(name, disk).with_kind(saved.kind);
+                saved.conflict = false;
+                saved.observed_disk = None;
+                return DocumentReady {
+                    editor: saved.editor.clone(),
+                    kind: saved.kind,
+                    observation: Some((key, saved)),
+                    message: String::new(),
+                };
+            }
             saved.conflict = saved.editor.original != disk;
             saved.observed_disk = saved.conflict.then_some(disk);
             saved.editor.name = name;
@@ -695,6 +706,11 @@ pub fn apply_operation<H: OperationHost>(
                     }
                 }
                 ui.kind = prepared.kind;
+                if prepared.kind == Kind::Proxy
+                    && matches!(action, Action::Create { .. } | Action::Add(_))
+                {
+                    ui.active_profile = Some(name.clone());
+                }
                 if let Some(index) = ui.rows().iter().position(|r| r.instance.name == name) {
                     let kind = ui.index();
                     ui.selections[kind] = index;
@@ -745,7 +761,16 @@ pub fn apply_operation<H: OperationHost>(
             {
                 ui.tui_viewer = None;
             }
-            if context.same
+            let critical_mutation = matches!(
+                action,
+                Action::Save { .. }
+                    | Action::Start(_)
+                    | Action::ForceStart(_)
+                    | Action::Restart(_)
+                    | Action::BindStart { .. }
+                    | Action::UpdateTransaction { .. }
+            );
+            if (context.same || critical_mutation)
                 && context.log_target_current
                 && (!context.background || (ui.prompt.is_none() && ui.recovery.is_none()))
             {

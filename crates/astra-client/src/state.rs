@@ -123,6 +123,7 @@ pub enum Operation {
     Stop,
     Restart,
     Reload,
+    Activate,
     Edit,
     Logs,
     Bind,
@@ -143,6 +144,7 @@ impl Operation {
             Self::Stop => "Stop",
             Self::Restart => "Restart",
             Self::Reload => "Reload",
+            Self::Activate => "Use as active profile",
             Self::UpdateSubscriptions => "Update subscriptions",
             Self::Edit => "Edit",
             Self::Logs => "Logs",
@@ -612,9 +614,15 @@ impl Client {
     }
     pub fn suspend_editor(&mut self) {
         if self.editor.is_some() {
+            let dirty = self.editor.as_ref().is_some_and(|editor| {
+                let (key, _) = self.draft_key(&editor.name);
+                editor.is_dirty() || self.drafts.get(&key).is_some_and(|draft| draft.conflict)
+            });
             self.remember_draft();
             self.editor = None;
-            self.message = t("Draft retained · reopen the configuration to continue").into();
+            if dirty {
+                self.message = t("Draft retained · reopen the configuration to continue").into();
+            }
         }
     }
     pub fn discard_current_draft(&mut self) {
@@ -638,25 +646,77 @@ impl Client {
             self.message = t("No external conflict was observed when this draft was opened").into();
             return;
         };
-        let draft = editor.text();
+        let draft = editor
+            .source_buffer
+            .clone()
+            .unwrap_or_else(|| editor.text());
         let disk_lines: Vec<_> = disk.lines().collect();
         let draft_lines: Vec<_> = draft.lines().collect();
-        let mut text=format!("{} · {}\n{}\n\n",t("Draft conflict"),editor.name,t("Disk snapshot from the latest conflict check. - disk / + draft; no source file is changed."));
-        let count = disk_lines.len().max(draft_lines.len());
-        for index in 0..count.min(2000) {
-            match (disk_lines.get(index), draft_lines.get(index)) {
-                (Some(a), Some(b)) if a == b => text.push_str(&format!("  {a}\n")),
-                (a, b) => {
-                    if let Some(a) = a {
-                        text.push_str(&format!("- {a}\n"));
-                    }
-                    if let Some(b) = b {
-                        text.push_str(&format!("+ {b}\n"));
+        let mut text = format!(
+            "{} · {}\n{}\n\n",
+            t("Draft conflict"),
+            editor.name,
+            t("Disk snapshot from the latest conflict check. - disk / + draft; no source file is changed.")
+        );
+        let mut emitted = 0usize;
+        let mut truncated = false;
+        let mut push_line = |prefix: &str, line: &str| {
+            if emitted < 2000 {
+                text.push_str(prefix);
+                text.push_str(line);
+                text.push('\n');
+                emitted += 1;
+            } else {
+                truncated = true;
+            }
+        };
+        if disk_lines.len() <= 600 && draft_lines.len() <= 600 {
+            let n = disk_lines.len();
+            let m = draft_lines.len();
+            let stride = m + 1;
+            let mut dp = vec![0u32; (n + 1) * stride];
+            for i in (0..n).rev() {
+                for j in (0..m).rev() {
+                    dp[i * stride + j] = if disk_lines[i] == draft_lines[j] {
+                        dp[(i + 1) * stride + (j + 1)] + 1
+                    } else {
+                        dp[(i + 1) * stride + j].max(dp[i * stride + (j + 1)])
+                    };
+                }
+            }
+            let (mut i, mut j) = (0, 0);
+            while i < n || j < m {
+                if i < n && j < m && disk_lines[i] == draft_lines[j] {
+                    push_line("  ", disk_lines[i]);
+                    i += 1;
+                    j += 1;
+                } else if i < n
+                    && (j == m || dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)])
+                {
+                    push_line("- ", disk_lines[i]);
+                    i += 1;
+                } else {
+                    push_line("+ ", draft_lines[j]);
+                    j += 1;
+                }
+            }
+        } else {
+            let count = disk_lines.len().max(draft_lines.len());
+            for index in 0..count {
+                match (disk_lines.get(index), draft_lines.get(index)) {
+                    (Some(a), Some(b)) if a == b => push_line("  ", a),
+                    (a, b) => {
+                        if let Some(a) = a {
+                            push_line("- ", a);
+                        }
+                        if let Some(b) = b {
+                            push_line("+ ", b);
+                        }
                     }
                 }
             }
         }
-        if count > 2000 {
+        if truncated {
             text.push_str(
                 "\nPreview limited to 2000 lines; use the external editor for the complete file.\n",
             );
@@ -958,6 +1018,16 @@ impl Client {
             {
                 Some("Update running or requires recovery; draft retained, retry save afterward")
             }
+            Id::OverwriteConflict
+                if !self.editor.as_ref().is_some_and(|editor| {
+                    let (key, _) = self.draft_key(&editor.name);
+                    self.drafts
+                        .get(&key)
+                        .is_some_and(|draft| draft.conflict && draft.observed_disk.is_some())
+                }) =>
+            {
+                Some("No external conflict on current draft")
+            }
             Id::Profiles if self.prompt.is_some() => {
                 Some("Finish or cancel the current prompt first")
             }
@@ -1200,6 +1270,29 @@ impl Client {
             Id::CompareDraft => {
                 self.compare_draft();
                 Input::Idle
+            }
+            Id::OverwriteConflict => {
+                let name = self
+                    .editor
+                    .as_ref()
+                    .expect("availability checks editor")
+                    .name
+                    .clone();
+                let (key, _) = self.draft_key(&name);
+                if let Some(observed_disk) = self
+                    .drafts
+                    .get_mut(&key)
+                    .and_then(|draft| draft.observed_disk.take())
+                {
+                    if let Some(draft) = self.drafts.get_mut(&key) {
+                        draft.conflict = false;
+                        draft.editor.original = observed_disk.clone();
+                    }
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.original = observed_disk;
+                    }
+                }
+                self.run_command(Id::Save)
             }
             Id::ExternalEditor => Input::ExternalEditor,
             Id::ReadExternal => {

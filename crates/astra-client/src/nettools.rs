@@ -97,6 +97,7 @@ pub struct View {
     pub server: String,
     pub resolver: String,
     pub count: u32,
+    pub numeric_fresh: bool,
     pub http_method: String,
     pub trace_hops: u8,
     /// NAT only: manually selected physical interface, cleared after each run.
@@ -162,6 +163,7 @@ impl View {
             server: "1.1.1.1".into(),
             resolver: String::new(),
             count: 4,
+            numeric_fresh: true,
             http_method: "GET".into(),
             trace_hops: 30,
             nat_interface: None,
@@ -340,10 +342,12 @@ impl View {
             KeyCode::Up | KeyCode::BackTab => {
                 self.field = fields[(index + fields.len() - 1) % fields.len()];
                 self.egress_query.clear();
+                self.numeric_fresh = true;
             }
             KeyCode::Down | KeyCode::Tab => {
                 self.field = fields[(index + 1) % fields.len()];
                 self.egress_query.clear();
+                self.numeric_fresh = true;
             }
             KeyCode::Left => self.cycle(-1),
             KeyCode::Right => self.cycle(1),
@@ -353,7 +357,13 @@ impl View {
                     self.find_egress();
                 } else if matches!(self.field, Field::Count | Field::Hops) {
                     let current = self.field_value(self.field).parse::<u32>().unwrap_or(1);
-                    let _ = self.set_text(self.field, (current / 10).max(1).to_string());
+                    if current < 10 {
+                        let _ = self.set_text(self.field, "1".into());
+                        self.numeric_fresh = true;
+                    } else {
+                        let _ = self.set_text(self.field, (current / 10).max(1).to_string());
+                        self.numeric_fresh = false;
+                    }
                 } else if let Some(text) = self.text_mut() {
                     text.pop();
                 }
@@ -387,9 +397,18 @@ impl View {
                         } else {
                             30
                         };
-                        let current = self.field_value(self.field).parse::<u32>().unwrap_or(1);
-                        let appended = current * 10 + digit;
-                        let next = if appended > maximum { digit } else { appended };
+                        let next = if self.numeric_fresh {
+                            self.numeric_fresh = false;
+                            digit
+                        } else {
+                            let current = self.field_value(self.field).parse::<u32>().unwrap_or(1);
+                            let appended = current * 10 + digit;
+                            if appended > maximum {
+                                digit
+                            } else {
+                                appended
+                            }
+                        };
                         let _ = self.set_text(self.field, next.clamp(1, maximum).to_string());
                     }
                 }

@@ -214,3 +214,47 @@ fn palette_opens_package_installation_in_both_languages() {
         });
     }
 }
+
+#[test]
+fn palette_supports_multi_token_bilingual_queries_and_ranks_available_first() {
+    crate::i18n::with_language(Language::Simplified, || {
+        let mut ui = profile_ui();
+        ui.palette = Some(Palette::default());
+
+        ui.palette.as_mut().unwrap().query = "update sub".into();
+        let entries = ui.palette_matches();
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.run, Intent::Op(Operation::UpdateSubscriptions))));
+
+        ui.palette.as_mut().unwrap().query = "mode global".into();
+        let mode_entries = ui.palette_matches();
+        assert!(mode_entries
+            .iter()
+            .any(|entry| matches!(entry.run, Intent::Runtime(Command::SetMode(Mode::Global)))));
+        assert_eq!(mode_entries[0].label, t("Mode: global"));
+
+        ui.palette.as_mut().unwrap().query = "模式 global".into();
+        let bilingual_entries = ui.palette_matches();
+        assert!(bilingual_entries
+            .iter()
+            .any(|entry| matches!(entry.run, Intent::Runtime(Command::SetMode(Mode::Global)))));
+
+        ui.palette.as_mut().unwrap().query = "全局".into();
+        let availability_entries = ui.palette_matches();
+        let first_unavailable = availability_entries
+            .iter()
+            .position(|entry| entry.unavailable.is_some());
+        if let Some(first_unavailable) = first_unavailable {
+            assert!(availability_entries[first_unavailable..]
+                .iter()
+                .all(|entry| entry.unavailable.is_some()));
+        }
+
+        ui.palette.as_mut().unwrap().query = "设置".into();
+        let settings_entries = ui.palette_matches();
+        assert!(settings_entries
+            .iter()
+            .any(|entry| matches!(entry.run, Intent::Page(SETTINGS))));
+    });
+}

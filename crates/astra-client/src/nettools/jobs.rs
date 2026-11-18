@@ -328,6 +328,12 @@ impl View {
                     .unwrap_or(0);
                 self.comparison =
                     comparison.and_then(|c| self.egresses.iter().position(|e| *e == c));
+                if self.captured_runtime.is_none() && context.runtime.is_some() {
+                    self.captured_runtime = context.runtime.clone();
+                }
+                if self.captured_core.is_none() && context.core.is_some() {
+                    self.captured_core = context.core.clone();
+                }
                 if self.running()
                     && (self.captured_runtime.as_ref().map(runtime_selection)
                         != context.runtime.as_ref().map(runtime_selection)

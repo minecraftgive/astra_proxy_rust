@@ -60,6 +60,61 @@ impl Entry {
         }
     }
 }
+pub fn filter_and_rank_entries(
+    entries: Vec<Entry>,
+    english_entries: Vec<Entry>,
+    current_language: Language,
+    query: &str,
+) -> Vec<Entry> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return entries;
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut ranked: Vec<(bool, u8, usize, Entry)> = entries
+        .into_iter()
+        .zip(english_entries)
+        .enumerate()
+        .filter_map(|(index, (entry, english))| {
+            let local_hay = format!(
+                "{} {} {}",
+                translate(entry.scope, current_language),
+                entry.label,
+                entry.key
+            )
+            .to_lowercase();
+            let en_hay = format!(
+                "{} {} {}",
+                translate(english.scope, Language::English),
+                english.label,
+                english.key
+            )
+            .to_lowercase();
+            if !tokens
+                .iter()
+                .all(|tok| local_hay.contains(tok) || en_hay.contains(tok))
+            {
+                return None;
+            }
+            let local_label = entry.label.to_lowercase();
+            let en_label = english.label.to_lowercase();
+            let tier = if entry.key.eq_ignore_ascii_case(&trimmed)
+                || local_label.starts_with(&trimmed)
+                || en_label.starts_with(&trimmed)
+            {
+                0
+            } else if local_label.contains(&trimmed) || en_label.contains(&trimmed) {
+                1
+            } else {
+                2
+            };
+            Some((entry.unavailable.is_some(), tier, index, entry))
+        })
+        .collect();
+    ranked.sort_by_key(|(unavailable, tier, index, _)| (*unavailable, *tier, *index));
+    ranked.into_iter().map(|(_, _, _, entry)| entry).collect()
+}
+
 impl Client {
     pub fn palette_matches_for_view(
         &self,
@@ -412,38 +467,13 @@ impl Client {
         query: &str,
         page: usize,
     ) -> Vec<Entry> {
-        let query = query.to_lowercase();
         let current_language = language();
         let entries = self.palette_entries_for_page(current_language, mode, page);
-        if query.is_empty() {
+        if query.trim().is_empty() {
             return entries;
         }
-        let matches = |entry: &Entry, language| {
-            format!(
-                "{} {} {}",
-                translate(entry.scope, language),
-                entry.label,
-                entry.key
-            )
-            .to_lowercase()
-            .contains(&query)
-        };
-        if current_language == Language::English {
-            return entries
-                .into_iter()
-                .filter(|entry| matches(entry, Language::English))
-                .collect();
-        }
-        // The same UI state produces the same actions in either language. Keep
-        // localized entries for display and dispatch; English is a search alias.
-        entries
-            .into_iter()
-            .zip(self.palette_entries_for_page(Language::English, mode, page))
-            .filter_map(|(entry, english)| {
-                (matches(&entry, current_language) || matches(&english, Language::English))
-                    .then_some(entry)
-            })
-            .collect()
+        let english_entries = self.palette_entries_for_page(Language::English, mode, page);
+        filter_and_rank_entries(entries, english_entries, current_language, query)
     }
     pub fn command_help(&self) -> String {
         let mut result = commands::help();

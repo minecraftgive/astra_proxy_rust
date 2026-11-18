@@ -542,6 +542,7 @@ impl Editor {
             return Ok(());
         };
         self.lines = text.split('\n').map(str::to_owned).collect();
+        self.source_buffer = None;
         self.form.marked_rules.clear();
         self.form.marked_nodes.clear();
         self.form.guide = None;
@@ -651,6 +652,9 @@ impl Editor {
             _ => {}
         }
     }
+    pub fn is_dirty(&self) -> bool {
+        self.source_buffer.is_some() || self.text() != self.original
+    }
     pub fn browsing(&self) -> bool {
         matches!(self.form.mode, Mode::Browse)
     }
@@ -667,8 +671,10 @@ impl Editor {
     pub fn import(&mut self, text: String) -> Result<()> {
         let mut candidate = Self::new(self.name.clone(), text);
         candidate.kind = self.kind;
+        candidate.interfaces = self.interfaces.clone();
         candidate.node_tags = self.node_tags.clone();
         candidate.subscription_nodes = self.subscription_nodes.clone();
+        candidate.form.expanded_collections = self.form.expanded_collections.clone();
         candidate.document()?;
         candidate.original = self.original.clone();
         candidate.history = std::mem::take(&mut self.history);
@@ -907,6 +913,37 @@ impl Editor {
                                     output.push(FlatRow::Rule { index, label });
                                     self.flatten_table(doc, &item, output);
                                 }
+                            }
+                        }
+                    } else if matches!(key.as_str(), "listeners" | "users") {
+                        output.push(FlatRow::Collection {
+                            path: child.clone(),
+                            label,
+                        });
+                        if let Some(array) = collection(doc, &child) {
+                            for (index, table) in array.iter().enumerate() {
+                                let mut item = child.clone();
+                                item.push(Part::Index(index));
+                                let entry_label = if key == "listeners" {
+                                    let tag = table.get("tag").map(scalar).unwrap_or_default();
+                                    let listen = table.get("listen").map(scalar).unwrap_or_default();
+                                    let protocol =
+                                        table.get("protocol").map(scalar).unwrap_or_default();
+                                    format!("#{} {} · {} [{}]", index + 1, tag, listen, protocol)
+                                } else {
+                                    let ident = table
+                                        .get("name")
+                                        .or_else(|| table.get("username"))
+                                        .or_else(|| table.get("id"))
+                                        .map(scalar)
+                                        .unwrap_or_default();
+                                    format!("#{} {}", index + 1, ident)
+                                };
+                                output.push(FlatRow::Section {
+                                    path: item.clone(),
+                                    label: entry_label,
+                                });
+                                self.flatten_table(doc, &item, output);
                             }
                         }
                     } else {
@@ -2336,7 +2373,7 @@ impl Editor {
             }
             FlatRow::Section { path, .. } => path.len().saturating_sub(1),
             FlatRow::Info { path, .. } | FlatRow::AddHeader { path } => path.len(),
-            FlatRow::Collection { .. } => 0,
+            FlatRow::Collection { path, .. } => path.len().saturating_sub(1),
             FlatRow::Node { .. } | FlatRow::RuleGroup { .. } | FlatRow::UpdateSubscriptions => 1,
             FlatRow::Rule { .. } => 2,
         };

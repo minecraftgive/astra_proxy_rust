@@ -1368,3 +1368,70 @@ mod text_input_history_tests {
         assert!(old.redo.is_empty());
     }
 }
+
+#[test]
+fn server_editor_exposes_listeners_and_users_without_inserting_rules() {
+    let source = "[[listeners]]\ntag='edge'\nprotocol='vless'\nlisten='0.0.0.0:443'\n[[listeners.users]]\nname='alice'\nuuid='00000000-0000-0000-0000-000000000001'\n";
+    let mut editor = Editor::new("srv".into(), source.into()).with_kind(CoreKind::Server);
+    editor.interfaces = vec!["en0".into()];
+    let presentation = editor.presentation().unwrap();
+    assert!(presentation
+        .tree
+        .iter()
+        .any(|row| row.title.contains("#1 edge")));
+    assert!(presentation
+        .tree
+        .iter()
+        .any(|row| row.title.contains("#1 alice")));
+
+    editor.new_entry().unwrap();
+    let doc = editor.document().unwrap();
+    assert!(doc.get("rules").is_none());
+    assert_eq!(
+        collection(&doc, &[Part::Key("listeners".into())])
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let rows = editor.visible_rows(&doc);
+    let users_row = rows
+        .iter()
+        .position(|r| matches!(r, FlatRow::Collection { path, .. } if path == &[Part::Key("listeners".into()), Part::Index(0), Part::Key("users".into())]))
+        .unwrap();
+    editor.form.selected = users_row;
+    editor.new_entry().unwrap();
+    let doc = editor.document().unwrap();
+    assert_eq!(
+        collection(
+            &doc,
+            &[
+                Part::Key("listeners".into()),
+                Part::Index(0),
+                Part::Key("users".into())
+            ]
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+
+    let rows = editor.visible_rows(&doc);
+    let second_listener = rows
+        .iter()
+        .position(|r| matches!(r, FlatRow::Section { path, .. } if path == &[Part::Key("listeners".into()), Part::Index(1)]))
+        .unwrap();
+    editor.form.selected = second_listener;
+    editor.delete_selected().unwrap();
+    let doc = editor.document().unwrap();
+    assert_eq!(
+        collection(&doc, &[Part::Key("listeners".into())])
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let text = editor.text();
+    editor.import(text).unwrap();
+    assert_eq!(editor.interfaces, vec!["en0".to_owned()]);
+}

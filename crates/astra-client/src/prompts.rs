@@ -252,6 +252,9 @@ impl Client {
                             "Draft retained; correct the file or permissions, then Ctrl-S to retry"
                                 .into();
                     }
+                    Resume::Request(Action::Save { name, .. }) => {
+                        return Input::Run(Action::Read(name), None);
+                    }
                     Resume::Request(Action::BindStart { name, targets }) => {
                         self.open_bindings(name, Some(targets));
                     }

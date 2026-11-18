@@ -77,6 +77,23 @@ impl Editor {
         } else if last_key(&path) == Some("headers") {
             self.form.path = path;
             self.form.mode = Mode::Header(TextInput::default());
+        } else if self.kind == Some(CoreKind::Server) {
+            if let Some(pos) = path.iter().position(|p| p == &Part::Key("users".into())) {
+                self.form.path = path[..=pos].to_vec();
+                let next = collection(&doc, &self.form.path).map_or(0, |a| a.len()) + 1;
+                let mut table = Table::new();
+                table["name"] = value(format!("user-{next}"));
+                table["password"] = value("change-me");
+                self.append(table)?;
+            } else {
+                self.form.path = vec![Part::Key("listeners".into())];
+                let next = collection(&doc, &self.form.path).map_or(0, |a| a.len()) + 1;
+                let mut table = Table::new();
+                table["tag"] = value(format!("listener-{next}"));
+                table["protocol"] = value("socks5");
+                table["listen"] = value("127.0.0.1:1080");
+                self.append(table)?;
+            }
         } else if self.is_proxy(&doc) {
             self.form.path = vec![Part::Key("outbounds".into())];
             self.form.mode = Mode::NewOutbound(0);
@@ -132,37 +149,48 @@ impl Editor {
                 };
             }
             Some(FlatRow::Section { mut path, .. } | FlatRow::Collection { mut path, .. }) => {
-                if let Some(name) = proxy_group_name(&path) {
+                if let Some(&Part::Index(index)) = path.last() {
+                    let parent = &path[..path.len() - 1];
+                    if matches!(last_key(parent), Some("listeners" | "users")) {
+                        self.form.path = parent.to_vec();
+                        self.form.mode = Mode::Delete {
+                            key: None,
+                            index: Some(index),
+                        };
+                    }
+                } else {
+                    if let Some(name) = proxy_group_name(&path) {
+                        anyhow::ensure!(
+                            !astra_model::groups::reserved(name),
+                            t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
+                        );
+                        anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
+                    }
                     anyhow::ensure!(
-                        !astra_model::groups::reserved(name),
+                        path != vec![Part::Key("proxy_groups".into())],
                         t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
                     );
-                    anyhow::ensure!(!proxy_references(&doc, name), t("Proxy target is referenced; change its groups or default before deleting"));
-                }
-                anyhow::ensure!(
-                    path != vec![Part::Key("proxy_groups".into())],
-                    t("Built-in groups PROXY, DIRECT and REJECT cannot be renamed or deleted")
-                );
-                if path == vec![Part::Key("outbounds".into())] {
-                    anyhow::ensure!(!collection(&doc, &path).is_some_and(|nodes| nodes.iter().filter_map(|n| n.get("tag").and_then(Item::as_str)).any(|tag| proxy_references(&doc, tag))), t("Proxy target is referenced; change its groups or default before deleting"));
-                }
-                if let Some(name) = rule_set_name(&path) {
-                    anyhow::ensure!(
-                        rule_set_references(&doc, Some(name)) == 0,
-                        t("Rule set is referenced; change its rules before deleting")
-                    );
-                } else if last_key(&path) == Some("rule_sets") {
-                    anyhow::ensure!(
-                        rule_set_references(&doc, None) == 0,
-                        t("Rule set is referenced; change its rules before deleting")
-                    );
-                }
-                if let Some(Part::Key(key)) = path.pop() {
-                    self.form.path = path;
-                    self.form.mode = Mode::Delete {
-                        key: Some(key),
-                        index: None,
-                    };
+                    if path == vec![Part::Key("outbounds".into())] {
+                        anyhow::ensure!(!collection(&doc, &path).is_some_and(|nodes| nodes.iter().filter_map(|n| n.get("tag").and_then(Item::as_str)).any(|tag| proxy_references(&doc, tag))), t("Proxy target is referenced; change its groups or default before deleting"));
+                    }
+                    if let Some(name) = rule_set_name(&path) {
+                        anyhow::ensure!(
+                            rule_set_references(&doc, Some(name)) == 0,
+                            t("Rule set is referenced; change its rules before deleting")
+                        );
+                    } else if last_key(&path) == Some("rule_sets") {
+                        anyhow::ensure!(
+                            rule_set_references(&doc, None) == 0,
+                            t("Rule set is referenced; change its rules before deleting")
+                        );
+                    }
+                    if let Some(Part::Key(key)) = path.pop() {
+                        self.form.path = path;
+                        self.form.mode = Mode::Delete {
+                            key: Some(key),
+                            index: None,
+                        };
+                    }
                 }
             }
             _ => {}

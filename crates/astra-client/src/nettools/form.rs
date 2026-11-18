@@ -159,6 +159,7 @@ impl View {
         if !self.fields().contains(&self.field) {
             self.field = Field::Kind;
         }
+        self.numeric_fresh = true;
     }
     pub fn set_text(&mut self, field: Field, value: String) -> Result<(), String> {
         match field {

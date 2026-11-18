@@ -4,8 +4,19 @@ use crate::{i18n::t, protocol::*, state::*};
 use anyhow::{Context, Result};
 
 impl Client {
+    pub fn operations_for(&self, row: &Row) -> Vec<Operation> {
+        let mut ops = row_operations(row);
+        if row.instance.kind == Kind::Proxy
+            && self.active_proxy().map(|r| &r.instance.name) != Some(&row.instance.name)
+        {
+            ops.insert(1.min(ops.len()), Operation::Activate);
+        }
+        ops
+    }
     pub fn operations(&self) -> Vec<Operation> {
-        self.selected().map(row_operations).unwrap_or_default()
+        self.selected()
+            .map(|row| self.operations_for(row))
+            .unwrap_or_default()
     }
     pub fn switch_core(&mut self, kind: Kind) {
         self.kind = kind;
@@ -98,6 +109,13 @@ impl Client {
                     self.message = "Not running".into();
                     None
                 }
+            }
+            Operation::Activate => {
+                if row.instance.kind == Kind::Proxy {
+                    self.activate_profile(name.clone());
+                    self.message = tr!("Active profile switched to {}", name);
+                }
+                None
             }
             Operation::Edit => {
                 self.suspend_editor();
@@ -255,12 +273,16 @@ impl Client {
             return Input::Idle;
         };
         let previous = self.selections;
+        let previous_kind = self.kind;
         self.kind = Kind::Rule;
         if let Some(index) = self.rows().iter().position(|r| r.instance.name == name) {
             self.selections[1] = index;
         }
         let input = self.operation(operation);
         self.selections = previous;
+        if !matches!(operation, Operation::Edit) {
+            self.kind = previous_kind;
+        }
         input
     }
     pub fn rule_search(&mut self) -> Input {
@@ -768,8 +790,8 @@ impl Client {
         };
         match action {
             EditorAction::UpdateSubscriptions => {
-                if editor.text() != editor.original {
-                    self.message = "请先按 Ctrl-S 保存订阅配置，再手动更新".into();
+                if editor.is_dirty() {
+                    self.message = t("Save subscription changes (Ctrl-S) before updating").into();
                 } else {
                     return Input::Run(Action::UpdateSubscriptions(editor.name.clone()), None);
                 }

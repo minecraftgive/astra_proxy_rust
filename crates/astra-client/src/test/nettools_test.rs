@@ -406,3 +406,19 @@ fn space_cycles_the_tool_row_like_other_choices() {
     view.key(key(KeyCode::Char(' ')));
     assert_eq!(view.kind, Kind::Tcp);
 }
+
+#[test]
+fn numeric_fields_replace_default_on_first_digit_and_type_naturally() {
+    let mut view = view();
+    view.field = Field::Count;
+    assert_eq!(view.count, 4);
+    view.key(key(KeyCode::Char('1')));
+    view.key(key(KeyCode::Char('5')));
+    assert_eq!(view.count, 15);
+    view.key(key(KeyCode::Backspace));
+    assert_eq!(view.count, 1);
+    view.key(key(KeyCode::Backspace));
+    view.key(key(KeyCode::Char('1')));
+    view.key(key(KeyCode::Char('0')));
+    assert_eq!(view.count, 10);
+}

@@ -224,12 +224,16 @@ impl Feeds {
             changed = true;
             match result {
                 Ok(reply) => {
+                    let was_offline = !self.list_online;
                     self.ready = true;
                     if !self.list_online {
                         ui.refresh_program_info();
                     }
                     self.list_online = true;
-                    ui.update_rows(reply)
+                    ui.update_rows(reply);
+                    if was_offline && ui.active_proxy().and_then(|r| r.pid).is_none() {
+                        ui.runtime_error.clear();
+                    }
                 }
                 Err(error) => {
                     self.list_online = false;
